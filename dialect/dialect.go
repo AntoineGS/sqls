@@ -11,6 +11,13 @@ type Dialect interface {
 type GenericSQLDialect struct {
 }
 
+func DialectForDriver(driver DatabaseDriver) Dialect {
+	if driver == DatabaseDriverInterBase {
+		return &InterBaseDialect{}
+	}
+	return &GenericSQLDialect{}
+}
+
 func (*GenericSQLDialect) IsIdentifierStart(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '@'
 }

@@ -34,6 +34,9 @@ type DBConfig struct {
 }
 
 func (c *DBConfig) Validate() error {
+	if c == nil {
+		return errors.New("connection config is nil")
+	}
 	if c.Driver == "" {
 		return errors.New("required: connections[].driver")
 	}
@@ -135,6 +138,19 @@ func (c *DBConfig) Validate() error {
 			if c.SSHCfg != nil {
 				return c.SSHCfg.Validate()
 			}
+		}
+	case dialect.DatabaseDriverInterBase:
+		if c.User == "" {
+			return errors.New("required: connections[].user")
+		}
+		if c.SSHCfg != nil {
+			return errors.New("InterBase connections via SSH are not supported")
+		}
+		if _, err := interBaseAttachment(c); err != nil {
+			return err
+		}
+		if _, err := interBaseCharset(c); err != nil {
+			return err
 		}
 
 	default:

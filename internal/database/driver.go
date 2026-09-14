@@ -63,6 +63,9 @@ func Registered(name dialect.DatabaseDriver) bool {
 }
 
 func Open(cfg *DBConfig) (*DBConnection, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("connection config is nil")
+	}
 	OpenFn, ok := driverOpeners[cfg.Driver]
 	if !ok {
 		return nil, fmt.Errorf("driver not found, %s", cfg.Driver)

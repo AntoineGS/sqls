@@ -90,7 +90,7 @@ func completionTypeIs(completionTypes []completionType, expect completionType) b
 }
 
 func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercaseKeywords bool) ([]lsp.CompletionItem, error) {
-	parsed, err := parser.Parse(text)
+	parsed, err := parser.ParseWithDriver(text, c.Driver)
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +115,7 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 		return nil, err
 	}
 
-	lastWord := getLastWord(text, params.Position.Line+1, params.Position.Character)
+	lastWord := getLastWordWithDriver(text, params.Position.Line+1, params.Position.Character, c.Driver)
 	withBackQuote := strings.HasPrefix(lastWord, "`")
 
 	var items []lsp.CompletionItem
@@ -432,10 +432,18 @@ func getLine(text string, line int) string {
 }
 
 func getLastWord(text string, line, char int) string {
+	return getLastWordWithDriver(text, line, char, "")
+}
+
+func getLastWordWithDriver(text string, line, char int, driver dialect.DatabaseDriver) string {
 	t := getBeforeCursorText(text, line, char)
 	s := getLine(t, line)
 
-	reg := regexp.MustCompile("[\\w`]+$")
+	wordPattern := "[\\w`]+$"
+	if driver == dialect.DatabaseDriverInterBase {
+		wordPattern = "[\\w$`]+$"
+	}
+	reg := regexp.MustCompile(wordPattern)
 	ss := reg.FindAllString(s, -1)
 	if len(ss) == 0 {
 		return ""

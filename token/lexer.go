@@ -66,6 +66,10 @@ func MakeKeyword(word string, quoteStyle rune) *SQLWord {
 	}
 }
 
+type keywordMatcher interface {
+	MatchKeyword(string) dialect.KeywordKind
+}
+
 type Token struct {
 	Kind  Kind
 	Value interface{}
@@ -200,16 +204,20 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 			return NationalStringLiteral, str, nil
 		}
 		s := t.tokenizeWord('N')
-		v := MakeKeyword(s, 0)
+		v := t.makeKeyword(s, 0)
 		return SQLKeyword, v, nil
 
 	case t.Dialect.IsIdentifierStart(r):
 		t.Scanner.Next()
 		s := t.tokenizeWord(r)
-		return SQLKeyword, MakeKeyword(s, 0), nil
+		return SQLKeyword, t.makeKeyword(s, 0), nil
 
 	case r == '\'':
 		s := t.tokenizeSingleQuotedString()
+		return SingleQuotedString, s, nil
+
+	case r == '"' && !t.Dialect.IsDelimitedIdentifierStart(r):
+		s := t.tokenizeQuotedString('"', true)
 		return SingleQuotedString, s, nil
 
 	case t.Dialect.IsDelimitedIdentifierStart(r):
@@ -391,6 +399,10 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 		t.Scanner.Next()
 		t.Col++
 		return RBrace, "}", nil
+	case r == '?' && t.Dialect.IsPlaceHolderStart(r):
+		t.Scanner.Next()
+		t.Col++
+		return Char, "?", nil
 	case scanner.EOF == r:
 		return ILLEGAL, "", io.EOF
 	default:
@@ -398,6 +410,16 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 		t.Col++
 		return Char, string(r), nil
 	}
+}
+
+func (t *Tokenizer) makeKeyword(word string, quoteStyle rune) *SQLWord {
+	keyword := MakeKeyword(word, quoteStyle)
+	if quoteStyle == 0 {
+		if matcher, ok := t.Dialect.(keywordMatcher); ok {
+			keyword.Kind = matcher.MatchKeyword(keyword.Keyword)
+		}
+	}
+	return keyword
 }
 
 func (t *Tokenizer) tokenizeWord(f rune) string {
@@ -418,6 +440,10 @@ func (t *Tokenizer) tokenizeWord(f rune) string {
 }
 
 func (t *Tokenizer) tokenizeSingleQuotedString() string {
+	return t.tokenizeQuotedString('\'', !t.Dialect.IsDelimitedIdentifierStart('"'))
+}
+
+func (t *Tokenizer) tokenizeQuotedString(quote rune, preserveEscapes bool) string {
 	var str []rune
 	t.Scanner.Next()
 	cols := 1
@@ -425,12 +451,16 @@ func (t *Tokenizer) tokenizeSingleQuotedString() string {
 
 	for {
 		n := t.Scanner.Peek()
-		if n == '\'' {
+		if n == quote {
 			t.Scanner.Next()
-			if t.Scanner.Peek() == '\'' {
-				// An escaped quote consumes two source columns
-				// but is stored as a single rune.
-				str = append(str, '\'')
+			if t.Scanner.Peek() == quote {
+				// An escaped quote consumes two source columns. Generic SQL
+				// keeps the historical decoded representation, while dialects
+				// that use double quotes for strings preserve the source spelling.
+				str = append(str, quote)
+				if preserveEscapes {
+					str = append(str, quote)
+				}
 				t.Scanner.Next()
 				cols += 2
 			} else {
@@ -451,9 +481,9 @@ func (t *Tokenizer) tokenizeSingleQuotedString() string {
 
 	t.Col += cols
 	if isClosed {
-		return "'" + string(str) + "'"
+		return string(quote) + string(str) + string(quote)
 	}
-	return "'" + string(str)
+	return string(quote) + string(str)
 }
 
 func (t *Tokenizer) tokenizeDelimitedIdentifier(r rune) *SQLWord {

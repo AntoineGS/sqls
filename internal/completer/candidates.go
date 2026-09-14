@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser/parseutil"
@@ -164,6 +165,7 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 		return candidates
 	}
 
+	caseInsensitive := c.Driver == dialect.DatabaseDriverInterBase
 	tMap := make(map[string]*parseutil.TableInfo)
 	for _, t := range targetTables {
 		tMap[t.Name] = t
@@ -171,7 +173,7 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 	fkMap := make(map[string][][]*database.ForeignKey)
 	if lastTable == nil {
 		for t := range tMap {
-			for k, v := range c.DBCache.ForeignKeys[t] {
+			for k, v := range c.foreignKeysForTable(t) {
 				fkMap[k] = append(fkMap[k], v)
 			}
 		}
@@ -182,15 +184,15 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 			rTab = resolveTables(lastTable, c.DBCache)
 		}
 		for _, lt := range rTab {
-			for k, v := range c.DBCache.ForeignKeys[lt.Name] {
-				if _, ok := tMap[k]; ok {
+			for k, v := range c.foreignKeysForTable(lt.Name) {
+				if _, ok := tableInfoForName(tMap, k, caseInsensitive); ok {
 					fkMap[lt.Name] = append(fkMap[lt.Name], v)
 				}
 			}
 		}
 
 		for _, t := range rTab {
-			if _, ok := tMap[t.Name]; !ok {
+			if _, ok := tableInfoForName(tMap, t.Name, caseInsensitive); !ok {
 				tMap[t.Name] = t
 			}
 		}
@@ -207,11 +209,43 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 		for _, fks := range v {
 			for _, fk := range fks {
 				candidates = append(candidates, generateForeignKeyCandidate(k, tMap, aliases,
-					fk, joinOn, lowercaseKeywords))
+					fk, joinOn, lowercaseKeywords, caseInsensitive))
 			}
 		}
 	}
 	return candidates
+}
+
+func (c *Completer) foreignKeysForTable(tableName string) map[string][]*database.ForeignKey {
+	foreignKeys, ok := c.DBCache.ForeignKeys[tableName]
+	if ok || c.Driver != dialect.DatabaseDriverInterBase {
+		return foreignKeys
+	}
+	for cachedTableName, foreignKeys := range c.DBCache.ForeignKeys {
+		if strings.EqualFold(cachedTableName, tableName) {
+			return foreignKeys
+		}
+	}
+	return nil
+}
+
+func tableInfoForName(tMap map[string]*parseutil.TableInfo, name string, caseInsensitive bool) (*parseutil.TableInfo, bool) {
+	if table, ok := tMap[name]; ok {
+		return table, true
+	}
+	if !caseInsensitive {
+		return nil, false
+	}
+	for tableName, table := range tMap {
+		if strings.EqualFold(tableName, name) {
+			return table, true
+		}
+	}
+	return nil, false
+}
+
+func tableNamesEqual(left, right string, caseInsensitive bool) bool {
+	return left == right || (caseInsensitive && strings.EqualFold(left, right))
 }
 
 func resolveTables(t *parseutil.TableInfo, cache *database.DBCache) []*parseutil.TableInfo {
@@ -250,37 +284,44 @@ func generateForeignKeyCandidate(target string,
 	tMap map[string]*parseutil.TableInfo,
 	aliases map[string]interface{},
 	fk *database.ForeignKey,
-	joinOn, lowercaseKeywords bool) lsp.CompletionItem {
+	joinOn, lowercaseKeywords, caseInsensitive bool) lsp.CompletionItem {
 	var tAlias string
 	if joinOn {
-		tAlias = tMap[target].Alias
-		if tAlias == "" {
-			tAlias = tMap[target].Name
+		if table, ok := tableInfoForName(tMap, target, caseInsensitive); ok {
+			tAlias = table.Alias
+			if tAlias == "" {
+				tAlias = table.Name
+			}
+		} else {
+			tAlias = target
 		}
 	} else {
 		tAlias = generateTableAlias(target, aliases)
 	}
 	builder := []struct {
-		sb    *strings.Builder
-		alias string
+		sb      *strings.Builder
+		alias   string
+		snippet bool
 	}{
 		{
-			sb:    &strings.Builder{},
-			alias: tAlias,
+			sb:      &strings.Builder{},
+			alias:   tAlias,
+			snippet: false,
 		},
 		{
-			sb:    &strings.Builder{},
-			alias: tAlias,
+			sb:      &strings.Builder{},
+			alias:   escapeSnippetLiteral(tAlias, caseInsensitive),
+			snippet: true,
 		},
 	}
 	if !joinOn {
-		builder[1].alias = fmt.Sprintf("${1:%s}", tAlias)
+		builder[1].alias = fmt.Sprintf("${1:%s}", builder[1].alias)
 		onKw := "ON"
 		if lowercaseKeywords {
 			onKw = "on"
 		}
 		for _, b := range builder {
-			fmt.Fprintf(b.sb, "%s %s %s ", target, b.alias, onKw)
+			fmt.Fprintf(b.sb, "%s %s %s ", escapeSnippetLiteral(target, b.snippet && caseInsensitive), b.alias, onKw)
 		}
 	}
 	andKw := " AND "
@@ -290,7 +331,7 @@ func generateForeignKeyCandidate(target string,
 	prefix := ""
 	for _, cur := range *fk {
 		tIdx, rIdx := 0, 1
-		if cur[rIdx].Table == target {
+		if tableNamesEqual(cur[rIdx].Table, target, caseInsensitive) {
 			tIdx, rIdx = rIdx, tIdx
 		}
 		for _, b := range builder {
@@ -298,15 +339,27 @@ func generateForeignKeyCandidate(target string,
 		}
 		prefix = andKw
 		for _, b := range builder {
-			b.sb.WriteString(strings.Join([]string{b.alias, cur[tIdx].Name}, "."))
+			b.sb.WriteString(strings.Join([]string{
+				b.alias,
+				escapeSnippetLiteral(cur[tIdx].Name, b.snippet && caseInsensitive),
+			}, "."))
 			b.sb.WriteString(" = ")
 		}
-		rAlias := tMap[cur[rIdx].Table].Alias
+		rAlias := ""
+		if table, ok := tableInfoForName(tMap, cur[rIdx].Table, caseInsensitive); ok {
+			rAlias = table.Alias
+			if rAlias == "" {
+				rAlias = table.Name
+			}
+		}
 		if rAlias == "" {
 			rAlias = cur[rIdx].Table
 		}
 		for _, b := range builder {
-			b.sb.WriteString(strings.Join([]string{rAlias, cur[rIdx].Name}, "."))
+			b.sb.WriteString(strings.Join([]string{
+				escapeSnippetLiteral(rAlias, b.snippet && caseInsensitive),
+				escapeSnippetLiteral(cur[rIdx].Name, b.snippet && caseInsensitive),
+			}, "."))
 		}
 	}
 	builder[1].sb.WriteString("$0")
@@ -317,6 +370,15 @@ func generateForeignKeyCandidate(target string,
 		InsertText:       builder[1].sb.String(),
 		InsertTextFormat: lsp.SnippetTextFormat,
 	}
+}
+
+func escapeSnippetLiteral(value string, escape bool) string {
+	if !escape {
+		return value
+	}
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `$`, `\$`)
+	return strings.ReplaceAll(value, `}`, `\}`)
 }
 
 func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.CompletionItem {

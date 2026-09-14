@@ -20,6 +20,7 @@ sqls aims to provide advanced intelligence for you to edit sql in your own edito
 - MSSQL([go-mssqldb](https://github.com/microsoft/go-mssqldb))
 - H2([pgx](https://github.com/CodinGame/h2go))
 - Vertica([vertica-sql-go](https://github.com/vertica/vertica-sql-go))
+- InterBase SQL Dialect 1 ([interbase-go](../interbase-go), optional native build)
 
 ### Language Server Features
 
@@ -68,6 +69,25 @@ If the tables are connected with a foreign key sqls can complete ```JOIN``` stat
 ```shell
 go install github.com/sqls-server/sqls@latest
 ```
+
+### InterBase Build
+
+InterBase connectivity is opt-in. The current integration uses the experimental
+local `interbase-go` module through `replace interbase-go => ../interbase-go` in
+`go.mod`; keep the driver checkout alongside this repository. It requires
+Linux/amd64, Go 1.25.7 or newer, a C compiler, and the official InterBase SDK at
+`/opt/interbase/include` with `libgds.so` at `/opt/interbase/lib`. The proprietary
+SDK and client library are not distributed with sqls.
+
+Build from this checkout:
+
+```shell
+CGO_ENABLED=1 go build -tags interbase -o sqls .
+```
+
+Ordinary builds do not link the InterBase client. Selecting an InterBase
+connection in such a build reports that the native build is required. The
+upstream `go install ...@latest` command does not include this local integration.
 
 ## Editor Plugins
 
@@ -232,12 +252,12 @@ The first setting in `connections` is the default connection.
 
 ### connections
 
-`dataSourceName` takes precedence over the value set in `proto`, `user`, `passwd`, `host`, `port`, `dbName`, `params`.
+`dataSourceName` takes precedence over the value set in `proto`, `user`, `passwd`, `host`, `port`, `dbName`, `params`, except for InterBase, where credentials and charset remain separate settings (see below).
 
 | Key            | Description                                 |
 | -------------- | ------------------------------------------- |
 | alias          | Connection alias name. Optional.            |
-| driver         | `mysql`, `postgresql`, `sqlite3`, `mssql`, `h2`. Required. |
+| driver         | `mysql`, `postgresql`, `sqlite3`, `mssql`, `h2`, `interbase`. Required. |
 | dataSourceName | Data source name.                           |
 | proto          | `tcp`, `udp`, `unix`.                       |
 | user           | User name                                   |
@@ -266,6 +286,66 @@ See also.
 - <https://github.com/go-sql-driver/mysql#dsn-data-source-name>
 - <https://pkg.go.dev/github.com/jackc/pgx/v4>
 - <https://github.com/mattn/go-sqlite3#connection-string>
+
+#### InterBase (SQL Dialect 1)
+
+```yaml
+connections:
+  - alias: interbase_example
+    driver: interbase
+    dataSourceName: "db.example.test/3050:/srv/interbase/example.ib"
+    user: sqls_reader
+    passwd: "your-password"
+    params:
+      charset: UTF8
+```
+
+`dataSourceName` is a native InterBase attachment string, not a URL or a
+credential-bearing DSN. `user` is required and `passwd` is supplied separately
+(an empty password is permitted). Protect configuration files containing
+credentials; the example values are placeholders, not environment-variable
+references.
+
+Alternatively, supply `host`, optional `port` (default `3050`), and `path`
+(or `dbName`) instead of `dataSourceName`. Without a host, the path is used as a
+local attachment. `proto` may be omitted or set to `tcp` for a remote attachment.
+`params.charset` defaults to `UTF8`; `WIN1250` is also supported. Built-in SSH
+tunneling is not supported for this driver.
+
+The driver always uses client SQL Dialect 1; no dialect parameter is necessary.
+Both single and double quotes delimit strings, doubled quotes escape a quote,
+unquoted identifiers may contain `$`, and positional parameters use `?`.
+Parsing and formatting use these rules when the selected connection is
+InterBase. Parameter binding is a driver capability; the sqls execute command
+does not prompt for parameter values.
+
+Completion and hover use user table/view, column, primary-key, and foreign-key
+metadata. InterBase has no schema namespace or database enumeration through this
+adapter, so switching databases is not supported; configure separate connections
+instead. Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported.
+
+The native driver is experimental. Context cancellation cannot interrupt an
+in-flight native call, and the driver exposes no TLS configuration API. Use a
+trusted network or independently verified native transport security and a
+least-privilege database account. Executing DML/DDL uses the driver's implicit
+commit behavior; SQL transaction-control statements are not supported.
+
+Run the offline suite and the native-enabled suite with:
+
+```shell
+go test ./...
+CGO_ENABLED=1 go test -tags interbase ./...
+```
+
+The native suite includes a read-only live test that skips unless
+`INTERBASE_DATABASE`, `INTERBASE_USER`, and `INTERBASE_PASSWORD` are explicitly
+set in the environment (`INTERBASE_PASSWORD` may be empty). It does not retrieve
+credentials from other tools or create database fixtures. To run it separately
+with an outer timeout for native calls:
+
+```shell
+timeout 60s go test -tags interbase ./internal/database -run '^TestInterBaseLive' -count=1 -v -timeout=50s
+```
 
 ## Contributors
 

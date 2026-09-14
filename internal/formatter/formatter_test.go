@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -40,6 +41,24 @@ func TestEval(t *testing.T) {
 				t.Errorf("expected: %s, got %s", tt.expected, actual[0].NewText)
 			}
 		})
+	}
+}
+
+func TestFormatWithInterBaseDialect1(t *testing.T) {
+	got, err := FormatWithDriver(
+		`select "a""b", 'c''d' from rdb$database`,
+		lsp.DocumentFormattingParams{},
+		&config.Config{LowercaseKeywords: false},
+		dialect.DatabaseDriverInterBase,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d text edits, want 1", len(got))
+	}
+	if got, want := got[0].NewText, "SELECT\n\t\"a\"\"b\",\n\t'c''d'\nFROM\n\trdb$database"; got != want {
+		t.Fatalf("formatted InterBase Dialect 1 query = %q, want %q", got, want)
 	}
 }
 

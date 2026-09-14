@@ -5,8 +5,68 @@ import (
 	"testing"
 
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
 )
+
+func TestParseWithInterBaseDialect1(t *testing.T) {
+	input := `SELECT "a""b", 'c''d' FROM RDB$DATABASE WHERE ID = ?`
+	parsed, err := ParseWithDriver(input, dialect.DatabaseDriverInterBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var sqlTokens []*ast.SQLToken
+	collectSQLTokens(parsed, &sqlTokens)
+
+	var strings []string
+	var dollarIdentifier bool
+	var placeholder bool
+	for _, sqlToken := range sqlTokens {
+		if sqlToken.Kind == token.SingleQuotedString {
+			strings = append(strings, sqlToken.String())
+		}
+		if sqlToken.Kind == token.SQLKeyword {
+			word, ok := sqlToken.Value.(*token.SQLWord)
+			if ok && word.Value == "RDB$DATABASE" {
+				dollarIdentifier = true
+			}
+		}
+		if sqlToken.Kind == token.Char && sqlToken.Value == "?" {
+			placeholder = true
+		}
+	}
+
+	if got, want := strings, []string{`"a""b"`, `'c''d'`}; !reflect.DeepEqual(got, want) {
+		t.Errorf("parsed Dialect 1 strings = %#v, want %#v", got, want)
+	}
+	if got := parsed.String(); got != input {
+		t.Errorf("parsed Dialect 1 String() = %q, want original SQL %q", got, input)
+	}
+	if got := parsed.Render(&ast.RenderOptions{LowerCase: false}); got != input {
+		t.Errorf("parsed Dialect 1 Render() = %q, want original SQL %q", got, input)
+	}
+	if !dollarIdentifier {
+		t.Error("parsed Dialect 1 query lost the RDB$DATABASE identifier")
+	}
+	if !placeholder {
+		t.Error("parsed Dialect 1 query lost the positional placeholder")
+	}
+}
+
+func collectSQLTokens(node ast.Node, into *[]*ast.SQLToken) {
+	if tokenNode, ok := node.(ast.Token); ok {
+		*into = append(*into, tokenNode.GetToken())
+		return
+	}
+	list, ok := node.(ast.TokenList)
+	if !ok {
+		return
+	}
+	for _, child := range list.GetTokens() {
+		collectSQLTokens(child, into)
+	}
+}
 
 func TestParseStatement(t *testing.T) {
 	testcases := []struct {

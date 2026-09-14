@@ -8,6 +8,7 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -30,15 +31,19 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	return definition(params.TextDocument.URI, f.Text, params, s.worker.Cache())
+	return definitionWithDriver(params.TextDocument.URI, f.Text, params, s.worker.Cache(), s.parserDriver())
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {
+	return definitionWithDriver(url, text, params, dbCache, "")
+}
+
+func definitionWithDriver(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (lsp.Definition, error) {
 	pos := token.Pos{
 		Line: params.Position.Line,
 		Col:  params.Position.Character + 1,
 	}
-	parsed, err := parser.Parse(text)
+	parsed, err := parser.ParseWithDriver(text, driver)
 	if err != nil {
 		return nil, err
 	}

@@ -906,3 +906,70 @@ test
 		}
 	})
 }
+
+func TestTokenizer_InterBaseDialect1(t *testing.T) {
+	src := `"a""b" 'c''d' RDB$DATABASE ?`
+	tokenizer := NewTokenizer(bytes.NewBufferString(src), &dialect.InterBaseDialect{})
+
+	tokens, err := tokenizer.Tokenize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 7 {
+		t.Fatalf("got %d tokens, want 7: %s", len(tokens), pp.Sprint(tokens))
+	}
+
+	if got, want := tokens[0].Kind, SingleQuotedString; got != want {
+		t.Fatalf("double-quoted Dialect 1 string kind = %v, want %v", got, want)
+	}
+	if got, want := tokens[0].Value, `"a""b"`; got != want {
+		t.Fatalf("double-quoted Dialect 1 string value = %q, want %q", got, want)
+	}
+	if got, want := tokens[0].To, (Pos{Line: 0, Col: 6}); got != want {
+		t.Fatalf("double-quoted Dialect 1 string end = %v, want %v", got, want)
+	}
+
+	if got, want := tokens[2].Kind, SingleQuotedString; got != want {
+		t.Fatalf("single-quoted Dialect 1 string kind = %v, want %v", got, want)
+	}
+	if got, want := tokens[2].Value, `'c''d'`; got != want {
+		t.Fatalf("single-quoted Dialect 1 string value = %q, want %q", got, want)
+	}
+
+	word, ok := tokens[4].Value.(*SQLWord)
+	if !ok {
+		t.Fatalf("RDB$DATABASE token value = %T, want *SQLWord", tokens[4].Value)
+	}
+	if got, want := word.Value, "RDB$DATABASE"; got != want {
+		t.Errorf("RDB$DATABASE value = %q, want %q", got, want)
+	}
+	if got, want := word.Keyword, "RDB$DATABASE"; got != want {
+		t.Errorf("RDB$DATABASE keyword = %q, want %q", got, want)
+	}
+	if got, want := word.Kind, dialect.KeywordKind(dialect.Unmatched); got != want {
+		t.Errorf("RDB$DATABASE keyword kind = %v, want %v", got, want)
+	}
+
+	if got, want := tokens[6].Kind, Char; got != want {
+		t.Errorf("positional placeholder kind = %v, want %v", got, want)
+	}
+	if got, want := tokens[6].Value, "?"; got != want {
+		t.Errorf("positional placeholder value = %q, want %q", got, want)
+	}
+}
+
+func TestTokenizer_GenericDoubleQuotesRemainDelimitedIdentifiers(t *testing.T) {
+	tokenizer := NewTokenizer(bytes.NewBufferString(`"name"`), &dialect.GenericSQLDialect{})
+
+	tokens, err := tokenizer.Tokenize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 1 {
+		t.Fatalf("got %d tokens, want 1", len(tokens))
+	}
+	word, ok := tokens[0].Value.(*SQLWord)
+	if !ok || word.QuoteStyle != '"' {
+		t.Fatalf("generic double-quoted token = %#v, want a delimited SQLWord", tokens[0].Value)
+	}
+}

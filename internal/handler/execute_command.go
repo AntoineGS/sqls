@@ -15,6 +15,7 @@ import (
 	"github.com/olekukonko/tablewriter/tw"
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -147,7 +148,7 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	stmts, err := getStatements(text)
+	stmts, err := getStatementsWithDriver(text, s.parserDriver())
 	if err != nil {
 		return nil, err
 	}
@@ -494,8 +495,8 @@ func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams
 	return strings.Join(results, "\n"), nil
 }
 
-func getStatements(text string) ([]*ast.Statement, error) {
-	parsed, err := parser.Parse(text)
+func getStatementsWithDriver(text string, driver dialect.DatabaseDriver) ([]*ast.Statement, error) {
+	parsed, err := parser.ParseWithDriver(text, driver)
 	if err != nil {
 		return nil, err
 	}

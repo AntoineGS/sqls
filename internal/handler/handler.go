@@ -10,6 +10,7 @@ import (
 
 	"github.com/sourcegraph/jsonrpc2"
 
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
@@ -427,6 +428,13 @@ func (s *Server) getConfig() *config.Config {
 		cfg = config.NewConfig()
 	}
 	return cfg
+}
+
+func (s *Server) parserDriver() dialect.DatabaseDriver {
+	if s.dbConn == nil {
+		return ""
+	}
+	return s.dbConn.Driver
 }
 
 func validConfig(cfg *config.Config) bool {

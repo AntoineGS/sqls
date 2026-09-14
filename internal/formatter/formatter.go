@@ -6,6 +6,7 @@ import (
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -13,10 +14,18 @@ import (
 )
 
 func Format(text string, params lsp.DocumentFormattingParams, cfg *config.Config) ([]lsp.TextEdit, error) {
+	return formatWithDialect(text, params, cfg, &dialect.GenericSQLDialect{})
+}
+
+func FormatWithDriver(text string, params lsp.DocumentFormattingParams, cfg *config.Config, driver dialect.DatabaseDriver) ([]lsp.TextEdit, error) {
+	return formatWithDialect(text, params, cfg, dialect.DialectForDriver(driver))
+}
+
+func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *config.Config, d dialect.Dialect) ([]lsp.TextEdit, error) {
 	if text == "" {
 		return nil, errors.New("empty")
 	}
-	parsed, err := parser.Parse(text)
+	parsed, err := parser.ParseWithDialect(text, d)
 	if err != nil {
 		return nil, err
 	}

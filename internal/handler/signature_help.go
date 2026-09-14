@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -28,7 +29,7 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := SignatureHelp(f.Text, params, s.worker.Cache())
+	res, err := SignatureHelpWithDriver(f.Text, params, s.worker.Cache(), s.parserDriver())
 	if err != nil {
 		return nil, err
 	}
@@ -36,11 +37,15 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 }
 
 func SignatureHelp(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache) (*lsp.SignatureHelp, error) {
+	return SignatureHelpWithDriver(text, params, dbCache, "")
+}
+
+func SignatureHelpWithDriver(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.SignatureHelp, error) {
 	if dbCache == nil {
 		return nil, nil
 	}
 
-	parsed, err := parser.Parse(text)
+	parsed, err := parser.ParseWithDriver(text, driver)
 	if err != nil {
 		return nil, err
 	}

@@ -26,11 +26,7 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 	}
 
 	c := completer.NewCompleter(s.worker.Cache())
-	if s.dbConn != nil {
-		c.Driver = s.dbConn.Driver
-	} else {
-		c.Driver = ""
-	}
+	c.Driver = s.parserDriver()
 	completionItems, err := c.Complete(f.Text, params, s.getConfig().LowercaseKeywords)
 	if err != nil {
 		return nil, err

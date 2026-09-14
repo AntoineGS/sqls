@@ -54,8 +54,16 @@ func parseInfixGroup(reader *astutil.NodeReader, matcher astutil.NodeMatcher, ig
 }
 
 func Parse(text string) (ast.TokenList, error) {
+	return ParseWithDialect(text, &dialect.GenericSQLDialect{})
+}
+
+func ParseWithDriver(text string, driver dialect.DatabaseDriver) (ast.TokenList, error) {
+	return ParseWithDialect(text, dialect.DialectForDriver(driver))
+}
+
+func ParseWithDialect(text string, d dialect.Dialect) (ast.TokenList, error) {
 	src := bytes.NewBuffer([]byte(text))
-	p, err := NewParser(src, &dialect.GenericSQLDialect{})
+	p, err := NewParser(src, d)
 	if err != nil {
 		return nil, err
 	}

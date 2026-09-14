@@ -23,7 +23,10 @@ require (
 	github.com/microsoft/go-mssqldb v1.10.0
 	github.com/olekukonko/tablewriter v1.1.4
 	github.com/vertica/vertica-sql-go v1.3.7
+	interbase-go v0.0.0
 )
+
+replace interbase-go => ../interbase-go
 
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect

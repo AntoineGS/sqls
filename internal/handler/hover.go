@@ -9,6 +9,7 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
@@ -33,7 +34,7 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := hover(f.Text, params, s.worker.Cache())
+	res, err := hoverWithDriver(f.Text, params, s.worker.Cache(), s.parserDriver())
 	if err != nil {
 		if errors.Is(err, ErrNoHover) {
 			return nil, nil
@@ -44,6 +45,10 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 }
 
 func hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp.Hover, error) {
+	return hoverWithDriver(text, params, dbCache, "")
+}
+
+func hoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.Hover, error) {
 	if dbCache == nil {
 		return nil, nil
 	}
@@ -52,7 +57,7 @@ func hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp
 		Line: params.Position.Line,
 		Col:  params.Position.Character + 1,
 	}
-	parsed, err := parser.Parse(text)
+	parsed, err := parser.ParseWithDriver(text, driver)
 	if err != nil {
 		return nil, err
 	}
