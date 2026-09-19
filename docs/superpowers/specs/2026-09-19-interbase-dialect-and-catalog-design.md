@@ -144,7 +144,7 @@ exactly like `internal/database/interbase_test.go:293-418` does today.
 | `Config.TransactionOptions` (no-wait, record version, table reservation) and per-statement isolation | Execution semantics are sub-project 3's subject; exposing them here would fix an interface before that spec exists. |
 | `schema` roles, dependencies and privileges in the cache | `schema` supports them, but no sub-project-3 feature consumes them; adding cache surface with no reader is dead weight. |
 | Bulk (non-N+1) catalog reads | Requires new `schema` API in the driver repository, so it is a driver change, not an sqls change. Trigger condition in §8. |
-| Trigger-event decoding and external-function type rendering | The logic exists in `schema` but is unexported (`ddl.go:871-913`; no `FunctionArgument` renderer at all). Reimplementing it in sqls would guarantee drift, so it is delegated to the companion driver spec named in §4.4, and the three affected display fields render `""` until it lands. |
+| Trigger-event decoding and external-function type rendering | The logic exists in `schema` but is unexported (`ddl.go:871-913`; no `FunctionArgument` renderer at all). Reimplementing it in sqls would guarantee drift, so it is delegated to the companion driver spec named in §4.4, which specifies `Trigger.Event()`, `FunctionArgument.SQLType()` and `Function.ReturnType()`. The three affected display fields render `""` until those land. |
 | Services-backed admin commands | Ruled out for the whole project. |
 
 ## Architecture
@@ -806,29 +806,53 @@ Notes on the adjudicated shape, recorded so neither spec re-derives it:
 
 #### Fields populated from companion `schema` accessors
 
-Three fields cannot be populated from `schema`'s exported API as it stands
-today, and **sqls does not reimplement any of them**:
-
-| Field | Missing exported capability | Evidence |
-| --- | --- | --- |
-| `TriggerDesc.Event` | Decoding `RDB$TRIGGER_TYPE` into `BEFORE INSERT` / `ON CONNECT` and friends. `schema.Trigger` exposes only `TriggerType sql.NullInt64`. | `catalog_extended.go:92`; the decoder `triggerEvent` is unexported at `ddl.go:871-913` |
-| `FunctionArgumentDesc.Type` | Rendering a type from a `FunctionArgument`, which is not a `Domain`, has `CharacterSetID` but no `CharacterSetName`, and has no exported renderer. | `catalog_extended.go:133-145`; `ddl.go` has no `FunctionArgument` renderer at all |
-| `FunctionDesc.ReturnType` | Same renderer, applied to the argument identified by `Function.ReturnArgument`. | `catalog_extended.go:124` |
-
-These are supplied by a companion driver-side spec,
+Three fields cannot be populated from `schema`'s API as it stands in the
+current checkout, and **sqls reimplements none of them.** They are supplied by
+the companion driver-side spec
 `docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md` in the
-`interbase-go` repository, which exports the accessors from `schema` itself
-reusing the existing internal logic so the two implementations cannot drift. At
-the time of writing that spec has **not** landed (the `interbase-go` specs
-directory contains only the cancellation and pooled-introspection specs), so the
-dependency is stated by capability rather than by signature: sqls needs (a) a
-trigger-event decoder taking the catalog trigger type, and (b) a type renderer
-for external-function arguments including the return argument. **When that spec
-lands, plan 2 uses its exact signatures verbatim.** This sub-project deliberately
-specifies neither the bit-decoding semantics nor the argument type rendering.
+`interbase-go` repository (commits `aa5cfa7`, `d859a5c`), which exports the
+accessors from `schema` itself, reusing the existing internal logic so the two
+implementations cannot drift. Its signatures are final:
 
-**Dependency:** plan 2 (§9) cannot complete until those accessors exist. It can
-start and deliver everything else; the three fields are its tail. Until then
+| sqls field | Companion accessor | Why sqls cannot do it |
+| --- | --- | --- |
+| `TriggerDesc.Event` | `func (t Trigger) Event() (string, error)` | `schema.Trigger` exposes only `TriggerType sql.NullInt64` (`catalog_extended.go:92`); the decoder `triggerEvent` is unexported (`ddl.go:871-913`) |
+| `FunctionArgumentDesc.Type` | `func (a FunctionArgument) SQLType() (string, error)` | `FunctionArgument` is not a `Domain`, has `CharacterSetID` but no `CharacterSetName`, and has no exported renderer (`catalog_extended.go:133-145`) |
+| `FunctionDesc.ReturnType` | `func (f Function) ReturnType() (string, error)` | Resolving `Function.ReturnArgument` to an argument row is an encoding detail callers must not repeat (`catalog_extended.go:124`) |
+
+Three behaviors of those accessors that sqls's catalog code must expect:
+
+1. **The return argument is matched by `Position`, not by slice index.**
+   `RDB$RETURN_ARGUMENT` holds an argument *position*; position and index
+   coincide only for dense rows starting at zero. sqls never indexes
+   `Arguments[ReturnArgument]` — it calls `Function.ReturnType()` and lets the
+   driver resolve it. When `ReturnArgument = N > 0` the return value *is*
+   argument `N`, which is simultaneously an input, so the same argument can
+   legitimately appear both as an entry in `FunctionDesc.Arguments` and as
+   `FunctionDesc.ReturnType`. Any rendering of a UDF declaration must not
+   assume the return is a separate, additional argument.
+2. **`Trigger.Event()` returns one joined string** for a multi-event trigger,
+   for example `"BEFORE INSERT OR UPDATE"`. `TriggerDesc.Event` takes it
+   verbatim. sqls does not split it, does not re-decode it, and specifies no
+   parsing of it; a consumer that wants the parts splits on `" OR "`.
+3. **`ErrUnsupportedDDL` from these accessors is a normal, expected result, not
+   a failure.** `RDB$CHARACTER_LENGTH` is never populated for function
+   arguments, so `sqlTypeParts` rejects every CHAR and VARCHAR argument for
+   want of a character length (`ddl.go:288-293`) — this is broader than the
+   charset case and fires during ordinary operation. The renderer therefore
+   maps `errors.Is(err, schema.ErrUnsupportedDDL)` from `Trigger.Event()`,
+   `FunctionArgument.SQLType()` and `Function.ReturnType()` to `""` for that
+   one field and **carries on**: it never aborts the catalog build, never
+   propagates the error to `DescribeFunctions`/`DescribeTriggers`, and never
+   drops the surrounding descriptor. This is the same degradation rule §4.3
+   rule 4 applies to column types, stated explicitly here because it is an
+   error path on the happy road rather than an exceptional one. A non-
+   `ErrUnsupportedDDL` error is still returned, since that indicates a real
+   catalog fault.
+
+**Dependency:** the companion spec is written but not yet implemented, so plan 2
+(§9) still cannot complete until the accessors exist in the driver. Plan 2 can
+start and deliver everything else; these three fields are its tail. Until then
 they are populated as `""`, which is exactly the documented "undecodable" value,
 so no consumer breaks.
 
@@ -1243,6 +1267,24 @@ existing test is extended with the tables `schema` reads
   field the fixture can determine, including `ViewDesc.Columns`, parameter order
   and direction (`"input"`/`"output"`), `Nullable` valid-true / valid-false /
   invalid, and `Active` valid-false for an inactive index and trigger.
+- `TestInterBaseFunctionArgumentTypeDegradesToEmpty`: the UDF fixture carries a
+  `CSTRING` argument with a positive `RDB$FIELD_LENGTH` and NULL
+  `RDB$CHARACTER_LENGTH` (the shape every measured production row has), which
+  renders `CSTRING(n)`; an `INTEGER` argument, which renders `INTEGER`; and a
+  `CHAR` argument, which renders `Type: ""` because no character length is
+  available. The surrounding `FunctionDesc` is still returned with every other
+  field populated, and `DescribeFunctions` returns a nil error — the
+  degradation rule from §4.4, asserted rather than assumed. No test case asserts
+  that a CHAR or VARCHAR UDF argument renders a type string.
+- `TestInterBaseFunctionReturnTypeUsesDriverResolution`: a fixture whose
+  `RDB$RETURN_ARGUMENT` is a positive position that is also an input argument
+  asserts `ReturnType` matches that argument's rendering and that the argument
+  still appears once in `Arguments` — guarding against treating the return as a
+  separate entry or indexing `Arguments` by `ReturnArgument`.
+- `TestInterBaseTriggerEventIsVerbatim`: a multi-event trigger fixture yields
+  `Event == "BEFORE INSERT OR UPDATE"` as one unsplit string, and a trigger with
+  a NULL or undecodable type yields `Event == ""` with the rest of the
+  `TriggerDesc` intact.
 - `TestInterBaseProcedureParameterDomainIsUserOnly`: a parameter whose
   `FieldSource` is a user domain reports that name in `Domain`; a parameter
   whose `FieldSource` is an `RDB$`-prefixed system domain, and one whose domain
@@ -1493,15 +1535,33 @@ configuration API (README.md:328) is replaced by item 3.
    driver repo) specifies exactly the assumed signatures, so the risk is now
    schedule, not shape; if they land differently, only `interbase_native.go`
    changes.
-7. **Companion `schema` accessors dependency (new).** `TriggerDesc.Event`,
-   `FunctionArgumentDesc.Type` and `FunctionDesc.ReturnType` need exported
-   accessors that do not exist yet and that this spec deliberately does not
-   design. Until
-   `docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md` lands
-   in the driver repo, those three fields render `""`. The blast radius is three
-   display fields, not the cache or the capability contract, so plan 2 can ship
-   with them empty and fill them in afterwards.
-8. **Cross-dialect test coverage needs two databases.** The live dialect tests
+7. **Companion `schema` accessors dependency.** `TriggerDesc.Event`,
+   `FunctionArgumentDesc.Type` and `FunctionDesc.ReturnType` are populated by
+   `Trigger.Event()`, `FunctionArgument.SQLType()` and `Function.ReturnType()`,
+   specified in
+   `docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md` in the
+   driver repo. That spec is written and its signatures are final, so the shape
+   risk is gone; the remaining risk is schedule, because it is not yet
+   implemented. Until it is, those three fields render `""`. The blast radius is
+   three display fields, not the cache or the capability contract, so plan 2 can
+   ship with them empty and fill them in afterwards.
+8. **Some UDF arguments will always render an empty type.** Independent of
+   schedule, `FunctionArgumentDesc.Type` is permanently `""` for CHAR and
+   VARCHAR arguments: `RDB$CHARACTER_LENGTH` is not populated for function
+   arguments, so the renderer has no length to declare. A measurement across
+   three production InterBase 15.1 databases sizes this honestly — of 357
+   external-function arguments, 1 was CHAR and 0 were VARCHAR, while CSTRING,
+   which renders correctly from `RDB$FIELD_LENGTH`, accounted for 166, followed
+   by 97 INTEGER, 51 TIMESTAMP, 26 DOUBLE and 16 BLOB (BLOB renders as `BLOB` or
+   `BLOB SUB_TYPE <n>`). `RDB$CHARACTER_LENGTH` was NULL in all 357 rows across
+   every field type, and `RDB$FIELD_LENGTH` was populated throughout. So the
+   empty-type path is real but rare — roughly one argument in 357 — and the
+   dominant argument type renders correctly. Sample limits worth stating: one
+   organisation, one InterBase version, and heavy use of the standard public UDF
+   libraries, so the distribution is indicative rather than representative.
+   Accepted rather than mitigated: the alternative is inventing a length the
+   catalog does not carry.
+9. **Cross-dialect test coverage needs two databases.** The live dialect tests
    are meaningful only if run against both a Dialect 1 and a Dialect 3 database.
    The offline table-driven tests cover the lexing and rendering differences
    without a server, so the live suite verifies resolution and wiring rather
