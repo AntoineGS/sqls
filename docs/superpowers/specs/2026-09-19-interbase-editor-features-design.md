@@ -175,15 +175,21 @@ From `../interbase-go/README.md` and `../interbase-go/schema/README.md`:
 
 ## Dependencies on sub-project 2
 
-This is the reconciliation section. Every cross-spec dependency is listed here
-with the name this spec assumes; nothing below is assumed silently elsewhere in
-the document. The coordinator should align names before planning. Where a
-dependency cannot be met as stated, the stated fallback keeps sub-project 3
-shippable.
+**This section is a mapping, not a proposal.** The cross-spec contract was
+adjudicated by the coordinator and is defined authoritatively in
+`docs/superpowers/specs/2026-09-19-interbase-dialect-and-catalog-design.md`
+§4.4 (capability interfaces and descriptors) and §4.5 (cache). Everything below
+names the contract members exactly as they are defined there; where an earlier
+draft of this spec proposed a different name or shape, the contract wins and
+the divergence is recorded only where it changed sqls-3 behavior. The D-numbers
+are retained as this document's internal reference, so the plan decomposition
+and the architecture sections can keep pointing at them.
 
-All names are in package `github.com/sqls-server/sqls/internal/database`.
+All names are in package `github.com/sqls-server/sqls/internal/database`,
+declared in `internal/database/capability.go` (driver-neutral, no `schema`
+import).
 
-### D1 — object kind enum
+### D1 — `ObjectKind`
 
 ```go
 type ObjectKind string
@@ -193,192 +199,250 @@ const (
     ObjectKindView      ObjectKind = "view"
     ObjectKindProcedure ObjectKind = "procedure"
     ObjectKindTrigger   ObjectKind = "trigger"
+    ObjectKindDomain    ObjectKind = "domain"
+    ObjectKindIndex     ObjectKind = "index"
     ObjectKindGenerator ObjectKind = "generator"
-    ObjectKindFunction  ObjectKind = "function" // external UDF
+    ObjectKindFunction  ObjectKind = "function"
 )
 ```
 
-Used by `ObjectDDL` (D6), hover (§4), and definition (§5). If sub-project 2
-prefers per-kind methods instead of an enum, sub-project 3 adapts with a
-six-case switch; the enum is a convenience, not a requirement.
+Sub-project 3 uses `Table`, `View`, `Procedure`, `Trigger`, `Generator` and
+`Function`. `Domain` and `Index` exist in the contract and are unused here.
 
-### D2 — catalog capability interfaces on the repository
-
-Optional interfaces that `InterBaseDBRepository` implements and that callers
-reach by type assertion on `database.DBRepository`:
+### D2 — `CatalogRepository`
 
 ```go
-type ProcedureDescriber interface {
-    Procedures(ctx context.Context) ([]*ProcedureDesc, error)
-}
-type ViewDescriber interface {
-    Views(ctx context.Context) ([]*ViewDesc, error)
-}
-type TriggerDescriber interface {
-    Triggers(ctx context.Context) ([]*TriggerDesc, error)
-}
-type GeneratorDescriber interface {
-    Generators(ctx context.Context) ([]*GeneratorDesc, error)
-}
-type ExternalFunctionDescriber interface {
-    ExternalFunctions(ctx context.Context) ([]*FunctionDesc, error)
+type CatalogRepository interface {
+    DescribeViews(ctx context.Context) ([]*ViewDesc, error)
+    DescribeProcedures(ctx context.Context) ([]*ProcedureDesc, error)
+    DescribeGenerators(ctx context.Context) ([]*GeneratorDesc, error)
+    DescribeTriggers(ctx context.Context) ([]*TriggerDesc, error)
+    DescribeDomains(ctx context.Context) ([]*DomainDesc, error)
+    DescribeIndexes(ctx context.Context) ([]*IndexDesc, error)
+    DescribeFunctions(ctx context.Context) ([]*FunctionDesc, error)
 }
 ```
 
-Sub-project 3 does **not** need the domain, index, or constraint capabilities;
-if they exist they are simply unused here.
+One interface rather than the five `*Describer` interfaces an earlier draft of
+this spec proposed. Sub-project 3 never calls these methods directly — the
+cache (D4) is built from them by sub-project 2's `GenerateCatalogCache`, and
+every editor feature reads the cache. The interface matters here only as the
+thing whose absence means "no extended catalog", which sub-project 3 detects
+through `DBCache.HasCatalog()` rather than by type assertion.
 
-### D3 — descriptor fields required
+### D3 — descriptor types
 
-Only the fields listed are required. Extra fields are welcome and ignored.
+Defined in §4.4 of the contract. The fields sub-project 3 reads:
 
-`ProcedureDesc`:
+`ProcedureDesc` — `Name`, `Description sql.NullString`,
+`Source sql.NullString` (verbatim PSQL body),
+`InputParameters []*ProcedureParameterDesc`,
+`OutputParameters []*ProcedureParameterDesc` (both ordered by `Position`).
+`Schema` is `""` for InterBase and is ignored. `OwnerName` is unused.
 
-| Field | Type | Used by |
-| --- | --- | --- |
-| `Name` | `string` | completion label, hover, definition, signature label |
-| `Description` | `sql.NullString` | hover, completion documentation |
-| `Source` | `sql.NullString` | definition fallback, hover fallback (verbatim PSQL) |
-| `InputParameters` | `[]*ProcedureParameterDesc` | signature help, hover |
-| `OutputParameters` | `[]*ProcedureParameterDesc` | selectable-procedure columns, exec routing |
+`ProcedureParameterDesc` — `Name`, `Position int`,
+`Direction ParameterDirection` (`ParameterInput` / `ParameterOutput`, values
+`"input"` / `"output"`), `Type string` (rendered for the resolved dialect by
+sub-project 2; `""` when unrenderable), `Domain string` (user domain name, `""`
+for an inline type), `Nullable sql.NullBool`, `Description sql.NullString`.
 
-`ProcedureParameterDesc`:
+`ViewDesc` — `Name`, `ViewSource sql.NullString` (**not** `Source`),
+`Description`, `Columns []*ColumnDesc` (ordered, rendered exactly like table
+columns, which is what §4's hover table needs).
 
-| Field | Type | Used by |
-| --- | --- | --- |
-| `Name` | `string` | parameter label |
-| `Position` | `int` | ordering, active-parameter match |
-| `Direction` | `ParameterDirection` (`"input"` / `"output"`) | direction text |
-| `Type` | `string` | rendered type, e.g. `VARCHAR(40)`, `NUMERIC(18, 2)` |
-| `Nullable` | `sql.NullBool` | **must preserve unknown**; see §3 |
-| `Description` | `sql.NullString` | parameter documentation |
+`TriggerDesc` — `Name`, `RelationName sql.NullString` (invalid for a
+database-level trigger), `Event string` (`""` when undecodable, see D10),
+`Sequence sql.NullInt64`, `Active sql.NullBool`, `Source sql.NullString`,
+`Description`.
 
-`ViewDesc`: `Name string`, `Source sql.NullString`, `Columns []*ColumnDesc`.
+`GeneratorDesc` — `Name`, `ID sql.NullInt64`. There is no `Description`: the
+contract records that `schema.Sequence` carries only identity, so generator
+hover and completion documentation render the name and nothing else.
 
-`TriggerDesc`: `Name string`, `RelationName sql.NullString`,
-`Source sql.NullString`, `Event string` (e.g. `BEFORE INSERT`),
-`Active sql.NullBool`, `Sequence sql.NullInt64`.
+`FunctionDesc` — `Name`, `ReturnType string` (`""` when unrenderable, D10),
+`ReturnPosition sql.NullInt64`, `Arguments []*FunctionArgumentDesc`,
+`ModuleName sql.NullString`, `EntryPoint sql.NullString`, `Description`.
 
-`GeneratorDesc`: `Name string`, `Description sql.NullString`.
+`FunctionArgumentDesc` — `Name string`, `Position sql.NullInt64`,
+`Type string` (`""` when unrenderable, D10). A distinct type from
+`ProcedureParameterDesc` because a UDF argument has no direction, domain or
+nullability; this is the shape this spec asked for and it arrived under the
+name it asked for.
 
-`FunctionDesc` (external UDF): `Name string`, `ModuleName sql.NullString`,
-`EntryPoint sql.NullString`, `ReturnPosition sql.NullInt64`,
-`Arguments []*FunctionArgumentDesc` where `FunctionArgumentDesc` has
-`Position int` and `Type string`.
+Two adjudicated shapes worth restating because they are load-bearing here:
 
-Requirement on `Type`: it must be a **rendered declaration string** produced by
-sub-project 2 from the resolved `RDB$FIELDS` attributes, not raw catalog
-integers. Sub-project 3 renders no types itself.
+- **`Nullable sql.NullBool`, not a string.** §3's requirement that unknown
+  nullability never renders as a confident value is now type-enforced rather
+  than convention-enforced: `Valid == false` is the unknown case and cannot be
+  confused with `"NO"` or `""`.
+- **`Description`, not `Comment`.** Uniform across every descriptor.
 
-### D4 — extended `DBCache` accessors
+### D4 — `DBCache` catalog accessors
 
 ```go
-func (dc *DBCache) SortedProcedures() []string
-func (dc *DBCache) Procedure(name string) (*ProcedureDesc, bool)
-func (dc *DBCache) SortedViews() []string
+func (dc *DBCache) HasCatalog() bool
 func (dc *DBCache) View(name string) (*ViewDesc, bool)
-func (dc *DBCache) SortedTriggers() []string
-func (dc *DBCache) Trigger(name string) (*TriggerDesc, bool)
-func (dc *DBCache) SortedGenerators() []string
+func (dc *DBCache) Procedure(name string) (*ProcedureDesc, bool)
 func (dc *DBCache) Generator(name string) (*GeneratorDesc, bool)
-func (dc *DBCache) SortedExternalFunctions() []string
-func (dc *DBCache) ExternalFunction(name string) (*FunctionDesc, bool)
+func (dc *DBCache) Function(name string) (*FunctionDesc, bool)
+func (dc *DBCache) Trigger(name string) (*TriggerDesc, bool)
+func (dc *DBCache) SortedProcedures() []string
+func (dc *DBCache) SortedViews() []string
+func (dc *DBCache) SortedGenerators() []string
 ```
 
-Requirements:
+`Domain`, `Index`, `IndexesForTable` and `TriggersForTable` also exist and are
+unused here. All accessors are nil-safe; `HasCatalog()` reports whether the
+active repository produced a catalog at all, and is the single gate every
+feature in this spec uses before touching catalog data.
 
-- **Lookups must be case-insensitive**, keyed the way `columnDatabaseKey`
-  already does it (`strings.ToUpper`). InterBase catalog names are uppercase;
-  users type lowercase. Without this, every feature here silently misses.
-- The singular accessors return `(nil, false)` for unknown names; they never
-  return a non-nil descriptor with zero fields.
-- `SortedViews()` **must be disjoint from `SortedTables()`** — i.e. the rebuilt
-  repository's `SchemaTables` returns base tables only, and views arrive through
-  the view cache. *Fallback if not met:* §2 de-duplicates view candidates
-  against `SortedTables()` with an `EqualFold` check, at the cost of views
-  showing the `table` detail string in the FROM position.
+Two consequences of the contract that change this spec:
 
-### D5 — unsupported-DDL sentinel re-exported by sqls
+1. **Views stay in `SchemaTables`.** `SortedViews()` is additive metadata and
+   does not subtract from `SortedTables()`; views keep completing in the `FROM`
+   position exactly as they do today. The de-duplication fallback an earlier
+   draft of §2 carried is **deleted**, not retained as a contingency — building
+   it would be dead code.
+2. **Catalog keys are upper-cased** (`CatalogCache` doc comment: "All maps are
+   keyed by the upper-cased object name"), which is what makes a user typing
+   `myproc` find `MYPROC`. See D11 for the one thing this leaves unstated.
 
-Because `internal/database/interbase_common.go` carries no build tag, it cannot
-import `interbase-go`. Sub-project 2 must therefore re-export the sentinel and
-its detail, so untagged handler code can classify the failure:
+**Timing.** The contract builds the extended catalog in the worker's
+**secondary, asynchronous pass**, not in `GenerateDBCachePrimary`. So between
+`initialize` and the first successful secondary pass, `HasCatalog()` is false
+even on a healthy InterBase connection. Every feature here already degrades to
+its pre-InterBase behavior in that case (§"User-Visible Behavior", last entry),
+so the window is invisible rather than broken — but it is a window, and the
+tests in the testing strategy that assert degradation double as its coverage.
+
+### D5 — sentinels
 
 ```go
-var ErrUnsupportedDDL = errors.New("database: unsupported DDL")
+var (
+    ErrObjectNotFound = errors.New("database: catalog object not found")
+    ErrUnsupportedDDL = errors.New("database: DDL is unavailable for this object")
+)
 
-// UnsupportedDDLDetail reports the object, name and blocking feature of an
-// unsupported-DDL error, mapped from *schema.UnsupportedDDLError.
 func UnsupportedDDLDetail(err error) (object, name, feature string, ok bool)
 ```
 
-`ObjectDDL` must return an error satisfying
-`errors.Is(err, database.ErrUnsupportedDDL)` whenever the underlying
-`schema.GenerateDDL` failed with `schema.ErrUnsupportedDDL`. Hover (§4) and
-definition (§5) branch on exactly this; they never string-match error text.
+`UnsupportedDDLDetail` is `errors.As` against an unexported
+`unsupportedDDLDetailer` interface, so `capability.go` never imports `schema`
+and sub-project 3 never matches on message text — the requirement this spec
+raised is satisfied exactly. When the driver returns a bare sentinel with no
+structured detail, `ok` is false and the caller degrades its message (§4).
 
-### D6 — `ObjectDDL`
+### D6 — `DDLRepository`
 
 ```go
-type DDLDescriber interface {
+type DDLRepository interface {
     ObjectDDL(ctx context.Context, kind ObjectKind, name string) (string, error)
 }
 ```
 
-Requirements: read-only; name matching is case-insensitive in the same sense as
-D4; returns `("", nil)` — empty string, nil error — for an object that does not
-exist, so callers can distinguish "no such object" from "cannot render DDL";
-honours `ctx`.
+Not-found is reported as `ErrObjectNotFound`, **not** as `("", nil)` as an
+earlier draft of this spec requested. The underlying requirement — that
+"no such object" stays distinguishable from "exists but has no renderable DDL",
+because sub-project 3 shows nothing for the first and a reason for the second —
+is preserved, through a sentinel instead of an empty string. Hover (§4) and
+definition (§5) branch on `errors.Is(err, database.ErrObjectNotFound)` and
+`errors.Is(err, database.ErrUnsupportedDDL)`.
 
-### D7 — `ExplainPlan`
+`ObjectKindFunction` **always** returns `ErrUnsupportedDDL`
+(`schema/ddl.go:1216-1219`), which confirms §4's decision never to call
+`ObjectDDL` for an external function.
+
+### D7 — `ExplainRepository`
 
 ```go
-type PlanExplainer interface {
+type ExplainRepository interface {
     ExplainPlan(ctx context.Context, query string) (string, error)
 }
 ```
 
-Requirements, all load-bearing for §1 and for the user-facing safety claim:
+Implemented only in the tagged file: it acquires a `*sql.Conn` and calls
+sub-project 1's `interbase.Plan(ctx, conn, query)`, returning the plan text
+unchanged. On an untagged build `*InterBaseDBRepository` does not satisfy the
+interface and §1's code action reports that the driver does not support it.
+The contract confirms the three properties §1's user-facing safety claim rests
+on: prepare-only, its own connection, plan text returned verbatim.
 
-- backed by the driver's `Plan`, which **prepares without executing**;
-- acquires and releases its own `*sql.Conn` from the pool (the repository holds
-  a `*sql.DB`; the driver's `Plan` takes a `*sql.Conn`), and does not leave a
-  transaction open;
-- propagates `ctx` so §6.1 cancellation reaches it;
-- returns `("", nil)` for a statement that prepares successfully with no plan
-  text, and never substitutes a placeholder string for an empty plan.
+### D8 — mocks for capability tests
 
-### D8 — mock repository for capability tests
+Sub-project 2's testing strategy provides repository mocks implementing
+`CatalogRepository`, `DDLRepository` and `ExplainRepository`. Sub-project 3
+uses them. The constraint this spec raised still holds and should be checked
+during Plan 3: the capability mock must be a **distinct type** from
+`MockDBRepository`, because if `MockDBRepository` itself satisfied the
+capability interfaces, every existing handler test would start passing the type
+assertions and panic on nil func fields. If the delivered mock does not satisfy
+that, sub-project 3 adds a wrapper type in
+`internal/database/interbase_mock.go` rather than modifying `MockDBRepository`.
 
-Sub-project 2 is expected to add a mock that implements D2/D6/D7. Sub-project 3
-assumes:
+### D9 — contract members sub-project 3 does not use
 
-```go
-type MockInterBaseDBRepository struct {
-    MockDBRepository
-    MockProcedures        func(context.Context) ([]*ProcedureDesc, error)
-    MockViews             func(context.Context) ([]*ViewDesc, error)
-    MockTriggers          func(context.Context) ([]*TriggerDesc, error)
-    MockGenerators        func(context.Context) ([]*GeneratorDesc, error)
-    MockExternalFunctions func(context.Context) ([]*FunctionDesc, error)
-    MockObjectDDL         func(context.Context, ObjectKind, string) (string, error)
-    MockExplainPlan       func(context.Context, string) (string, error)
-}
-```
+`CatalogSnapshotRepository` (a cache-build optimisation; `ObjectDDL` and
+`ExplainPlan` are interactive one-shots that use the `*sql.DB` directly),
+`DomainDesc`, `IndexDesc`, `DBCache.Domain`/`Index`/`IndexesForTable`/
+`TriggersForTable`, and `ProcedureDesc.OwnerName`/`ViewDesc.OwnerName`.
 
-It must be a **separate type from `MockDBRepository`**, not extra fields on it:
-if `MockDBRepository` implemented the capability interfaces, every existing
-handler test would start satisfying the type assertions and panic on the nil
-func fields. If sub-project 2 does not provide this, sub-project 3 adds it in
-`internal/database/interbase_mock.go`.
+`parserDriver()` is retained by the contract with its existing name and
+`dialect.DatabaseDriver` result, with a `parserDriverVariant()` sibling added
+alongside. This spec's call sites — `getStatementsWithDriver(text,
+s.parserDriver())` and `dialect.DataBaseFunctions(c.Driver)` — are unchanged,
+and this spec's earlier statement that it needs no dialect value on the
+connection stands.
 
-### D9 — things sub-project 3 explicitly does *not* need
+### D10 — three fields that render empty until a driver spec lands
 
-Stated so the peers do not build them on our account: no dialect value on the
-connection beyond the existing `s.parserDriver()` driver identity (all
-dialect-sensitive rendering happens in the driver or in sub-project 2's `Type`
-strings); no domain/index/constraint capabilities; no `Diagnostics` surface in
-the editor (it belongs to a status command, not to these six features).
+`TriggerDesc.Event`, `FunctionArgumentDesc.Type` and `FunctionDesc.ReturnType`
+are populated from `schema` accessors that do not exist yet. They are specified
+in the driver-side companion spec
+`interbase-go/docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md`
+as `(Trigger) Event() (string, error)`, `(FunctionArgument) SQLType() (string,
+error)` and `(Function) ReturnType() (string, error)`. Until it lands, all
+three render `""`.
+
+**This is a rendering question sub-project 3 owns, so here is the answer for
+each surface. The rule is uniform: an empty string means "the catalog did not
+tell us", and an omitted row is how this spec has rendered that everywhere
+else — the same rule already governs unknown parameter nullability in §3.**
+
+| Surface | Empty `Event` | Empty argument `Type` / `ReturnType` |
+| --- | --- | --- |
+| Hover, trigger (§4) | the `BEFORE INSERT`-style line is omitted; name, relation, active flag and verbatim `Source` still render | n/a |
+| Hover, external function (§4) | n/a | an argument with an empty `Type` renders as `argument N` alone; an empty `ReturnType` omits the `returns …` line. Module and entry point still render |
+| Completion detail/documentation (§2) | n/a | the UDF candidate keeps its label, `FunctionCompletion` kind and `external function` detail; the signature line in its documentation lists only the arguments whose `Type` is known, and is omitted entirely when none is |
+| Definition (§5) | n/a — triggers are located by name, not by event | n/a — `ObjectDDL` never renders a UDF (D6) |
+
+No feature emits a placeholder such as `<unknown>`, and none suppresses an
+object merely because a type is missing: a UDF with unrenderable arguments is
+still completable by name, which is the thing the user actually needs.
+
+**Measured exposure, from three production InterBase 15.1 databases:** of 357
+UDF arguments, 166 are CSTRING, 97 INTEGER, 51 TIMESTAMP, 26 DOUBLE, 16 BLOB,
+1 CHAR and 0 VARCHAR. `RDB$CHARACTER_LENGTH` is never populated for function
+arguments, so CHAR and VARCHAR arguments render `""` **by design even after the
+driver spec lands** — 1 argument in 357. That is well inside the "omit the row"
+rule above and needs no special handling; it is recorded so nobody later reads
+an empty CHAR argument type as a bug. It does mean §2's UDF rendering must not
+assume every argument yields a type string, which the table above encodes.
+
+### D11 — one thing the contract leaves implicit, flagged not worked around
+
+The contract states that `CatalogCache` maps are **keyed** by the upper-cased
+object name, and sub-project 2's tests assert that keys are upper-cased. It does
+not state that the **accessors upper-case their argument**. Sub-project 3 needs
+them to: InterBase stores catalog names uppercase, users type lowercase, and
+every feature here looks objects up by the identifier text under the cursor. If
+the accessors turn out to be exact-match, hover, definition, signature help and
+procedure routing all silently miss for every lowercase identifier.
+
+This is flagged rather than worked around. Putting `strings.ToUpper` at each of
+sub-project 3's call sites would be the wrong place for it — `DBCache.Column`
+already normalises internally (`cache.go:173-184`), so the accessors should too.
+The expectation is that they do; if Plan 3 finds otherwise, it is a one-line fix
+in sub-project 2's accessors, not a change here.
 
 ## Scope
 
@@ -452,13 +516,20 @@ up against the code:
 Two refinements to the split as proposed by review, both dependency
 corrections rather than disagreements:
 
-1. Plan 4 depends on **D4 as well as D1, D5 and D6.** Resolving the identifier
-   under the cursor to a procedure, view or trigger is a `DBCache` lookup
-   (§5, "Resolution order"); without D4 there is nothing to resolve against.
+1. Plan 4 depends on the cache accessors (D4) as well as `ObjectKind`,
+   `ObjectDDL` and the sentinels. Resolving the identifier under the cursor to a
+   procedure, view or trigger is a `DBCache` lookup (§5, "Resolution order");
+   without `Procedure`/`View`/`Trigger` there is nothing to resolve against.
 2. Plan 2 is **partially** dependent on sub-project 2, not wholly independent of
    it: §6.2 (read-only transaction) and §6.3 (`ScanRowsWithTypes`) need nothing
-   from D1–D8 and can start immediately after Plan 1. Only §6.4 needs D4, so if
-   D4 slips, Plan 2 ships its first two thirds and §6.4 moves to Plan 3.
+   from the contract and can start immediately after Plan 1. Only §6.4 needs
+   `DBCache.Procedure`, so if that slips, Plan 2 ships its first two thirds and
+   §6.4 moves to Plan 3.
+
+Dependency lines below name the contract members each plan needs, since the
+D-section is now a mapping onto
+`docs/superpowers/specs/2026-09-19-interbase-dialect-and-catalog-design.md`
+§4.4/§4.5 rather than a proposal.
 
 ### Plan 1 — Server concurrency and cancellation
 
@@ -487,8 +558,10 @@ and that is verified by the race detector in CI for the first time.
 contract, including `s.query` rendering partial rows; §6.4 `EXECUTE PROCEDURE`
 routing by output arity.
 
-**Depends on:** Plan 1 (it renders the cancellation outcomes Plan 1 classifies);
-D4 for §6.4 only.
+**Depends on:** Plan 1 (it renders the cancellation outcomes Plan 1
+classifies). From the contract, §6.4 alone needs `DBCache.HasCatalog()`,
+`DBCache.Procedure(name) (*ProcedureDesc, bool)` and
+`ProcedureDesc.OutputParameters`. §6.2 and §6.3 need nothing from it.
 
 **Delivers working software:** SELECTs run in an explicit read-only
 transaction; results distinguish `NULL` from the empty string, render exact
@@ -502,7 +575,17 @@ stops being routed unconditionally to `Exec`.
 candidates and the `EXECUTE PROCEDURE` parser change, signature help, hover DDL
 augmentation with its memo.
 
-**Depends on:** Plan 1 (hover memo under `stateMu`); D1–D8.
+**Depends on:** Plan 1 (hover memo under `stateMu`). From the contract:
+`ExplainRepository.ExplainPlan` (§1); `DDLRepository.ObjectDDL` with
+`ObjectKind`, `ErrObjectNotFound`, `ErrUnsupportedDDL` and
+`UnsupportedDDLDetail` (§4); `DBCache.HasCatalog`, `Procedure`, `View`,
+`Generator`, `Function`, `Trigger`, `SortedProcedures`, `SortedViews`,
+`SortedGenerators` and the exported `CatalogCache.Functions` map (§§2–4); the
+descriptors `ProcedureDesc`, `ProcedureParameterDesc`, `ViewDesc`,
+`GeneratorDesc`, `FunctionDesc`, `FunctionArgumentDesc`, `TriggerDesc` and
+`ParameterDirection`. `TriggerDesc.Event`, `FunctionArgumentDesc.Type` and
+`FunctionDesc.ReturnType` may be `""` throughout this plan (D10); nothing here
+blocks on the driver-side accessor spec.
 
 **Delivers working software:** the four surfaces a developer touches every
 minute — explain, complete, signature, hover — become InterBase-aware.
@@ -512,8 +595,11 @@ minute — explain, complete, signature, hover — become InterBase-aware.
 **Contents:** feature 5 in full — resolution, the snapshot store, banner and
 body selection, range computation, pruning, and the `Server.Stop` restructure.
 
-**Depends on:** Plan 1 (store generation under `stateMu`, `Stop` restructure);
-D1, D4, D5, D6.
+**Depends on:** Plan 1 (store generation under `stateMu`, `Stop` restructure).
+From the contract: `ObjectKind`, `DDLRepository.ObjectDDL`,
+`ErrObjectNotFound`, `ErrUnsupportedDDL`, `UnsupportedDDLDetail`,
+`DBCache.HasCatalog`/`Procedure`/`View`/`Trigger`, and the source fields
+`ProcedureDesc.Source`, `ViewDesc.ViewSource`, `TriggerDesc.Source`.
 
 **Delivers working software:** jumping to a procedure, view or trigger opens its
 real source.
@@ -531,7 +617,9 @@ and keeping it last means cutting it costs nothing already built.
 Three placement rules keep the fork upstreamable:
 
 1. **Capability, not driver check, wherever possible.** Handlers type-assert
-   `database.PlanExplainer`, `database.DDLDescriber`, etc. A non-InterBase
+   `database.ExplainRepository`, `database.DDLRepository`, and read catalog data
+   through `DBCache.HasCatalog()` rather than by asserting
+   `database.CatalogRepository`. A non-InterBase
    driver that later implements one gets the feature for free.
 2. **Driver identity only for parser/lexer-shaped behavior**, matching the
    existing `c.Driver == dialect.DatabaseDriverInterBase` checks at
@@ -580,7 +668,7 @@ statements are split with `getStatementsWithDriver(text, s.parserDriver())`.
 `-show-vertical` is not accepted — a plan is not a table.
 
 **Capability.** `repo, err := s.newDBRepository(ctx)`, then
-`explainer, ok := repo.(database.PlanExplainer)`. When `!ok`, return
+`explainer, ok := repo.(database.ExplainRepository)`. When `!ok`, return
 `fmt.Errorf("explain is not supported by the %s driver", repo.Driver())`.
 
 **Statement admission.** For each statement, `database.QueryExecType(query, "")`
@@ -690,25 +778,52 @@ written to be extended.
 - *External functions.* Appended to the existing `CompletionTypeFunction`
   branch alongside `dialect.DataBaseFunctions(c.Driver)` — no new type, no new
   context, since a UDF is callable exactly where a built-in function is.
+
+  **Enumeration.** The contract has no `SortedFunctions()` accessor: it provides
+  `DBCache.Function(name)` for lookup and the exported `CatalogCache.Functions`
+  map, but only `SortedProcedures`/`SortedViews`/`SortedGenerators` for
+  listing. UDF completion is the one surface in this spec that must enumerate
+  rather than look up, so it guards with `HasCatalog()` and ranges over
+  `dc.Catalog.Functions`, sorting the names locally — the same shape
+  `SortedSchemas` uses over `dc.Schemas` (`cache.go:143-150`). This is recorded
+  as a small gap rather than papered over: a `SortedFunctions()` accessor would
+  be the consistent shape and would keep `Catalog` field access out of the
+  completer. It is not a blocker and not worth a contract change on its own.
 - *Generators.* Emitted only when the cursor is inside the argument list of a
   call whose function name is `GEN_ID` (case-insensitive), detected from the
   enclosing `ast.FunctionLiteral` — the same detection §3 uses. *Decision:*
   offering every generator in every expression position would bury column
   candidates; `GEN_ID(` is where a generator name is actually required.
 - *Views.* `CompletionTypeView` branches in `Complete` call a new
-  `c.ViewCandidates(ctx.parent)`, mirroring `TableCandidates`, with the D4
-  disjointness requirement (or the `EqualFold` de-duplication fallback).
+  `c.ViewCandidates(ctx.parent)`, mirroring `TableCandidates`, built from
+  `DBCache.SortedViews()` and `DBCache.View(name)`.
 
-**Case-insensitivity.** All lookups go through the D4 accessors, which are
+  **`SortedViews()` does not subtract from `SortedTables()`** (D4): views stay
+  in `SchemaTables` and keep appearing in the `FROM` position as they do today.
+  So a view already reachable as a "table" candidate would be offered twice if
+  view candidates were simply appended in the same contexts. The resolution is
+  not de-duplication but **placement**: view candidates are emitted only where
+  `CompletionTypeView` is set and `CompletionTypeTable` is *not* — which, per
+  `getCompletionTypes`, is the `InsertColumn` position and the member-identifier
+  branches of `ColName`/`SelectExpr`/`WhereCondition`. In every context that
+  already offers tables, the existing table candidate is the view's candidate
+  and gains only the `view` detail string when `DBCache.View(name)` hits. That
+  keeps one candidate per object with no name comparison anywhere.
+
+**Case-insensitivity.** All lookups go through the D4 accessors, whose maps are
+keyed by upper-cased name (and see D11), which are
 case-insensitive. `filterCandidates` already upper-cases both sides, so a user
 typing `myp` matches `MYPROC` without further work.
 
-**Documentation body.** Procedures render a markdown block: the description if
-present, then an input parameter list and an output parameter list, each entry
-`` - NAME: `TYPE` (input) ``, with nullability rendered only when known (§3).
-Generators render `` `GEN` generator `` plus description. External functions
-render the argument types, the return position, and the module/entry point, all
-labelled as declaration metadata.
+**Documentation body.** Procedures render a markdown block: `Description` when
+valid, then an input parameter list and an output parameter list, each entry
+`` - NAME: `TYPE` (input) ``, with nullability rendered only when known (§3) and
+the `` `TYPE` `` element omitted when `Type` is `""`. Generators render
+`` `GEN` generator `` and nothing else — `GeneratorDesc` carries only `Name` and
+`ID` (D3), so there is no description to show and none is invented. External
+functions render `Description` when valid, the argument list, and the
+module/entry point, all labelled as declaration metadata, under the empty-type
+rules in D10.
 
 ### 3. Signature help for procedures
 
@@ -762,10 +877,11 @@ current output. The database-backed part lives in
 1. Resolve a hover *target* — `(kind database.ObjectKind, name string)` — with a
    new `resolveInterBaseHoverTarget(text, params, cache, driver)` in
    `internal/handler/interbase_hover.go`, reusing the same `NodeWalker` and
-   identifier matchers as `hoverWithDriver`. A target is produced only for an
-   identifier that names a cached table, view, procedure, trigger, generator, or
-   external function; columns and aliases produce none.
-2. If a target exists and `repo` implements `database.DDLDescriber`, call
+   identifier matchers as `hoverWithDriver`. A target is produced only when
+   `DBCache.HasCatalog()` is true and the identifier hits `ColumnDescs` (table),
+   `View`, `Procedure`, `Trigger`, `Generator` or `Function`; columns and
+   aliases produce none.
+2. If a target exists and `repo` implements `database.DDLRepository`, call
    `ObjectDDL` under a **3-second derived context**.
 3. On success, append to the existing markdown content:
 
@@ -777,9 +893,24 @@ current output. The database-backed part lives in
    ```
    ````
 4. On `errors.Is(err, database.ErrUnsupportedDDL)`, append exactly one italic
-   line built from `UnsupportedDDLDetail`, e.g.
-   `*DDL not shown: the catalog does not record declaration nullability for parameter IN_AMOUNT.*`
-5. On any other error (including the 3-second timeout), append nothing and
+   line built from `database.UnsupportedDDLDetail(err)`. With `ok == true` it
+   names the structured reason, matching the wording the contract fixes in
+   §4.4:
+
+   ```
+   _DDL unavailable: procedure "MYPROC": parameter "IN_AMOUNT" nullability is unknown._
+   ```
+
+   With `ok == false` it degrades to `_DDL unavailable._` — never to a rendered
+   driver message.
+5. On `errors.Is(err, database.ErrObjectNotFound)`, append **nothing at all**,
+   not even a note: the cache said the identifier was an object and the
+   catalog disagrees, which means the cache is stale, and a stale-cache
+   footnote on a hover popup is noise the user cannot act on. This is the
+   branch the contract's `ErrObjectNotFound` sentinel exists to make possible —
+   an earlier draft of this spec asked for `("", nil)` here and would have had
+   to treat a missing object as an empty DDL string.
+6. On any other error (including the 3-second timeout), append nothing and
    `log.Printf` it. The hover response is the unchanged summary.
 
 *Decisions.* (a) Append rather than replace, so the markdown column table that
@@ -803,10 +934,10 @@ each one is a catalog round trip.
 | --- | --- | --- |
 | table | existing column table | `ObjectDDL` output, or the note line when a computed column blocks it |
 | view | column table from `ViewDesc.Columns` | `ObjectDDL`, else the note line; `ViewSource` is included in the summary regardless |
-| procedure | name, description, input/output parameter list (nullability per §3) | `ObjectDDL`, else the note line; the verbatim `Source` is included in the summary regardless |
-| trigger | name, relation, event, active flag | `ObjectDDL`, else note; verbatim `Source` in the summary |
-| generator | name, description | `ObjectDDL` (`CREATE GENERATOR`) |
-| external function (`Function`) | name, arguments, return position, module, entry point | **never attempted** — `schema` documents `Function` as permanently unsupported, so calling it would guarantee a wasted round trip and a note line |
+| procedure | name, `Description`, input/output parameter list (nullability per §3) | `ObjectDDL`, else the note line; the verbatim `Source` is included in the summary regardless |
+| trigger | name, `RelationName`, `Event` (omitted when `""`, D10), `Active` (omitted when invalid) | `ObjectDDL`, else note; verbatim `Source` in the summary |
+| generator | name only — `GeneratorDesc` has no `Description` (D3) | `ObjectDDL` (`CREATE GENERATOR`) |
+| external function (`FunctionDesc`) | name, `Description`, arguments, return position, module, entry point, under D10's empty-type rules | **never attempted** — the contract (D6) states `ObjectKindFunction` always returns `ErrUnsupportedDDL`, so calling it would guarantee a wasted round trip and a note line |
 | `DatabaseFile`, `Shadow` | not reachable | these are never identifiers in a SQL statement, so they are out of scope for hover entirely |
 
 The user never sees a fabricated declaration: what is not renderable as DDL is
@@ -878,12 +1009,18 @@ than returning nothing. **Rejected.**
   -- Editing this file does not change the database.
   CREATE PROCEDURE "MYPROC" (...) AS BEGIN ... END
   ```
-- **Body selection.** `ObjectDDL` output when it succeeds. On
-  `ErrUnsupportedDDL` — the normal case for procedures, per `schema/README.md` —
-  the body is the **verbatim** `Source` / `ViewSource` from the catalog,
-  preceded by one more comment line naming the blocking feature. No `CREATE`
-  header is synthesized in that case. When neither is available, definition
-  returns `nil, nil` and the client shows "no definition found".
+- **Body selection**, by error classification, in this order:
+
+  | `ObjectDDL` result | Body |
+  | --- | --- |
+  | success | the returned DDL |
+  | `errors.Is(err, database.ErrUnsupportedDDL)` | the **verbatim** `ProcedureDesc.Source`, `ViewDesc.ViewSource` or `TriggerDesc.Source`, preceded by one comment line naming the blocking feature from `database.UnsupportedDDLDetail(err)`, or a generic line when `ok == false`. **No `CREATE` header is synthesized.** This is the normal case for procedures, since `schema/README.md` states parameter nullability is usually unknown |
+  | `errors.Is(err, database.ErrObjectNotFound)` | **no file is written**; definition returns `nil, nil` and the client shows "no definition found". The cache named an object the catalog does not have, which means the cache is stale, and writing a snapshot of nothing would be worse than navigating nowhere |
+  | any other error | no file written, `nil, nil`, logged |
+
+  When `ErrUnsupportedDDL` is returned but the descriptor's source field is also
+  invalid, definition likewise returns `nil, nil` rather than writing a
+  banner-only file.
 - **Range.** The generator records the 0-based line and UTF-16 character offset
   of the first occurrence of the object name after the banner, and returns a
   zero-width range there; `(0,0)` if the name does not appear (possible when
@@ -929,9 +1066,9 @@ than returning nothing. **Rejected.**
 
 **Resolution order** in `definitionWithDriver`: the existing alias/subquery
 resolution runs first and wins. Only when it yields nothing, the driver is
-InterBase, and the identifier under the cursor names a cached procedure, view,
-or trigger, does the snapshot path run. This keeps every existing definition
-test passing unchanged.
+InterBase, `DBCache.HasCatalog()` is true, and the identifier under the cursor
+hits `DBCache.Procedure`, `DBCache.View` or `DBCache.Trigger`, does the snapshot
+path run. This keeps every existing definition test passing unchanged.
 
 **Plumbing.** `definitionWithDriver` is currently pure and has no repository.
 Rather than thread a repository through the pure function, `handleDefinition`
@@ -1233,11 +1370,15 @@ In `executeQuery`, for the InterBase driver only, a statement whose
 identifier following `EXECUTE PROCEDURE`, parsed from the already-parsed
 statement — in the cache:
 
+Concretely: `dbCache.HasCatalog()` and then
+`dbCache.Procedure(name) (*ProcedureDesc, bool)`, branching on
+`len(desc.OutputParameters)`.
+
 | Cache state | Path | Rationale |
 | --- | --- | --- |
-| procedure with ≥1 output parameter | `repo.Query` (driver `QueryContext`), rendered as a table, footer `1 row in set` | driver supports it and returns exactly one row |
-| procedure with 0 output parameters | `repo.Exec` | driver requires `ExecContext` here |
-| procedure not in cache | `repo.Exec` | see below |
+| `len(OutputParameters) >= 1` | `repo.Query` (driver `QueryContext`), rendered as a table, footer `1 row in set` | driver supports it and returns exactly one row |
+| `len(OutputParameters) == 0` | `repo.Exec` | driver requires `ExecContext` here |
+| procedure not in cache, or `HasCatalog()` false | `repo.Exec` | see below |
 | not InterBase | unchanged behavior | |
 
 *Decision on the unknown case:* use `Exec` and surface the driver's rejection
@@ -1247,7 +1388,10 @@ output-producing procedures from `ExecContext`, in both cases on the basis of
 the prepared statement type — but "try one path, then the other" is a shape that
 can execute a mutating procedure twice if that reasoning is ever wrong, and a
 stale cache is not worth that risk. The error message tells the user to refresh
-the connection (`switchConnections` to the same index re-caches).
+the connection (`switchConnections` to the same index re-caches). The same
+branch covers the startup window in which `HasCatalog()` is still false (D4):
+routing falls back to today's unconditional `Exec`, which is exactly the
+current behavior and therefore not a regression.
 
 A one-row procedure result is rendered with an explicit note:
 `EXECUTE PROCEDURE returns at most one row.`
@@ -1303,14 +1447,31 @@ statements; got CREATE TABLE.
 **Explain on a driver without the capability.** JSON-RPC error:
 `explain is not supported by the mysql driver`.
 
-**DDL is unsupported (hover).** The usual hover content, then one italic line:
+**DDL is unsupported (hover).** The usual hover content, then one italic line
+built from `database.UnsupportedDDLDetail(err)`:
 
-> *DDL not shown: the catalog does not record declaration nullability for
-> parameter `IN_AMOUNT`.*
+> *DDL unavailable: procedure "MYPROC": parameter "IN_AMOUNT" nullability is
+> unknown.*
 
-The procedure's verbatim source and parameter list are still shown above it. No
-popup error, no fabricated `CREATE PROCEDURE` header. Hovering an external
-function shows its declaration metadata and never mentions DDL at all.
+When the error carries no structured detail (`ok == false`) the line degrades
+to *DDL unavailable.* rather than rendering a driver message. The procedure's
+verbatim source and parameter list are still shown above it. No popup error, no
+fabricated `CREATE PROCEDURE` header. Hovering an external function shows its
+declaration metadata and never mentions DDL at all.
+
+**The object is gone from the catalog.** `ObjectDDL` returns
+`ErrObjectNotFound` when the cache named an object the database no longer has.
+Hover shows the cached summary and **no note**; go-to-definition returns no
+location and the editor says "no definition found". Neither surface reports an
+error, because a stale cache is not something the user did.
+
+**A trigger event, UDF argument type or UDF return type is unknown.** The
+corresponding line or list entry is omitted. A trigger with an empty `Event`
+still shows its name, relation, active flag and body; a UDF argument with an
+empty `Type` shows as `argument 3`; a UDF with an empty `ReturnType` shows no
+`returns` line. No placeholder text, and no object is hidden merely because a
+type could not be rendered. See D10 for why these can be empty and for how rare
+it is in practice.
 
 **DDL is unsupported (go-to-definition).** The snapshot opens and reads:
 
@@ -1390,10 +1551,14 @@ MYPROC is not in the catalog cache. If it was created after this connection
 opened, switch to this connection again to refresh the cache.
 ```
 
-**No InterBase capability present** (ordinary build, or non-InterBase driver):
+**No InterBase capability present** — an ordinary build, a non-InterBase driver,
+or the window before the worker's secondary pass has built the catalog, all of
+which present as `DBCache.HasCatalog() == false` or a failed type assertion:
 every feature degrades to today's behavior. Completion offers tables and
-keywords; hover shows the summary; definition resolves aliases; execution uses
-`ScanRows`. Nothing errors.
+keywords; hover shows the summary; definition resolves aliases; `EXECUTE
+PROCEDURE` routes to `Exec`; execution uses `ScanRows`. Nothing errors, and
+nothing tells the user the catalog is still loading — it arrives silently and
+the surfaces get richer.
 
 ## Testing Strategy
 
@@ -1409,9 +1574,14 @@ today. Completer features are exercised as direct unit tests like
 `INTERBASE_DATABASE`/`INTERBASE_USER`/`INTERBASE_PASSWORD` are unset.
 
 A shared `configureInterBaseCapabilityServer(t, tx)` helper extends the existing
-one with a `MockInterBaseDBRepository` (D8) carrying two procedures (`MYPROC`
-with two inputs and one output, `DOWORK` with inputs only), one view, one
-trigger, one generator, and one external function.
+one with sub-project 2's capability mock (D8) implementing `CatalogRepository`,
+`DDLRepository` and `ExplainRepository`, and populates the resulting
+`DBCache.Catalog` with: two procedures (`MYPROC`, two inputs and one output;
+`DOWORK`, inputs only), one view with columns, one trigger, one generator, and
+one external function. At least one procedure parameter has
+`Nullable: sql.NullBool{}` and at least one has `{Bool: false, Valid: true}`,
+and at least one UDF argument has `Type: ""`, so the unknown-value paths are
+covered by the shared fixture rather than by bespoke setup per test.
 
 ### Feature 1 — Explain
 
@@ -1443,11 +1613,19 @@ trigger, one generator, and one external function.
   `FieldCompletion` with detail `column from "MYPROC"`.
 - `TestInterBaseExternalFunctionCompletionInSelectExpr` — assert the UDF appears
   beside built-in function candidates with `Detail == "external function"`.
+- `TestInterBaseExternalFunctionCompletionWithUnrenderableArgumentType` — a UDF
+  whose argument `Type` is `""` is still offered, its documentation lists the
+  known arguments only, and no placeholder token appears anywhere in the item.
 - `TestInterBaseGeneratorCompletionInsideGenId` — `select gen_id(` offers the
   generator; `select upper(` does not.
-- `TestInterBaseViewCandidatesAreNotDuplicatedWithTables` — with a cache where a
-  view name also appears in `SortedTables()`, assert exactly one candidate with
-  that label.
+- `TestInterBaseViewInFromPositionIsOfferedExactlyOnce` — a view present in both
+  `SchemaTables` and the view cache (which is the contract's normal state, D4)
+  yields exactly one candidate for that name in `select * from `, carrying the
+  `view` detail.
+- `TestInterBaseCompletionDegradesWithoutCatalog` — with `HasCatalog()` false
+  (the window before the worker's secondary pass lands, D4), completion returns
+  today's table and keyword candidates and no procedure, generator or UDF
+  items, and does not error.
 - `TestInterBaseCompletionIsCaseInsensitive` — lowercase `myp` prefix matches
   `MYPROC`.
 - `TestExecuteProcedureMultiKeywordParsing` (in `parser`) — assert
@@ -1477,9 +1655,19 @@ trigger, one generator, and one external function.
   `CREATE PROCEDURE` string; assert the response contains both the parameter
   summary and the fenced SQL block.
 - `TestInterBaseHoverUnsupportedDDLFallsBackToSummary` — `MockObjectDDL` returns
-  an error wrapping `database.ErrUnsupportedDDL` with feature text; assert the
-  summary is intact, the note line contains the feature text, no fenced block
-  appears, and `conn.Call` returns no error.
+  an error that satisfies `errors.Is(err, database.ErrUnsupportedDDL)` and
+  carries detail; assert the summary is intact, the note line contains the
+  object, name and feature reported by `database.UnsupportedDDLDetail`, no
+  fenced block appears, and `conn.Call` returns no error.
+- `TestInterBaseHoverUnsupportedDDLWithoutDetailDegradesToBareNote` — the bare
+  sentinel, `UnsupportedDDLDetail` reporting `ok == false`; assert the note is
+  exactly `_DDL unavailable._` and that no driver message text leaks into it.
+- `TestInterBaseHoverObjectNotFoundAppendsNothing` — `MockObjectDDL` returns
+  `database.ErrObjectNotFound`; assert the hover is byte-identical to the same
+  hover with no `DDLRepository` present — no note, no fenced block, no error.
+- `TestInterBaseHoverTriggerOmitsEmptyEvent` — a `TriggerDesc` with
+  `Event: ""` (D10) renders name, relation and source with no event line and no
+  placeholder.
 - `TestInterBaseHoverDDLErrorIsNotSurfacedAsRequestError` — `MockObjectDDL`
   returns a plain error; assert the hover succeeds with the unchanged summary.
 - `TestInterBaseHoverTableStillShowsColumnTable` — the existing
@@ -1502,8 +1690,16 @@ and ubuntu-only CI would never reveal it.
   in a `0o700` directory, the banner names the object, and the body is the
   `ObjectDDL` output.
 - `TestInterBaseDefinitionUnsupportedDDLUsesVerbatimSource` — assert the body is
-  `Source` with no synthesized `CREATE` line, and that the blocking feature is
-  named in a comment.
+  `ProcedureDesc.Source` with no synthesized `CREATE` line, and that the
+  blocking feature from `UnsupportedDDLDetail` is named in a comment. A view
+  variant asserts the same for `ViewDesc.ViewSource`.
+- `TestInterBaseDefinitionObjectNotFoundWritesNoFile` — `MockObjectDDL` returns
+  `database.ErrObjectNotFound`; assert `nil, nil` is returned **and** that the
+  snapshot root is still empty, so a stale cache entry never leaves a file
+  behind.
+- `TestInterBaseDefinitionUnsupportedDDLWithNoSourceWritesNoFile` — unsupported
+  DDL and an invalid `Source`; assert `nil, nil` and an empty root rather than a
+  banner-only file.
 - `TestInterBaseDefinitionRangePointsAtObjectName` — assert the range's line and
   character match the first occurrence of the name after the banner.
 - `TestInterBaseDefinitionFallsBackToAliasResolution` — a document with aliases
@@ -1603,8 +1799,17 @@ In `internal/database/interbase_live_test.go` and a new
   slow catalog cross join; assert `ClassifyFailure` reports `FailureCanceled` or
   `FailureUncertain` and never `FailureNone`.
 - `TestInterBaseLiveObjectDDLRoundTrip` — for every procedure in the target
-  database, assert `ObjectDDL` either succeeds or fails with
-  `database.ErrUnsupportedDDL`, and never with anything else.
+  database, assert `ObjectDDL` either succeeds or fails an
+  `errors.Is` check against `database.ErrUnsupportedDDL`, and never with
+  anything else. A name that does not exist must fail
+  `errors.Is(err, database.ErrObjectNotFound)`, which is the live check that the
+  two sentinels stay distinguishable.
+- `TestInterBaseLiveCatalogFieldsThatMayBeEmpty` — for every trigger and
+  external function in the target database, assert that an empty `Event`,
+  argument `Type` or `ReturnType` is tolerated by the hover and completion
+  renderers without panicking or emitting a placeholder. This is the test that
+  turns green rather than red when the driver-side accessor spec (D10) lands,
+  so it is written now and needs no revision then.
 
 ## Documentation
 
