@@ -30,7 +30,7 @@
 
 **Racy window, narrowed and stated on purpose:** Task 5 makes `workspace/executeCommand` concurrent and guards `Server.files` **in the same commit**, so no commit ever ships a concurrent server with an unguarded document map — the one race that was independently reproduced against this design. `WSCfg`, `dbConn` and the cursor fields remain unguarded until Task 6, and `connMu` does not exist until Task 7, so Tasks 5–7 must land as one contiguous run; do not stop after Task 5 and ship. Closing the remaining window would mean one commit spanning Tasks 5–7, which is too large to review as a unit.
 
-**Demonstrating a race is not the same as having a concurrent test.** Three tasks (2, 5, 6) must *show* their race before fixing it, and in each the racy read happens **before** the gated repository call. A test that waits for the gate's signal therefore establishes a happens-before edge that orders the read ahead of the writes it then performs, and the detector reports nothing — the test passes identically before and after the fix. Those three tests wait with `time.Sleep`, never with `gate.waitEntered`. This was verified empirically, not reasoned about: the Task 2 test with a channel handshake passed 3 runs out of 3 against unfixed code, and the same test with a sleep reported `WARNING: DATA RACE` at `worker.go:76`/`worker.go:58` in 3 runs out of 3. Use `gate.waitEntered` everywhere else — in Tasks 5, 7 and 8 it tests liveness, where it is correct and a sleep would be flaky.
+**Demonstrating a race is not the same as having a concurrent test.** Three tasks (2, 5, 6) must *show* their race before fixing it, and in each the racy read happens **before** the gated repository call. A test that waits for the gate's signal therefore establishes a happens-before edge that orders the read ahead of the writes it then performs, and the detector reports nothing — the test passes identically before and after the fix. Those three tests wait with `time.Sleep`, never with `gate.waitEntered`. This was verified empirically, not reasoned about: the Task 2 test with a channel handshake passed 3 runs out of 3 against unfixed code, and the same test with a sleep reported `WARNING: DATA RACE` at `worker.go:76`/`worker.go:58` in 3 runs out of 3. Use `gate.waitEntered` everywhere else — in Tasks 5, 7, 8 and 9 it tests liveness, where it is correct and a sleep would be flaky. Do not "fix" one of those into a sleep for consistency; the distinction is which property the test is establishing, not which helper it calls.
 
 ## File Structure
 
@@ -48,14 +48,14 @@
 | `internal/database/interbase_failure_native_test.go` | Create (tagged) | classification of real driver errors |
 | `internal/database/interbase_failure_stub_test.go` | Create (inverse tag) | stub returns `FailureNone` |
 | `internal/database/interbase_failure_live_test.go` | Create (tagged) | gated live cancellation test |
-| `internal/handler/dispatch.go` | Create | `NewDispatcher`, `cancelRegistry`, `cancelParams`, `cancelledError` |
+| `internal/handler/dispatch.go` | Create | `NewDispatcher`, `cancelRegistry`, `cancelParams` |
 | `internal/handler/dispatch_test.go` | Create | async dispatch, cancel registry, late-cancellation note |
 | `internal/handler/concurrency_test.go` | Create | test fixture: stub `database/sql` driver, gated stub repository, install helper |
 | `internal/handler/concurrency_race_test.go` | Create | the `-race`-only regression tests for `files`, `WSCfg` and `connMu` |
 | `internal/handler/failure.go` | Create | `cancellationNotice` and the results-pane message constants |
 | `internal/handler/failure_test.go` | Create | message rendering tests |
 | `internal/handler/handler.go` | Modify | `stateMu`, `connMu`, `fileText`, `$/cancelRequest` case, `Stop` restructure |
-| `internal/handler/execute_command.go` | Modify | `connMu` per command, copy rule, cancellation rendering |
+| `internal/handler/execute_command.go` | Modify | `connMu` per command, copy rule, `cancelledError`, cancellation rendering |
 | `internal/handler/completion.go`, `hover.go`, `definition.go`, `rename.go`, `signature_help.go`, `format.go` | Modify | read document text through `fileText` |
 | `internal/handler/handler_test.go` | Modify | wrap the handler with the dispatcher; read files through `fileText` |
 | `main.go` | Modify (`:125`) | wrap the handler with the dispatcher |
@@ -2076,6 +2076,13 @@ and replace the body of `handleWorkspaceExecuteCommand` after the unmarshal (`:9
 // than as a plain string so the wrapper above can tell "this statement was
 // cancelled" apart from "this statement completed, and a cancellation arrived
 // too late". Task 9 populates it; until then nothing returns one.
+//
+// It deliberately carries only the rendered text: nothing in this plan needs
+// the underlying driver error past this boundary, so adding an Unwrap now
+// would be speculative. A later plan that wants to log why a statement
+// stopped should add a cause field here rather than reconstructing it from
+// the rendered string, because the cause is otherwise discarded at
+// executeQuery.
 type cancelledError struct {
 	rendered string
 }
