@@ -982,11 +982,32 @@ func (dc *DBCache) TriggersForTable(table string) []*TriggerDesc
 func (dc *DBCache) SortedProcedures() []string
 func (dc *DBCache) SortedViews() []string
 func (dc *DBCache) SortedGenerators() []string
+func (dc *DBCache) SortedFunctions() []string
 ```
+
+Every singular accessor **normalises the name it is given**; callers pass the
+identifier text as the user typed it and never upper-case at the call site. This
+follows the existing convention rather than introducing one: `columnDatabaseKey`
+upper-cases its arguments (`internal/database/cache.go:186-188`) and
+`DBCache.Column` matches the column with `strings.EqualFold`
+(`internal/database/cache.go:179`). The requirement is stated explicitly because
+InterBase stores catalog names upper-cased while users type them lower-cased, so
+an exact-match accessor would silently miss for every lower-case identifier —
+and the failure would look like missing metadata rather than a lookup bug.
+`IndexesForTable` and `TriggersForTable` normalise their table argument the same
+way.
+
+`SortedFunctions()` exists because external functions are the one object kind a
+consumer must enumerate rather than look up: sub-project 3's UDF completion
+needs the whole list. Without the accessor that consumer would range over
+`CatalogCache.Functions` directly, which is the only place any consumer would
+reach past the accessors into the cache struct.
 
 `SortedViews()` is additive metadata and does **not** subtract from
 `SortedTables()`: views remain in `SchemaTables` exactly as today, so no caller
-needs to deduplicate the two.
+needs to deduplicate the two. Consumers that offer both must therefore separate
+them by *context* rather than by comparing names — in a position where tables are
+offered, the existing table candidate already represents the view.
 
 Generation and refresh:
 
