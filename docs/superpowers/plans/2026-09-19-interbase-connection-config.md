@@ -931,6 +931,12 @@ type interBaseConnConfig struct {
 // driver composes the attachment itself, which is the only way TLS options can
 // be carried (interbase.go:185-239). A dataSourceName stays a raw attachment
 // string with no host, exactly as before.
+//
+// This mirrors interBaseAttachment's composition in structured form rather than
+// sharing it, because interBaseAttachment must keep producing the exact display
+// string its existing tests pin. TestInterBaseDriverConfigMapping recomposes
+// Host + ":" + Database and asserts it equals interBaseAttachment's output for
+// every case, so add a case there when adding a branch to either function.
 func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
 	// Shares the proto, port, host and path validation with DBConfig.Validate.
 	if _, err := interBaseAttachment(cfg); err != nil {
@@ -982,6 +988,19 @@ func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
 ```
 
 `interBaseAttachment` keeps its current body and its current output. It is now the *display* attachment used for `DBConnection.DatabaseName`, `showConnections` and error messages, and it deliberately omits TLS parameters: the driver's composed attachment can contain `clientPassPhrase`, and the display string is echoed back to the user by `showDatabases`.
+
+Add the converse note above it, so the pairing is documented from both sides. The recompose assertion only catches drift for composition shapes already in the mapping table, so a *new* branch added to one function and not the other is the one failure it cannot see:
+
+```go
+// interBaseAttachment composes the display attachment string. Its output is
+// pinned by existing tests and is what the user sees in showDatabases and
+// showConnections, so it must not gain TLS parameters.
+//
+// interBaseConnectionConfig mirrors this composition in structured form for the
+// driver. TestInterBaseDriverConfigMapping pins the two together by recomposing
+// Host + ":" + Database; add a case there when adding a branch here.
+func interBaseAttachment(cfg *DBConfig) (string, error) {
+```
 
 - [ ] **Step 4: Use the mapping in the tagged connect path**
 
@@ -1099,7 +1118,11 @@ CGO_ENABLED=1 go build -tags interbase ./...
 CGO_ENABLED=1 go test -tags interbase ./internal/database/ -count=1 -run '^TestInterBaseDriverConfigIsAcceptedByConnector$' -v
 ```
 
-Expected: PASS for the untagged commands, and a clean tagged build. Run the tagged test only where the InterBase client is installed; report whether it ran.
+Expected: PASS for the untagged commands, and a clean tagged build.
+
+**`CGO_ENABLED=1 go build -tags interbase ./...` is mandatory for this task, not optional.** Step 4 removes `Database: attachment` from the config literal in `interbase_native.go`, and `attachment` only stays live because plan 1 assigns it to `DBConnection.DatabaseName`. If this task is executed before plan 1 has landed, `attachment` becomes an unused variable and that file will not compile — and the untagged suite cannot see it, because `interbase_native.go` is behind the build tag. The tagged build is the only check that catches it. `/opt/interbase` is present on the development machine, so there is no excuse to skip it; if the build fails with `declared and not used: attachment`, plan 1 has not landed and this task must wait rather than be worked around by deleting the variable.
+
+The tagged *test* on the last line additionally needs a reachable server for the rest of the live suite's environment gating; run it where the client is installed and report whether it ran.
 
 - [ ] **Step 7: Commit**
 
@@ -1132,6 +1155,8 @@ Spec §4.3 declares `InterBaseDBRepository` with both `SQLDialect` and `Database
 Either way, Steps 2 and 5 of this task run unchanged.
 
 - [ ] **Step 2: Write the failing test**
+
+**Known cross-plan collision, restated here because the File Structure note is far above:** the spec lists `TestInterBaseCurrentDatabaseAndDatabases` under plan 2's `interbase_catalog_test.go`, and two files in one Go package cannot both declare it. If plan 2 has already landed its copy, keep that one, add only the assertions below that it is missing, and skip the rest of this step. If it has not, this file owns the test.
 
 Append to `internal/database/interbase_config_test.go`, adding `"context"` to its imports:
 
@@ -1604,7 +1629,11 @@ separate connection entry to open another database. InterBase has no schema
 namespace, so `showSchemas` reports one synthetic empty schema.
 ```
 
-Then replace the TLS clause at `README.md:327-330`:
+Then replace the TLS clause in the paragraph at `README.md:327-331`. Match on the
+text below, not on the line numbers: the sentence being replaced **ends mid-line
+at line 330**, and the sentence after it must survive.
+
+Replace only this:
 
 ```
 The native driver is experimental. Context cancellation cannot interrupt an
@@ -1621,6 +1650,17 @@ in-flight native call. Use a least-privilege database account, and read the TLS
 statement above before relying on `interbase.tls` for transport security.
 ```
 
+**Retain the sentence that follows it verbatim**, so the paragraph still ends:
+
+```
+Executing DML/DDL uses the driver's implicit
+commit behavior; SQL transaction-control statements are not supported.
+```
+
+Deleting to the end of line 330 would take half of that sentence and orphan the
+rest as a dangling fragment. Step 6's grep for `commit behavior` confirms it
+survived.
+
 Leave the build, test and live-test instructions at `README.md:333-348` exactly as they are — the spec's item 6 keeps them.
 
 - [ ] **Step 6: Check the documentation against the code**
@@ -1631,10 +1671,11 @@ Run:
 grep -n "WIN1252\|ISO8859_1\|ASCII" README.md
 grep -n "connectTimeout\|clientPassPhraseFile\|LI-V15.1.0.42" README.md
 grep -n "no TLS configuration API\|Dialect 3 is not supported" README.md
+grep -n "commit behavior; SQL transaction-control statements are not supported" README.md
 go test ./... 2>&1 | tail -20
 ```
 
-Expected: the first two commands find the new text; the third prints nothing for "no TLS configuration API" (plan 1 removes the Dialect 3 sentence, so a match there is fine if plan 1 has not landed yet); the suite passes.
+Expected: the first two commands find the new text; the third prints nothing for "no TLS configuration API" (plan 1 removes the Dialect 3 sentence, so a match there is fine if plan 1 has not landed yet); the fourth finds exactly one match, proving the Step 5 replacement did not truncate the sentence that followed it; the suite passes.
 
 Read the TLS paragraph once more against `interbase-go/README.md:119-125` and confirm no sentence claims verification, authentication or proof of identity.
 
