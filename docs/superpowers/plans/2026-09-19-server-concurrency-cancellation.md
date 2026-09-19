@@ -12,11 +12,11 @@
 
 ## Global Constraints
 
-- **Lock ordering: `connMu` before `stateMu`, never the reverse**, and `stateMu` is never held across any I/O. Copy this sentence into `doc/develop.md` verbatim (Task 11). Every task's locking decisions are subordinate to it.
+- **Lock ordering: `connMu` before `stateMu`, never the reverse**, and `stateMu` is never held across any I/O. Copy this sentence into `doc/develop.md` verbatim (Task 10). Every task's locking decisions are subordinate to it.
 - `connMu` guards *connection lifetime*. `executeQuery`, `showDatabases`, `showSchemas`, `showTables` and `showConnections` take `connMu.RLock()` for the whole of their database work including rendering; `switchDatabase`, `switchConnections`, `handleInitialize` and the reconnect branch of `handleWorkspaceDidChangeConfiguration` take `connMu.Lock()` across `reconnectionDB`.
 - `stateMu` guards *mutable `Server` fields*. It is taken for short, non-blocking field accesses only. `reconnectionDB` performs `Close`, `Open` and `ReCache` holding only `connMu.Lock()`, taking `stateMu.Lock()` only for the pointer assignments.
 - `getConfig()`, `topConnection()`, `getConnection()`, `parserDriver()`, `newDBRepository()` and `fileText()` take `stateMu` **internally**. Never call any of them while already holding `stateMu` — `sync.RWMutex` does not guarantee recursive `RLock` when a writer is queued.
-- `Server.Stop`, `handleShutdown` and `handleExit` do **not** take `connMu`. Shutdown must never block on a runaway query, and `sql.DB.Close` is documented (`$GOROOT/src/database/sql/sql.go:925-927`) as safe to call while queries are in flight.
+- `Server.Stop`, `handleShutdown` and `handleExit` do **not** take `connMu`. Shutdown must never block on a runaway query, and `sql.DB.Close` is documented (`$GOROOT/src/database/sql/sql.go:925-927`) as safe to call while queries are in flight. They **do** take `stateMu` for the `s.dbConn` read: `handleExit` runs on the read loop while an async `switchDatabase` may be reassigning that pointer. "No `connMu`" is not "no lock".
 - Every reader of `Server.files` copies `File.Text` into a local `string` **while still holding the lock** and never retains the `*File`. `updateFile` mutates `f.Text` through the stored pointer (`internal/handler/handler.go:301`).
 - `SpecificFileCfg` and `DefaultFileCfg` are written once in `main.go:133`/`:140`, **before** `jsonrpc2.NewConn` at `main.go:151`, and are never written again. This is a stated invariant, not a lock. Any future writer after serving begins must take `stateMu`.
 - Any new `Server` field added by a later plan must be added to the audit table in `doc/develop.md` and classified.
@@ -28,7 +28,9 @@
 
 **Baseline fact, verified at HEAD before this plan was written:** `go test -race ./...` is **already green** on `master`. The `Worker.dbRepo` race described in spec §6.1d is real but *latent* — no existing test calls `ReCache` twice against a busy worker, so the detector never sees it. This is why Task 1 (turn on `-race`) can safely come first and Task 2 (fix the worker) is the task that surfaces and fixes the race. Do not assume the first `-race` run fails; if it does, stop and report, because something changed since this plan was written.
 
-**Racy window, stated on purpose:** Task 5 makes `workspace/executeCommand` concurrent before Tasks 6–8 add the locks. The tests written in Task 5 deliberately use only *read-only* inline requests, so `go test -race ./...` stays green at every commit boundary. Tasks 5–8 must land as one contiguous run; do not stop after Task 5 and ship.
+**Racy window, narrowed and stated on purpose:** Task 5 makes `workspace/executeCommand` concurrent and guards `Server.files` **in the same commit**, so no commit ever ships a concurrent server with an unguarded document map — the one race that was independently reproduced against this design. `WSCfg`, `dbConn` and the cursor fields remain unguarded until Task 6, and `connMu` does not exist until Task 7, so Tasks 5–7 must land as one contiguous run; do not stop after Task 5 and ship. Closing the remaining window would mean one commit spanning Tasks 5–7, which is too large to review as a unit.
+
+**Demonstrating a race is not the same as having a concurrent test.** Three tasks (2, 5, 6) must *show* their race before fixing it, and in each the racy read happens **before** the gated repository call. A test that waits for the gate's signal therefore establishes a happens-before edge that orders the read ahead of the writes it then performs, and the detector reports nothing — the test passes identically before and after the fix. Those three tests wait with `time.Sleep`, never with `gate.waitEntered`. This was verified empirically, not reasoned about: the Task 2 test with a channel handshake passed 3 runs out of 3 against unfixed code, and the same test with a sleep reported `WARNING: DATA RACE` at `worker.go:76`/`worker.go:58` in 3 runs out of 3. Use `gate.waitEntered` everywhere else — in Tasks 5, 7 and 8 it tests liveness, where it is correct and a sleep would be flaky.
 
 ## File Structure
 
@@ -46,7 +48,7 @@
 | `internal/database/interbase_failure_native_test.go` | Create (tagged) | classification of real driver errors |
 | `internal/database/interbase_failure_stub_test.go` | Create (inverse tag) | stub returns `FailureNone` |
 | `internal/database/interbase_failure_live_test.go` | Create (tagged) | gated live cancellation test |
-| `internal/handler/dispatch.go` | Create | `NewDispatcher`, `cancelRegistry`, `cancelParams` |
+| `internal/handler/dispatch.go` | Create | `NewDispatcher`, `cancelRegistry`, `cancelParams`, `cancelledError` |
 | `internal/handler/dispatch_test.go` | Create | async dispatch, cancel registry, late-cancellation note |
 | `internal/handler/concurrency_test.go` | Create | test fixture: stub `database/sql` driver, gated stub repository, install helper |
 | `internal/handler/concurrency_race_test.go` | Create | the `-race`-only regression tests for `files`, `WSCfg` and `connMu` |
@@ -148,11 +150,15 @@ package database
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 // newWorkerTestRepo builds a repository whose secondary cache pass (which the
 // worker goroutine runs) can be parked, so the test can write w.dbRepo from the
 // caller goroutine while the worker goroutine is reading it.
+//
+// `entered` is buffered and the parked pass sends on it without anyone
+// receiving: the send must never block, because nothing reads it.
 func newWorkerTestRepo(describeAll func(context.Context) ([]*ColumnDesc, error)) *MockDBRepository {
 	return &MockDBRepository{
 		MockDatabase:  func(context.Context) (string, error) { return "", nil },
@@ -193,10 +199,14 @@ func TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates(t *testing.T) {
 		t.Fatal("first ReCache:", err)
 	}
 
-	// The worker goroutine has now read w.dbRepo and is inside the secondary
-	// pass. The write below is concurrent with that read and has no
-	// happens-before edge to it, which is exactly the reported race.
-	<-entered
+	// Deliberately a sleep, not a receive on `entered`. The worker goroutine
+	// reads w.dbRepo at worker.go:58 *before* it calls the gated method, so
+	// receiving the gate's signal would place that read in this goroutine's
+	// happens-before history and the detector would consider the write below
+	// ordered after it. A sleep leaves the two accesses unordered, which is
+	// what the race actually is. Verified: with a receive here the test passes
+	// against unfixed code; with this sleep it reports the race.
+	time.Sleep(200 * time.Millisecond)
 
 	if err := w.ReCache(ctx, fast); err != nil {
 		t.Fatal("second ReCache:", err)
@@ -217,8 +227,22 @@ func TestWorkerStopIsIdempotent(t *testing.T) {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `go test -race -run 'TestWorker' ./internal/database/ -v`
-Expected: `TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates` FAILS with `WARNING: DATA RACE`, naming a write at `worker.go:76` and a read at `worker.go:58`. `TestWorkerStopIsIdempotent` FAILS with `panic: close of closed channel`.
+Run: `go test -race -run 'TestWorker' ./internal/database/ -count=1 -v`
+Expected: `TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates` FAILS with `WARNING: DATA RACE`. This exact failure was reproduced against unfixed code while writing this plan, in 3 runs out of 3:
+
+```
+Write at 0x00c000236900 by goroutine 9:
+  github.com/sqls-server/sqls/internal/database.(*Worker).ReCache()
+      internal/database/worker.go:76
+
+Previous read at 0x00c000236900 by goroutine 10:
+  github.com/sqls-server/sqls/internal/database.(*Worker).Start.func1()
+      internal/database/worker.go:58
+```
+
+`TestWorkerStopIsIdempotent` FAILS with `panic: close of closed channel`.
+
+If the race test passes here, do not proceed: it means the sleep was replaced by a handshake on `entered`, which orders the read ahead of the write and makes the test vacuous.
 
 - [ ] **Step 3: Write the minimal implementation**
 
@@ -437,6 +461,8 @@ func (s *Server) Stop() error {
 }
 ```
 
+This is not the final form: `stateMu` does not exist yet, and Task 6 adds the guarded read of `s.dbConn` here. The server is still single-threaded at this commit, so the unguarded read is correct until Task 5 makes it shared.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `go test -run 'TestDBConnectionClose|TestStopStopsWorker' ./internal/database/ ./internal/handler/ -v`
@@ -536,9 +562,13 @@ func (r *stubSQLRows) Next(dest []driver.Value) error {
 
 // stubGate parks one repository method so a test can hold a command in flight.
 type stubGate struct {
-	entered       chan struct{}
-	released      chan struct{}
-	ignoreCancel  bool
+	entered      chan struct{}
+	released     chan struct{}
+	ignoreCancel bool
+	// releaseOnce makes release idempotent: a test releases its own gate and
+	// the backend cleanup releases every gate, so most gates are released
+	// twice.
+	releaseOnce   sync.Once
 	mu            sync.Mutex
 	sawCancelled  bool
 	enteredClosed bool
@@ -554,11 +584,7 @@ func (g *stubGate) waitEntered(t *testing.T) {
 }
 
 func (g *stubGate) release() {
-	select {
-	case <-g.released:
-	default:
-		close(g.released)
-	}
+	g.releaseOnce.Do(func() { close(g.released) })
 }
 
 func (g *stubGate) contextWasCancelled() bool {
@@ -709,7 +735,17 @@ func installStubBackend(t *testing.T) *stubBackend {
 		currentStubBackend.Lock()
 		currentStubBackend.backend = nil
 		currentStubBackend.Unlock()
+		// Snapshot under the mutex: a gated call may still be reading b.gates
+		// through enter, and ranging the map unlocked races with gate() — a
+		// concurrent map iteration and write is a fatal runtime error, in the
+		// very suite whose green -race status gates every task.
+		b.mu.Lock()
+		gates := make([]*stubGate, 0, len(b.gates))
 		for _, g := range b.gates {
+			gates = append(gates, g)
+		}
+		b.mu.Unlock()
+		for _, g := range gates {
 			g.release()
 		}
 	})
@@ -816,21 +852,36 @@ git commit -m "test: add a controllable repository fixture and finish Test_execu
 
 ---
 
-### Task 5: Selective async dispatch for `workspace/executeCommand`
+### Task 5: Selective async dispatch, with `Server.files` guarded in the same commit
 
-Spec §6.1a. `main.go:125` wraps the handler with `jsonrpc2.HandlerWithError` and no `AsyncHandler`, and `Conn.readMessages` calls `Handle` inline, so a running query blocks the server from reading the next message. Dispatch is made selective rather than using `jsonrpc2.AsyncHandler`, because making every request concurrent turns every unsynchronised `Server` field into a race on day one.
+Spec §6.1a and §6.1c. `main.go:125` wraps the handler with `jsonrpc2.HandlerWithError` and no `AsyncHandler`, and `Conn.readMessages` calls `Handle` inline, so a running query blocks the server from reading the next message. Dispatch is made selective rather than using `jsonrpc2.AsyncHandler`, because making every request concurrent turns every unsynchronised `Server` field into a race on day one.
 
-The test in this task deliberately uses `textDocument/formatting` as the concurrent second request. Formatting only *reads* `Server.files` and `Server.dbConn`, so it introduces no data race at this commit, where the locks do not exist yet. Do not substitute `didChange` or `didOpen` here — those write, and this commit would go red under `-race`. Task 6 adds exactly that test, after the lock exists.
+`updateFile` (`handler.go:296-303`) mutates `f.Text` through the stored `*File` pointer, so holding a lock only while looking the pointer up is not enough. `executeQuery` (`execute_command.go:125-141`) is today's concrete offender: it retains `f` at line 125 and reads `f.Text` sixteen lines later at line 141.
+
+**These two are one task on purpose.** The dispatcher is what makes the `files` map shared, so a commit that adds the dispatcher without the lock ships a binary with a real, reproducible `didChange`-during-query race — green tests notwithstanding. Landing them together means no commit ever contains a concurrent server with an unguarded document map. Do not split this task back apart.
+
+Its two halves are still driven separately by the TDD cycle: the async test is written and made to pass first (Steps 1–4), then the race test (Steps 5–8). Only Step 11 commits.
+
+**Residual window, stated rather than hidden:** after this task the server is concurrent and `files` is safe, but `WSCfg`, `dbConn` and the cursor fields are not guarded until Task 6, and `connMu` does not exist until Task 7. Tasks 5–7 must therefore land as one contiguous run. Closing that window entirely would mean merging Tasks 5–7 into a single commit, which is too large to review as one unit; an alternative ordering that avoids it — land the locks first, driving each with a race test that calls the handler methods directly from a goroutine instead of through the dispatcher, then add the dispatcher last — is a viable restructure if the reviewer prefers zero racy commits over reviewable ones.
+
+Step 1's async test deliberately uses `textDocument/formatting` as the concurrent second request, because it only *reads* server state. Keep it that way even after the lock lands: it is testing dispatch liveness, not locking.
 
 **Files:**
 - Create: `internal/handler/dispatch.go`
 - Modify: `main.go:125`
-- Modify: `internal/handler/handler_test.go:29`
+- Modify: `internal/handler/handler.go` (struct at `:23-42`, `openFile:282`, `closeFile:291`, `updateFile:296`)
+- Modify: `internal/handler/completion.go:23`, `hover.go:32`, `definition.go:29`, `rename.go:28`, `signature_help.go:27`, `format.go:23`, `format.go:48`
+- Modify: `internal/handler/execute_command.go:125-141`
+- Modify: `internal/handler/handler_test.go:29`, `:206`, `:213`
 - Test: `internal/handler/dispatch_test.go`
+- Test: `internal/handler/concurrency_race_test.go` (create)
 
 **Interfaces:**
 - Consumes: `installStubBackend`, `stubConnections`, `(*stubBackend).gate`, `(*stubGate).waitEntered`, `(*stubGate).release` (Task 4).
-- Produces: `func NewDispatcher(inner jsonrpc2.Handler) jsonrpc2.Handler` — runs `workspace/executeCommand` in its own goroutine, everything else inline.
+- Produces:
+  - `func NewDispatcher(inner jsonrpc2.Handler) jsonrpc2.Handler` — runs `workspace/executeCommand` in its own goroutine, everything else inline.
+  - `Server.stateMu sync.RWMutex` — guards mutable `Server` fields.
+  - `func (s *Server) fileText(uri string) (string, bool)` — returns a copy of the document text; the only supported way to read `Server.files`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -940,38 +991,9 @@ In `internal/handler/handler_test.go`, replace line 29:
 Run: `go test -run TestExecuteCommandDispatchesAsynchronously ./internal/handler/ -v`
 Expected: PASS.
 
-- [ ] **Step 5: Run the whole suite**
+Do not run `make test-race` here and do not commit: the server is now concurrent and `Server.files` is still unguarded, which is precisely the state Steps 5–8 close. Continue straight to Step 5.
 
-Run: `make test-race`
-Expected: every package `ok`, no race warnings. If a race is reported here, a test other than this one is exercising a writer concurrently — find it and move that assertion into Task 6, do not add a lock early.
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add internal/handler/dispatch.go internal/handler/dispatch_test.go internal/handler/handler_test.go main.go
-git commit -m "feat: dispatch workspace/executeCommand on its own goroutine"
-```
-
----
-
-### Task 6: `stateMu` over `Server.files` and the copy rule
-
-Spec §6.1c. `updateFile` (`handler.go:296-303`) mutates `f.Text` through the stored `*File` pointer, so holding a lock only while looking the pointer up is not enough. `executeQuery` (`execute_command.go:125-141`) is today's concrete offender: it retains `f` at line 125 and reads `f.Text` sixteen lines later at line 141.
-
-**Files:**
-- Modify: `internal/handler/handler.go` (struct at `:23-42`, `openFile:282`, `closeFile:291`, `updateFile:296`)
-- Modify: `internal/handler/completion.go:23`, `hover.go:32`, `definition.go:29`, `rename.go:28`, `signature_help.go:27`, `format.go:23`, `format.go:48`
-- Modify: `internal/handler/execute_command.go:125-141`
-- Modify: `internal/handler/handler_test.go:206`, `:213`
-- Test: `internal/handler/concurrency_race_test.go` (create)
-
-**Interfaces:**
-- Consumes: `NewDispatcher` (Task 5), the Task 4 fixture.
-- Produces:
-  - `Server.stateMu sync.RWMutex` — guards mutable `Server` fields.
-  - `func (s *Server) fileText(uri string) (string, bool)` — returns a copy of the document text; the only supported way to read `Server.files`.
-
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 5: Write the failing race test**
 
 Create `internal/handler/concurrency_race_test.go`:
 
@@ -989,6 +1011,11 @@ import (
 // This test is meaningful under -race. It parks executeQuery after it has read
 // the document text and then rewrites that text from the inline read loop,
 // which is the unsynchronised write/read pair the copy rule closes.
+//
+// The wait below is a sleep, not gate.waitEntered. executeQuery reads f.Text at
+// execute_command.go:141 *before* it reaches repo.Query, so receiving the gate's
+// signal would order that read ahead of every didChange this test then sends and
+// the detector would see no race at all.
 func TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
@@ -1008,7 +1035,7 @@ func TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText(t *testing.T) {
 			Arguments: []interface{}{testFileURI},
 		}, &got)
 	}()
-	gate.waitEntered(t)
+	time.Sleep(200 * time.Millisecond)
 
 	for i := 0; i < 50; i++ {
 		params := lsp.DidChangeTextDocumentParams{
@@ -1038,12 +1065,16 @@ func TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText(t *testing.T) {
 }
 ```
 
-- [ ] **Step 2: Run the test to verify it fails**
+- [ ] **Step 6: Run the race test to verify it fails**
 
-Run: `go test -race -run TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText ./internal/handler/ -v`
-Expected: FAIL. It will not compile first (`tx.server.fileText undefined`); add only the accessor's signature if you want to see the race itself, otherwise the compile failure is the failing state. After the accessor exists but before the locks are added, the run reports `WARNING: DATA RACE` naming a write in `updateFile` at `handler.go:301` and a read in `executeQuery`.
+The test calls `s.fileText`, which does not exist yet, so it will not compile. To see the race itself rather than a compile error, first add the accessor in its *unlocked* form — `f, ok := s.files[uri]; if !ok { return "", false }; return f.Text, true` — then run:
 
-- [ ] **Step 3: Write the minimal implementation**
+Run: `go test -race -run TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText ./internal/handler/ -count=1 -v`
+Expected: FAIL with `WARNING: DATA RACE`, naming a write in `updateFile` at `handler.go:301` and a read reached from `executeQuery`.
+
+A PASS here means the race was not demonstrated. The usual cause is a `gate.waitEntered(t)` in place of the sleep; the second is having already added the locking. Do not proceed past a green Step 6.
+
+- [ ] **Step 7: Write the minimal implementation**
 
 In `internal/handler/handler.go`, add the mutex to the struct (`:23-42`), directly above `dbConn`:
 
@@ -1163,43 +1194,43 @@ func (tx *TestContext) testFile(t *testing.T, uri, text string) {
 }
 ```
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [ ] **Step 8: Run the race test to verify it passes**
 
-Run: `go test -race -run TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText ./internal/handler/ -v`
+Run: `go test -race -run TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText ./internal/handler/ -count=1 -v`
 Expected: PASS, no race warnings.
 
-- [ ] **Step 5: Verify no direct `s.files` access remains outside the accessors**
+- [ ] **Step 9: Verify no direct `s.files` access remains outside the accessors**
 
-Run: `grep -rn 's\.files\|server\.files\|\.Text' internal/handler --include='*.go' | grep -v '_test.go' | grep -v 'handler.go:'`
-Expected: no lines referencing `s.files`; remaining `.Text` hits are `File.Text` in `handler.go` and unrelated LSP params.
+Run: `grep -rn 's\.files\|server\.files' internal/handler --include='*.go' | grep -v '_test.go'`
+Expected: hits only inside `openFile`, `closeFile`, `updateFile` and `fileText` in `handler.go`. The grep deliberately does **not** filter out `handler.go` — that is the file most likely to retain a stray access, so read its hits rather than hiding them. Any hit in another file is a reader that was missed.
 
-- [ ] **Step 6: Run the whole suite**
+- [ ] **Step 10: Run the whole suite**
 
 Run: `make test-race`
-Expected: every package `ok`.
+Expected: every package `ok`. This is the first race run since Task 4; the dispatcher and the lock land together, so it must be green here.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
-git add internal/handler/handler.go internal/handler/completion.go internal/handler/hover.go internal/handler/definition.go internal/handler/rename.go internal/handler/signature_help.go internal/handler/format.go internal/handler/execute_command.go internal/handler/handler_test.go internal/handler/concurrency_race_test.go
-git commit -m "fix: guard Server.files with stateMu and copy document text under the lock"
+git add internal/handler/dispatch.go internal/handler/dispatch_test.go internal/handler/handler.go internal/handler/completion.go internal/handler/hover.go internal/handler/definition.go internal/handler/rename.go internal/handler/signature_help.go internal/handler/format.go internal/handler/execute_command.go internal/handler/handler_test.go internal/handler/concurrency_race_test.go main.go
+git commit -m "feat: dispatch workspace/executeCommand asynchronously with Server.files guarded"
 ```
 
 ---
 
-### Task 7: `stateMu` over the connection and configuration fields
+### Task 6: `stateMu` over the connection and configuration fields
 
 Spec §6.1c, the rest of the audit table. `WSCfg` is the genuine inline-writer/async-reader race: `handleWorkspaceDidChangeConfiguration:315` writes it on the read loop while an async command reads it through `getConfig:423` ← `topConnection`. `dbConn`, `curDBCfg`, `curDBName`, `curConnectionIndex` and `initOptionDBConfig` are all reachable from the async path.
 
 The restructuring below exists to honour the invariant that `stateMu` is never held across I/O: `reconnectionDB` and `newDBConnection` read fields into locals, do their I/O unlocked, and take the write lock only for the assignments.
 
 **Files:**
-- Modify: `internal/handler/handler.go:171`, `:192-205`, `:309-359`, `:361-438`
+- Modify: `internal/handler/handler.go:72-78` (`Stop`), `:171`, `:192-205`, `:309-359`, `:361-438`
 - Modify: `internal/handler/execute_command.go:115`, `:391`, `:459`
 - Test: `internal/handler/concurrency_race_test.go`
 
 **Interfaces:**
-- Consumes: `Server.stateMu` (Task 6), the Task 4 fixture.
+- Consumes: `Server.stateMu` (Task 5), the Task 4 fixture.
 - Produces: no new exported names. `getConfig`, `topConnection`, `getConnection`, `parserDriver` and `newDBRepository` keep their current signatures and now take `stateMu` internally.
 
 - [ ] **Step 1: Write the failing test**
@@ -1210,6 +1241,11 @@ Append to `internal/handler/concurrency_race_test.go`:
 // switchDatabase reads WSCfg through getConfig and then parks inside the cache
 // rebuild, so an inline didChangeConfiguration writes WSCfg while the async
 // command's read is still unordered against it. Meaningful under -race.
+//
+// As in the file-text test, the wait is a sleep rather than gate.waitEntered:
+// getConfig reads WSCfg at handler.go:423, well before the gated CurrentSchema
+// call, so receiving the gate's signal would order the read ahead of the write
+// below and hide the race.
 func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
@@ -1227,7 +1263,7 @@ func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T)
 			Arguments: []interface{}{"other"},
 		}, nil)
 	}()
-	gate.waitEntered(t)
+	time.Sleep(200 * time.Millisecond)
 
 	tx.addWorkspaceConfig(t, stubConnections("primary", "secondary"))
 
@@ -1242,8 +1278,8 @@ func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T)
 
 - [ ] **Step 2: Run the test to verify it fails**
 
-Run: `go test -race -run TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace ./internal/handler/ -v`
-Expected: FAIL with `WARNING: DATA RACE`, naming a write at `handler.go:315` (`s.WSCfg = ...`) and a read at `handler.go:423` (`validConfig(s.WSCfg)`).
+Run: `go test -race -run TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace ./internal/handler/ -count=1 -v`
+Expected: FAIL with `WARNING: DATA RACE`, naming a write at `handler.go:315` (`s.WSCfg = ...`) and a read at `handler.go:423` (`validConfig(s.WSCfg)`). As in Task 2 and Task 5, a PASS means the race was not demonstrated — check that the wait is still a sleep.
 
 - [ ] **Step 3: Write the minimal implementation**
 
@@ -1281,6 +1317,25 @@ func (s *Server) handleExit(ctx context.Context, conn *jsonrpc2.Conn, req *jsonr
 	return nil, err
 }
 ```
+
+`Stop` itself (`:72-78`, restructured in Task 3) reads `s.dbConn` too, and `handleExit` reaches it from the read loop while an async `switchDatabase` can be inside `reconnectionDB` writing that pointer. Snapshot it the same way:
+
+```go
+// Stop closes the database connection and always stops the worker, including
+// when closing the connection fails. It deliberately takes no connMu — a
+// runaway query must not be able to hold the process open — but it does take
+// stateMu for the pointer read, because a concurrent switch may be reassigning
+// it.
+func (s *Server) Stop() error {
+	defer s.worker.Stop()
+	s.stateMu.RLock()
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	return dbConn.Close()
+}
+```
+
+`dbConn` may be nil here and `(*DBConnection).Close` nil-guards its receiver (Task 3), so the local needs no nil check.
 
 `handleWorkspaceDidChangeConfiguration` (`:309-339`), replacing lines 315-320:
 
@@ -1472,7 +1527,7 @@ Expected: PASS, no race warnings.
 - [ ] **Step 5: Verify no unguarded field access remains**
 
 Run: `grep -rn 's\.dbConn\|s\.curDB\|s\.curConnectionIndex\|s\.WSCfg\|s\.initOptionDBConfig\|s\.SpecificFileCfg\|s\.DefaultFileCfg' internal/handler --include='*.go' | grep -v '_test.go'`
-Expected: every hit is inside a `stateMu.RLock()`/`stateMu.Lock()` region in `handler.go`, and nothing in `execute_command.go` outside the three blocks above.
+Expected: every hit is inside a `stateMu.RLock()`/`stateMu.Lock()` region in `handler.go` — including the one in `Stop` — and nothing in `execute_command.go` outside the three blocks above.
 
 - [ ] **Step 6: Run the whole suite**
 
@@ -1488,7 +1543,7 @@ git commit -m "fix: guard the connection and configuration fields with stateMu"
 
 ---
 
-### Task 8: `connMu` and the command-versus-command policy
+### Task 7: `connMu` and the command-versus-command policy
 
 Spec §6.1bis. With all of `workspace/executeCommand` async, `executeQuery` and `switchConnections` can run at the same time, and `reconnectionDB` closes and reassigns `s.dbConn`. The hazard is **not** a use-after-close: `DB.Close` "waits for all queries that have started processing on the server to finish" (`$GOROOT/src/database/sql/sql.go:925-927`). The two real hazards are a query that snapshotted the repository but *starts* after `Close` completes and fails with `sql: database is closed`, and `reconnectionDB` blocking for the drain — which, held under `stateMu`, would freeze every inline request for up to the ~10 s an InterBase row-lock wait can take.
 
@@ -1498,7 +1553,7 @@ Spec §6.1bis. With all of `workspace/executeCommand` async, `executeQuery` and 
 - Test: `internal/handler/concurrency_race_test.go`
 
 **Interfaces:**
-- Consumes: `Server.stateMu` (Tasks 6–7), the Task 4 fixture including `(*stubBackend).opened` and `(*stubBackend).queries`.
+- Consumes: `Server.stateMu` (Tasks 5–6), the Task 4 fixture including `(*stubBackend).opened` and `(*stubBackend).queries`.
 - Produces: `Server.connMu sync.RWMutex` — guards connection lifetime. Later plans' database-touching commands must take `connMu.RLock()`.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1659,7 +1714,7 @@ In `handleInitialize`, replace the reconnect block at `:176-188` in full. Only t
 	return result, nil
 ```
 
-In `handleWorkspaceDidChangeConfiguration`, apply the identical transformation to its reconnect block at `:323-336`, which has the same shape and the same two inner blocks. It sits **after** the early return added in Task 7, so the `WSCfg` write itself never waits on a running query — only the reconnect does.
+In `handleWorkspaceDidChangeConfiguration`, apply the identical transformation to its reconnect block at `:323-336`, which has the same shape and the same two inner blocks. It sits **after** the early return added in Task 6, so the `WSCfg` write itself never waits on a running query — only the reconnect does.
 
 ```go
 	messenger := lsp.NewMessenger(conn)
@@ -1720,7 +1775,7 @@ git commit -m "feat: serialise connection-mutating commands against in-flight qu
 
 ---
 
-### Task 9: `$/cancelRequest` and the cancel registry
+### Task 8: `$/cancelRequest` and the cancel registry
 
 Spec §6.1b. `sourcegraph/jsonrpc2@v0.2.1` has no `$/cancelRequest` support — zero occurrences in the module — so the registry lives in sqls. Now that dispatch is non-blocking for `workspace/executeCommand`, the cancel notification can actually be read while the query runs.
 
@@ -1743,6 +1798,7 @@ This task also implements the "cancellation that arrived too late" note from the
   - `func (e *cancelEntry) cancelRequested() bool`
   - `Server.cancels *cancelRegistry`
   - `const lateCancellationNote string`
+  - `type cancelledError struct { rendered string }` with `func (e *cancelledError) Error() string` — declared here and returned from `executeQuery` in Task 9; the wrapper unwraps it with `errors.As`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1994,6 +2050,16 @@ and replace the body of `handleWorkspaceExecuteCommand` after the unmarshal (`:9
 	defer s.cancels.unregister(req.ID)
 
 	result, err = s.dispatchCommand(ctx, params)
+
+	// A statement that actually stopped reports itself through cancelledError.
+	// It is rendered as its own notice and never carries the late-arrival note:
+	// the two messages contradict each other, and Task 9 adds the regression
+	// test that asserts they never appear together.
+	var cancelled *cancelledError
+	if errors.As(err, &cancelled) {
+		return cancelled.rendered, nil
+	}
+
 	if err != nil || !entry.cancelRequested() {
 		return result, err
 	}
@@ -2003,6 +2069,19 @@ and replace the body of `handleWorkspaceExecuteCommand` after the unmarshal (`:9
 		return lateCancellationNote + text, nil
 	}
 	return result, nil
+}
+
+// cancelledError carries the results-pane text for a statement that stopped
+// because its request was cancelled. The outcome travels as an error rather
+// than as a plain string so the wrapper above can tell "this statement was
+// cancelled" apart from "this statement completed, and a cancellation arrived
+// too late". Task 9 populates it; until then nothing returns one.
+type cancelledError struct {
+	rendered string
+}
+
+func (e *cancelledError) Error() string {
+	return e.rendered
 }
 
 func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
@@ -2045,13 +2124,15 @@ git commit -m "feat: honour \$/cancelRequest for workspace/executeCommand"
 
 ---
 
-### Task 10: `ClassifyFailure` and the results-pane cancellation messages
+### Task 9: `ClassifyFailure` and the results-pane cancellation messages
 
 Spec §6.5 and the "Query cancelled" entries of the User-Visible Behavior section. `UncertainOutcomeError` is checked **before** `CancellationError` because `(*UncertainOutcomeError).Unwrap` returns its `Cause`, which is normally a `*CancellationError` (`../interbase-go/cancellation.go:507-512`), so `errors.As` for a cancellation also matches an uncertain outcome. No error string is ever matched.
 
 `FailureKind` and its constants live in an untagged file so there is exactly one definition of the enum; only `ClassifyFailure` is in the tagged/untagged pair. This is a small deviation from the spec's §0 file table, taken so the two builds cannot drift apart.
 
-The rendering also honours a bare `context.Canceled` so the cancelled message is reachable on an ordinary, untagged build — otherwise the whole path would be unreachable outside an InterBase build and untestable in CI. The classifier stays authoritative whenever it recognises the error.
+The rendering also honours a bare `context.Canceled` so the path is reachable on an ordinary, untagged build — otherwise it would be unreachable outside an InterBase build and untestable in CI. The classifier stays authoritative whenever it recognises the error, and the bare-context case gets its own weaker wording (`stoppedWaitingMessage`), because on MySQL or PostgreSQL a cancelled `UPDATE` commonly surfaces as bare `context.Canceled` with the server-side outcome unestablished — claiming "the statement was stopped" there would assert a confirmation no driver gave.
+
+This task is also where the cancellation outcome starts travelling as the `cancelledError` that Task 8 defined. `executeQuery` must return one rather than `(string, nil)`: Task 8's wrapper prepends the late-arrival note whenever the command succeeded *and* a cancellation was requested, so returning the notice as a successful string would render "the cancellation request arrived after the statement completed" directly above "Cancelled. The statement was stopped before it finished." The tests below assert those two never co-occur.
 
 **Files:**
 - Create: `internal/database/failure.go`
@@ -2065,12 +2146,14 @@ The rendering also honours a bare `context.Canceled` so the cancelled message is
 - Modify: `internal/handler/execute_command.go:156-179`
 
 **Interfaces:**
-- Consumes: `Server.connMu` (Task 8), the cancel registry (Task 9).
+- Consumes: `Server.connMu` (Task 7), the cancel registry (Task 8).
 - Produces:
   - `type FailureKind int` with `FailureNone`, `FailureCanceled`, `FailureUncertain`.
   - `func ClassifyFailure(err error) (FailureKind, string)` — kind and operation name.
   - `func cancellationNotice(ctx context.Context, err error) string` (package `handler`) — the results-pane text, `""` when the failure is not a cancellation.
+  - `const canceledMessage`, `const uncertainOutcomeMessage`, `const stoppedWaitingMessage` (package `handler`).
   - `func (s *Server) runStatement(ctx context.Context, query string, vertical bool) (string, error)`.
+  - `executeQuery` now returns `*cancelledError` (defined in Task 8) for a cancelled statement instead of a rendered string.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2162,14 +2245,16 @@ func TestCancellationNoticeForContextCancellation(t *testing.T) {
 	cancel()
 
 	got := cancellationNotice(ctx, context.Canceled)
-	if got != canceledMessage {
-		t.Errorf("cancellationNotice = %q, want %q", got, canceledMessage)
+	if got != stoppedWaitingMessage {
+		t.Errorf("cancellationNotice = %q, want %q", got, stoppedWaitingMessage)
+	}
+	// A driver that only reports context.Canceled has confirmed nothing, so the
+	// notice must not claim the statement was stopped.
+	if got == canceledMessage {
+		t.Error("a bare context cancellation must not render the confirmed-stop message")
 	}
 	if strings.Contains(got, "UNCERTAIN") {
-		t.Error("the cancelled message must not mention an uncertain outcome")
-	}
-	if strings.Contains(got, "Do not re-run") {
-		t.Error("the cancelled message must not carry the do-not-retry warning")
+		t.Error("the fallback message must not mention an uncertain outcome")
 	}
 }
 
@@ -2196,6 +2281,17 @@ func TestQueryFailureMessagesMatchClassification(t *testing.T) {
 	// guaranteed stopped: the driver's cancellation is best effort.
 	if strings.Contains(canceledMessage, "guaranteed") {
 		t.Error("the canceled message must not promise a guarantee the driver cannot make")
+	}
+	// No cancellation message may ever be rendered together with the note
+	// saying the statement completed after all — they assert opposite things.
+	for name, message := range map[string]string{
+		"canceled":        canceledMessage,
+		"uncertain":       uncertainOutcomeMessage,
+		"stopped waiting": stoppedWaitingMessage,
+	} {
+		if strings.Contains(message, "arrived after the statement completed") {
+			t.Errorf("the %s message must not contain the late-arrival note", name)
+		}
 	}
 }
 ```
@@ -2303,11 +2399,21 @@ func TestCancelledQueryRendersTheCancelledMessage(t *testing.T) {
 		if res.err != nil {
 			t.Fatal("conn.Call workspace/executeCommand:", res.err)
 		}
-		if !strings.Contains(res.out, "Cancelled. The statement was stopped before it finished.") {
-			t.Errorf("result = %q, want the cancelled message", res.out)
+		// This is an untagged build, so ClassifyFailure reports FailureNone and
+		// the notice degrades to the stopped-waiting wording.
+		if !strings.Contains(res.out, "sqls stopped waiting for this statement") {
+			t.Errorf("result = %q, want the stopped-waiting message", res.out)
 		}
 		if strings.Contains(res.out, "42") {
 			t.Errorf("result = %q, want no rows for a cancelled statement", res.out)
+		}
+		// The regression assertion: a cancelled statement must never also be
+		// told that it completed and the cancellation arrived too late.
+		if strings.Contains(res.out, "arrived after the statement completed") {
+			t.Errorf("result = %q, want no late-arrival note on a cancelled statement", res.out)
+		}
+		if strings.Contains(res.out, lateCancellationNote) {
+			t.Errorf("result = %q, want the late-cancellation note absent", res.out)
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the cancelled command never completed")
@@ -2407,6 +2513,16 @@ import (
 
 const canceledMessage = "Cancelled. The statement was stopped before it finished."
 
+// stoppedWaitingMessage is the fallback for a driver that reports a cancelled
+// statement as a bare context.Canceled. It deliberately does not say the
+// statement was stopped: for MySQL or PostgreSQL a cancelled UPDATE commonly
+// surfaces this way while the server-side outcome is unestablished, and
+// canceledMessage would assert something the driver never confirmed.
+const stoppedWaitingMessage = `Cancelled. sqls stopped waiting for this statement.
+
+Whether it took effect depends on the database driver, which did not report a
+confirmed outcome. Check the database state before re-running it.`
+
 const uncertainOutcomeMessage = `Cancelled, but the outcome is UNCERTAIN.
 
 InterBase could not confirm whether this statement took effect. Do not re-run it
@@ -2415,9 +2531,11 @@ querying the affected rows.`
 
 // cancellationNotice renders the results-pane text for a statement that failed
 // after its request was cancelled, or "" when the failure is something else.
-// The driver's classifier is authoritative when it recognises the error; a bare
-// context cancellation is reported as cancelled so the message is reachable on
-// every driver and on an ordinary, untagged build.
+// The driver's classifier is authoritative when it recognises the error;
+// canceledMessage is reserved for the case where the driver confirmed the
+// statement stopped. A bare context cancellation degrades to the weaker
+// stoppedWaitingMessage, which keeps the path reachable on every driver and on
+// an ordinary, untagged build without claiming a confirmation nobody gave.
 func cancellationNotice(ctx context.Context, err error) string {
 	switch kind, operation := database.ClassifyFailure(err); kind {
 	case database.FailureUncertain:
@@ -2428,7 +2546,7 @@ func cancellationNotice(ctx context.Context, err error) string {
 		return canceledMessage
 	}
 	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
-		return canceledMessage
+		return stoppedWaitingMessage
 	}
 	return ""
 }
@@ -2449,7 +2567,11 @@ In `internal/handler/execute_command.go`, replace the statement loop of `execute
 		if err != nil {
 			if notice := cancellationNotice(ctx, err); notice != "" {
 				fmt.Fprintln(buf, notice)
-				return buf.String(), nil
+				// Reported as a cancelledError, not as (string, nil): the
+				// command wrapper must be able to tell this apart from a
+				// statement that completed before a late cancellation, or it
+				// prepends a note saying the opposite of this one.
+				return nil, &cancelledError{rendered: buf.String()}
 			}
 			return nil, err
 		}
@@ -2490,7 +2612,7 @@ git commit -m "feat: classify and render cancelled and uncertain statement outco
 
 ---
 
-### Task 11: Document the concurrency invariants
+### Task 10: Document the concurrency invariants
 
 Spec's Documentation section: "`doc/develop.md`: … the **server concurrency invariants**, because they are the kind of rule a future contributor breaks silently". The README gains the cancellation paragraph, which is the only user-visible behaviour this plan ships; the rest of the InterBase README section belongs to Plans 2–4.
 
@@ -2499,7 +2621,7 @@ Spec's Documentation section: "`doc/develop.md`: … the **server concurrency in
 - Modify: `README.md` (the `### InterBase Build` section ends at line 90)
 
 **Interfaces:**
-- Consumes: every name introduced by Tasks 2–10.
+- Consumes: every name introduced by Tasks 2–9.
 - Produces: no code.
 
 - [ ] **Step 1: Add the invariants section to `doc/develop.md`**
@@ -2541,9 +2663,13 @@ only for the pointer assignments. `getConfig`, `topConnection`, `getConnection`,
 `parserDriver`, `newDBRepository` and `fileText` take `stateMu` internally, so
 never call them while already holding it.
 
-`Server.Stop`, `handleShutdown` and `handleExit` take no `connMu`: shutdown must
-not block on a runaway query, and `sql.DB.Close` is documented as safe to call
-while queries are in flight.
+**Shutdown takes no `connMu`, but it does take `stateMu`.** `Server.Stop`,
+`handleShutdown` and `handleExit` must not block on a runaway query, and
+`sql.DB.Close` is documented as safe to call while queries are in flight — so
+none of them takes `connMu`. All three still read `s.dbConn`, and `handleExit`
+runs on the read loop while an async `switchDatabase` may be inside
+`reconnectionDB` reassigning that pointer, so each snapshots it under
+`stateMu.RLock()` and closes the local. "No `connMu`" is not "no lock".
 
 **The field audit.** Every field of `Server` is classified. Any new field must
 be added here and classified, or it ships a race.
@@ -2551,7 +2677,7 @@ be added here and classified, or it ships a race.
 | Field | Written by | Read by | Treatment |
 | --- | --- | --- | --- |
 | `files` | `openFile`/`updateFile`/`closeFile` (inline) | every handler; `executeQuery` (async) | `stateMu` on every access, plus the copy rule below |
-| `dbConn` | `reconnectionDB` (async-reachable) | `newDBRepository`, `parserDriver` | `stateMu` |
+| `dbConn` | `reconnectionDB` (async-reachable) | `newDBRepository`, `parserDriver`, `Server.Stop`, `handleShutdown`, `handleExit` | `stateMu` on every access, shutdown paths included — they take no `connMu` but still snapshot the pointer under `stateMu.RLock()` |
 | `curDBCfg` | `newDBConnection` | `newDBRepository` | `stateMu` |
 | `curDBName` | `switchDatabase` (async) | `newDBConnection` | `stateMu` |
 | `curConnectionIndex` | `switchConnections` (async) | `newDBConnection` | `stateMu` |
@@ -2576,6 +2702,18 @@ is rendered normally with a note saying so.
 **The worker.** `Worker.dbRepo` is read by the worker goroutine and written by
 `ReCache` on the handler goroutine. Both go through `repo()`/`setRepo()` under
 `w.lock`; no `Server` lock can cover that pair.
+
+**Writing a test that actually demonstrates a race.** The race tests in
+`internal/handler/concurrency_race_test.go` and
+`internal/database/worker_test.go` park an async call on a gate and then perform
+the conflicting access. Do **not** wait for the gate by receiving on a channel
+the async goroutine sent on: in every one of these cases the racy read happens
+*before* the gated call, so the receive is a happens-before edge that orders the
+read ahead of the write and the detector sees nothing. Such a test passes
+identically with and without the lock it is supposed to be testing. Wait with a
+short `time.Sleep` instead. Channel handshakes are correct in the tests that
+assert liveness — that a second request is served while a command is in flight —
+where there is no racing access to order.
 ````
 
 - [ ] **Step 2: Add the cancellation paragraph to `README.md`**
