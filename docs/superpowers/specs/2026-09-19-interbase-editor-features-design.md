@@ -427,6 +427,103 @@ the editor (it belongs to a status command, not to these six features).
 - Any new configuration keys. Every feature here is automatic when the driver is
   InterBase and the capability is present.
 
+## Plan decomposition
+
+This spec is delivered as four sequenced plans. The ordering inverts an earlier
+draft of this document, which proposed the concurrency work as a *fallback* to
+be deferred if it proved too large. That was wrong, for three reasons that hold
+up against the code:
+
+- **§6.1 is the only part of this spec with zero dependency on sub-project 2.**
+  It touches `main.go`, `internal/handler/handler.go`,
+  `internal/database/worker.go` and CI, and needs no descriptor, no capability
+  interface, and no cache accessor. It can therefore be built while sub-project
+  2 is still in flight, which is exactly what a first plan should do.
+- **Without it, §6.5 is dead code.** The context reaching the driver is never
+  cancelled today (correction 2), so `CancellationError` and
+  `UncertainOutcomeError` cannot arise from an editor cancellation at all, and
+  the cancelled/uncertain rendering would be testable only against synthetic
+  errors — a rendering path no user could reach.
+- **Retrofitting locks is more expensive than starting with them.** §4's hover
+  memo is specified as living under `stateMu`, and §5's snapshot store keeps a
+  generation counter there. Building either before the mutex exists means
+  touching both again.
+
+Two refinements to the split as proposed by review, both dependency
+corrections rather than disagreements:
+
+1. Plan 4 depends on **D4 as well as D1, D5 and D6.** Resolving the identifier
+   under the cursor to a procedure, view or trigger is a `DBCache` lookup
+   (§5, "Resolution order"); without D4 there is nothing to resolve against.
+2. Plan 2 is **partially** dependent on sub-project 2, not wholly independent of
+   it: §6.2 (read-only transaction) and §6.3 (`ScanRowsWithTypes`) need nothing
+   from D1–D8 and can start immediately after Plan 1. Only §6.4 needs D4, so if
+   D4 slips, Plan 2 ships its first two thirds and §6.4 moves to Plan 3.
+
+### Plan 1 — Server concurrency and cancellation
+
+**Contents:** §6.1a selective async dispatch; §6.1b `$/cancelRequest` registry;
+§6.1c `stateMu` with the complete field audit and the `files` copy rule;
+§6.1bis `connMu` command-versus-command policy; §6.1d the `Worker.dbRepo` lock
+fix; §6.1e adding `-race` to `.github/workflows/test.yaml` and a `make
+test-race` target; §6.5 `ClassifyFailure` with its tagged/untagged file pair.
+
+**Depends on:** nothing. Not sub-project 2, and only sub-project 1's already
+existing driver error types for §6.5.
+
+**Delivers working software:** a language server that keeps answering hover and
+completion while a query runs, that stops a runaway query when the editor asks,
+that reports a cancelled write as cancelled-or-uncertain in the results pane,
+and that is verified by the race detector in CI for the first time.
+
+**Acceptance:** `go test -race ./...` green in CI; `TestExecuteQueryHonoursCancelRequest`,
+`TestSwitchConnectionWaitsForInFlightQuery` and
+`TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates` passing.
+
+### Plan 2 — Results-pane semantics
+
+**Contents:** §6.2 `ReadOnlyQuerier` and the read-only transaction; §6.3
+`ScanRowsWithTypes`, `RenderOptions`, `QueryResult` and the partial-result
+contract, including `s.query` rendering partial rows; §6.4 `EXECUTE PROCEDURE`
+routing by output arity.
+
+**Depends on:** Plan 1 (it renders the cancellation outcomes Plan 1 classifies);
+D4 for §6.4 only.
+
+**Delivers working software:** SELECTs run in an explicit read-only
+transaction; results distinguish `NULL` from the empty string, render exact
+scaled decimals, and cap huge cells; a fetch that dies on an oversized BLOB
+shows the rows that preceded it instead of nothing; and `EXECUTE PROCEDURE`
+stops being routed unconditionally to `Exec`.
+
+### Plan 3 — Catalog-backed editor surfaces
+
+**Contents:** features 1–4 — Explain code action and command, completion
+candidates and the `EXECUTE PROCEDURE` parser change, signature help, hover DDL
+augmentation with its memo.
+
+**Depends on:** Plan 1 (hover memo under `stateMu`); D1–D8.
+
+**Delivers working software:** the four surfaces a developer touches every
+minute — explain, complete, signature, hover — become InterBase-aware.
+
+### Plan 4 — Go-to-definition snapshots
+
+**Contents:** feature 5 in full — resolution, the snapshot store, banner and
+body selection, range computation, pruning, and the `Server.Stop` restructure.
+
+**Depends on:** Plan 1 (store generation under `stateMu`, `Stop` restructure);
+D1, D4, D5, D6.
+
+**Delivers working software:** jumping to a procedure, view or trigger opens its
+real source.
+
+**Separate for a reason:** it introduces the server's first writes to the user's
+filesystem, a directory lifecycle and pruning subsystem, and a security posture
+(what is written, where, with what permissions, for how long) that nothing else
+in this spec touches. It is also the feature most likely to be cut on review,
+and keeping it last means cutting it costs nothing already built.
+
 ## Architecture
 
 ### 0. Shared shape
@@ -455,6 +552,15 @@ New files:
 | `internal/database/result.go` | none | `QueryResult`, `ColumnMeta`, `ScanRowsWithTypes` |
 | `internal/database/interbase_failure_native.go` | `interbase,cgo,linux,amd64` | cancellation classification |
 | `internal/database/interbase_failure_stub.go` | inverse | classification no-op |
+
+Modified existing files, called out because three of them are driver-neutral
+shared code and one is CI: `main.go` (wrap the handler with the dispatcher),
+`internal/handler/handler.go` (`stateMu`, `connMu`, `$/cancelRequest`, `Stop`),
+`internal/database/worker.go` (`dbRepo` accessors under `w.lock`),
+`parser/parser.go` and `parser/parseutil/position.go` (the `EXECUTE PROCEDURE`
+group and syntax position), `internal/completer/completer.go`
+(`getSortTextPrefix` cases and new `Complete` branches),
+`.github/workflows/test.yaml` and `Makefile` (`-race`).
 
 ### 1. Explain SQL code action
 
@@ -552,10 +658,24 @@ written to be extended.
   `parseutil.ExecuteProcedure` syntax position matched by
   `genKeywordMatcher([]string{"EXECUTE PROCEDURE"})`, placed in
   `CheckSyntaxPosition` before the `TableReference` case. `getCompletionTypes`
-  maps it to `[]completionType{CompletionTypeProcedureName}`. *Decision:*
-  grouping `EXECUTE PROCEDURE` is additive and only fires on that literal
-  two-keyword sequence, so PostgreSQL's `EXECUTE stmt` and MSSQL's
-  `EXECUTE proc` are unaffected. Known limitation, shared with the existing
+  maps it to
+  `[]completionType{CompletionTypeProcedureName, CompletionTypeKeyword}`.
+
+  *Decision, and its real blast radius:* `multiKeywordMap` is
+  dialect-independent — `parser.go:112` applies it on every parse — so this does
+  change parsing for other drivers wherever the literal sequence appears.
+  PostgreSQL's `EXECUTE stmt` and MSSQL's `EXECUTE proc` are unaffected because
+  `PROCEDURE` does not follow, but **PostgreSQL's legacy trigger syntax
+  `CREATE TRIGGER … FOR EACH ROW EXECUTE PROCEDURE f()` contains exactly this
+  sequence** and is still accepted by current PostgreSQL (superseded by
+  `EXECUTE FUNCTION` in PG 11, not removed). For that statement the syntax
+  position after the keywords changes from `Unknown` to `ExecuteProcedure`.
+  That is precisely why `CompletionTypeKeyword` is retained in the branch:
+  without it, a PostgreSQL user writing a trigger would lose the keyword
+  candidates they get today and receive nothing, because no procedure cache
+  exists for that driver. With it, the PostgreSQL user keeps exactly today's
+  behavior and the InterBase user gains procedure names. Known limitation,
+  shared with the existing
   `DELETE FROM` handling: irregular internal whitespace
   (`EXECUTE&nbsp;&nbsp;PROCEDURE`) does not match, because `IsMatchKeyword`
   compares `node.String()`.
@@ -709,8 +829,37 @@ than returning nothing. **Rejected.**
 **The shipped design: read-only source snapshots as real files.**
 
 - **Store.** `internal/handler/interbase_definition.go` owns a
-  `sourceSnapshotStore` rooted at
-  `filepath.Join(os.UserCacheDir(), "sqls", "interbase-sources")`.
+  `sourceSnapshotStore` with an **injected root**:
+
+  ```go
+  type sourceSnapshotStore struct {
+      root string // absolute; empty means "resolve from the user cache dir"
+      // ...
+  }
+
+  func defaultSnapshotRoot() (string, error) {
+      cacheDir, err := os.UserCacheDir() // returns (string, error)
+      if err != nil {
+          return "", fmt.Errorf("locate user cache directory: %w", err)
+      }
+      return filepath.Join(cacheDir, "sqls", "interbase-sources"), nil
+  }
+  ```
+
+  *Decision:* the root is a field, resolved once at construction, not an inline
+  `os.UserCacheDir()` call at each use. Two reasons. First,
+  `os.UserCacheDir` returns `(string, error)`, so it cannot be nested inside
+  `filepath.Join` at all — an earlier draft of this spec had exactly that
+  non-compiling shape and a planner would have transcribed it. Second,
+  `t.Setenv("XDG_CACHE_HOME", …)` only redirects `os.UserCacheDir` on
+  Linux and BSD; on macOS it resolves to `~/Library/Caches` regardless, so a
+  prune test that relied on the environment variable would operate on a real
+  user directory. CI is ubuntu-only, so that would never be caught there. Tests
+  set `root` to `t.TempDir()` directly and the hazard disappears.
+
+  When `defaultSnapshotRoot` fails, go-to-definition for database-resident
+  objects is disabled for the session and logged once; every other feature is
+  unaffected.
 - **URI scheme.** Ordinary `file://`. Everything that can open a file can open
   these.
 - **Directory layout.** One directory per server process per connection:
@@ -740,11 +889,43 @@ than returning nothing. **Rejected.**
   zero-width range there; `(0,0)` if the name does not appear (possible when
   `GenerateDDL` quotes it differently than the catalog spells it).
 - **Lifetime.** Written or overwritten on every definition request — a snapshot
-  is never served stale. The process's own directories are removed by
-  `Server.Stop`. At server start, sibling directories with an mtime older than
-  24 hours are removed. *Decision:* mtime pruning rather than PID-liveness
-  probing, because it is portable, needs no signals, and cannot delete a
-  concurrent instance's live directory (which is why the PID is in the name).
+  is never served stale. At server start, sibling directories with an mtime
+  older than 24 hours are removed. *Decision:* mtime pruning rather than
+  PID-liveness probing, because it is portable, needs no signals, and cannot
+  delete a concurrent instance's live directory (which is why the PID is in the
+  name).
+- **Shutdown cleanup must not depend on `Server.Stop` reaching its end.**
+  `Stop` (`handler.go:72-78`) is:
+
+  ```go
+  func (s *Server) Stop() error {
+      if err := s.dbConn.Close(); err != nil {
+          return err   // <- everything after this is skipped
+      }
+      s.worker.Stop()
+      return nil
+  }
+  ```
+
+  A failing `dbConn.Close()` — entirely plausible against a half-dead InterBase
+  attachment — returns early, so snapshot removal appended after that line would
+  silently not run, and a shutdown test asserting removal would be flaky by
+  construction. `Stop` is therefore restructured so cleanup is unconditional:
+
+  ```go
+  func (s *Server) Stop() error {
+      defer s.snapshots.RemoveAll() // best effort, logs its own failure
+      defer s.worker.Stop()
+      return s.dbConn.Close()
+  }
+  ```
+
+  This also fixes `worker.Stop()` being skipped on the same path, which is a
+  pre-existing goroutine leak on the error branch. `handleExit`
+  (`handler.go:199-205`) calls `s.dbConn.Close()` and then `s.Stop()`, so
+  `DBConnection.Close` must stay idempotent; it is (`driver.go:25-43` nil-guards
+  its receiver), but a second call on a non-nil connection whose `Conn` is
+  already closed returns `sql.DB.Close`'s nil, so the double call is safe.
 
 **Resolution order** in `definitionWithDriver`: the existing alias/subquery
 resolution runs first and wins. Only when it yields nothing, the driver is
@@ -793,16 +974,136 @@ return. Because dispatch is now non-blocking for that method, the cancel
 notification can actually be read while the query runs. `Server.handle` needs
 access to `req.ID`, which it already has.
 
-**c. State guarding.** A `sync.RWMutex` on `Server` guards `files`, `dbConn`,
-`curDBCfg`, `curDBName`, `curConnectionIndex`, the DDL memo, and the snapshot
-store generation. `openFile`/`updateFile`/`closeFile`/`saveFile` and every
-reader take it. The async command snapshots the document text and the repository
-under the lock before doing any I/O.
+**c. State guarding.** A `sync.RWMutex` named `stateMu` on `Server`. The audit
+below covers every field declared at `internal/handler/handler.go:23-42`; each
+one is classified, because an incomplete list is the failure mode that ships a
+race.
+
+| Field | Written by | Read by | Treatment |
+| --- | --- | --- | --- |
+| `files` (map) | `openFile`/`updateFile`/`closeFile` (inline) | every handler; `executeQuery`/`explainQuery` (async) | `stateMu` on every access, **plus** the copy rule below |
+| `dbConn` | `reconnectionDB:350` (async-reachable) | `newDBRepository:387`, `parserDriver:434` | `stateMu` |
+| `curDBCfg` | `newDBConnection:376` | `newDBRepository:387` | `stateMu` |
+| `curDBName` | `switchDatabase:391` (async) | `newDBConnection:373` | `stateMu` |
+| `curConnectionIndex` | `switchConnections:459` (async) | `newDBConnection:367` | `stateMu` |
+| `WSCfg` | `handleWorkspaceDidChangeConfiguration:315` (**inline**) | `getConfig:423` ← `topConnection`/`showConnections`/`switchConnections` (**async**) | `stateMu` — a genuine inline-writer/async-reader race |
+| `initOptionDBConfig` | `handleInitialize:171` (inline, once) | `topConnection:399` (async-reachable) | `stateMu` — write-once, but read from the async path, so the read is still guarded |
+| `SpecificFileCfg`, `DefaultFileCfg` | `main.go:133`/`:140`, **before** `jsonrpc2.NewConn:151` | `getConfig:421`/`:425` | write-once-before-serving; stated as an invariant, not locked. Any future writer after serving begins must take `stateMu` |
+| `worker` | `NewServer` | everywhere | pointer never reassigned; the *contents* are the worker's problem, see (d) |
+| DDL memo (§4), snapshot store generation (§5) | new | new | `stateMu` |
+
+**The copy rule for `files`.** `updateFile` (`handler.go:296-303`) mutates
+`f.Text` **through the stored `*File` pointer**. Holding `stateMu` only while
+looking the pointer up is therefore not enough — a reader that keeps the `*File`
+and reads `f.Text` after releasing the lock races with a concurrent
+`didChange`. Every reader must copy the field to a local `string` **while still
+holding the lock**:
+
+```go
+s.stateMu.RLock()
+f, ok := s.files[uri]
+var text string
+if ok {
+    text = f.Text // copy under the lock, never retain f
+}
+s.stateMu.RUnlock()
+```
+
+`executeQuery` (`execute_command.go:125-141`) is the concrete offender today: it
+retains `f` and reads `f.Text` sixteen lines later.
+
+**d. The `Worker.dbRepo` race, which `stateMu` cannot fix.**
+`Worker.ReCache` (`internal/database/worker.go:75-82`) writes `w.dbRepo = repo`
+with no lock, and the worker goroutine reads it at `worker.go:58`
+(`NewDBCacheUpdater(w.dbRepo)`) and `worker.go:85`. The existing `w.lock`
+(`worker.go:15`) guards only `dbCache`. No mutex on `Server` can close this: the
+reader is a goroutine inside `Worker` that no server lock is held across.
+
+This is **pre-existing**, not introduced here: `ReCache` already runs on the
+handler goroutine while the worker goroutine may still be reading `dbRepo` from
+the previous `updateAdditionalCache` send. Making
+`switchDatabase`/`switchConnections` async (they reach `reconnectionDB:355` →
+`ReCache`) widens the window rather than creating it, and turning on `-race` in
+CI (see below) is likely to surface it.
+
+Fix, inside `internal/database/worker.go`: add `setRepo`/`repo` accessors taking
+`w.lock`, have `ReCache` use `setRepo`, and have the goroutine at `worker.go:58`
+and `updateAllCache` at `:85` read through `repo()`. This is a small, additive,
+driver-neutral fix and is upstreamable on its own.
+
+**e. Race detection is a deliverable, not an assumption.** The repository does
+**not** run the race detector today:
+`.github/workflows/test.yaml:21` is
+`go test -coverprofile coverage.out -covermode atomic ./...` (note `-covermode
+atomic` without `-race`), and `Makefile:37` (`test: build`) is
+`go test -v ./...`. Neither passes `-race`. Since this sub-project introduces
+the server's first concurrency, the concurrency plan must **add** it:
+
+- a `-race` step in `.github/workflows/test.yaml`, and
+- a `make test-race` target running `go test -race ./...`.
+
+Adding `-race` may fail the first run because of (d). That is the point of
+adding it, and (d) is scheduled in the same plan.
 
 No timeout is added. With non-blocking dispatch a stalled query no longer
 freezes the server, and the driver README is explicit that only process
 supervision is a hard bound — a sqls-side timeout would imply a guarantee the
 stack cannot make.
+
+#### 6.1bis Command-versus-command concurrency
+
+Making all of `workspace/executeCommand` async means `executeQuery`,
+`explainQuery`, `switchDatabase` and `switchConnections` can now run at the same
+time — and the last two call `reconnectionDB` (`handler.go:341`), which calls
+`s.dbConn.Close()` and then reassigns `s.dbConn`. The §6.1c pattern of
+"snapshot the repository under the lock, then do I/O" hands a query a
+repository whose `*sql.DB` a concurrent switch may close. The spec must state a
+policy, so here it is.
+
+**First, precisely what goes wrong.** It is *not* memory-unsafe.
+`database/sql`'s `DB.Close` is documented (`$GOROOT/src/database/sql/sql.go:925-927`)
+as: "Close closes the database and prevents new queries from starting. Close
+then waits for all queries that have started processing on the server to
+finish." So an in-flight query is not torn down under the caller. The two real
+hazards are:
+
+1. a query that has snapshotted the repository but has **not yet started** when
+   `Close` completes fails with `sql: database is closed` — a confusing error
+   attributed to the user's SQL; and
+2. `reconnectionDB` **blocks** until in-flight queries drain. With InterBase's
+   best-effort cancellation that can be ~10 seconds (driver README: a
+   row-lock wait returned after roughly 9.2–10 s). If `reconnectionDB` held
+   `stateMu` for its duration, every inline request — hover, completion,
+   didChange — would block behind it, which is a worse outcome than the
+   original bug.
+
+**Policy: serialise connection-mutating commands against in-flight database
+work, with a second lock.** A `sync.RWMutex` named `connMu` on `Server`,
+distinct from `stateMu`:
+
+- `executeQuery`, `explainQuery`, `showDatabases`, `showSchemas`, `showTables`
+  hold `connMu.RLock()` for the whole of their database work, including
+  rendering;
+- `switchDatabase` and `switchConnections` hold `connMu.Lock()` across
+  `reconnectionDB`;
+- `handleInitialize` and `handleWorkspaceDidChangeConfiguration` also take
+  `connMu.Lock()` around their `reconnectionDB` call, since they reconnect too;
+- `stateMu` is used only for short, non-blocking field accesses. **Lock
+  ordering: `connMu` before `stateMu`, never the reverse**, and `stateMu` is
+  never held across any I/O. `reconnectionDB` therefore performs `Close`,
+  `Open` and `ReCache` while holding only `connMu.Lock()`, taking
+  `stateMu.Lock()` only for the pointer assignments.
+
+*Decision:* serialise rather than keep the old `*sql.DB` alive until its users
+drain. Reference-counting connections would mean a switch returns "done" while
+the previous database is still being queried and its results are about to land
+in the pane — a confusing lie to the user — and it adds a lifetime subsystem to
+close a hazard that a reader/writer lock closes in ten lines. The cost is that
+switching connections waits for a running query, which is the behavior a user
+would predict anyway.
+
+Hover, completion, signature help and definition stay inline and take only
+`stateMu`, so a long-running query never makes the editor feel dead.
 
 #### 6.2 Read-only transaction for read-only statements
 
@@ -853,10 +1154,46 @@ type QueryResult struct {
     Columns []ColumnMeta
     Rows    [][]string
     Notes   []string
+    // Complete is false when scanning stopped early because of an error.
+    Complete bool
 }
+
+// RenderOptions controls driver-sensitive cell formatting. The zero value
+// reproduces the existing ScanRows output exactly.
+type RenderOptions struct {
+    // DistinguishNull renders SQL NULL as the literal NULL instead of an
+    // empty cell. Set only for InterBase.
+    DistinguishNull bool
+    // MaxCellRunes caps rendered cell width. Zero means DefaultMaxCellRunes.
+    MaxCellRunes int
+}
+
+// DefaultMaxCellRunes is the display cap applied when RenderOptions.MaxCellRunes
+// is zero.
+const DefaultMaxCellRunes = 512
 
 func ScanRowsWithTypes(rows *sql.Rows, opts RenderOptions) (*QueryResult, error)
 ```
+
+**Partial-result contract.** `ScanRowsWithTypes` returns a **non-nil
+`*QueryResult` together with a non-nil error** when `rows.Next`, `rows.Scan` or
+`rows.Err` fails partway: `Rows` holds everything scanned before the failure,
+`Columns` is populated (column metadata is available before the first row), and
+`Complete` is false. On success it returns `(result, nil)` with
+`Complete == true`. It returns `(nil, err)` only when `rows.ColumnTypes()`
+itself fails, i.e. when there is nothing to report.
+
+This is a deliberate departure from `ScanRows`
+(`internal/database/scan_row.go:30`), which returns `nil, err` and discards
+every scanned row. `s.query` (`execute_command.go:279`) today compounds that by
+returning `"", err`. Both are why the BLOB-limit failure in
+"User-Visible Behavior" can show the rows that preceded the oversized value:
+`s.query` must render a non-nil result **before** reporting the error, emit the
+`N rows in set (incomplete)` footer when `Complete` is false, and return the
+rendered string as the command result rather than propagating a bare error.
+Without this contract that user-visible section is unimplementable.
+
+`RowsAffected`-style paths are unaffected.
 
 `ScanRowsWithTypes` calls `rows.ColumnTypes()` once, allocates per-column
 destinations from `ScanType()` where it is concrete (`string`, `int64`,
@@ -870,17 +1207,19 @@ destinations from `ScanType()` where it is concrete (`string`, `int64`,
 | `int64`, `float64`, `bool` | `%v` |
 | scaled `NUMERIC`/`DECIMAL` (scan type `string`) | verbatim exact decimal text |
 | `DatabaseTypeName == "BLOB"`, scan type `[]byte` | `<BLOB n bytes>` |
-| `DatabaseTypeName == "BLOB"`, scan type `string` | first 512 characters + `…(truncated, n characters)` |
-| any cell over 512 characters | same truncation marker |
+| `DatabaseTypeName == "BLOB"`, scan type `string` | first `MaxCellRunes` characters + `…(truncated, n characters)` |
+| any cell over `MaxCellRunes` characters | same truncation marker |
 
 *Decision:* `DistinguishNull` defaults to false and is set to true only for
 InterBase, so no other driver's rendering or test output changes. It matters for
 InterBase specifically because the driver guarantees "empty values remain
 distinct from NULL" and the current renderer destroys that distinction.
 
-*Decision:* the 512-character cell cap is a display cap, unrelated to the
+*Decision:* `DefaultMaxCellRunes = 512` is a display cap, unrelated to the
 driver's 64 MiB materialisation limit. It exists so a 40 MiB text BLOB that the
 driver *did* materialise does not get pushed through JSON-RPC into the editor.
+It is a named constant reachable through `RenderOptions.MaxCellRunes` rather
+than a literal, so the tests can set a small cap without building huge fixtures.
 This is stated in the user documentation so the cap is never mistaken for
 truncated data.
 
@@ -1153,8 +1492,10 @@ trigger, one generator, and one external function.
 
 ### Feature 5 — Definition
 
-All use `t.Setenv("XDG_CACHE_HOME", t.TempDir())` so nothing touches the real
-cache directory.
+All construct the store with `root: t.TempDir()` directly. They do **not** use
+`t.Setenv("XDG_CACHE_HOME", …)`: that only steers `os.UserCacheDir` on Linux and
+BSD, so on macOS the prune test would delete from a real user cache directory,
+and ubuntu-only CI would never reveal it.
 
 - `TestInterBaseDefinitionProcedureWritesReadOnlySnapshot` — assert the returned
   `lsp.Location.URI` has a `file://` scheme, the file exists with mode `0o600`
@@ -1171,6 +1512,10 @@ cache directory.
   name, returns `nil, nil`.
 - `TestInterBaseDefinitionSnapshotsRemovedOnShutdown` — after `Server.Stop`, the
   process directory is gone.
+- `TestSnapshotsRemovedEvenWhenConnectionCloseFails` — a connection whose
+  `Close` returns an error; assert `Stop` still removes the snapshot directory
+  and still stops the worker. This is the regression test for the restructured
+  `Stop` in §5, and it fails against today's early-return shape.
 - `TestInterBaseDefinitionPrunesStaleSnapshotDirectories` — a sibling directory
   backdated past 24 hours is removed at start; a fresh one is not.
 - `TestInterBaseDefinitionEscapesCatalogNames` — an object named `MY$PROC "X"`
@@ -1185,6 +1530,26 @@ cache directory.
   a goroutine, send `$/cancelRequest` with the same id, assert the call returns
   within a short bound and the mock saw a canceled context.
 - `TestCancelRequestForUnknownIDIsIgnored` — no panic, no error.
+- `TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText` — run a blocking
+  `executeQuery` while hammering `textDocument/didChange` on the same URI;
+  meaningful only under `-race`, and it is the regression test for the §6.1c
+  copy rule.
+- `TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace` — the same
+  shape for `WSCfg`: inline `workspace/didChangeConfiguration` against an
+  in-flight `showConnections`.
+- `TestSwitchConnectionWaitsForInFlightQuery` — assert `switchConnections`
+  blocks until a running `executeQuery` finishes, and that the query result is
+  returned intact rather than failing with `sql: database is closed`. This is
+  the §6.1bis regression test.
+- `TestQueryAfterSwitchUsesNewConnection` — a query issued after a completed
+  switch reaches the new repository, proving the `connMu` window closes.
+- `TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates` (in `database`) — call
+  `ReCache` repeatedly while the worker goroutine services updates; meaningful
+  under `-race`, and it covers the pre-existing `Worker.dbRepo` race fixed in
+  §6.1d.
+- CI: the `-race` step added in §6.1e is itself the acceptance criterion for
+  Plan 1 — the plan is not done until `go test -race ./...` is green in
+  `.github/workflows/test.yaml` and reproducible through `make test-race`.
 - `TestExecuteQueryUsesReadOnlyTransactionForSelect` — a mock implementing
   `ReadOnlyQuerier` records that `QueryReadOnly`, not `Query`, was used for
   `SELECT`.
@@ -1202,9 +1567,15 @@ cache directory.
   `<BLOB n bytes>`; text BLOB truncates at 512 characters.
 - `TestScanRowsWithTypesRendersScaledNumericExactly` — a `NUMERIC(18,2)` column
   whose scan type is `string` passes through unmodified.
-- `TestScanRowsWithTypesDefaultsPreserveExistingRendering` — with
-  `DistinguishNull` false, output matches `ScanRows` for the existing
+- `TestScanRowsWithTypesDefaultsPreserveExistingRendering` — with a zero
+  `RenderOptions`, output matches `ScanRows` for the existing
   `scan_row_test.go` fixtures.
+- `TestScanRowsWithTypesReturnsPartialRowsOnScanFailure` — a fixture driver
+  that fails on the third `Next`; assert the returned `*QueryResult` is non-nil
+  alongside the error, holds two rows, and has `Complete == false`.
+- `TestQueryRendersPartialResultBeforeReportingError` — `s.query` with that
+  fixture renders the two rows and the `2 rows in set (incomplete)` footer
+  rather than returning `"", err`.
 - `TestInterBaseClassifyFailureUncertainOutcome` (tagged `interbase`) —
   construct an `*interbase.UncertainOutcomeError` wrapping a
   `*interbase.CancellationError`; assert `FailureUncertain`, and assert the
@@ -1248,10 +1619,17 @@ In `internal/database/interbase_live_test.go` and a new
   not change the database; that query results distinguish `NULL` from the empty
   string; that cells are display-capped at 512 characters; and that cancelling a
   query is best effort, with the uncertain-outcome warning quoted.
-- **`doc/develop.md`**: a short section on the capability-interface pattern —
-  new InterBase behavior goes behind an optional interface asserted at the call
-  site, driver imports stay behind the `interbase` build tag, and shared code is
-  extended additively — with the new file table from §0 as the map.
+- **`doc/develop.md`**: two short sections. First, the capability-interface
+  pattern — new InterBase behavior goes behind an optional interface asserted at
+  the call site, driver imports stay behind the `interbase` build tag, and
+  shared code is extended additively — with the file table from §0 as the map.
+  Second, the **server concurrency invariants**, because they are the kind of
+  rule a future contributor breaks silently: which methods run async, that
+  `connMu` is taken before `stateMu` and never the reverse, that `stateMu` is
+  never held across I/O, that any new `Server` field must be added to the §6.1c
+  audit table, that readers of `files` copy `Text` under the lock rather than
+  retaining the `*File`, and that `make test-race` is the check that catches
+  violations.
 - **Code comments**: only where the reason is not visible in the code, matching
   the surrounding density. Four places earn one: why `EXECUTE PROCEDURE` never
   uses the read-only transaction; why the unknown-procedure case does not retry
@@ -1271,13 +1649,15 @@ and turning it on is a separate, client-visible change).
 **Genuine risks.**
 
 1. *The async dispatch change is the riskiest thing here.* It converts a
-   single-threaded server into a two-threaded one. The mutex in §6.1c must cover
-   every mutable `Server` field or we ship a data race into an editor plugin.
-   Mitigation: `go test -race` over the handler package is already part of the
-   repo's test story, plus the explicit
-   `TestExecuteCommandDispatchesAsynchronously` test. If review judges this too
-   large for this sub-project, the fallback is to ship features 1–5 and §6.2–6.5
-   and land §6.1 separately — cancellation is the only part that needs it.
+   single-threaded server into a two-threaded one. The locks in §6.1c/6.1bis
+   must cover every mutable `Server` field, and the `Worker.dbRepo` fix in
+   §6.1d is outside any server lock. **There is no existing race-detection
+   safety net to fall back on**: neither `.github/workflows/test.yaml:21` nor
+   `Makefile:37` passes `-race`, so adding it is a deliverable of the
+   concurrency plan (§6.1e), not a mitigation that already exists. Expect the
+   first `-race` run to fail on the pre-existing `Worker.dbRepo` race, which is
+   scheduled in the same plan. Sequencing mitigates the rest: this work is
+   Plan 1 and lands alone, with nothing else in flight on top of it.
 2. *`EXECUTE PROCEDURE` routing depends on a cache that can be stale.* A
    procedure created or altered after connect routes on old output arity. The
    chosen behavior fails safely (one rejected statement, a clear message) rather
@@ -1289,9 +1669,12 @@ and turning it on is a separate, client-visible change).
    not use this feature; there is no way to satisfy portable LSP navigation
    without it.
 4. *The `EXECUTE PROCEDURE` multi-keyword addition touches shared parser state.*
-   It only fires on that literal sequence, but it is the one change in this
-   sub-project that alters behavior for every dialect, and it is the one to
-   scrutinise in review before upstreaming.
+   It fires on that literal sequence for **every** dialect, and PostgreSQL's
+   legacy `CREATE TRIGGER … EXECUTE PROCEDURE f()` contains it, so PostgreSQL
+   parsing does change. The retained `CompletionTypeKeyword` fallback (§2) means
+   no PostgreSQL user loses a candidate they get today, but this remains the one
+   change in this sub-project that alters behavior for other drivers and the one
+   to scrutinise before upstreaming.
 5. *Cancellation is best effort and cannot be made better from sqls.* A stalled
    native call outlives its context; the user may see the cancel take seconds.
    The messages say "stopped", never "guaranteed stopped", precisely because of
@@ -1302,3 +1685,8 @@ and turning it on is a separate, client-visible change).
    practice, the fix is to move hover onto the async path too — deliberately not
    done here, because it widens the concurrency surface for a feature that is
    usually cache-only.
+7. *`connMu` makes connection switching wait for a running query*, which against
+   an InterBase statement stuck on a row lock can be ~10 seconds (driver
+   README). The alternative — letting a switch report success while the old
+   connection's results are still arriving into the pane — was judged worse, but
+   a user who switches during a slow query will notice the pause.
