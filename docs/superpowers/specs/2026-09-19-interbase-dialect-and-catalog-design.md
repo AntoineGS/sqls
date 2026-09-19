@@ -117,7 +117,8 @@ exactly like `internal/database/interbase_test.go:293-418` does today.
 4. Replacement of the three hand-written `RDB$` queries and the field-type
    switch with `schema.Catalog` plus a dialect-aware type renderer.
 5. Optional capability interfaces (`CatalogRepository`, `DDLRepository`,
-   `ExplainRepository`) with concrete descriptor types.
+   `ExplainRepository`, `CatalogSnapshotRepository`) with concrete descriptor
+   types, adjudicated as the authoritative cross-spec contract in §4.4.
 6. `DBCache` extension for the new object kinds, populated only when the
    repository implements `CatalogRepository`.
 7. Connection settings for structured host/port, `role`, `connectTimeout`, TLS
@@ -143,6 +144,7 @@ exactly like `internal/database/interbase_test.go:293-418` does today.
 | `Config.TransactionOptions` (no-wait, record version, table reservation) and per-statement isolation | Execution semantics are sub-project 3's subject; exposing them here would fix an interface before that spec exists. |
 | `schema` roles, dependencies and privileges in the cache | `schema` supports them, but no sub-project-3 feature consumes them; adding cache surface with no reader is dead weight. |
 | Bulk (non-N+1) catalog reads | Requires new `schema` API in the driver repository, so it is a driver change, not an sqls change. Trigger condition in §8. |
+| Trigger-event decoding and external-function type rendering | The logic exists in `schema` but is unexported (`ddl.go:871-913`; no `FunctionArgument` renderer at all). Reimplementing it in sqls would guarantee drift, so it is delegated to the companion driver spec named in §4.4, and the three affected display fields render `""` until it lands. |
 | Services-backed admin commands | Ruled out for the whole project. |
 
 ## Architecture
@@ -374,13 +376,30 @@ Without this, switching InterBase to Dialect 3 would make the formatter rewrite
 | --- | --- | --- |
 | `dialect` | `DialectForDriver(driver)` | `DialectForDriverVariant(dv)` (existing delegates) |
 | `parser` | `ParseWithDriver(text, driver)` | `ParseWithDriverVariant(text string, dv dialect.DriverVariant)` (existing delegates) |
-| `completer` | `Completer.Driver` | new field `Variant dialect.SQLVariant`; `Complete` uses `parser.ParseWithDriverVariant`, `getLastWordWithVariant`, `DataBaseKeywordsForVariant`, `DataBaseFunctionsForVariant` |
-| `handler` | `(*Server).parserDriver()` | replaced by `(*Server).parserDriverVariant() dialect.DriverVariant`; it is an unexported method of the fork's server, so nothing public breaks |
-| `handler` helpers | `hoverWithDriver`, `definitionWithDriver`, `renameWithDriver`, `SignatureHelpWithDriver`, `getStatementsWithDriver`, `formatter.FormatWithDriver` | each takes `dialect.DriverVariant` instead of `dialect.DatabaseDriver`; names unchanged so sub-project 3 and existing tests keep their call shapes |
+| `completer` | `Completer.Driver` | field retained; new field `Variant dialect.SQLVariant` added beside it; `Complete` uses `parser.ParseWithDriverVariant`, `getLastWordWithVariant`, `DataBaseKeywordsForVariant`, `DataBaseFunctionsForVariant` |
+| `handler` | `(*Server).parserDriver()` | **retained** as a thin helper (`return s.parserDriverVariant().Driver`); new sibling `(*Server).parserDriverVariant() dialect.DriverVariant` added |
+| `handler` helpers | `hoverWithDriver`, `definitionWithDriver`, `renameWithDriver`, `SignatureHelpWithDriver`, `getStatementsWithDriver`, `formatter.FormatWithDriver` | each **keeps its current `dialect.DatabaseDriver` signature** and delegates to a new `…WithDriverVariant` sibling with the default variant; the server's own call sites move to the siblings |
 | `completion.go` | `c.Driver = s.parserDriver()` | `dv := s.parserDriverVariant(); c.Driver, c.Variant = dv.Driver, dv.Variant` |
 
 `getLastWordWithDriver` keeps its signature and delegates to a new
 `getLastWordWithVariant`.
+
+**What is actually source-compatible.** Every existing exported and unexported
+entry point keeps its name *and* its parameter types: `DialectForDriver`,
+`DataBaseKeywords`, `DataBaseFunctions`, `ParseWithDriver`,
+`getLastWordWithDriver`, `getStatementsWithDriver`, `hoverWithDriver`,
+`definitionWithDriver`, `renameWithDriver`, `SignatureHelpWithDriver`,
+`formatter.FormatWithDriver`, `(*Server).parserDriver()` and
+`completer.Completer.Driver`. Each gains a variant-aware sibling rather than a
+changed signature, so a call written as
+`getStatementsWithDriver(text, s.parserDriver())` or
+`dialect.DataBaseFunctions(c.Driver)` still compiles unchanged. This is a
+correction to an earlier draft of this table, which claimed the names were
+retained while silently changing the argument type from
+`dialect.DatabaseDriver` to `dialect.DriverVariant` — that would have broken
+every one of those call sites, including the ones sub-project 3 builds on.
+The duplication is the price of additivity and upstreamability; a follow-up
+could collapse the driver-keyed forms once no caller remains.
 
 **Offline fallback.** With no live connection, `parserDriverVariant()` returns
 the zero `DriverVariant`; for the InterBase driver that resolves to Dialect 3,
@@ -435,26 +454,73 @@ All `DBRepository` methods route through `schema.New(q)`:
 
 | Method | Implementation |
 | --- | --- |
-| `SchemaTables` | `catalog.Relations(ctx, "")` → `map[string][]string{"": names}` (tables *and* views, as today) |
-| `DescribeDatabaseTable` / `…BySchema` | `catalog.Relations(ctx, "")` for columns + `catalog.Constraints(ctx, "")` for primary-key membership |
-| `DescribeForeignKeysBySchema` | `catalog.Constraints(ctx, "")` filtered to `FOREIGN KEY`, paired via `Columns`/`ReferencedColumns` |
+| `SchemaTables` | relation names → `map[string][]string{"": names}` (tables *and* views, as today) |
+| `DescribeDatabaseTable` / `…BySchema` | relation columns + constraints for primary-key membership |
+| `DescribeForeignKeysBySchema` | constraints filtered to `FOREIGN KEY`, paired via `Columns`/`ReferencedColumns` |
 | `CurrentDatabase` | `DatabaseName` |
 | `Databases` | `[]string{DatabaseName}`, or `[]string{}` when empty |
 | `CurrentSchema` / `Schemas` | unchanged: `""` and `[]string{""}` |
 | `Exec` / `Query` | unchanged |
 
-Each cache build wraps its reads in one explicit read-only transaction
-(`db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})`, `schema.New(tx)`,
-`defer tx.Rollback()`), which gives a single consistency boundary and avoids a
-per-statement implicit transaction in the native client. `ObjectDDL` and
-`ExplainPlan` are interactive one-shots and use the `*sql.DB` directly.
+##### One catalog read per cache build
+
+`GenerateDBCachePrimary` calls `SchemaTables`, then
+`DescribeDatabaseTableBySchema`, then `DescribeForeignKeysBySchema`
+(`internal/database/cache.go:43-59`). Mapping the first two independently onto
+`catalog.Relations(ctx, "")` would walk every relation twice, because
+`Relations` issues one column query per relation (`schema/schema.go:360-366`).
+That is roughly `2 + 2R + 4K` round trips for `R` relations and `K`
+constraints, where today it is 3 — it doubles the dominant term, so it is fixed
+here rather than left for the §8 measurement to discover. A read-only
+transaction alone does not deduplicate anything.
+
+The fix is an optional, driver-neutral snapshot capability:
+
+```go
+// CatalogSnapshotRepository is implemented by repositories that can serve a
+// whole cache build from one consistent catalog read. The returned repository
+// is read-only and valid until close is called; the source repository is
+// unaffected and remains usable concurrently.
+type CatalogSnapshotRepository interface {
+	CatalogSnapshot(ctx context.Context) (repo DBRepository, close func() error, err error)
+}
+```
+
+`DBCacheGenerator` opens a snapshot at the start of `GenerateDBCachePrimary`,
+`GenerateDBCacheSecondary` and `GenerateCatalogCache`, uses it for every read in
+that build, and closes it at the end; when the repository does not implement
+the interface it uses the repository directly and a no-op closer. Returning a
+*new* repository rather than mutating the receiver is deliberate: `ReCache`
+runs on a handler goroutine while the worker's secondary pass runs on its own
+goroutine (`internal/database/worker.go:49-69`), so a shared mutable snapshot
+field would race.
+
+The InterBase snapshot begins one read-only transaction
+(`db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})`, `schema.New(tx)`), reads
+`Relations(ctx, "")` and `Constraints(ctx, "")` **once each**, and serves
+`SchemaTables`, `DescribeDatabaseTable*` and `DescribeForeignKeysBySchema` from
+those two slices; extended-catalog reads run on the same transaction. `close`
+rolls the transaction back. The primary pass therefore costs `1 + R` plus
+`1 + 4K` round trips instead of `2 + 2R + 4K`, under one consistency boundary.
+
+`SchemaTables` needs names only, but `schema` has no name-only projection —
+`Relations` always loads columns. Inside a snapshot this costs nothing extra
+because the relations are already loaded; outside one it is `1 + R`. A
+name-only relation projection is a natural addition to the driver's `schema`
+package and is recorded in §8 as a driver-side opportunity, not an sqls change.
+
+`ObjectDDL` and `ExplainPlan` are interactive one-shots outside any cache build
+and use the `*sql.DB` directly.
 
 The three `interBase*Query` constants and `interBaseColumnRow`,
-`interBaseColumnDescription`, `interBaseNullability`, `interBaseColumnType`,
-`interBaseCharacterLength`, `interBaseNumericType`, `parseInterBaseForeignKeys`
-are deleted. `interBaseDefault`/`interBaseEffectiveDefault` (the
-`DEFAULT `-prefix stripper, `interbase_common.go:301-325`) are kept: `schema`
-returns `DefaultSource` verbatim, including the keyword.
+`interBaseColumnDescription`, `parseInterBaseForeignKeys` are deleted.
+`interBaseDefault`/`interBaseEffectiveDefault` (the `DEFAULT `-prefix stripper,
+`interbase_common.go:301-325`) are kept: `schema` returns `DefaultSource`
+verbatim, including the keyword. `interBaseNullability`, `interBaseColumnType`,
+`interBaseCharacterLength` and `interBaseNumericType` are **also kept** — see
+the fallback rule below — re-sourced to read their inputs from `schema.Domain`
+(`FieldType`, `FieldSubType`, `FieldLength`, `FieldScale`, `FieldPrecision`,
+`CharacterLength`) instead of `interBaseColumnRow`. Their logic is unchanged.
 
 #### Dialect-aware type rendering
 
@@ -466,19 +532,41 @@ func interBaseTypeName(domain *schema.Domain, sqlDialect int) string
 Order of rules:
 
 1. `domain == nil` → `""` (the catalog row resolved to no `RDB$FIELDS` entry).
-2. **Dialect 1 overrides**, applied before delegating:
-   - field type 35 → `DATE` (Dialect 1 has no separate `TIMESTAMP`; Dialect 3
-     keeps `TIMESTAMP`, which is the mapping fix);
-   - field type 27 with `FieldScale < 0` → `NUMERIC(p, |scale|)`, or
-     `DECIMAL(p, |scale|)` when `FieldSubType == 2`, with `p = FieldPrecision`
-     when positive and `15` otherwise. This is how Dialect 1 stores
-     `NUMERIC`/`DECIMAL` above precision 9, and `schema.Domain.SQLType()`
-     rejects it (`ddl.go:273-276`).
+2. **Dialect 1 override**, applied before delegating: field type 35 → `DATE`.
+   Dialect 1 has no separate `TIMESTAMP`; Dialect 3 keeps `TIMESTAMP`, which is
+   the mapping fix. This is the only genuinely dialect-dependent rule.
 3. Otherwise delegate to `domain.SQLType()`.
-4. On error, fall back without inventing a declaration:
-   type 9 → `QUAD`, 40 → `CSTRING(n)`, 45 → `BLOB_ID`, arrays → the renderable
-   base followed by ` ARRAY`, any other failure with a valid `FieldType` →
-   `TYPE(n)` (the current behavior), invalid `FieldType` → `""`.
+4. **On error, fall back to the retained `interBaseColumnType` switch** rather
+   than to `TYPE(n)`. `TYPE(n)` is reached only where that switch reaches it
+   today — an unrecognized field type — and an invalid `FieldType` yields `""`.
+
+Rule 4 is deliberately a *retention*, not a new ladder. An earlier draft
+specified an explicit fallback list covering only types 9/40/45 and arrays, with
+everything else collapsing to `TYPE(n)`. That was a regression:
+`Domain.SQLType()` returns `ErrUnsupportedDDL` on at least five further paths
+that today's switch renders correctly, and each would have silently become
+`TYPE(8)`/`TYPE(14)`, contradicting the behavior-preservation test in §6 and
+Risk 2. Keeping the switch makes the fallback exhaustive by construction:
+
+| Case | `Domain.SQLType()` | Retained switch renders | Today |
+| --- | --- | --- | --- |
+| type 9 | `ErrUnsupportedDDL` (`ddl.go:313-314`) | `QUAD` | same |
+| type 40 | `ErrUnsupportedDDL` (`ddl.go:315-316`) | `CSTRING(n)` | same |
+| type 45 | `ErrUnsupportedDDL` (`ddl.go:317-318`) | `BLOB_ID` | same |
+| `Dimensions != 0` (array) | `ErrUnsupportedDDL` (`ddl.go:214-215`) | base name from the switch | same |
+| type 27, scale < 0, no numeric subtype | `ErrUnsupportedDDL` (`ddl.go:273-276`) | `NUMERIC(15, \|s\|)` — how Dialect 1 stores `NUMERIC`/`DECIMAL` above precision 9 | same (`interbase_common.go:348-356`) |
+| numeric subtype with no precision | `ErrUnsupportedDDL` (`ddl.go:230-232`) | `NUMERIC(9, \|s\|)` via the natural-precision default | same (`interbase_common.go:398-401`) |
+| numeric subtype with no scale | `ErrUnsupportedDDL` (`ddl.go:233-235`) | `NUMERIC(p, 0)` | same (`interbase_common.go:390-393`) |
+| positive `FieldScale` on an integer type | `ErrUnsupportedDDL` (`ddl.go:226-228`) | plain base name when subtype 0 | same (`interbase_common.go:394-396`) |
+| CHAR/VARCHAR with NULL `CharacterLength` | `ErrUnsupportedDDL` (`ddl.go:288-293`) | falls back to `FieldLength`, then 0 | same (`interbase_common.go:375-383`) |
+| charset name unavailable, charset id ≠ 0 | `ErrUnsupportedDDL` (`ddl.go:331-333`) | plain `CHAR(n)`/`VARCHAR(n)` | same |
+| collation name unavailable, collation id ≠ 0 | `ErrUnsupportedDDL` (`ddl.go:336-338`) | plain `CHAR(n)`/`VARCHAR(n)` | same |
+| unrecognized field type | `ErrUnsupportedDDL` (`ddl.go:319-320`) | `TYPE(n)` | same |
+
+The net effect: `SQLType()` upgrades rendering where it is strictly better
+(`TIMESTAMP`, `BLOB SUB_TYPE TEXT`, `CHARACTER SET`/`COLLATE` suffixes,
+validated precision/scale), and the existing switch guarantees no case
+regresses.
 
 For the one-line `ColumnDesc.Type` the rendered text is trimmed at the first
 ` CHARACTER SET ` or ` COLLATE `, because `SQLType()` appends both and the
@@ -495,17 +583,31 @@ should say so), `Schema` = `""`.
 
 ### 4.4 Capability interfaces and descriptor types
 
-`internal/database/capability.go`, driver neutral, no `schema` import in the
-interface declarations. Callers type-assert; absence is the normal case.
+**This section is the authoritative cross-spec contract.** Sub-project 3's spec
+(`docs/superpowers/specs/2026-09-19-interbase-editor-features-design.md`) and an
+earlier draft of this one described the same seam with incompatible names and
+types; the coordinator adjudicated every divergence and both specs are aligned
+to exactly what follows. The tiebreak rule for anything not named here is: **use
+the name and type that the driver's `schema` package already uses**, which is why
+descriptors carry `sql.Null*` fields and `schema`'s spellings
+(`RelationName`, `OwnerName`, `DefaultSource`, `ValidationSource`,
+`CharacterSetName`, `CollationName`, `ModuleName`) rather than sqls-invented
+shorthands. Cache *accessor* names follow sqls's own vocabulary
+(`DBCache.SortedTables`, `ColumnDescs(tableName)`), so `IndexesForTable` reads
+"table" while `IndexDesc.RelationName` reads "relation"; the boundary is
+deliberate — descriptors mirror the catalog, accessors mirror the cache.
+
+`internal/database/capability.go`, driver neutral, no `schema` import. Callers
+type-assert; absence is the normal case.
 
 ```go
 // CatalogRepository is implemented by repositories that can enumerate catalog
 // objects beyond tables and columns. All methods return objects for the whole
 // attachment; sqls drivers without a schema namespace use an empty Schema.
 type CatalogRepository interface {
-	DescribeViews(ctx context.Context) ([]*ObjectDesc, error)
+	DescribeViews(ctx context.Context) ([]*ViewDesc, error)
 	DescribeProcedures(ctx context.Context) ([]*ProcedureDesc, error)
-	DescribeSequences(ctx context.Context) ([]*ObjectDesc, error)
+	DescribeGenerators(ctx context.Context) ([]*GeneratorDesc, error)
 	DescribeTriggers(ctx context.Context) ([]*TriggerDesc, error)
 	DescribeDomains(ctx context.Context) ([]*DomainDesc, error)
 	DescribeIndexes(ctx context.Context) ([]*IndexDesc, error)
@@ -513,7 +615,7 @@ type CatalogRepository interface {
 }
 
 // DDLRepository is implemented by repositories that can reproduce an object's
-// definition. Callers must handle ErrObjectNotFound and ErrDDLUnsupported.
+// definition. Callers must handle ErrObjectNotFound and ErrUnsupportedDDL.
 type DDLRepository interface {
 	ObjectDDL(ctx context.Context, kind ObjectKind, name string) (string, error)
 }
@@ -527,11 +629,26 @@ type ExplainRepository interface {
 var (
 	// ErrObjectNotFound reports that the named catalog object does not exist.
 	ErrObjectNotFound = errors.New("database: catalog object not found")
-	// ErrDDLUnsupported reports that the catalog cannot reproduce the object's
-	// definition faithfully. The wrapped message explains why.
-	ErrDDLUnsupported = errors.New("database: DDL is unavailable for this object")
+	// ErrUnsupportedDDL reports that the catalog cannot reproduce the object's
+	// definition faithfully. Use UnsupportedDDLDetail for the structured reason.
+	ErrUnsupportedDDL = errors.New("database: DDL is unavailable for this object")
 )
+
+// unsupportedDDLDetailer is implemented by driver-specific errors that carry a
+// structured reason. It keeps this file free of any driver import.
+type unsupportedDDLDetailer interface {
+	UnsupportedDDLDetail() (object, name, feature string)
+}
+
+// UnsupportedDDLDetail reports the structured reason behind an
+// ErrUnsupportedDDL error: the object kind, the object name, and the metadata
+// facet that could not be rendered. ok is false when err carries no detail.
+func UnsupportedDDLDetail(err error) (object, name, feature string, ok bool)
 ```
+
+`UnsupportedDDLDetail` is `errors.As` against `unsupportedDDLDetailer`. It
+exists so callers branch on structure rather than on message text: sub-project 3
+uses it in hover and definition.
 
 Object kinds and descriptors:
 
@@ -546,105 +663,195 @@ const (
 	ObjectKindTrigger   ObjectKind = "trigger"
 	ObjectKindDomain    ObjectKind = "domain"
 	ObjectKindIndex     ObjectKind = "index"
-	ObjectKindSequence  ObjectKind = "sequence"
+	ObjectKindGenerator ObjectKind = "generator"
 	ObjectKindFunction  ObjectKind = "function"
 )
 
-// ObjectDesc describes a named catalog object that carries no attributes
-// beyond identity and an optional definition. Used for views and sequences.
-type ObjectDesc struct {
-	Schema     string     // "" for InterBase
-	Name       string
-	Kind       ObjectKind
-	Owner      string     // "" when the catalog has none
-	Comment    string     // RDB$DESCRIPTION, "" when absent
-	Definition string     // view source; "" for sequences
+// ViewDesc describes a view, its source text, and its resolved columns.
+type ViewDesc struct {
+	Schema      string // "" for InterBase
+	Name        string
+	OwnerName   sql.NullString
+	ViewSource  sql.NullString
+	Description sql.NullString
+	Columns     []*ColumnDesc // ordered; same rendering as table columns
+}
+
+// GeneratorDesc describes a generator/sequence. InterBase's own DDL is
+// CREATE GENERATOR, and the catalog carries nothing but identity.
+type GeneratorDesc struct {
+	Schema string
+	Name   string
+	ID     sql.NullInt64
 }
 
 // ProcedureDesc describes a stored procedure and its ordered parameters.
 type ProcedureDesc struct {
-	Schema  string
-	Name    string
-	Comment string
-	Source  string           // PSQL body verbatim, "" when unavailable
-	Inputs  []*ParameterDesc // ordered by Position
-	Outputs []*ParameterDesc // ordered by Position
+	Schema           string
+	Name             string
+	OwnerName        sql.NullString
+	Source           sql.NullString // PSQL body verbatim
+	Description      sql.NullString
+	InputParameters  []*ProcedureParameterDesc // ordered by Position
+	OutputParameters []*ProcedureParameterDesc // ordered by Position
 }
 
-// ParameterDirection identifies a parameter's direction.
+// ParameterDirection identifies a parameter's direction. The values match
+// schema.ParameterInput and schema.ParameterOutput.
 type ParameterDirection string
 
 const (
-	ParameterIn  ParameterDirection = "in"
-	ParameterOut ParameterDirection = "out"
+	ParameterInput  ParameterDirection = "input"
+	ParameterOutput ParameterDirection = "output"
 )
 
-// ParameterDesc describes one procedure or external-function parameter.
-type ParameterDesc struct {
-	Name      string
-	Position  int
-	Direction ParameterDirection
-	Type      string             // rendered for the resolved dialect; "" when unrenderable
-	Domain    string             // user domain name; "" for an inline type
-	Nullable  string             // "YES", "NO", or "" when the catalog cannot say
-	Default   sql.NullString
-	Comment   string
+// ProcedureParameterDesc describes one procedure parameter.
+type ProcedureParameterDesc struct {
+	Name        string
+	Position    int
+	Direction   ParameterDirection
+	Type        string         // rendered for the resolved dialect; "" when unrenderable
+	Domain      string         // user domain name; "" for an inline type
+	Nullable    sql.NullBool   // invalid when the catalog cannot determine it
+	Description sql.NullString
 }
 
 // TriggerDesc describes a DML or database trigger.
 type TriggerDesc struct {
-	Schema   string
-	Name     string
-	Table    string // "" for a database-level trigger
-	Event    string // e.g. "BEFORE INSERT"; "" when the type code is unknown
-	Sequence int
-	Enabled  bool
-	Source   string
-	Comment  string
+	Schema       string
+	Name         string
+	RelationName sql.NullString // invalid for a database-level trigger
+	Event        string         // e.g. "BEFORE INSERT"; "" when undecodable
+	Sequence     sql.NullInt64
+	Active       sql.NullBool
+	Source       sql.NullString
+	Description  sql.NullString
 }
 
 // DomainDesc describes a user domain.
 type DomainDesc struct {
-	Schema    string
-	Name      string
-	Type      string         // full rendering, including CHARACTER SET/COLLATE
-	Nullable  string         // "YES", "NO", or ""
-	Default   sql.NullString
-	Check     string         // RDB$VALIDATION_SOURCE verbatim, "" when absent
-	Charset   string
-	Collation string
-	Comment   string
+	Schema           string
+	Name             string
+	Type             string // full rendering, including CHARACTER SET/COLLATE
+	Nullable         sql.NullBool
+	DefaultSource    sql.NullString
+	ValidationSource sql.NullString // CHECK text, verbatim
+	CharacterSetName sql.NullString
+	CollationName    sql.NullString
+	Description      sql.NullString
 }
 
 // IndexDesc describes an index and its ordered segments.
 type IndexDesc struct {
-	Schema     string
-	Name       string
-	Table      string
-	Columns    []string // ordered segment names; empty for an expression index
-	Expression string   // "" for a segment index
-	Unique     bool
-	Enabled    bool
-	Constraint string // owning constraint name; "" for a standalone index
-	Comment    string
+	Schema         string
+	Name           string
+	RelationName   string
+	Columns        []string       // ordered segment names; empty for an expression index
+	Expression     sql.NullString // invalid for a segment index
+	Unique         sql.NullBool
+	Active         sql.NullBool
+	ConstraintName sql.NullString // owning constraint; invalid when standalone
+	Description    sql.NullString
 }
 
 // FunctionDesc describes an external function (UDF) declaration. sqls never
 // invokes a UDF; this is declaration metadata only.
 type FunctionDesc struct {
-	Schema     string
-	Name       string
-	ReturnType string           // rendered; "" when the catalog cannot render it
-	Arguments  []*ParameterDesc // Direction is always ParameterIn
-	Module     string
-	EntryPoint string
-	Comment    string
+	Schema         string
+	Name           string
+	ReturnType     string // rendered; "" when the catalog cannot render it
+	ReturnPosition sql.NullInt64
+	Arguments      []*FunctionArgumentDesc // ordered by Position
+	ModuleName     sql.NullString
+	EntryPoint     sql.NullString
+	Description    sql.NullString
+}
+
+// FunctionArgumentDesc describes one external function argument.
+type FunctionArgumentDesc struct {
+	Name     string
+	Position sql.NullInt64
+	Type     string // rendered; "" when the catalog cannot render it
 }
 ```
 
-Sequences use `ObjectDesc` because `schema.Sequence`
-(`catalog_extended.go:15-19`) carries only a name, an id and a system flag —
-there is nothing else to model.
+Notes on the adjudicated shape, recorded so neither spec re-derives it:
+
+- **Views and generators are separate types.** A field audit found `OwnerName`
+  and `Description` unpopulatable for generators — `schema.Sequence`
+  (`catalog_extended.go:15-19`) carries only `Name`, `ID` and `SystemFlag` — so a
+  shared `ObjectDesc` would have guaranteed two permanently empty fields.
+  `ViewDesc` additionally carries `Columns`, which sub-project 3's hover table
+  needs and a generator has no analogue for.
+- **`ProcedureParameterDesc` has no `Default`.**
+  `procedureParametersQuery` (`schema/schema.go:234-240`) does not select
+  `RDB$DEFAULT_SOURCE`; only domain-level defaults are reachable, and those are
+  already on `DomainDesc`. An unfillable field is worse than an absent one.
+- **`FunctionArgumentDesc` is a distinct type**, a mechanical consequence of
+  renaming `ParameterDesc` to `ProcedureParameterDesc`: a UDF argument has no
+  direction, no domain and no nullability (`schema.FunctionArgument`,
+  `catalog_extended.go:133-145`), so reusing the procedure type would have
+  carried three dead fields.
+- **`Nullable` and `Active` are `sql.NullBool`, not `"YES"/"NO"/""`.** This
+  matches `schema.ProcedureParameter.Nullable` and keeps unknown genuinely
+  unknown instead of overloading the empty string. `Unique` on `IndexDesc` is
+  `sql.NullBool` for the same reason: it derives from
+  `schema.Index.UniqueFlag sql.NullInt64`, which can be NULL.
+- **Views stay in `SchemaTables`.** The extended view cache is *additive
+  metadata*, not a replacement: `SchemaTables` continues to return tables and
+  views together, exactly as `interBaseRelationsQuery` does today (and as
+  `internal/database/interbase_test.go:31-33` asserts). Views therefore keep
+  completing in the `FROM` position, and no consumer needs to deduplicate
+  `SortedTables()` against `SortedViews()`.
+
+#### Fields populated from companion `schema` accessors
+
+Three fields cannot be populated from `schema`'s exported API as it stands
+today, and **sqls does not reimplement any of them**:
+
+| Field | Missing exported capability | Evidence |
+| --- | --- | --- |
+| `TriggerDesc.Event` | Decoding `RDB$TRIGGER_TYPE` into `BEFORE INSERT` / `ON CONNECT` and friends. `schema.Trigger` exposes only `TriggerType sql.NullInt64`. | `catalog_extended.go:92`; the decoder `triggerEvent` is unexported at `ddl.go:871-913` |
+| `FunctionArgumentDesc.Type` | Rendering a type from a `FunctionArgument`, which is not a `Domain`, has `CharacterSetID` but no `CharacterSetName`, and has no exported renderer. | `catalog_extended.go:133-145`; `ddl.go` has no `FunctionArgument` renderer at all |
+| `FunctionDesc.ReturnType` | Same renderer, applied to the argument identified by `Function.ReturnArgument`. | `catalog_extended.go:124` |
+
+These are supplied by a companion driver-side spec,
+`docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md` in the
+`interbase-go` repository, which exports the accessors from `schema` itself
+reusing the existing internal logic so the two implementations cannot drift. At
+the time of writing that spec has **not** landed (the `interbase-go` specs
+directory contains only the cancellation and pooled-introspection specs), so the
+dependency is stated by capability rather than by signature: sqls needs (a) a
+trigger-event decoder taking the catalog trigger type, and (b) a type renderer
+for external-function arguments including the return argument. **When that spec
+lands, plan 2 uses its exact signatures verbatim.** This sub-project deliberately
+specifies neither the bit-decoding semantics nor the argument type rendering.
+
+**Dependency:** plan 2 (§9) cannot complete until those accessors exist. It can
+start and deliver everything else; the three fields are its tail. Until then
+they are populated as `""`, which is exactly the documented "undecodable" value,
+so no consumer breaks.
+
+#### `ParameterDesc.Domain`: the user-versus-system domain test
+
+`schema.ProcedureParameter.FieldSource` (`schema/schema.go:163`) holds the domain
+name, but a parameter declared with an inline type gets a system-generated
+`RDB$…` domain that must not be shown as a domain reference. The driver's own
+test, `userDomainReference` (`ddl.go:407-412`), is unexported, and the companion
+spec was permitted to decline exporting it on YAGNI grounds. sqls therefore
+implements the same two conditions inline, in `interbase_catalog.go`:
+
+`ProcedureParameterDesc.Domain` is set to the resolved domain name when **both**
+hold, and `""` otherwise:
+
+1. the name is non-empty and does not begin with `RDB$`, compared
+   case-insensitively after right-trimming catalog padding; and
+2. the domain's `SystemFlag` is NULL or `0`.
+
+When the domain is `""`, `Type` carries the rendered inline type instead. A test
+asserts both branches. If the companion spec does export the predicate, sqls
+deletes its copy and calls the exported form; the two-condition definition above
+is the contract either way.
 
 #### `ObjectDDL` and the `ErrUnsupportedDDL` cases
 
@@ -652,30 +859,58 @@ there is nothing else to model.
 | --- | --- |
 | `table`, `view` | `catalog.Table` / `catalog.View` (these load constraints, indexes and triggers, `schema/schema.go:261-286`) then `Relation.GenerateDDL()` |
 | `procedure` | `catalog.Procedure` then `Procedure.GenerateDDL()` |
-| `trigger`, `index`, `domain`, `sequence` | the matching singular getter then `GenerateDDL()` |
-| `function` | always `ErrDDLUnsupported` (`schema/ddl.go:1216-1219`) |
+| `trigger`, `index`, `domain` | the matching singular getter then `GenerateDDL()` |
+| `generator` | `catalog.Generator` then `Sequence.GenerateDDL()`, which emits `CREATE GENERATOR` |
+| `function` | always `ErrUnsupportedDDL` (`schema/ddl.go:1216-1219`) |
 
-A `nil, nil` result from a singular getter becomes `ErrObjectNotFound`. A
-`schema.ErrUnsupportedDDL` becomes
-`fmt.Errorf("interbase: %s: %w", detail, ErrDDLUnsupported)`, where `detail` is
-the driver's explanation (for example `procedure "POST_ORDER": parameter
-"QTY" nullability is unknown`). Callers use `errors.Is`.
+A `nil, nil` result from a singular getter becomes `ErrObjectNotFound`.
+Returning `("", nil)` for an unknown object is specifically rejected: it
+conflates "no such object" with "the object exists but has no renderable DDL",
+which is the one distinction sub-project 3 needs in order to choose between
+showing nothing and showing a reason.
+
+A driver error satisfying `errors.Is(err, schema.ErrUnsupportedDDL)` is wrapped
+so that both the sentinel check and the structured accessor work, without
+`capability.go` importing `schema`:
+
+```go
+// interbase_ddl.go
+type interBaseUnsupportedDDL struct{ detail *schema.UnsupportedDDLError }
+
+func (e *interBaseUnsupportedDDL) Error() string { return "interbase: " + e.detail.Error() }
+func (e *interBaseUnsupportedDDL) Unwrap() error { return ErrUnsupportedDDL }
+func (e *interBaseUnsupportedDDL) UnsupportedDDLDetail() (string, string, string) {
+	return e.detail.Object, e.detail.Name, e.detail.Feature
+}
+```
+
+The detail is recovered with `errors.As(err, **schema.UnsupportedDDLError)`
+against the driver error (`schema/ddl.go:17-35`, whose `Unwrap` returns
+`schema.ErrUnsupportedDDL`); when the driver returns a bare
+`schema.ErrUnsupportedDDL` with no detail, the three strings are empty and
+`UnsupportedDDLDetail` reports `ok == false`. So
+`errors.Is(err, database.ErrUnsupportedDDL)` holds for every unsupported case,
+and `database.UnsupportedDDLDetail(err)` holds for every case that carries a
+reason.
 
 **What sqls shows the user** (the contract sub-project 3 implements; specified
 here so behavior is decided, not invented later): when `ObjectDDL` returns
-`ErrDDLUnsupported`, the feature falls back to the cached descriptor rendering
+`ErrUnsupportedDDL`, the feature falls back to the cached descriptor rendering
 that exists today — `database.TableDoc` for a table or view, a signature line
-for a procedure — and appends one italic line:
+for a procedure — and appends one italic line built from the structured detail,
+never from string matching:
 
 ```
-_DDL unavailable: interbase: table "ORDERS": column "TOTAL" is computed._
+_DDL unavailable: table "ORDERS": column "TOTAL" is computed._
 ```
 
-For `ErrObjectNotFound`, the feature shows nothing rather than an error. Both
-cases are expected in the target database: computed columns block table DDL, and
-`schema/README.md` states that procedure parameter nullability is unknown unless
-a non-nullable domain proves it, so procedure DDL will frequently fall back to
-`ProcedureDesc.Source`, which is always available from the catalog.
+When `UnsupportedDDLDetail` reports `ok == false`, the line degrades to
+`_DDL unavailable._` For `ErrObjectNotFound`, the feature shows nothing rather
+than an error. Both cases are expected in the target database: computed columns
+block table DDL, and `schema/README.md` states that procedure parameter
+nullability is unknown unless a non-nullable domain proves it, so procedure DDL
+will frequently fall back to `ProcedureDesc.Source`, which is always available
+from the catalog.
 
 `ExplainPlan` is implemented only in the tagged file: it acquires a `*sql.Conn`
 and calls sub-project 1's `interbase.Plan(ctx, conn, query)`, returning the plan
@@ -689,9 +924,9 @@ text unchanged. On untagged builds `*InterBaseDBRepository` does not satisfy
 // active repository does not implement CatalogRepository. All maps are keyed by
 // the upper-cased object name.
 type CatalogCache struct {
-	Views           map[string]*ObjectDesc
+	Views           map[string]*ViewDesc
 	Procedures      map[string]*ProcedureDesc
-	Sequences       map[string]*ObjectDesc
+	Generators      map[string]*GeneratorDesc
 	Domains         map[string]*DomainDesc
 	Functions       map[string]*FunctionDesc
 	Indexes         map[string]*IndexDesc
@@ -711,9 +946,9 @@ Nil-safe accessors in the style of the existing ones (`DBCache.Column`,
 
 ```go
 func (dc *DBCache) HasCatalog() bool
-func (dc *DBCache) View(name string) (*ObjectDesc, bool)
+func (dc *DBCache) View(name string) (*ViewDesc, bool)
 func (dc *DBCache) Procedure(name string) (*ProcedureDesc, bool)
-func (dc *DBCache) Sequence(name string) (*ObjectDesc, bool)
+func (dc *DBCache) Generator(name string) (*GeneratorDesc, bool)
 func (dc *DBCache) Domain(name string) (*DomainDesc, bool)
 func (dc *DBCache) Function(name string) (*FunctionDesc, bool)
 func (dc *DBCache) Index(name string) (*IndexDesc, bool)
@@ -722,7 +957,12 @@ func (dc *DBCache) IndexesForTable(table string) []*IndexDesc
 func (dc *DBCache) TriggersForTable(table string) []*TriggerDesc
 func (dc *DBCache) SortedProcedures() []string
 func (dc *DBCache) SortedViews() []string
+func (dc *DBCache) SortedGenerators() []string
 ```
+
+`SortedViews()` is additive metadata and does **not** subtract from
+`SortedTables()`: views remain in `SchemaTables` exactly as today, so no caller
+needs to deduplicate the two.
 
 Generation and refresh:
 
@@ -740,6 +980,21 @@ result in with a copy-on-write setter mirroring `setColumnCache`:
 ```go
 func (w *Worker) setCatalogCache(c *CatalogCache)
 ```
+
+**The two passes must run independently.** The existing loop body `continue`s on
+a `GenerateDBCacheSecondary` error (`worker.go:59-63`), so appending the catalog
+build after it would silently skip the catalog whenever the column pass failed.
+Each pass is therefore attempted, logged and swapped in on its own; neither
+error path short-circuits the other.
+
+**The update signal must not block a handler.** `updateAdditionalCache` does a
+blocking send on the size-1 `update` channel (`worker.go:95-97`) and is reached
+from `ReCache` ← `reconnectionDB` ← `handleWorkspaceDidChangeConfiguration`,
+an LSP handler. Today the passes are short; a long catalog pass would make a
+config change block until it finished. The send becomes a non-blocking
+`select { case w.update <- struct{}{}: default: }`: the buffered slot already
+holds a pending request, so dropping a duplicate signal loses nothing — the
+in-flight or queued pass will read state that is at least as fresh.
 
 **The extended catalog is built in the secondary (asynchronous) pass, which
 `ReCache` already kicks off at connect** (`worker.go:75-82`). It is eager in the
@@ -850,10 +1105,11 @@ same database, which is what happens today.
 - `DBConnection.Variant`, `.DatabaseName`, `.Warnings`, `ConnFactory`,
   `RegisterConnFactory`, `CreateRepositoryFromConnection` — a driver may need
   connection-level context to build its repository.
-- `CatalogRepository`, `DDLRepository`, `ExplainRepository`, the descriptor
-  types, `ObjectKind`, `ErrObjectNotFound`, `ErrDDLUnsupported`, `CatalogCache`
-  and the `DBCache` accessors: all driver neutral. PostgreSQL and MySQL could
-  implement them later without touching `DBRepository`.
+- `CatalogRepository`, `DDLRepository`, `ExplainRepository`,
+  `CatalogSnapshotRepository`, the descriptor types, `ObjectKind`,
+  `ErrObjectNotFound`, `ErrUnsupportedDDL`, `UnsupportedDDLDetail`,
+  `CatalogCache` and the `DBCache` accessors: all driver neutral. PostgreSQL and
+  MySQL could implement them later without touching `DBRepository`.
 
 **InterBase-only** (stays in this fork):
 
@@ -982,15 +1238,30 @@ existing test is extended with the tables `schema` reads
   A companion case asserts that the charset/collation suffix is present in
   `DomainDesc.Type` and absent from `ColumnDesc.Type`.
 - `TestInterBaseDescribesExtendedCatalogObjects`: fixture contains one view, one
-  procedure with two inputs and one output, one trigger, one generator, one
-  domain, one unique index and one UDF; asserts every descriptor field that the
-  fixture can determine, including parameter order, direction, `Nullable`
-  `"YES"/"NO"/""`, and `Enabled` for an inactive index and trigger.
+  procedure with two input and one output parameters, one trigger, one
+  generator, one domain, one unique index and one UDF; asserts every descriptor
+  field the fixture can determine, including `ViewDesc.Columns`, parameter order
+  and direction (`"input"`/`"output"`), `Nullable` valid-true / valid-false /
+  invalid, and `Active` valid-false for an inactive index and trigger.
+- `TestInterBaseProcedureParameterDomainIsUserOnly`: a parameter whose
+  `FieldSource` is a user domain reports that name in `Domain`; a parameter
+  whose `FieldSource` is an `RDB$`-prefixed system domain, and one whose domain
+  has `SystemFlag = 1`, both report `Domain == ""` with the inline `Type`
+  rendered instead — the two-condition test from §4.4.
+- `TestInterBaseColumnWithoutDomainRowIsRetained`: a `RDB$RELATION_FIELDS` row
+  whose `RDB$FIELD_SOURCE` has no `RDB$FIELDS` match is **kept** with
+  `Type: ""`, not dropped. This is a deliberate, asserted behavior change:
+  today's inner `JOIN RDB$FIELDS` (`interbase_common.go:195-196`) silently drops
+  such a column, while `schema` LEFT JOINs and yields `Domain == nil`. Showing a
+  column with an unknown type beats hiding a column that exists.
 - `TestInterBaseObjectDDL`: table DDL for a plain table returns a `CREATE TABLE`
   containing the quoted name; a table with a computed column returns an error
-  satisfying `errors.Is(err, ErrDDLUnsupported)` whose message names the column;
-  `ObjectKindFunction` always returns `ErrDDLUnsupported`; an unknown name
-  returns `ErrObjectNotFound`.
+  satisfying `errors.Is(err, ErrUnsupportedDDL)` for which
+  `UnsupportedDDLDetail` reports `ok == true` with the object kind, the table
+  name and a feature string naming the column — asserted structurally, not by
+  substring match on the message; `ObjectKindFunction` always returns
+  `ErrUnsupportedDDL`; `ObjectKindGenerator` returns `CREATE GENERATOR` text;
+  an unknown name returns `ErrObjectNotFound`.
 - `TestInterBaseCurrentDatabaseAndDatabases`: with a `DatabaseName` the
   repository returns it from both methods; without one, `""` and `[]string{}`
   (preserving the current assertions at `interbase_test.go:18-23`).
@@ -1023,6 +1294,18 @@ existing test is extended with the tables `schema` reads
   `Worker.Cache().Catalog` is non-nil and the previously returned `*DBCache`
   snapshot is unaffected (copy-on-write, mirroring the existing
   `setColumnCache` contract).
+- `TestWorkerCatalogPassRunsDespiteColumnPassError`: a repository whose
+  `DescribeDatabaseTable` fails but whose catalog methods succeed still yields a
+  populated `Catalog`, guarding the independence rule in §4.5.
+- `TestWorkerUpdateSignalDoesNotBlock`: with the worker goroutine stopped and
+  the `update` slot already full, `ReCache` returns rather than blocking —
+  the non-blocking-send guard.
+- `TestCacheBuildUsesOneCatalogSnapshot`: a counting repository implementing
+  `CatalogSnapshotRepository` asserts `CatalogSnapshot` is opened once and
+  closed once per `GenerateDBCachePrimary`, and that `SchemaTables`,
+  `DescribeDatabaseTableBySchema` and `DescribeForeignKeysBySchema` are served
+  from it; a repository without the interface still builds correctly through
+  the direct path.
 
 **`internal/handler/interbase_test.go`**
 
@@ -1064,7 +1347,7 @@ created, following the existing skip pattern at `:22-28`:
   (the measurement that feeds the §8 trigger).
 - `TestInterBaseLiveObjectDDL`: for the first table, `ObjectDDL` either returns
   text starting with `CREATE TABLE` or an error satisfying
-  `errors.Is(err, ErrDDLUnsupported)`; the same for the first procedure; a
+  `errors.Is(err, ErrUnsupportedDDL)`; the same for the first procedure; a
   deliberately unknown name returns `ErrObjectNotFound`.
 - `TestInterBaseLiveExplainPlan`: `ExplainPlan(ctx, "SELECT RDB$RELATION_ID FROM
   RDB$DATABASE")` returns non-empty text and does not execute a result set.
@@ -1172,21 +1455,28 @@ configuration API (README.md:328) is replaced by item 3.
    relation; `Constraints` costs 1 + roughly four per constraint (enforcing
    index, its segments, referenced index, its segments); `Procedures` costs 1 +
    one per procedure plus one per parameter domain. For a catalog with `R`
-   relations, `K` constraints and `P` procedures the primary pass is roughly
+   relations, `K` constraints and `P` procedures the primary pass is
    `1 + R + 4K` round trips and the catalog pass adds roughly `P + parameters +
-   indexes + triggers`. Mitigations in this design: one read-only transaction
-   per cache build, and moving the extended catalog to the asynchronous
+   indexes + triggers`. Mitigations in this design: the snapshot capability in
+   §4.3, which collapses the naive `2 + 2R + 4K` to `1 + R + 4K` by reading
+   relations and constraints once per cache build; one read-only transaction per
+   build for consistency; and moving the extended catalog to the asynchronous
    secondary pass so only the primary pass affects startup. **Trigger for
    escalation:** if the live measurement on the `centrale` database shows the
    primary pass above 5 seconds or the catalog pass above 30 seconds, the fix is
    a bulk projection added to the driver's `schema` package (a driver change,
    deferred out of this sub-project, not a re-introduction of hand-written
-   queries in sqls).
+   queries in sqls). The concrete driver-side opportunities, in order of value:
+   a name-only relation projection for `SchemaTables`, a single-query columns
+   projection across all relations, and a constraint projection that returns
+   segment names without a per-index round trip.
 2. **Type-rendering regressions.** Moving from a nine-case switch to
-   `Domain.SQLType()` plus overrides changes strings users see. The dialect
-   table test pins every case that the current code handles, plus the cases the
-   current code gets wrong; anything not in that table renders `TYPE(n)` rather
-   than a guess.
+   `Domain.SQLType()` changes strings users see. Mitigated structurally rather
+   than by vigilance: the existing switch is *retained* as the fallback (§4.3
+   rule 4), so `SQLType()` can only upgrade a rendering, never degrade one, and
+   `TYPE(n)` is reached exactly where today's code reaches it. The dialect table
+   test pins every case the current code handles plus every path where
+   `SQLType()` returns `ErrUnsupportedDDL`.
 3. **DDL frequently unavailable.** Computed columns block table DDL and unknown
    parameter nullability blocks procedure DDL, both realistic in the target
    database. Mitigated by the specified fallback: cached descriptor rendering
@@ -1198,11 +1488,91 @@ configuration API (README.md:328) is replaced by item 3.
    this is a fork-local constraint, recorded in §5 as an upstreaming blocker for
    the catalog files only.
 6. **Sub-project 1 dependency.** `ExplainPlan` and dialect resolution need
-   `interbase.Diagnostics` and `interbase.Plan`. If sub-project 1's helper
-   signatures land differently, only `interbase_native.go` changes; the
-   capability interfaces, descriptors and cache do not.
-7. **Cross-dialect test coverage needs two databases.** The live dialect tests
+   `interbase.Diagnostics` and `interbase.Plan`. Sub-project 1's spec
+   (`docs/superpowers/specs/2026-09-19-pooled-introspection-design.md` in the
+   driver repo) specifies exactly the assumed signatures, so the risk is now
+   schedule, not shape; if they land differently, only `interbase_native.go`
+   changes.
+7. **Companion `schema` accessors dependency (new).** `TriggerDesc.Event`,
+   `FunctionArgumentDesc.Type` and `FunctionDesc.ReturnType` need exported
+   accessors that do not exist yet and that this spec deliberately does not
+   design. Until
+   `docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md` lands
+   in the driver repo, those three fields render `""`. The blast radius is three
+   display fields, not the cache or the capability contract, so plan 2 can ship
+   with them empty and fill them in afterwards.
+8. **Cross-dialect test coverage needs two databases.** The live dialect tests
    are meaningful only if run against both a Dialect 1 and a Dialect 3 database.
    The offline table-driven tests cover the lexing and rendering differences
    without a server, so the live suite verifies resolution and wiring rather
    than dialect semantics.
+
+## Plan decomposition
+
+Three plans. Each delivers working, reviewable software on its own and has a
+test suite that passes before the next begins.
+
+### Plan 1 — Dialect resolution and propagation
+
+**Contents.** §4.1 in full (`DBConfig.Dialect` and its validation, the
+`interBaseOpen` connect flow, `DBConnection.Variant`/`DatabaseName`/`Warnings`,
+`ConnFactory`/`RegisterConnFactory`/`CreateRepositoryFromConnection`, the
+mismatch warning and its delivery through `lsp.Messenger.ShowWarning`) and §4.2
+in full (`SQLVariant`, `DriverVariant`, the parameterized `InterBaseDialect`,
+the `quotedStringEscapePreserver` lexer interface, and the variant-aware
+siblings in `dialect/`, `parser/`, `internal/completer/`,
+`internal/handler/`). Tests: `dialect/interbase_test.go`,
+`parser/parser_test.go`, `token/lexer_test.go`,
+`internal/completer/completer_test.go`, the `internal/handler/interbase_test.go`
+variant cases, and the live `TestInterBaseLiveDialectAutoDetect` and
+`TestInterBaseLiveExplicitDialectMismatchWarnsAndConnects`. README item 1.
+
+**Dependencies.** Sub-project 1 only, for `interbase.Diagnostics`.
+
+**Delivers.** The live correctness bug is fixed: a Dialect 3 database is lexed,
+parsed, completed and formatted correctly; `'c''d'` survives formatting in both
+dialects; auto-detect and the mismatch warning work against a real server. No
+catalog code changes, so the risk surface is the lexer and the connect path
+only.
+
+### Plan 2 — Catalog migration, capabilities, cache
+
+**Contents.** §4.3, §4.4 and §4.5: the `schema`-backed repository, the snapshot
+capability, dialect-aware type rendering with the retained fallback switch, the
+capability interfaces and descriptor types, `UnsupportedDDLDetail`, and the
+`CatalogCache` plus worker changes. Tests:
+`internal/database/interbase_catalog_test.go`, `capability_test.go`,
+`cache_test.go`, and the live `TestInterBaseLiveCatalogObjectsSurface`,
+`TestInterBaseLiveObjectDDL`, `TestInterBaseLiveExplainPlan`. README item 4.
+
+**Dependencies.** Consumes `SQLDialect` and `DatabaseName` from plan 1, but the
+zero value means Dialect 3, so plan 2 is independently buildable and testable
+against the fixture even if plan 1 slips. Also depends on the companion
+`schema` accessors spec for three display fields (§8 risk 7) — that dependency
+gates only the final task, not the plan.
+
+**Delivers.** The hand-written `RDB$` queries are gone, `DBRepository` behavior
+is preserved (asserted by the migrated existing test), Dialect 3 types render
+correctly, the extended catalog is cached, and sub-project 3 has the exact
+contract it consumes.
+
+### Plan 3 — Connection configuration and database identity
+
+**Contents.** §4.6 and §4.7: `InterBaseConfig`, `InterBaseTLSConfig`, the
+structured `interbase.Config` mapping, the widened charset allowlist, and
+`CurrentDatabase`/`Databases`/`switchDatabase`. Tests:
+`internal/database/interbase_config_test.go`,
+`TestInterBaseCurrentDatabaseAndDatabases`. README items 2, 3 and 5, plus the
+`schema.json` change.
+
+**Dependencies.** Plan 1, which owns the `interbase.Config` construction site
+that plan 3 extends.
+
+**Delivers.** TLS- and role-capable connections with security wording that does
+not overclaim, a `connectTimeout` that bounds the native handshake, all five
+charsets the driver accepts, and a `showDatabases` that prints something.
+
+**On the ordering.** Plans 2 and 3 are independent of each other and could run
+in parallel; both depend on plan 1. Plan 1 first is not merely topological — it
+is the one that fixes the reported bug, so it delivers user-visible value before
+any refactor lands.
