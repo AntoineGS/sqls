@@ -339,6 +339,8 @@ func TestNonInterBaseRepositoriesDoNotImplementCapabilities(t *testing.T) {
 		dialect.DatabaseDriverMssql:      NewMssqlDBRepository(nil),
 		dialect.DatabaseDriverH2:         NewH2DBRepository(nil),
 		dialect.DatabaseDriverVertica:    NewVerticaDBRepository(nil),
+		dialect.DatabaseDriverClickhouse: NewClickhouseRepository(nil),
+		dialect.DatabaseDriverOracle:     NewOracleDBRepository(nil),
 		dialect.DatabaseDriver("mock"):   NewMockDBRepository(nil),
 	}
 
@@ -584,6 +586,15 @@ git commit -m "feat(database): add the driver-neutral catalog capability contrac
 
 Test-only. The fixture is what makes every later task testable with plain `go test ./...`, and it has two non-obvious problems — the `NOT STARTING WITH` clause and CHAR padding — that a reviewer should be able to judge on their own.
 
+One consequence worth stating so nobody later reads it as a regression: this file
+imports `github.com/mattn/go-sqlite3` **by name** (it needs `sqlite3.SQLiteDriver`
+to wrap), where today the package only ever reaches SQLite through
+`sql.Open("sqlite3", …)`. That makes `go test ./internal/database` fail to
+*compile* under `CGO_ENABLED=0`, where today it compiles and fails at run time
+instead. Nothing real is lost — the suite already requires a working SQLite
+driver — and the untagged *production* build is unaffected, because this is a
+`_test.go` file.
+
 **Files:**
 - Create: `internal/database/interbase_catalog_test.go`
 - Test: itself
@@ -592,6 +603,7 @@ Test-only. The fixture is what makes every later task testable with plain `go te
 - Consumes: `interBaseFixed(value string) string` (`internal/database/interbase_test.go:416-418`), which right-pads to 31 characters; `schema.New`, `schema.Catalog` (`interbase-go/schema`).
 - Produces (test scope):
   - `func openInterBaseSchemaFixture(t *testing.T) *sql.DB` — an in-memory catalog the `schema` package can read end to end.
+  - `func interBaseFixtureCountPrepares(t *testing.T) func() int64` — resets and reads the statement counter; Task 8 uses it to measure the N+1 mitigation.
   - The registered driver name `"sqlite3_interbase_catalog"`.
 
 - [ ] **Step 1: Write the fixture and its smoke test**
@@ -636,14 +648,30 @@ func interBaseFixtureRewrite(query string) string {
 	return strings.ReplaceAll(query, "NOT STARTING WITH 'RDB$'", "NOT LIKE 'RDB$%'")
 }
 
+// interBaseFixturePrepares counts every statement the fixture prepares. Because
+// this wrapper forces all traffic through PrepareContext (see below), the count
+// is the exact round-trip count for a catalog build, which is what turns Task
+// 8's N+1 claim into a measurement instead of an argument.
+var interBaseFixturePrepares atomic.Int64
+
+// interBaseFixtureCountPrepares resets the counter and returns a reader for it.
+// Tests using it must not run in parallel with each other.
+func interBaseFixtureCountPrepares(t *testing.T) func() int64 {
+	t.Helper()
+	interBaseFixturePrepares.Store(0)
+	return interBaseFixturePrepares.Load
+}
+
 // Embedding driver.Conn promotes only the driver.Conn methods, so this wrapper
 // deliberately does not satisfy driver.QueryerContext; database/sql therefore
 // routes every statement through PrepareContext, where the rewrite applies.
 func (c interBaseFixtureConn) Prepare(query string) (driver.Stmt, error) {
+	interBaseFixturePrepares.Add(1)
 	return c.Conn.Prepare(interBaseFixtureRewrite(query))
 }
 
 func (c interBaseFixtureConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	interBaseFixturePrepares.Add(1)
 	if preparer, ok := c.Conn.(driver.ConnPrepareContext); ok {
 		return preparer.PrepareContext(ctx, interBaseFixtureRewrite(query))
 	}
@@ -909,6 +937,18 @@ func TestInterBaseSchemaFixtureFeedsTheCatalogReader(t *testing.T) {
 	domains, err := catalog.Domains(ctx, "")
 	if err != nil {
 		t.Fatalf("Domains() error = %v (the NOT STARTING WITH rewrite is missing or wrong)", err)
+	}
+	// Assert presence before absence. The loop below asserts nothing at all on
+	// an empty result set, so without this the test that advertises itself as
+	// the rewrite guard would pass against a fixture returning no domains.
+	userDomains := map[string]bool{}
+	for _, domain := range domains {
+		userDomains[domain.Name] = true
+	}
+	for _, want := range []string{"EMAIL_ADDRESS", "CUSTOMER_CODE"} {
+		if !userDomains[want] {
+			t.Errorf("Domains() did not return the user domain %q; got %v", want, domains)
+		}
 	}
 	for _, domain := range domains {
 		if strings.HasPrefix(domain.Name, "RDB$") {
@@ -3125,7 +3165,7 @@ git commit -m "feat(database): reproduce InterBase object DDL with a structured 
 
 ## Task 8: `CatalogSnapshot` and one catalog read per cache build
 
-The N+1 mitigation, and the only structural one available without changing the driver. `GenerateDBCachePrimary` calls `SchemaTables`, then `DescribeDatabaseTableBySchema`, then `DescribeForeignKeysBySchema` (`cache.go:43-59`); mapping each independently onto `catalog.Relations` would walk every relation twice, because `Relations` issues one column query per relation. A snapshot collapses `2 + 2R + 4K` round trips to `1 + R + 4K`, under one consistency boundary.
+The N+1 mitigation, and the only structural one available without changing the driver. `GenerateDBCachePrimary` calls `SchemaTables`, then `DescribeDatabaseTableBySchema`, then `DescribeForeignKeysBySchema` (`cache.go:43-59`); mapping each independently onto `catalog.Relations` would walk every relation twice, because `Relations` issues one column query per relation. A snapshot collapses `2 + 2R + 4K` round trips to `2 + R + 4K`, under one consistency boundary — the per-relation term halves, which is the term that grows with the schema. (The constant is 2, not 1: one `Relations` query and one `Constraints` query. The spec phrases it as `1 + R + 4K` by folding the constraints query into the `4K`; the arithmetic below is the exact count.)
 
 **Files:**
 - Modify: `internal/database/interbase_catalog.go` (add `CatalogSnapshot`)
@@ -3230,7 +3270,66 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 		t.Errorf("the source repository must stay usable after the snapshot closes: %v", err)
 	}
 }
+
+func TestInterBaseCatalogSnapshotHalvesThePerRelationReads(t *testing.T) {
+	// The reason CatalogSnapshot exists is round-trip count, so count them
+	// rather than asserting the structure and trusting the arithmetic. The
+	// fixture's driver funnels every statement through PrepareContext, so the
+	// counter is the exact number of statements a cache build issues.
+	db := openInterBaseSchemaFixture(t)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	// The direct path: SchemaTables and DescribeDatabaseTableBySchema each walk
+	// every relation, because Relations issues one column query per relation.
+	prepares := interBaseFixtureCountPrepares(t)
+	if _, err := repo.SchemaTables(ctx); err != nil {
+		t.Fatalf("SchemaTables() error = %v", err)
+	}
+	if _, err := repo.DescribeDatabaseTableBySchema(ctx, ""); err != nil {
+		t.Fatalf("DescribeDatabaseTableBySchema() error = %v", err)
+	}
+	if _, err := repo.DescribeForeignKeysBySchema(ctx, ""); err != nil {
+		t.Fatalf("DescribeForeignKeysBySchema() error = %v", err)
+	}
+	direct := prepares()
+
+	// The snapshot path: one Relations read shared by both.
+	prepares = interBaseFixtureCountPrepares(t)
+	snapshot, closeSnapshot, err := repo.CatalogSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CatalogSnapshot() error = %v", err)
+	}
+	if _, err := snapshot.SchemaTables(ctx); err != nil {
+		t.Fatalf("snapshot SchemaTables() error = %v", err)
+	}
+	if _, err := snapshot.DescribeDatabaseTableBySchema(ctx, ""); err != nil {
+		t.Fatalf("snapshot DescribeDatabaseTableBySchema() error = %v", err)
+	}
+	if _, err := snapshot.DescribeForeignKeysBySchema(ctx, ""); err != nil {
+		t.Fatalf("snapshot DescribeForeignKeysBySchema() error = %v", err)
+	}
+	if err := closeSnapshot(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+	snapshotted := prepares()
+
+	// Do not pin an exact number: it moves whenever the fixture gains a
+	// relation or a constraint, and the claim is about growth, not a constant.
+	// The per-relation term is what halves, so the snapshot path must issue
+	// strictly fewer statements than the direct path for the same answers.
+	if snapshotted >= direct {
+		t.Errorf("snapshot issued %d statements, direct issued %d; the snapshot must share one relation read",
+			snapshotted, direct)
+	}
+	t.Logf("catalog reads: direct %d statements, snapshot %d", direct, snapshotted)
+}
 ```
+
+That test is the evidence for the claim in this task's preamble. If it ever
+reports `snapshot >= direct`, the snapshot is being rebuilt per call rather than
+reused, and the mitigation is not doing anything — stop and fix it rather than
+relaxing the assertion.
 
 Create `internal/database/cache_test.go`:
 
