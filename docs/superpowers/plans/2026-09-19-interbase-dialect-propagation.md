@@ -3347,7 +3347,12 @@ git commit -m "feat(handler): surface InterBase connect warnings through ShowWar
 Only item 1 of the spec's six-item README rewrite belongs to this plan. Items 2, 3 and 5 (connection keys, TLS, single attachment) are plan 3; item 4 (metadata depth) is plan 2. The stale sentences that plan 1 directly contradicts are removed here.
 
 **Files:**
-- Modify: `README.md:290`, `:313-325`
+- Modify: `README.md:290` (the section title), `:315-320` (the dialect paragraph, replaced), `:325` (two sentences deleted from the metadata paragraph)
+
+Three plans edit this one README section, and each is scoped so they can land in
+any order. This plan owns the section title, the dialect paragraph, and the two
+dialect sentences at the end of the metadata paragraph — nothing else. See the
+ownership table in Step 2.
 
 **Interfaces:** none.
 
@@ -3369,6 +3374,25 @@ with:
 
 Replace lines 315-325, which currently read:
 
+> **Sentence ownership — do not replace the whole paragraph.** Three plans edit
+> this one section of the README, and the other two deliberately scope their
+> edits to a single sentence so the three can land in any order:
+>
+> | Sentence | Owner |
+> | --- | --- |
+> | "Completion and hover use user table/view, column, primary-key, and foreign-key metadata." | Plan 2 (catalog migration), README item 4 |
+> | "InterBase has no schema namespace or database enumeration through this adapter, so switching databases is not supported; configure separate connections instead." | Plan 3 (connection config), README item 5 |
+> | "Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported." | **This plan** |
+>
+> An earlier draft of this step replaced lines 315-325 wholesale and reproduced
+> the other two sentences verbatim inside its replacement. That compiles to the
+> right text when this plan lands first, but it silently reverts either sibling
+> that landed before it — which defeats the order-independence they were
+> written for. Replace the dialect paragraph, then delete the two dialect
+> sentences from the next paragraph, and touch nothing else.
+
+The dialect paragraph at `README.md:315-320` currently reads:
+
 ```markdown
 The driver always uses client SQL Dialect 1; no dialect parameter is necessary.
 Both single and double quotes delimit strings, doubled quotes escape a quote,
@@ -3376,14 +3400,9 @@ unquoted identifiers may contain `$`, and positional parameters use `?`.
 Parsing and formatting use these rules when the selected connection is
 InterBase. Parameter binding is a driver capability; the sqls execute command
 does not prompt for parameter values.
-
-Completion and hover use user table/view, column, primary-key, and foreign-key
-metadata. InterBase has no schema namespace or database enumeration through this
-adapter, so switching databases is not supported; configure separate connections
-instead. Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported.
 ```
 
-with the text below.
+Replace **that paragraph only** with the text below.
 
 > **Fence warning.** The replacement contains a ```` ```yaml ```` example, so it is a
 > fenced block inside a fenced block. Most renderers — and a naive copy — will
@@ -3426,14 +3445,33 @@ when the selected connection is InterBase; with no connection open, InterBase
 documents are parsed as Dialect 3, matching the driver default. Parameter
 binding is a driver capability; the sqls execute command does not prompt for
 parameter values.
+```
 
-Completion and hover use user table/view, column, primary-key, and foreign-key
-metadata. InterBase has no schema namespace or database enumeration through this
-adapter, so switching databases is not supported; configure separate connections
+The paragraph that follows in `README.md` — the one beginning "Completion and
+hover use user table/view…" — is **not** part of this replacement. Leave it in
+place; Step 3 edits two sentences out of it and nothing else.
+
+- [ ] **Step 3: Delete the two dialect sentences from the metadata paragraph**
+
+That paragraph currently ends:
+
+```
+instead. Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported.
+```
+
+Delete both dialect sentences so the line ends at `instead.`:
+
+```
 instead.
 ```
 
-- [ ] **Step 3: Verify no stale claim survives**
+Change nothing else in that paragraph. Its first sentence belongs to plan 2 and
+its middle sentence to plan 3, and both of those plans replace their own
+sentence in place — so if either has already landed, the surrounding text will
+not match what is quoted here and that is expected. Match on the two dialect
+sentences, not on the whole line.
+
+- [ ] **Step 4: Verify no stale claim survives**
 
 Run: `grep -n 'Dialect 3 is not supported\|always uses client SQL Dialect 1\|SQL Dialect 1)' README.md`
 Expected: no output.
@@ -3441,19 +3479,24 @@ Expected: no output.
 Run: `grep -n 'dialect' README.md | head -20`
 Expected: the new paragraphs, and no claim that a dialect parameter is unnecessary.
 
-Run: `grep -c 'switching databases is not supported' README.md`
-Expected: `1`. This is the last line of the replacement, after the nested YAML
-fence — a zero here means the paste stopped at the inner fence and the tail of
-the section is missing.
+Run: `grep -c 'parameter values\.' README.md`
+Expected: at least `1`. That sentence is the last line of the Step 2
+replacement, after the nested YAML fence — a zero means the paste stopped at the
+inner fence and the tail of the new paragraph is missing.
+
+Run: `grep -n 'Completion and hover use' README.md`
+Expected: exactly one hit, and the paragraph is still present. A zero here means
+Step 2 swallowed a paragraph it does not own — restore it before continuing,
+because plans 2 and 3 edit sentences inside it.
 
 The TLS sentence at what was line 328 ("the driver exposes no TLS configuration API") stays for now: it is still true until plan 3 lands TLS support, and rewriting it is plan 3's README item 3.
 
-- [ ] **Step 4: Run the whole suite one final time**
+- [ ] **Step 5: Run the whole suite one final time**
 
 Run: `go test ./...`
 Expected: every package `ok`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add README.md
