@@ -40,8 +40,12 @@ Values copied verbatim from the spec. Every task's requirements implicitly inclu
 - `IsIdentifierStart`, `IsIdentifierPart` (`$` allowed after the first character), `IsPlaceHolderStart('?')` and `MatchKeyword` are unchanged and dialect independent.
 - **No dialect other than `InterBaseDialect` implements the new optional lexer interfaces**, so nothing else changes.
 - InterBase attach and `Diagnostics` require cgo and the `interbase` build tag (`//go:build interbase && cgo && linux && amd64`).
-- `CreateRepositoryFromConnection` prefers a registered `ConnFactory` and falls back to the existing `*sql.DB` factory, so every other driver is untouched and `CreateRepository` keeps working.
+- `CreateRepositoryFromConnection` prefers a registered `ConnFactory` and falls back to the existing `*sql.DB` factory, so every other driver is untouched and `CreateRepository` keeps working. **It takes the driver as an explicit argument rather than reading `DBConnection.Driver`**, because `openPostgreSQL` (`postgresql.go:55`), `openSQLite3` (`sqlite3.go:24`) and the `"mock"` opener (`database_mock.go:549`) all leave that field empty; keying the lookup off it returns `driver not found` for PostgreSQL, SQLite3 and every handler test.
 - Services-backed administration (backup, restore, sweep, user management) is out of scope for the entire project.
+
+### Execution order: 1 → 2 → 3 → 4 → 5 → 6 → **9** → 7 → 8 → 10 → 11 → 12 → 13 → 14
+
+Task 9 is executed **after Task 6 and before Task 7**, out of numerical order. Task 7's `parserDriverVariant()` calls `DBConnection.DriverVariant()` and Task 8's tests construct `DBConnection{Variant: …}` — both arrive in Task 9, and Task 9 depends on nothing from Tasks 7 or 8. The numbering is left as written so that the cross-references throughout this document stay valid; only the order of execution changes. Tasks 7 and 9 each restate this at the point where it matters.
 
 ### Dependency: `interbase.Diagnostics` is not yet implemented
 
@@ -1258,6 +1262,7 @@ func TestCompleteInterBaseKeywordsByVariant(t *testing.T) {
 	tests := []struct {
 		name    string
 		variant dialect.SQLVariant
+		prefix  string
 		want    []string
 		absent  []string
 	}{
@@ -1267,9 +1272,25 @@ func TestCompleteInterBaseKeywordsByVariant(t *testing.T) {
 			absent:  []string{"TIME", "TIMESTAMP"},
 		},
 		{
+			// Absence alone would also hold if completion returned nothing at
+			// all, so this case proves the pipeline runs under dialect 1.
+			// TRIGGER is in the shared InterBase keyword list, not the
+			// dialect 3 delta, so it must be offered under both variants.
+			name:    "dialect 1 still offers its own keywords",
+			variant: dialect.SQLVariantInterBase1,
+			prefix:  "TRI",
+			want:    []string{"TRIGGER"},
+		},
+		{
 			name:    "dialect 3 offers TIME and TIMESTAMP",
 			variant: dialect.SQLVariantInterBase3,
 			want:    []string{"TIME", "TIMESTAMP"},
+		},
+		{
+			name:    "dialect 3 keeps the shared keywords too",
+			variant: dialect.SQLVariantInterBase3,
+			prefix:  "TRI",
+			want:    []string{"TRIGGER"},
 		},
 		{
 			name:    "the default variant is dialect 3",
@@ -1284,7 +1305,10 @@ func TestCompleteInterBaseKeywordsByVariant(t *testing.T) {
 			c.Driver = dialect.DatabaseDriverInterBase
 			c.Variant = tt.variant
 
-			const text = "TIM"
+			text := tt.prefix
+			if text == "" {
+				text = "TIM"
+			}
 			got, err := c.Complete(text, lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 					Position: lsp.Position{Line: 0, Character: len(text)},
@@ -1714,11 +1738,15 @@ func (s *Server) parserDriverVariant() dialect.DriverVariant {
 }
 ```
 
-`DBConnection.DriverVariant()` arrives in Task 9. Until then, add a temporary body of `return dialect.DriverVariant{Driver: s.dbConn.Driver}` and replace it in Task 9 — **or** complete Task 9 before this step. Prefer completing Task 9 first if the executing agent can reorder; otherwise use the temporary body and Task 9's Step 5 replaces it.
+**Prerequisite: Task 9 must already be complete.** `DBConnection.DriverVariant()` arrives there, and Task 8's tests set `DBConnection.Variant`, which arrives there too. Task 9 depends on nothing from Tasks 7 or 8, so the execution order is **6 → 9 → 7 → 8 → 10**; the task numbers are kept as written so that cross-references elsewhere in this plan stay valid.
+
+If you are executing Task 7 and `DBConnection.DriverVariant` does not exist, stop and do Task 9 first. Do not write a temporary body that reads `s.dbConn.Driver` directly: it compiles, it makes this task's tests pass, and it silently reports the default variant for every InterBase connection — which is the exact bug this plan exists to fix, reintroduced one layer up.
 
 - [ ] **Step 4: Add the five helper siblings**
 
 Each of the five is the same three-part edit: rename the existing function to `…WithDriverVariant` and change its last parameter to `dv dialect.DriverVariant`; change the one `parser.ParseWithDriver(text, driver)` line inside it to `parser.ParseWithDriverVariant(text, dv)`; and add a one-line retained function under the old name. Nothing else inside any body changes.
+
+> **The `…WithDriverVariant` blocks below are not complete functions.** `// unchanged body, except:` and `// ...` are elisions: the existing body stays exactly as it is in the file, and the only line that changes is the `parser.ParseWithDriver` call. Do not paste these blocks over the real functions — you would delete five working implementations. Edit in place: change the signature line, change the one parse line, and add the wrapper above.
 
 `internal/handler/hover.go` — rename `hoverWithDriver` (line 51) to `hoverWithDriverVariant`, change its signature and its parse call, then add the retained wrapper above it:
 
@@ -2111,7 +2139,7 @@ git commit -m "test(handler): pin language-server formatting under both InterBas
   - `func (db *DBConnection) DriverVariant() dialect.DriverVariant` — nil-safe
   - `type ConnFactory func(*DBConnection) DBRepository`
   - `func RegisterConnFactory(name dialect.DatabaseDriver, factory ConnFactory)`
-  - `func CreateRepositoryFromConnection(conn *DBConnection) (DBRepository, error)`
+  - `func CreateRepositoryFromConnection(driver dialect.DatabaseDriver, conn *DBConnection) (DBRepository, error)`
   - `func NewInterBaseDBRepositoryFromConnection(conn *DBConnection) DBRepository`
   - `InterBaseDBRepository` gains `SQLDialect int` and `DatabaseName string`
 
@@ -2153,7 +2181,7 @@ func TestCreateRepositoryFromConnectionPrefersConnFactory(t *testing.T) {
 		DatabaseName: "db.example.test/3050:/srv/interbase/example.ib",
 	}
 
-	repo, err := CreateRepositoryFromConnection(conn)
+	repo, err := CreateRepositoryFromConnection(dialect.DatabaseDriverInterBase, conn)
 	if err != nil {
 		t.Fatalf("CreateRepositoryFromConnection() error = %v", err)
 	}
@@ -2170,26 +2198,44 @@ func TestCreateRepositoryFromConnectionPrefersConnFactory(t *testing.T) {
 }
 
 func TestCreateRepositoryFromConnectionFallsBackToFactory(t *testing.T) {
-	// PostgreSQL registers no ConnFactory, so the *sql.DB factory is used and
-	// every other driver stays untouched by this change.
-	conn := &DBConnection{Driver: dialect.DatabaseDriverPostgreSQL}
-	repo, err := CreateRepositoryFromConnection(conn)
-	if err != nil {
-		t.Fatalf("CreateRepositoryFromConnection() error = %v", err)
-	}
-	if repo == nil {
-		t.Fatal("CreateRepositoryFromConnection() returned a nil repository")
-	}
-	if got, want := repo.Driver(), dialect.DatabaseDriverPostgreSQL; got != want {
-		t.Errorf("repository driver = %q, want %q", got, want)
+	// Drivers that register no ConnFactory fall back to the *sql.DB factory and
+	// stay untouched by this change.
+	//
+	// Every case here leaves DBConnection.Driver EMPTY on purpose. That is what
+	// the real openers produce: openPostgreSQL (postgresql.go:55), openSQLite3
+	// (sqlite3.go:24) and the "mock" opener (database_mock.go:549) all return a
+	// DBConnection with no Driver set. A lookup keyed off conn.Driver passes a
+	// hand-built {Driver: postgresql} literal and fails every real connection,
+	// so constructing one here would make this test agree with the bug.
+	for _, driver := range []dialect.DatabaseDriver{
+		dialect.DatabaseDriverPostgreSQL,
+		dialect.DatabaseDriverSQLite3,
+		dialect.DatabaseDriverMySQL,
+	} {
+		t.Run(string(driver), func(t *testing.T) {
+			conn := &DBConnection{}
+			if conn.Driver != "" {
+				t.Fatalf("this test is only meaningful with an empty conn.Driver, got %q", conn.Driver)
+			}
+			repo, err := CreateRepositoryFromConnection(driver, conn)
+			if err != nil {
+				t.Fatalf("CreateRepositoryFromConnection(%q) error = %v", driver, err)
+			}
+			if repo == nil {
+				t.Fatal("CreateRepositoryFromConnection() returned a nil repository")
+			}
+			if got := repo.Driver(); got != driver {
+				t.Errorf("repository driver = %q, want %q", got, driver)
+			}
+		})
 	}
 }
 
 func TestCreateRepositoryFromConnectionRejectsNil(t *testing.T) {
-	if _, err := CreateRepositoryFromConnection(nil); err == nil {
+	if _, err := CreateRepositoryFromConnection(dialect.DatabaseDriverPostgreSQL, nil); err == nil {
 		t.Fatal("CreateRepositoryFromConnection(nil) returned a nil error")
 	}
-	if _, err := CreateRepositoryFromConnection(&DBConnection{Driver: "nope"}); err == nil {
+	if _, err := CreateRepositoryFromConnection("nope", &DBConnection{}); err == nil {
 		t.Fatal("CreateRepositoryFromConnection() with an unknown driver returned a nil error")
 	}
 }
@@ -2292,14 +2338,21 @@ func RegisterConnFactory(name dialect.DatabaseDriver, factory ConnFactory) {
 // CreateRepositoryFromConnection builds a repository for a connection,
 // preferring a registered ConnFactory and falling back to the *sql.DB factory
 // so that drivers which register no ConnFactory are unaffected.
-func CreateRepositoryFromConnection(conn *DBConnection) (DBRepository, error) {
+//
+// The driver is passed in rather than read from conn.Driver because that field
+// is not populated by every opener: openPostgreSQL (postgresql.go:55),
+// openSQLite3 (sqlite3.go:24) and the "mock" opener (database_mock.go:549) all
+// return a DBConnection with an empty Driver. The caller's configured driver is
+// always populated, so keying the lookup off conn.Driver would return
+// "driver not found" for PostgreSQL, SQLite3 and every handler test.
+func CreateRepositoryFromConnection(driver dialect.DatabaseDriver, conn *DBConnection) (DBRepository, error) {
 	if conn == nil {
 		return nil, fmt.Errorf("connection is nil")
 	}
-	if factory, ok := driverConnFactories[conn.Driver]; ok {
+	if factory, ok := driverConnFactories[driver]; ok {
 		return factory(conn), nil
 	}
-	return CreateRepository(conn.Driver, conn.Conn)
+	return CreateRepository(driver, conn.Conn)
 }
 ```
 
@@ -2360,7 +2413,7 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 	if s.curDBCfg == nil || s.dbConn == nil {
 		return nil, ErrNoConnection
 	}
-	repo, err := database.CreateRepositoryFromConnection(s.dbConn)
+	repo, err := database.CreateRepositoryFromConnection(s.curDBCfg.Driver, s.dbConn)
 	if err != nil {
 		return nil, err
 	}
@@ -2368,7 +2421,9 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 }
 ```
 
-If Task 7 left a temporary body in `parserDriverVariant`, replace it now with `return s.dbConn.DriverVariant()`.
+The driver still comes from `s.curDBCfg.Driver`, exactly as the current body does — only the second argument is new. Do **not** "simplify" this to `s.dbConn.Driver`: the openers for PostgreSQL, SQLite3 and the test mock leave that field empty, and the whole `internal/handler` suite fails with `driver not found` if you do.
+
+This task runs **before** Task 7 (execution order 6 → 9 → 7 → 8 → 10), so `parserDriverVariant` does not exist yet and there is nothing to replace here. If you find it already present with a body reading `s.dbConn.Driver` directly, someone ran Task 7 early against the instruction there — fix it to `return s.dbConn.DriverVariant()` now.
 
 - [ ] **Step 6: Run the database and handler tests to verify they pass**
 
@@ -2914,7 +2969,11 @@ func TestInterBaseLiveExplicitDialectMismatchWarnsAndConnects(t *testing.T) {
 		opposite = 3
 	}
 
-	connection, err := Open(interBaseLiveConfig(t, opposite))
+	cfg := interBaseLiveConfig(t, opposite)
+	if cfg.Alias == "" {
+		t.Fatal("interBaseLiveConfig must set a non-empty Alias; the alias assertion below is vacuous without one")
+	}
+	connection, err := Open(cfg)
 	if err != nil {
 		t.Fatalf("Open() with a mismatched dialect must connect, got error = %v", err)
 	}
@@ -2935,8 +2994,9 @@ func TestInterBaseLiveExplicitDialectMismatchWarnsAndConnects(t *testing.T) {
 			t.Errorf("warning %q does not mention %q", warning, mention)
 		}
 	}
-	if strings.Contains(warning, connection.DatabaseName) && connection.DatabaseName == "" {
-		t.Error("the warning must name the connection alias")
+	// A user with several connections needs to know which one warned.
+	if !strings.Contains(warning, cfg.Alias) {
+		t.Errorf("warning %q does not name the connection alias %q", warning, cfg.Alias)
 	}
 }
 ```
@@ -3323,7 +3383,14 @@ adapter, so switching databases is not supported; configure separate connections
 instead. Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported.
 ```
 
-with:
+with the text below.
+
+> **Fence warning.** The replacement contains a ```` ```yaml ```` example, so it is a
+> fenced block inside a fenced block. Most renderers — and a naive copy — will
+> stop at the inner closing fence and drop everything after the YAML. What goes
+> into `README.md` is everything between the outer ```` ```markdown ```` and the
+> **final** ```` ``` ````, including the YAML example and both paragraphs that
+> follow it. Step 3's greps confirm the tail arrived.
 
 ```markdown
 Both SQL Dialect 1 and SQL Dialect 3 are supported. The optional `dialect` key
@@ -3373,6 +3440,11 @@ Expected: no output.
 
 Run: `grep -n 'dialect' README.md | head -20`
 Expected: the new paragraphs, and no claim that a dialect parameter is unnecessary.
+
+Run: `grep -c 'switching databases is not supported' README.md`
+Expected: `1`. This is the last line of the replacement, after the nested YAML
+fence — a zero here means the paste stopped at the inner fence and the tail of
+the section is missing.
 
 The TLS sentence at what was line 328 ("the driver exposes no TLS configuration API") stays for now: it is still true until plan 3 lands TLS support, and rewriting it is plan 3's README item 3.
 
