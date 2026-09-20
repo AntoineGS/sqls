@@ -4378,9 +4378,18 @@ func (w *Worker) setCatalogCache(c *CatalogCache) {
 
 Replace the `case <-w.update:` body in `Start`:
 
+> **`w.repo()`, not `w.dbRepo`.** Plan 1 (server concurrency) replaced the raw
+> field read on this exact line with the mutex-guarded accessor, because
+> `ReCache` writes `dbRepo` from a handler goroutine while this goroutine reads
+> it — a pre-existing data race that async dispatch makes reachable. Pasting
+> `w.dbRepo` back re-opens it, and `make test-race` will fail in
+> `internal/database` on Plan 1's own `TestWorkerReCacheIsRaceFree…` rather than
+> on anything this task added. If `w.repo()` does not exist, Plan 1 has not
+> landed — stop and run it first rather than reverting to the field.
+
 ```go
 			case <-w.update:
-				generator := NewDBCacheUpdater(w.dbRepo)
+				generator := NewDBCacheUpdater(w.repo())
 				// The two passes are independent. This loop used to continue
 				// on a secondary-pass error, so appending the catalog build
 				// after it would silently skip the catalog whenever the column
@@ -4430,6 +4439,11 @@ Expected: every package `ok`.
 Run: `go test -race ./internal/database/ -count=1`
 
 Expected: `ok`, no race reports. The catalog pass runs on the worker goroutine and `TestWorkerSwapsCatalogCache` reads `Worker.Cache()` from the test goroutine, so this is the run that would catch a cache swap done outside the mutex.
+
+It is also the run that catches the other way this step can go wrong. Plan 1's `TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates` lives in the same package and manufactures the `dbRepo` interleaving deliberately; if Step 5's replacement pasted `w.dbRepo` instead of `w.repo()`, that test — not one of this task's — reports `WARNING: DATA RACE` at `worker.go:76`/`worker.go:58`. A race attributed to a test you did not write is the expected symptom, so read the file:line in the report before assuming it is unrelated.
+
+Run: `grep -n 'w\.dbRepo' internal/database/worker.go`
+Expected: hits only inside `repo()` and `setRepo()`. Any other hit is an unguarded access.
 
 - [ ] **Step 8: Commit**
 
