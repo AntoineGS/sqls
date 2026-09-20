@@ -64,7 +64,28 @@ this is the index, not the authority.
 | `doc/develop.md` audit table | server concurrency, editor surfaces, definition snapshots | Concurrency creates it; the others add their own rows only. |
 | `README.md` InterBase section | dialect propagation, catalog migration, connection config, editor surfaces, definition snapshots | Sentence-scoped ownership, so the five can land in any order. Dialect propagation owns the section title, the dialect paragraph and the two dialect sentences; catalog migration owns the metadata sentence; connection config owns the database-enumeration sentence, the connection keys and the TLS statement; editor surfaces and definition snapshots share the `#### InterBase editor features` subsection, each creating it if absent. |
 | `parser/parser.go` `multiKeywordMap` | editor surfaces | Editor surfaces owns the `"EXECUTE": {"PROCEDURE"}` entry. Results-pane deliberately parses statement text instead so it does not depend on it. |
-| `internal/database` capability mock | catalog migration, editor surfaces | Both add a capability-bearing mock distinct from `MockDBRepository`. Resolve to one type when the second lands rather than carrying two. |
+| `internal/database` capability mock | catalog migration, editor surfaces | Both add a capability-bearing mock distinct from `MockDBRepository`. They do not collide, so neither plan is blocked; merge them in a cleanup commit once both have landed — see below. |
+
+## One cleanup after wave 4
+
+Catalog migration adds `MockCatalogDBRepository` in `capability_mock.go`;
+editor surfaces adds `MockCapabilityRepository` in `interbase_mock.go`. Both
+embed `*MockDBRepository` and both exist because the plain mock must not satisfy
+the capability interfaces — every existing handler test would start taking the
+capability branch and panic on a nil func field.
+
+The two were written independently on purpose: forcing them to share a type up
+front would create an ordering dependency between two plans that are otherwise
+independent, which is a worse trade than one cleanup commit. They do not
+collide — different identifiers, different files, non-colliding test names — so
+nothing fails to compile while both are present.
+
+When both have landed, merge them: keep `MockCapabilityRepository`, which names
+the general concept rather than one capability and has three consumers to the
+other's one, move it into `capability_mock.go`, fold in the seven `Describe*`
+fields, delete `interbase_mock.go`, and keep whichever of the two
+"`MockDBRepository` must not satisfy the capability interfaces" guard tests
+covers more interfaces.
 
 ## What is deliberately not here
 
