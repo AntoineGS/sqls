@@ -383,8 +383,41 @@ func TestScanRowsWithTypesDefaultsPreserveExistingRendering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanRowsWithTypes() error = %v", err)
 	}
-	if !reflect.DeepEqual(typed.Rows, legacy) {
-		t.Errorf("zero RenderOptions changed the rendering: got %#v, ScanRows gives %#v", typed.Rows, legacy)
+
+	// Row 0 has no NULLs and must render byte-for-byte as ScanRows renders it.
+	// That is the actual regression guard: VARCHAR, INTEGER and TIMESTAMP
+	// formatting — in particular time.RFC3339Nano — must not drift.
+	if !reflect.DeepEqual(typed.Rows[0], legacy[0]) {
+		t.Errorf("zero RenderOptions changed non-NULL rendering: got %#v, ScanRows gives %#v",
+			typed.Rows[0], legacy[0])
+	}
+
+	// Row 1 is all NULLs, and here the two DO differ, deliberately.
+	//
+	// ScanRows scans into *interface{} (scan_row.go:34-36). A driver NULL
+	// leaves the pointee an UNTYPED nil, whose reflect.Kind is Invalid rather
+	// than Pointer, so the IsNil branch at scan_row.go:69-72 never fires, no
+	// case in the type switch matches, and the default arm renders
+	// fmt.Sprintf("%v", nil) == "<nil>" (scan_row.go:97-98). The existing
+	// Test_sqlValToString_nilTypedPointer covers a *typed* nil pointer, which
+	// is a different value and does render "".
+	//
+	// So today a real NULL reaches the results pane as the literal text
+	// "<nil>". ScanRowsWithTypes renders it as an empty cell instead, and with
+	// DistinguishNull it renders "NULL". Both are better than "<nil>", which
+	// is indistinguishable from a string column literally containing "<nil>".
+	// Nothing in the repository asserts "<nil>" (grep confirms), so this is a
+	// safe improvement — but it is a cross-cutting change for every driver and
+	// is recorded as such in Risk 3 and in the README.
+	for column, cell := range legacy[1] {
+		if cell != "<nil>" {
+			t.Fatalf("this test's premise is wrong: ScanRows rendered NULL in column %d as %q, not \"<nil>\"; "+
+				"re-check scan_row.go before changing anything else", column, cell)
+		}
+	}
+	wantNull := []string{"", "", ""}
+	if !reflect.DeepEqual(typed.Rows[1], wantNull) {
+		t.Errorf("NULL row = %#v, want %#v", typed.Rows[1], wantNull)
 	}
 	names := make([]string, len(typed.Columns))
 	for i, column := range typed.Columns {
@@ -482,13 +515,26 @@ type QueryResult struct {
 	Complete bool
 }
 
-// RenderOptions controls driver-sensitive cell formatting. The zero value
-// reproduces the existing ScanRows output for every cell within the display
-// cap; cells longer than DefaultMaxCellRunes are truncated, which ScanRows
-// does not do.
+// RenderOptions controls driver-sensitive cell formatting.
+//
+// The zero value reproduces the existing ScanRows output for every non-NULL
+// cell within the display cap. It diverges in exactly two places, both of them
+// cross-cutting rather than InterBase-only, and both deliberate:
+//
+//   - a cell longer than DefaultMaxCellRunes is truncated, which ScanRows does
+//     not do; and
+//   - a SQL NULL renders as an empty cell, where ScanRows renders the literal
+//     text "<nil>". ScanRows scans into *interface{} (scan_row.go:34-36), so a
+//     driver NULL leaves an UNTYPED nil whose reflect.Kind is Invalid, not
+//     Pointer; the IsNil branch at scan_row.go:69-72 never fires and the
+//     default arm formats it as "<nil>" (scan_row.go:97-98). The existing
+//     Test_sqlValToString_nilTypedPointer covers a *typed* nil pointer, which
+//     is a different value and does render "". Nothing in the repository
+//     asserts "<nil>".
 type RenderOptions struct {
 	// DistinguishNull renders SQL NULL as the literal NULL instead of an
-	// empty cell. Set only for InterBase.
+	// empty cell. Set only for InterBase. Note that the zero value already
+	// differs from ScanRows here: it renders an empty cell, not "<nil>".
 	DistinguishNull bool
 	// MaxCellRunes caps rendered cell width. Zero means DefaultMaxCellRunes.
 	MaxCellRunes int
@@ -502,8 +548,13 @@ const DefaultMaxCellRunes = 512
 
 const nullCellText = "NULL"
 
-// blobTypeName is the DatabaseTypeName InterBase reports for a BLOB column.
-const blobTypeName = "BLOB"
+// BlobTypeName is the DatabaseTypeName InterBase reports for a BLOB column.
+//
+// It is exported because internal/handler gates the 64 MiB materialisation
+// hint on the same value (hasBlobColumn, Task 4). Two copies of the literal
+// "BLOB" in two packages would be free to drift, and the drift would be
+// silent: the hint would simply stop appearing.
+const BlobTypeName = "BLOB"
 
 var (
 	stringScanType  = reflect.TypeOf("")
@@ -653,7 +704,7 @@ func renderCell(dest interface{}, meta ColumnMeta, opts RenderOptions, maxCellRu
 		if *value == nil {
 			return nullCell(opts), nil
 		}
-		if meta.DatabaseTypeName == blobTypeName {
+		if meta.DatabaseTypeName == BlobTypeName {
 			return fmt.Sprintf("<BLOB %d bytes>", len(*value)), nil
 		}
 		return capCell(string(*value), meta, maxCellRunes), nil
@@ -837,7 +888,7 @@ If they all pass, that is the expected outcome and not a reason to stop: this ta
 
 - [ ] **Step 3: Prove the tests are not vacuous**
 
-Temporarily change `capCell` to `return text` unconditionally and change the `blobTypeName` branch in `renderCell` to `return string(*value), nil`. Then run:
+Temporarily change `capCell` to `return text` unconditionally and change the `BlobTypeName` branch in `renderCell` to `return string(*value), nil`. **Also remove the `unicode/utf8` import**, which `capCell` was its only user — leaving it makes the run fail with `vet: result.go:9:2: "unicode/utf8" imported and not used` instead of showing the two failures you are looking for. Then run:
 
 Run: `go test -run 'TestScanRowsWithTypesRendersBlob|TestScanRowsWithTypesCaps' ./internal/database/ -v`
 Expected: `TestScanRowsWithTypesRendersBlobPlaceholder` FAILS with `binary BLOB cell = "hello", want "<BLOB 5 bytes>"` and `TestScanRowsWithTypesCapsLongCellsByRunes` FAILS with the uncapped 12-rune string.
@@ -963,6 +1014,18 @@ func TestScanRowsWithTypesReturnsPartialRowsOnScanFailure(t *testing.T) {
 func TestScanRowsWithTypesReturnsNilOnlyWhenColumnTypesFails(t *testing.T) {
 	// The single case with nothing to report: the metadata call itself fails,
 	// so there are no columns and no rows to hand back.
+	//
+	// This test pins the (nil, err) BOUNDARY rather than a change, so unlike
+	// its two siblings it stays green under the "return nil, err" mutation in
+	// Step 4 — do not read its passing as evidence for the partial-result
+	// contract.
+	//
+	// It also depends on (*sql.Rows).ColumnTypes returning an error after
+	// Close, which is database/sql behaviour rather than a documented
+	// contract (verified on Go 1.27.1). If a future toolchain makes
+	// ColumnTypes succeed on closed rows, this test fails at "error = nil"
+	// and the fix is a fixture whose ColumnTypeScanType path errors, not
+	// deleting the assertion.
 	db := openResultTestDB(t, func() *resultTestRows {
 		return newResultTestRows(
 			[]resultTestColumn{{name: "N", databaseType: "INTEGER", scanType: reflect.TypeOf(int64(0))}},
@@ -1150,7 +1213,9 @@ func (r *stubSQLRows) Next(dest []driver.Value) error {
 }
 ```
 
-Add `"strings"` to the file's imports; `errors` and `io` are already there. The existing `Test_executeQuery` still expects one row containing `42` and a `1 rows in set` footer, which the no-marker branch still produces.
+Add `"strings"` to the file's imports; `errors` and `io` are already there.
+
+`Test_executeQuery` still expects one row containing `42` and a `1 rows in set` footer, which the no-marker branch still produces. To be precise about which version of that test: **Plan 1's Task 4 rewrites it**, replacing today's body whose `workspace/executeCommand` call is commented out (`execute_command_test.go:53-59`) and which asserts nothing about rendering. Plan 1 is a stated prerequisite of this plan, so the assertions are in place by the time you get here — but do not go looking for them in the current file first and conclude they are missing.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -1367,7 +1432,10 @@ func renderQueryResult(result *database.QueryResult, vertical bool, scanErr erro
 
 func hasBlobColumn(result *database.QueryResult) bool {
 	for _, column := range result.Columns {
-		if column.DatabaseTypeName == "BLOB" {
+		// database.BlobTypeName, never a second "BLOB" literal: the same
+		// value gates renderCell's placeholder, and two copies in two
+		// packages would drift silently.
+		if column.DatabaseTypeName == database.BlobTypeName {
 			return true
 		}
 	}
@@ -1661,6 +1729,11 @@ func TestInterBaseQueryReadOnlyRejectsNilConnection(t *testing.T) {
 	}
 }
 ```
+
+Run `gofmt -w internal/database/interbase_readonly_test.go` after pasting. The
+`txRecorderRows` one-line method block above is not column-aligned as written
+here, and `gofmt` realigns it silently — doing it now rather than discovering it
+in CI.
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
@@ -2238,6 +2311,27 @@ Register the second sqls driver in the same `init` as the first:
 
 Add `"github.com/sqls-server/sqls/dialect"` to the file's imports.
 
+Then apply the **same** `catalogStubRepository` wrap to the existing
+`stubDriverName` factory that Plan 1 registered — the identical three lines:
+
+```go
+		if len(b.describedProcedures()) > 0 {
+			return &catalogStubRepository{stubRepository: repository}
+		}
+		return repository
+```
+
+This is not symmetry for its own sake. `TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers`
+has to prove that the **driver check** stops the Query path; if the non-InterBase
+connection had no catalog, routing would return `unknown` for want of a cache and
+the test would pass even with the driver check deleted. Wrapping both factories
+makes the driver the only difference between that test and
+`TestExecuteProcedureWithOutputUsesQueryPath`.
+
+It changes nothing for Plan 1's tests: the wrap is gated on
+`len(b.describedProcedures()) > 0`, and only this plan's tests call
+`setProcedures`.
+
 - [ ] **Step 3: Write the failing tests**
 
 Append to `internal/handler/interbase_procedure_test.go`:
@@ -2284,6 +2378,24 @@ func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureD
 		backend.setProcedures(procs)
 	}
 	tx.addWorkspaceConfig(t, stubInterBaseConnections("interbase"))
+
+	// The catalog lands on the worker's SECONDARY, asynchronous pass:
+	// addWorkspaceConfig reaches ReCache, which only signals the worker
+	// goroutine (worker.go:95-97). Issuing the command straight afterwards
+	// races that goroutine, HasCatalog() is still false, and routing falls to
+	// the unknown-procedure branch — so the two tests that assert the Query
+	// path would fail or, worse, flake. Wait for the catalog first.
+	//
+	// waitForCatalog is the polling helper the catalog-migration plan adds
+	// alongside GenerateCatalogCache. If that plan has not landed, add it
+	// there rather than duplicating it here.
+	if procs != nil {
+		waitForCatalog(t, tx.server.worker)
+		if !tx.server.worker.Cache().HasCatalog() {
+			t.Fatal("the catalog never arrived; every routing assertion below would be vacuous")
+		}
+	}
+
 	tx.textDocumentDidOpen(t, testFileURI, text)
 
 	var got string
@@ -2365,6 +2477,14 @@ func TestExecuteProcedureWithoutCatalogUsesExecPath(t *testing.T) {
 }
 
 func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
+	// This test is only meaningful if the non-InterBase connection HAS a
+	// catalog. If it does not, routing returns unknown for want of a cache,
+	// takes the Exec path, and the assertion below passes for the wrong
+	// reason — deleting the parserDriver() check from
+	// interBaseProcedureRouting would leave it green. Step 2 therefore
+	// teaches the plain stubDriverName factory the same catalogStubRepository
+	// wrap the InterBase one gets, so the ONLY difference between this test
+	// and TestExecuteProcedureWithOutputUsesQueryPath is the driver.
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
@@ -2373,6 +2493,15 @@ func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
 	backend := installStubBackend(t)
 	backend.setProcedures(testProcedures())
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
+
+	waitForCatalog(t, tx.server.worker)
+	if !tx.server.worker.Cache().HasCatalog() {
+		t.Fatal("the non-InterBase connection has no catalog; this test would pass for the wrong reason")
+	}
+	if _, ok := tx.server.worker.Cache().Procedure("MYPROC"); !ok {
+		t.Fatal("MYPROC is not in the cache; routing would return unknown regardless of the driver")
+	}
+
 	tx.textDocumentDidOpen(t, testFileURI, "EXECUTE PROCEDURE MYPROC(1);")
 
 	var got string
@@ -2385,6 +2514,11 @@ func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
 
 	if queries := backend.queries(); len(queries) != 0 {
 		t.Fatalf("Query served %d statements on a non-InterBase driver, want 0 — routing must be InterBase-only", len(queries))
+	}
+	// And no cache-refresh hint either: an unknown procedure is an InterBase
+	// concept, so a non-InterBase driver must produce today's plain output.
+	if strings.Contains(got, "is not in the catalog cache") {
+		t.Errorf("result = %q, want no InterBase routing hint on a non-InterBase driver", got)
 	}
 }
 ```
@@ -2400,6 +2534,16 @@ Expected:
 - `TestExecuteProcedureRoutingIsCaseInsensitive` FAILS the same way.
 - `TestExecuteProcedureUnknownProcedureUsesExecAndExplainsCacheRefresh` FAILS on the missing hint.
 - `TestExecuteProcedureWithoutOutputUsesExecPath`, `TestExecuteProcedureWithoutCatalogUsesExecPath` and `TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers` PASS already: they assert today's behaviour survives, which is exactly their job.
+
+Because those three are green before and after, they carry no evidence on their own. After Step 5 lands, prove the last one discriminates: delete the
+
+```go
+	if s.parserDriver() != dialect.DatabaseDriverInterBase {
+		return procedureRouting{}
+	}
+```
+
+guard from `interBaseProcedureRouting` and re-run. `TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers` must then FAIL with `Query served 1 statements on a non-InterBase driver, want 0`. If it still passes, the non-InterBase connection is not catalog-bearing and Step 2's second wrap was not applied. Restore the guard with `git checkout -- internal/handler/execute_command.go` before continuing.
 
 - [ ] **Step 5: Write the minimal implementation**
 
@@ -2640,6 +2784,12 @@ Named here so no task drifts into them:
 
 1. **The `EXECUTE PROCEDURE` multi-keyword change is not in this plan, but it is worth restating where it lands.** Plan 3 adds `"EXECUTE": {"PROCEDURE"}` to `multiKeywordMap`, which `parser.go:112` applies on **every** parse regardless of dialect. PostgreSQL's legacy `CREATE TRIGGER … FOR EACH ROW EXECUTE PROCEDURE f()` contains exactly that sequence and is still accepted by current PostgreSQL (superseded by `EXECUTE FUNCTION` in PG 11, not removed), so **PostgreSQL parsing does change**: the syntax position after those two keywords goes from `Unknown` to `ExecuteProcedure`. The spec's mitigation is to retain `CompletionTypeKeyword` in that branch so no PostgreSQL user loses a candidate they get today. It is not true that no other dialect is affected. Task 7 keeps *this* plan clear of that blast radius by reading the statement text, which is the reason it is a separate task.
 2. **Routing depends on a cache that can be stale.** A procedure created or altered after connect routes on old output arity. The chosen behaviour fails safely — one rejected statement and a clear refresh instruction — rather than guessing, but it is a real papercut and the spec accepts it knowingly.
-3. **The display cap is a behaviour change for every driver, not only InterBase.** A cell over 512 characters is now truncated where `ScanRows` rendered it whole. `TestScanRowsWithTypesDefaultsPreserveExistingRendering` only proves equivalence for cells within the cap, and the `RenderOptions` doc comment says so. The spec's own comment ("The zero value reproduces the existing ScanRows output exactly") and its rule that the cap applies to "any cell over `MaxCellRunes` characters" cannot both hold; the cap wins, because it is the one the spec's User-Visible Behavior section describes to the user, and the divergence is documented in the README rather than hidden.
+3. **There are two cross-cutting rendering changes, not one, and both affect every driver.**
+
+   **The display cap.** A cell over 512 characters is now truncated where `ScanRows` rendered it whole. The spec's own comment ("The zero value reproduces the existing ScanRows output exactly") and its rule that the cap applies to "any cell over `MaxCellRunes` characters" cannot both hold; the cap wins, because it is the one the spec's User-Visible Behavior section describes to the user.
+
+   **NULL rendering.** A SQL NULL now renders as an empty cell where `ScanRows` renders the literal text `<nil>`. The spec's evidence line — "`sqlValToString` returns `\"\"` for a nil pointer" — is true only for a *typed* nil pointer, which is what `Test_sqlValToString_nilTypedPointer` (`scan_row_test.go:34`) covers. A real driver NULL is an **untyped** nil: `reflect.ValueOf(nil).Kind()` is `Invalid`, not `Pointer`, so the `IsNil` branch at `scan_row.go:69-72` never fires, no case in the type switch matches, and the default arm returns `fmt.Sprintf("%v", nil)` == `"<nil>"` (`scan_row.go:97-98`). Verified by direct execution, not read off the source.
+
+   Keep the new behaviour. `<nil>` is a worse lie than an empty cell — it is indistinguishable from a string column that literally contains `<nil>` — and nothing in the repository asserts it (`grep -rn '<nil>' --include='*_test.go' .` returns nothing). But it is a change every driver's users will see, so `TestScanRowsWithTypesDefaultsPreserveExistingRendering` asserts equivalence only for the non-NULL row, asserts the `<nil>` divergence explicitly for the NULL row, and `t.Fatal`s with a "this test's premise is wrong" message if `ScanRows` ever stops producing `<nil>`. Both divergences are documented in the README rather than hidden.
 4. **Task 8 is the only externally blocked work.** If sub-project 2 slips, the first two thirds of this plan ship on their own and §6.4 moves to Plan 3 exactly as the spec's plan decomposition anticipates. Nothing in Tasks 1–7 references a catalog symbol.
 5. **A quoted procedure name containing whitespace is not routed.** `EXECUTE PROCEDURE "My Proc"(1)` yields no name from `interBaseProcedureName` and falls back to `Exec`, which is today's behaviour. It is pinned by a test case rather than left to be discovered.

@@ -196,8 +196,10 @@ func TestSnapshotStoreUsesRestrictivePermissions(t *testing.T) {
 		t.Errorf("snapshot file mode = %#o, want %#o", got, snapshotFileMode)
 	}
 
-	// Every directory from the store root down must be 0700: the kind
-	// directory, the per-connection directory and the root itself.
+	// Every directory this store creates must be 0700: the kind directory and
+	// the per-connection directory. The root is deliberately NOT checked — the
+	// store never creates it here (t.TempDir does, at its own mode), so
+	// asserting on it would pin something this code does not control.
 	connDir := filepath.Join(store.root, snapshotDirName(sc.identity, os.Getpid()))
 	for _, dir := range []string{filepath.Dir(path), connDir} {
 		info, err := os.Stat(dir)
@@ -446,7 +448,11 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 	if err != nil {
 		return "", err
 	}
-	kindDir := filepath.Join(dir, kind)
+	// kind is escaped too. Every caller passes an ObjectKind constant today, so
+	// nothing unsafe is reachable — but the parameter is a plain string so this
+	// file stays free of the database package, which removes the type-level
+	// guarantee. One call keeps it closed permanently.
+	kindDir := filepath.Join(dir, escapeSnapshotName(kind))
 	if err := os.MkdirAll(kindDir, snapshotDirMode); err != nil {
 		return "", fmt.Errorf("create snapshot directory: %w", err)
 	}
@@ -494,6 +500,11 @@ func snapshotDirName(identity string, pid int) string {
 // Escaping conservatively also keeps `/`, `\`, `:` and quotes out of the name,
 // so a catalog name can neither escape the kind directory nor produce a path a
 // filesystem refuses.
+//
+// The escape is injective — `%` itself becomes `%25` — so two distinct catalog
+// names can never collide on one file. The result is bounded at three bytes per
+// input byte, so an all-escaped 31-byte Dialect 1 name yields 93 bytes and 97
+// with the `.sql` suffix, well inside every filesystem's 255-byte limit.
 func escapeSnapshotName(name string) string {
 	var b strings.Builder
 	for i := 0; i < len(name); i++ {
@@ -1403,6 +1414,7 @@ Four outcomes, one of which writes a file and three of which write nothing. Gett
   - `func renderSnapshot(target snapshotTarget, sc snapshotContext, now time.Time, body, note string) (content string, bannerLines int)`
   - `func snapshotRange(content string, bannerLines int, name string) lsp.Range`
   - `func commentLines(text string) string`
+  - `func singleLine(text string) string`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1571,6 +1583,32 @@ func TestRenderSnapshotKeepsTheNoteInsideComments(t *testing.T) {
 	}
 }
 
+func TestRenderSnapshotKeepsTheBannerThreeLines(t *testing.T) {
+	// The same rule applied to the connection label. It is the user's own
+	// config alias rather than attacker-controlled data, so this is a
+	// consistency guard: without it a multi-line alias would both break out of
+	// the comment and make bannerLines wrong, pushing snapshotRange into the
+	// banner and returning a range over the wrong text.
+	target := testSnapshotTarget(database.ObjectKindProcedure, "MYPROC", "BEGIN END")
+	sc := testSnapshotContext()
+	sc.label = "local\nDROP TABLE USERS; --"
+
+	content, bannerLines := renderSnapshot(target, sc, time.Unix(0, 0).UTC(), "BEGIN END", "")
+
+	if bannerLines != 3 {
+		t.Fatalf("bannerLines = %d, want 3", bannerLines)
+	}
+	lines := strings.Split(content, "\n")
+	for i := 0; i < bannerLines; i++ {
+		if !strings.HasPrefix(lines[i], "--") {
+			t.Errorf("line %d = %q, want a comment", i, lines[i])
+		}
+	}
+	if !strings.Contains(lines[1], "local DROP TABLE USERS; --") {
+		t.Errorf("banner line = %q, want the label collapsed onto one line", lines[1])
+	}
+}
+
 func TestSnapshotRange(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -1670,6 +1708,17 @@ func unsupportedDDLNote(err error) string {
 		object, name, feature)
 }
 
+// singleLine collapses CR and LF into spaces. The connection label is the
+// user's own config alias rather than attacker-controlled data, so this is not
+// closing a live hole — it applies the same rule commentLines applies to the
+// driver's detail strings, so "nothing interpolated into the banner can end a
+// comment" is a property of renderSnapshot rather than a case-by-case argument.
+// It also keeps bannerLines honest: a multi-line label would make the count
+// wrong and push snapshotRange into the banner.
+func singleLine(text string) string {
+	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
+}
+
 // commentLines prefixes every line with "-- ". The detail strings it renders
 // come from the driver, so a newline in one must not be able to end the comment
 // and leave text that reads like SQL.
@@ -1690,7 +1739,7 @@ func renderSnapshot(target snapshotTarget, sc snapshotContext, now time.Time, bo
 	fmt.Fprintf(&b, "-- sqls: read-only snapshot of InterBase %s %q\n",
 		strings.ToUpper(string(target.kind)), target.name)
 	fmt.Fprintf(&b, "-- connection: %s    generated: %s\n",
-		sc.label, now.UTC().Format(time.RFC3339))
+		singleLine(sc.label), now.UTC().Format(time.RFC3339))
 	b.WriteString("-- Editing this file does not change the database.\n")
 	bannerLines := 3
 
@@ -2128,6 +2177,31 @@ func TestInterBaseDefinitionFallsBackToAliasResolution(t *testing.T) {
 		t.Error("the alias path wrote a snapshot; it must win outright")
 	}
 }
+
+func TestDefinitionWithoutAConnectionReturnsNoLocations(t *testing.T) {
+	// Step 3's `return nil, nil` when newDBRepository fails is the one wiring
+	// line whose regression is visible to EVERY driver: an identifier that
+	// resolves to no in-document alias, with no connection configured, must
+	// come back as an empty result rather than a request error. Without this
+	// case nothing round-trips that branch, and a later edit that propagates
+	// the error would surface as "go to definition failed" in the editor for
+	// MySQL and PostgreSQL users too.
+	tx := newTestContext()
+	tx.initServer(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+	// Deliberately no configureInterBaseTestServer and no connection.
+
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT * FROM MYPROC")
+
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", definitionParamsAt(14), &got); err != nil {
+		t.Fatalf("textDocument/definition returned an error with no connection: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d locations, want none", len(got))
+	}
+}
 ```
 
 Add `"context"`, `"os"` and `"path/filepath"` to the test file's imports.
@@ -2234,8 +2308,10 @@ Expected: every test and subtest PASS.
 
 - [ ] **Step 5: Verify the existing definition tests are untouched**
 
-Run: `go test -run 'TestDefinition|Test_definition' ./internal/handler/ -v`
+Run: `go test -run 'Definition' ./internal/handler/ -v`
 Expected: every case in `definitionTestCases` PASS, unchanged. If any fails, the alias path was altered — revert and re-apply Step 3, which only *appends* a branch after `len(res) > 0`.
+
+The pattern is the bare word `Definition`, not `TestDefinition|Test_definition`: Go's `-run` is an unanchored substring regex, and `TestTypeDefinition` — which drives the same `definitionTestCases` through a different handler — does not contain the string `TestDefinition`. The narrower pattern silently skips it.
 
 - [ ] **Step 6: Verify no snapshot was written outside a temporary directory**
 
