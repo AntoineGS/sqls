@@ -60,7 +60,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 | `parser/parseutil/call.go` | Create | `EnclosingCall`/`CallInfo`: the callee name and active-argument index of the call the cursor is inside. Consumed by both the completer and the handler, so it lives in neither |
 | `parser/parseutil/call_test.go` | Create | callee resolution, the inside/on-the-name distinction, and the active-parameter index |
 | `internal/completer/completer.go` | Modify (`:22-70`, `:123-200`, `:212-249`, `:396-400`) | `CompletionTypeProcedureName`, the new `Complete` branches, the sort-prefix cases, the `ExecuteProcedure` context |
-| `internal/completer/candidates.go` | Modify (`:45-99`, `:384-402`) | procedure output parameters as columns; the `view` detail on an existing table candidate |
+| `internal/completer/candidates.go` | Modify (`:45-99`, `:384-402`, `:404-428`) | procedure output parameters as columns; the `view` detail on an existing table candidate, in both relation generators |
 | `internal/completer/interbase_candidates.go` | Create | procedure, selectable-procedure, view, generator and external-function candidates |
 | `internal/completer/interbase_candidates_test.go` | Create | the completer fixture and every feature-2 test |
 | `internal/handler/signature_help.go` | Modify (`:43-107`) | the procedure branch before the `InsertValue` case |
@@ -83,7 +83,7 @@ Copied from the spec. Every task's requirements implicitly include this section.
 
 **Five places the real code contradicts the spec.** Each is resolved in the task that hits it and listed here so a reviewer sees them together.
 
-1. **The `ExecuteProcedure` syntax-position case cannot go "before the `TableReference` case"** (spec §2, "Contexts"). Measured: for `execute procedure myproc(` with the cursor inside the parenthesis, `NodeWalker.PrevNodesIs(true, ExpectKeyword: ["EXECUTE PROCEDURE"])` is already **true** — the walker checks every path depth, and at statement depth the node before the `FunctionLiteral` is the `MultiKeyword`. That position resolves to `InsertColumn` today. A case placed before `TableReference` would steal it and offer procedure names where the user is typing arguments. The case goes **last, after `isInsertColumns`**. Task 4 pins this with a regression test.
+1. **The `ExecuteProcedure` syntax-position case cannot go "before the `TableReference` case"** (spec §2, "Contexts"). Measured: for `execute procedure myproc(` with the cursor inside the parenthesis, `NodeWalker.PrevNodesIs(true, ExpectKeyword: ["EXECUTE PROCEDURE"])` is **true once Task 4's `multiKeywordMap` entry exists** — the walker checks every path depth, and at statement depth the node before the `FunctionLiteral` is then the `MultiKeyword`. (On unmodified code it is false, because no `MultiKeyword` node is produced at all; measure it after the map entry, not before.) That position resolves to `InsertColumn` today. A case placed before `TableReference` would steal it and offer procedure names where the user is typing arguments. The case goes **last, after `isInsertColumns`**. Task 4 pins this with a regression test.
 2. **Explain's single-statement rendering.** §1 "Rendering" shows a bare `PLAN …` for one statement, but every sample in "User-Visible Behavior" shows `-- statement 1` even when there is only one. The header is always emitted; the User-Visible samples are the literal user-facing text and win.
 3. **Two parameter renderings.** §2 asks for `` - NAME: `TYPE` (input) `` and §3 for `` `VARCHAR(3)` input NOT NULL ``. Unified on §3's form, with the list entry being `` - NAME: `TYPE` input NOT NULL ``, so one renderer serves both surfaces.
 4. **Hover cannot always "append after the pure call succeeds"** (§4). `hoverWithDriver` has no catalog knowledge, so for a procedure, generator or external function identifier it returns `ErrNoHover` and there is nothing to append to. The InterBase path therefore *renders* the summary for catalog-only kinds and *appends* for tables. Feature 4 would otherwise never fire on a procedure, which is the object it exists for.
@@ -1023,7 +1023,10 @@ func TestTriggerDocOmitsEmptyEvent(t *testing.T) {
 	}
 	// An empty Event means the catalog did not decode it. The whole line is
 	// omitted; nothing stands in for it.
-	if strings.Contains(got, "<unknown>") || strings.Contains(got, "Event") || strings.Contains(got, "``") {
+	// "<unknown>" and an empty code span are the two substrings a naive
+	// renderer actually produces. An earlier draft also forbade "Event",
+	// which TriggerDoc never emits on any path, so that entry could not fire.
+	if strings.Contains(got, "<unknown>") || strings.Contains(got, "``") {
 		t.Errorf("TriggerDoc rendered a placeholder event:\n%s", got)
 	}
 
@@ -1366,7 +1369,7 @@ Spec §2 "Contexts", first bullet. This plan owns the `"EXECUTE": {"PROCEDURE"}`
 
 **The real blast radius, stated rather than minimised.** PostgreSQL's legacy trigger syntax `CREATE TRIGGER … FOR EACH ROW EXECUTE PROCEDURE f()` contains exactly this sequence and is still accepted by current PostgreSQL — superseded by `EXECUTE FUNCTION` in PG 11, not removed. For that statement the syntax position after the two keywords changes from `Unknown` to `ExecuteProcedure`. **PostgreSQL parsing does change.** The mitigation is that `getCompletionTypes` retains `CompletionTypeKeyword` in the new branch (Task 5), so a PostgreSQL user writing a trigger keeps exactly today's keyword candidates and gains nothing else — no procedure cache exists for that driver. A test in this task pins the position change so it is a recorded decision rather than a surprise.
 
-**Placement, and why it contradicts the spec.** §2 says to place the case "before the `TableReference` case". Measured against the real walker: for `execute procedure myproc(` with the cursor inside the parenthesis, `nw.PrevNodesIs(true, genKeywordMatcher([]string{"EXECUTE PROCEDURE"}))` is already **true**, because `PrevNodesIs` checks every path depth and at statement depth the node before the `FunctionLiteral` is the `MultiKeyword`. That position resolves to `InsertColumn` today, which is what gives the argument list its behaviour. A case before `TableReference` would capture it and offer procedure *names* where the user is typing *arguments*. The case therefore goes **last, after `isInsertColumns`**, and Step 1 pins that with a regression case.
+**Placement, and why it contradicts the spec.** §2 says to place the case "before the `TableReference` case". Measured against the real walker *with this task's `multiKeywordMap` entry applied*: for `execute procedure myproc(` with the cursor inside the parenthesis, `nw.PrevNodesIs(true, genKeywordMatcher([]string{"EXECUTE PROCEDURE"}))` is **true**, because `PrevNodesIs` checks every path depth and at statement depth the node before the `FunctionLiteral` is the `MultiKeyword`. Measure it after Step 2, not before: on unmodified code there is no `MultiKeyword` node for the pair to match, so the same expression is false and the placement argument looks wrong for the wrong reason. That position resolves to `InsertColumn` today, which is what gives the argument list its behaviour. A case before `TableReference` would capture it and offer procedure *names* where the user is typing *arguments*. The case therefore goes **last, after `isInsertColumns`**, and Step 1 pins that with a regression case.
 
 **The call helper ships here too, and this is why.** Feature 2 needs "the cursor is inside `GEN_ID(`" and feature 3 needs "the callee is a known procedure, and which argument is the cursor on". Both are the same question about the enclosing `ast.FunctionLiteral`, and they are asked from two different packages — `internal/completer` and `internal/handler`. Neither can import the other, so the helper lives in `parser/parseutil` beside `NodeWalker`, which is what it reads. It is added in this task rather than in Task 5 so that the whole "what does the parser say about this cursor" surface lands in one reviewable change, with no parser-shaped code in the completer.
 
@@ -1846,7 +1849,7 @@ There is no dedupe pass anywhere. Getting this wrong double-offers every view in
 - Create: `internal/completer/interbase_candidates.go`
 - Create: `internal/completer/interbase_candidates_test.go`
 - Modify: `internal/completer/completer.go:22-37` (the new type), `:39-70` (`String()`), `:123-200` (`Complete`), `:212-249` (`getSortTextPrefix`), `:396-405` (`getCompletionTypes`)
-- Modify: `internal/completer/candidates.go:45-82` (procedure output parameters as columns), `:384-402` (the `view` detail)
+- Modify: `internal/completer/candidates.go:45-82` (procedure output parameters as columns), `:384-402` and `:404-428` (the `view` detail in both relation generators)
 
 **Interfaces:**
 - Consumes: `database.ProcedureDoc`, `database.ViewDoc`, `database.GeneratorDoc`, `database.FunctionDoc`, `database.ParameterDoc` (Task 3); `parseutil.ExecuteProcedure`, `parseutil.EnclosingCall` and `parseutil.CallInfo` (Task 4); from the contract — `DBCache.HasCatalog/Procedure/View/Generator/Function/SortedProcedures/SortedViews/SortedGenerators/SortedFunctions`.
@@ -2097,25 +2100,44 @@ func TestInterBaseViewCandidatesInInsertColumnPosition(t *testing.T) {
 }
 
 func TestInterBaseProcedureOutputParameterColumnCompletion(t *testing.T) {
+	// Each case carries its own column. Do NOT derive it from len(text):
+	// the member-identifier case needs the procedure in scope as a relation
+	// as well as before the dot, so its text is longer than its cursor.
 	cases := []struct {
 		name string
 		text string
+		col  int
 	}{
-		{name: "select list over a selectable procedure", text: "select  from myproc"},
-		{name: "member identifier", text: "select myproc."},
+		// ParentTypeNone: the procedure is in FROM, the cursor is in the
+		// select list. Reaches procedureColumnCandidates through the
+		// no-parent fallback.
+		{name: "select list over a selectable procedure", text: "select  from myproc", col: 7},
+		// ParentTypeTable: "myproc." with myproc also in FROM. This is the
+		// half of the feature a user actually types, and it reaches
+		// procedureColumnCandidates through the ColumnDescs miss.
+		//
+		// The FROM clause is not decoration. parseutil.ExtractTable returns
+		// an empty slice for a bare "select myproc." — measured — and
+		// columnCandidates ranges over that slice, so with nothing in scope
+		// neither branch is ever entered and this subtest could not pass
+		// against any implementation. That is pre-existing completer
+		// behaviour ("select city." behaves identically), not something this
+		// plan introduces.
+		{name: "member identifier", text: "select myproc. from myproc", col: 14},
+		// The same branch reached through an alias. ExtractTable resolves
+		// aliases at this position and the ParentTypeTable match tests
+		// table.Alias as well as table.Name, so this path exists — it is
+		// here because nothing else in the plan exercises it.
+		{name: "aliased member identifier", text: "select p. from myproc p", col: 9},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
 			c := NewCompleter(interBaseCatalogCache(t))
 			c.Driver = dialect.DatabaseDriverInterBase
-			character := len(tt.text)
-			if tt.name == "select list over a selectable procedure" {
-				character = 7
-			}
 			got, err := c.Complete(tt.text, lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-					Position: lsp.Position{Line: 0, Character: character},
+					Position: lsp.Position{Line: 0, Character: tt.col},
 				},
 			}, false)
 			if err != nil {
@@ -2688,6 +2710,32 @@ func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.C
 	return candidates
 }
 ```
+
+Then do the same to `generateTableCandidatesByInfos` (`:404-428`), which is the
+*other* generator that labels a relation. `ReferencedTableCandidates` uses it to
+re-offer a table already named in `FROM` when the cursor is in `WHERE` or the
+select list, so without this a view reads `view` in the `FROM` position and
+`referenced table` two words later. It is a label inconsistency, not a
+double-offer — the `CompletionTypeTable` branch excludes `definedTables`, so
+exactly one candidate survives either way. Change only the detail strings:
+
+```go
+		name := table.Name
+		detail := "referenced table"
+		if table.Alias != "" {
+			name = table.Alias
+			detail = "aliased table"
+		}
+		if _, ok := dbCache.View(table.Name); ok {
+			detail = strings.Replace(detail, "table", "view", 1)
+		}
+```
+
+`dbCache.View` is nil-safe and false for every driver without a catalog, so no
+other driver's detail text changes. Leave the `TableDoc` documentation below it
+alone: a view's columns are in `ColumnDescs` like any relation's, and replacing
+it with `ViewDoc` here would be a second behaviour change this task does not
+need.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
@@ -3919,6 +3967,8 @@ Run: `grep -rn 'connGeneration' internal/handler --include='*.go'`
 
 If `Server.connGeneration` already exists and `reconnectionDB` already increments it, **skip those two edits in Step 4** and add only `ddlMemo`, `connectionGeneration()` and `memoisedObjectDDL`. If it does not exist, add it with exactly this name so Plan 4 can consume it in turn.
 
+The convergence rests on both plans using the identical name, and the failure mode if one drifts is safe rather than silent: a differently-named field makes this grep return nothing, both plans add their own, and the build fails on a duplicate `Server` field. Fix it by renaming to `connGeneration` — do not resolve it by keeping two counters, which would make a reconnect invalidate one consumer and not the other.
+
 - [ ] **Step 2: Write the failing tests**
 
 Append to `internal/handler/interbase_hover_test.go`:
@@ -4386,13 +4436,17 @@ signature help, need no server at all.
 Run:
 
 ```bash
-grep -n 'Explain supports SELECT, INSERT, UPDATE, DELETE and EXECUTE PROCEDURE' internal/handler/explain.go
-grep -n 'hoverDDLTimeout = 3 \* time.Second' internal/handler/interbase_hover.go
-grep -n '_DDL unavailable._' internal/handler/interbase_hover.go
-grep -n 'genIDFunctionName = "GEN_ID"' internal/completer/interbase_candidates.go
-grep -n 'NOT NULL' internal/database/catalog_doc.go
-grep -n 'ObjectKindFunction' internal/handler/interbase_hover.go
+grep -nF 'Explain supports SELECT, INSERT, UPDATE, DELETE and EXECUTE PROCEDURE' internal/handler/explain.go
+grep -nF 'hoverDDLTimeout = 3 * time.Second' internal/handler/interbase_hover.go
+grep -nF '_DDL unavailable._' internal/handler/interbase_hover.go
+grep -nF 'genIDFunctionName = "GEN_ID"' internal/completer/interbase_candidates.go
+grep -nF 'NOT NULL' internal/database/catalog_doc.go
+grep -nF 'ObjectKindFunction' internal/handler/interbase_hover.go
 ```
+
+`-F` throughout, because several of these patterns contain regex metacharacters
+— `.` in `_DDL unavailable._` and `*` in the timeout — and a regex match would
+succeed on a near-miss string that is not the literal the README promises.
 
 Expected: every marker found. The README claims the three-second bound, the
 `GEN_ID(`-only generator scope, the `NOT NULL`-only nullability rule, the
