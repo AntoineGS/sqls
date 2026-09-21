@@ -306,7 +306,7 @@ See also.
 - <https://pkg.go.dev/github.com/jackc/pgx/v4>
 - <https://github.com/mattn/go-sqlite3#connection-string>
 
-#### InterBase (SQL Dialect 1)
+#### InterBase
 
 ```yaml
 connections:
@@ -331,17 +331,46 @@ local attachment. `proto` may be omitted or set to `tcp` for a remote attachment
 `params.charset` defaults to `UTF8`; `WIN1250` is also supported. Built-in SSH
 tunneling is not supported for this driver.
 
-The driver always uses client SQL Dialect 1; no dialect parameter is necessary.
-Both single and double quotes delimit strings, doubled quotes escape a quote,
-unquoted identifiers may contain `$`, and positional parameters use `?`.
-Parsing and formatting use these rules when the selected connection is
-InterBase. Parameter binding is a driver capability; the sqls execute command
-does not prompt for parameter values.
+Both SQL Dialect 1 and SQL Dialect 3 are supported. The optional `dialect` key
+accepts `0` (the default, auto-detect from the database), `1` or `3`:
+
+```yaml
+connections:
+  - alias: interbase_example
+    driver: interbase
+    dataSourceName: "db.example.test/3050:/srv/interbase/example.ib"
+    user: sqls_reader
+    passwd: "your-password"
+    dialect: 0            # 0 auto-detect (default), 1, or 3
+    params:
+      charset: UTF8
+```
+
+Auto-detection asks the server which dialect the database uses and costs one
+extra attachment only for a Dialect 1 database; a Dialect 3 database is detected
+on the first attachment. Pinning `dialect:` is only needed to override
+auto-detection. A pinned dialect that disagrees with the database is a supported
+InterBase configuration — it is how Dialect 3 tooling reads a Dialect 1 database
+during a migration — so sqls connects and warns rather than refusing. The
+warning appears as an editor notification when sqls first connects or reconnects
+after a workspace configuration change; switching the active connection or
+database from a command logs it instead. If the server cannot answer, sqls
+keeps a pinned dialect, or falls back to Dialect 3 for auto-detect, and warns
+either way.
+
+Under Dialect 1, double quotes delimit strings and `DATE` carries a time
+component. Under Dialect 3, double quotes delimit identifiers, so `"My Column"`
+is a column name, and `TIMESTAMP` is distinct from `DATE`. In both dialects,
+unquoted identifiers may contain `$`, positional parameters use `?`, and doubled
+quotes are preserved verbatim by the formatter, so formatting never rewrites
+`'c''d'`. Parsing, completion and formatting use the resolved dialect's rules
+when the selected connection is InterBase. Parameter binding is a driver
+capability; the sqls execute command does not prompt for parameter values.
 
 Completion and hover use user table/view, column, primary-key, and foreign-key
 metadata. InterBase has no schema namespace or database enumeration through this
 adapter, so switching databases is not supported; configure separate connections
-instead. Dialect 1 `DATE` includes both date and time. Dialect 3 is not supported.
+instead.
 
 The native driver is experimental. Context cancellation cannot interrupt an
 in-flight native call, and the driver exposes no TLS configuration API. Use a
