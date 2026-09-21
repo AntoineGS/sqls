@@ -360,12 +360,14 @@ either way.
 
 Under Dialect 1, double quotes delimit strings and `DATE` carries a time
 component. Under Dialect 3, double quotes delimit identifiers, so `"My Column"`
-is a column name, and `TIMESTAMP` is distinct from `DATE`. In both dialects,
-unquoted identifiers may contain `$`, positional parameters use `?`, and doubled
-quotes are preserved verbatim by the formatter, so formatting never rewrites
-`'c''d'`. Parsing, completion and formatting use the resolved dialect's rules
-when the selected connection is InterBase. Parameter binding is a driver
-capability; the sqls execute command does not prompt for parameter values.
+is a column name, and `TIMESTAMP` is distinct from `DATE`. sqls does not yet
+render that distinction: completion and hover show `DATE` for a `TIMESTAMP`
+column under Dialect 3 too. In both dialects, unquoted identifiers may contain
+`$`, positional parameters use `?`, and doubled quotes are preserved verbatim
+by the formatter, so formatting never rewrites `'c''d'`. Parsing, completion
+and formatting use the resolved dialect's rules when the selected connection
+is InterBase. Parameter binding is a driver capability; the sqls execute
+command does not prompt for parameter values.
 
 Completion and hover use user table/view, column, primary-key, and foreign-key
 metadata. InterBase has no schema namespace or database enumeration through this

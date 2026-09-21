@@ -214,7 +214,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 	}
 }
 
-func TestParserVariantDefaultsToDialect3WithoutConnection(t *testing.T) {
+func TestParserDriverVariantZeroWithoutConnectionAndInterBaseZeroVariantIsDialect3(t *testing.T) {
 	s := NewServer()
 	if s.dbConn != nil {
 		t.Fatal("a fresh server must have no connection")

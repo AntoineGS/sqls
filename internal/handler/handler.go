@@ -556,8 +556,10 @@ func (s *Server) parserDriver() dialect.DatabaseDriver {
 }
 
 // parserDriverVariant returns the active connection's driver and its resolved
-// server-side SQL variant. With no connection it returns the zero value, which
-// selects each driver's default variant — for InterBase, SQL Dialect 3.
+// server-side SQL variant. With no connection it returns the fully zero
+// DriverVariant, and DialectForDriverVariant resolves that to the generic SQL
+// dialect because Driver is empty too — not to InterBase's rules. A zero
+// Variant field only selects SQL Dialect 3 once Driver is already InterBase.
 func (s *Server) parserDriverVariant() dialect.DriverVariant {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()

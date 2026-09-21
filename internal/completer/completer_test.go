@@ -416,10 +416,9 @@ func TestCompleteInterBaseDialect3DelimitedIdentifierPrefix(t *testing.T) {
 	tests := []struct {
 		name    string
 		variant dialect.SQLVariant
-		wantCol bool
 	}{
-		{name: "dialect 3 treats the double quote as an identifier start", variant: dialect.SQLVariantInterBase3, wantCol: true},
-		{name: "dialect 1 treats it as a string", variant: dialect.SQLVariantInterBase1, wantCol: false},
+		{name: "dialect 3 treats the double quote as an identifier start", variant: dialect.SQLVariantInterBase3},
+		{name: "dialect 1 treats it as a string", variant: dialect.SQLVariantInterBase1},
 	}
 
 	for _, tt := range tests {
