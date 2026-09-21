@@ -36,6 +36,10 @@ $(GOBIN)/gobump:
 test: build
 	go test -v ./...
 
+.PHONY: test-race
+test-race:
+	go test -race ./...
+
 .PHONY: clean
 clean:
 	go clean

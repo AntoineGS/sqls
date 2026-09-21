@@ -19,3 +19,5 @@ jobs:
         version: v2.6
     - name: Test
       run: go test -coverprofile coverage.out -covermode atomic ./...
+    - name: Test with race detector
+      run: make test-race
