@@ -40,6 +40,106 @@ func Test_executeQuery(t *testing.T) {
 	}
 }
 
+func TestQueryRendersPartialResultBeforeReportingError(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT fail_fetch FROM t;")
+
+	var got string
+	if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+		Command:   CommandExecuteQuery,
+		Arguments: []interface{}{testFileURI},
+	}, &got); err != nil {
+		t.Fatal("conn.Call workspace/executeCommand:", err)
+	}
+
+	if !strings.Contains(got, "42") {
+		t.Errorf("result = %q, want the rows that preceded the failure", got)
+	}
+	if !strings.Contains(got, "2 rows in set (incomplete)") {
+		t.Errorf("result = %q, want the incomplete row-count footer", got)
+	}
+	if !strings.Contains(got, "Fetch failed: interbase: BLOB result exceeds the materialization limit") {
+		t.Errorf("result = %q, want the driver's error text passed through verbatim", got)
+	}
+}
+
+func TestBlobLimitHintOnlyWithBlobColumn(t *testing.T) {
+	const hintFragment = "larger than the driver's 64 MiB"
+
+	for _, tt := range []struct {
+		name     string
+		text     string
+		wantHint bool
+	}{
+		{name: "blob column", text: "SELECT fail_blob_fetch FROM t;", wantHint: true},
+		{name: "no blob column", text: "SELECT fail_fetch FROM t;", wantHint: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := newTestContext()
+			tx.setup(t)
+			defer tx.tearDown()
+			defer tx.server.worker.Stop()
+
+			installStubBackend(t)
+			tx.addWorkspaceConfig(t, stubConnections("primary"))
+			tx.textDocumentDidOpen(t, testFileURI, tt.text)
+
+			var got string
+			if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+				Command:   CommandExecuteQuery,
+				Arguments: []interface{}{testFileURI},
+			}, &got); err != nil {
+				t.Fatal("conn.Call workspace/executeCommand:", err)
+			}
+
+			if strings.Contains(got, hintFragment) != tt.wantHint {
+				t.Errorf("result = %q, want BLOB hint present = %v", got, tt.wantHint)
+			}
+			// The failure itself is reported either way; only the advice is
+			// conditional, so the advice is never wrong.
+			if !strings.Contains(got, "Fetch failed:") {
+				t.Errorf("result = %q, want the fetch failure reported", got)
+			}
+		})
+	}
+}
+
+func TestQuerySucceedsWithCompleteFooter(t *testing.T) {
+	// Regression guard for the footer wording: a complete result must keep the
+	// exact "%d rows in set" text the existing pane and tests rely on.
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	var got string
+	if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+		Command:   CommandExecuteQuery,
+		Arguments: []interface{}{testFileURI},
+	}, &got); err != nil {
+		t.Fatal("conn.Call workspace/executeCommand:", err)
+	}
+	if !strings.Contains(got, "1 rows in set") {
+		t.Errorf("result = %q, want the complete row-count footer", got)
+	}
+	if strings.Contains(got, "(incomplete)") {
+		t.Errorf("result = %q, want no incomplete marker on a complete result", got)
+	}
+	if strings.Contains(got, "Fetch failed:") {
+		t.Errorf("result = %q, want no fetch failure on a complete result", got)
+	}
+}
+
 func Test_queryResultHeaderPreservesColumnNames(t *testing.T) {
 	// Regression test: column names with underscores should not be
 	// auto-formatted (e.g. "user_name" must not become "USER NAME").

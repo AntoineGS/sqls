@@ -338,29 +338,54 @@ func sliceUTF16(s string, start, end int) string {
 }
 
 func (s *Server) query(ctx context.Context, query string, vertical bool) (string, error) {
+	result, scanErr := s.queryResult(ctx, query)
+	if result == nil {
+		return "", scanErr
+	}
+	// A cancelled fetch is reported by the caller, which renders the
+	// cancellation notice; partial rows under that notice would suggest the
+	// statement produced a result when it was stopped.
+	if scanErr != nil && cancellationNotice(ctx, scanErr) != "" {
+		return "", scanErr
+	}
+	return renderQueryResult(result, vertical, scanErr)
+}
+
+func (s *Server) queryResult(ctx context.Context, query string) (*database.QueryResult, error) {
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	rows, err := repo.Query(ctx, query)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	columns, err := database.Columns(rows)
-	if err != nil {
-		return "", err
-	}
-	stringRows, err := database.ScanRows(rows, len(columns))
-	if err != nil {
-		return "", err
+	return database.ScanRowsWithTypes(rows, database.RenderOptionsFor(repo.Driver()))
+}
+
+// blobLimitHint is emitted only when the result actually has a BLOB column, so
+// the advice is never wrong. The driver's own error text is passed through
+// verbatim beside it and is never matched on.
+const blobLimitHint = `One or more BLOB columns in this result are larger than the driver's 64 MiB
+materialisation limit. Re-run the query without the BLOB column, or select a
+substring of it.`
+
+// renderQueryResult writes the header, the rows that were scanned, the
+// row-count footer and any notes. scanErr is non-nil when the fetch died
+// partway: the rows that preceded it are still rendered, because knowing which
+// row broke is the fastest route to the value that broke it.
+func renderQueryResult(result *database.QueryResult, vertical bool, scanErr error) (string, error) {
+	columns := make([]string, len(result.Columns))
+	for i, column := range result.Columns {
+		columns[i] = column.Name
 	}
 
 	buf := new(bytes.Buffer)
 	if vertical {
 		table := newVerticalTableWriter(buf)
 		table.setHeaders(columns)
-		for _, stringRow := range stringRows {
+		for _, stringRow := range result.Rows {
 			table.appendRow(stringRow)
 		}
 		table.render()
@@ -368,14 +393,12 @@ func (s *Server) query(ctx context.Context, query string, vertical bool) (string
 		table := tablewriter.NewTable(buf, tablewriter.WithHeaderConfig(tw.CellConfig{
 			Formatting: tw.CellFormatting{AutoFormat: tw.Off},
 		}))
-		// Convert []string to []any for Header
 		headers := make([]any, len(columns))
 		for i, v := range columns {
 			headers[i] = v
 		}
 		table.Header(headers...)
-		for _, stringRow := range stringRows {
-			// Convert []string to []any for Append
+		for _, stringRow := range result.Rows {
 			row := make([]any, len(stringRow))
 			for i, v := range stringRow {
 				row[i] = v
@@ -388,10 +411,39 @@ func (s *Server) query(ctx context.Context, query string, vertical bool) (string
 			return "", err
 		}
 	}
-	fmt.Fprintf(buf, "%d rows in set", len(stringRows))
+
+	if result.Complete {
+		fmt.Fprintf(buf, "%d rows in set", len(result.Rows))
+	} else {
+		fmt.Fprintf(buf, "%d rows in set (incomplete)", len(result.Rows))
+	}
 	fmt.Fprintln(buf, "")
 	fmt.Fprintln(buf, "")
+
+	notes := append([]string(nil), result.Notes...)
+	if scanErr != nil {
+		notes = append(notes, fmt.Sprintf("Fetch failed: %v", scanErr))
+		if hasBlobColumn(result) {
+			notes = append(notes, blobLimitHint)
+		}
+	}
+	for _, note := range notes {
+		fmt.Fprintln(buf, note)
+		fmt.Fprintln(buf, "")
+	}
 	return buf.String(), nil
+}
+
+func hasBlobColumn(result *database.QueryResult) bool {
+	for _, column := range result.Columns {
+		// database.BlobTypeName, never a second "BLOB" literal: the same
+		// value gates renderCell's placeholder, and two copies in two
+		// packages would drift silently.
+		if column.DatabaseTypeName == database.BlobTypeName {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) exec(ctx context.Context, query string, vertical bool) (string, error) {

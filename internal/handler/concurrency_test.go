@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,29 +25,66 @@ func (stubSQLDriver) Open(string) (driver.Conn, error) { return stubSQLConn{}, n
 
 type stubSQLConn struct{}
 
-func (stubSQLConn) Prepare(string) (driver.Stmt, error) { return stubSQLStmt{}, nil }
-func (stubSQLConn) Close() error                        { return nil }
-func (stubSQLConn) Begin() (driver.Tx, error)           { return nil, errors.New("stub: no transactions") }
+func (stubSQLConn) Prepare(query string) (driver.Stmt, error) { return stubSQLStmt{query: query}, nil }
+func (stubSQLConn) Close() error                              { return nil }
+func (stubSQLConn) Begin() (driver.Tx, error)                 { return nil, errors.New("stub: no transactions") }
 
-type stubSQLStmt struct{}
+type stubSQLStmt struct{ query string }
 
 func (stubSQLStmt) Close() error  { return nil }
 func (stubSQLStmt) NumInput() int { return 0 }
 func (stubSQLStmt) Exec([]driver.Value) (driver.Result, error) {
 	return driver.RowsAffected(1), nil
 }
-func (stubSQLStmt) Query([]driver.Value) (driver.Rows, error) { return &stubSQLRows{}, nil }
 
-type stubSQLRows struct{ sent bool }
+// Query serves one of three fixed result sets, chosen by a marker in the
+// statement text. The markers are ordinary identifiers so the statement still
+// parses and still reaches the repository unchanged.
+func (s stubSQLStmt) Query([]driver.Value) (driver.Rows, error) {
+	switch {
+	case strings.Contains(s.query, failBlobFetchMarker):
+		return &stubSQLRows{names: []string{"n", "b"}, types: []string{"INTEGER", "BLOB"}, rows: 2, failAfter: true}, nil
+	case strings.Contains(s.query, failFetchMarker):
+		return &stubSQLRows{names: []string{"n"}, types: []string{"INTEGER"}, rows: 2, failAfter: true}, nil
+	}
+	return &stubSQLRows{names: []string{"n"}, types: []string{"INTEGER"}, rows: 1}, nil
+}
 
-func (r *stubSQLRows) Columns() []string { return []string{"n"} }
+const (
+	failFetchMarker     = "fail_fetch"
+	failBlobFetchMarker = "fail_blob_fetch"
+)
+
+var errStubFetch = errors.New("interbase: BLOB result exceeds the materialization limit")
+
+type stubSQLRows struct {
+	names     []string
+	types     []string
+	rows      int
+	failAfter bool
+	sent      int
+}
+
+func (r *stubSQLRows) Columns() []string { return r.names }
 func (r *stubSQLRows) Close() error      { return nil }
+
+func (r *stubSQLRows) ColumnTypeDatabaseTypeName(index int) string { return r.types[index] }
+
 func (r *stubSQLRows) Next(dest []driver.Value) error {
-	if r.sent {
+	if r.sent >= r.rows {
+		if r.failAfter {
+			return errStubFetch
+		}
 		return io.EOF
 	}
-	r.sent = true
-	dest[0] = int64(42)
+	for i := range dest {
+		if r.types[i] == "BLOB" {
+			dest[i] = []byte("blob")
+			continue
+		}
+		dest[i] = int64(42)
+	}
+	r.sent++
 	return nil
 }
 
