@@ -111,6 +111,8 @@ func (s *Server) handleWorkspaceExecuteCommand(ctx context.Context, conn *jsonrp
 }
 
 func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	// parse execute command arguments
 	s.stateMu.RLock()
 	connected := s.dbConn != nil
@@ -357,6 +359,8 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool) (string,
 }
 
 func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return "", err
@@ -369,6 +373,8 @@ func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandPar
 }
 
 func (s *Server) showSchemas(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return "", err
@@ -381,6 +387,8 @@ func (s *Server) showSchemas(ctx context.Context, params lsp.ExecuteCommandParam
 }
 
 func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <DB Name>")
 	}
@@ -403,6 +411,8 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 }
 
 func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	results := []string{}
 	conns := s.getConfig().Connections
 	for i, conn := range conns {
@@ -428,6 +438,8 @@ func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandP
 }
 
 func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <Connection Index>")
 	}
@@ -473,6 +485,8 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 }
 
 func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return "", err

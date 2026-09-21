@@ -26,6 +26,11 @@ type Server struct {
 	DefaultFileCfg  *config.Config
 	WSCfg           *config.Config
 
+	// connMu guards connection lifetime. Commands that touch the database take
+	// it for reading; commands that replace the connection take it for
+	// writing. Lock ordering: connMu before stateMu, never the reverse.
+	connMu sync.RWMutex
+
 	// stateMu guards every mutable field below. It is taken for short,
 	// non-blocking accesses only: connMu, not stateMu, is what a command holds
 	// across database I/O.
@@ -186,7 +191,10 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 	// Initialize database database connection
 	// NOTE: If no connection is found at this point, it is possible that the connection settings are sent to workspace config, so don't make an error
 	messenger := lsp.NewMessenger(conn)
-	if err := s.reconnectionDB(ctx); err != nil {
+	s.connMu.Lock()
+	err = s.reconnectionDB(ctx)
+	s.connMu.Unlock()
+	if err != nil {
 		if errors.Is(err, ErrNoConnection) {
 			if err := messenger.ShowInfo(ctx, err.Error()); err != nil {
 				log.Println("send info", err.Error())
@@ -364,7 +372,10 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 
 	// Initialize database database connection
 	messenger := lsp.NewMessenger(conn)
-	if err := s.reconnectionDB(ctx); err != nil {
+	s.connMu.Lock()
+	err = s.reconnectionDB(ctx)
+	s.connMu.Unlock()
+	if err != nil {
 		if errors.Is(err, ErrNoConnection) {
 			if err := messenger.ShowInfo(ctx, err.Error()); err != nil {
 				log.Println("send info", err.Error())
