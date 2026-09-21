@@ -53,11 +53,12 @@ unsynchronised field into a race.
 **Two locks, one order.** `Server` has two mutexes:
 
 - `connMu` guards *connection lifetime*. `executeQuery`, `showDatabases`,
-  `showSchemas`, `showTables` and `showConnections` take `connMu.RLock()` for
-  the whole of their database work including rendering. `switchDatabase`,
-  `switchConnections`, `handleInitialize` and the reconnect branch of
+  `showSchemas` and `showTables` take `connMu.RLock()` for the whole of their
+  database work including rendering. `switchDatabase`, `switchConnections`,
+  `handleInitialize` and the reconnect branch of
   `handleWorkspaceDidChangeConfiguration` take `connMu.Lock()` across
-  `reconnectionDB`. `showConnections` is in the read set because
+  `reconnectionDB`. `showConnections` also takes `connMu.RLock()`, but it does
+  no database work at all: it is in the read set solely because
   `newDBConnection` writes `connCfg.DBName` in place on a `*database.DBConfig`
   that `showConnections` reads field-by-field.
 - `stateMu` guards *mutable `Server` fields*.
@@ -125,6 +126,27 @@ cancels; an unknown id is a no-op, because a cancellation that races the
 response is normal. Cancellation is best effort: a statement that completed
 before the native cancellation took effect is rendered normally with a note
 saying so.
+
+**`$/cancelRequest` delivery depends on the read loop being free.**
+`internal/handler/dispatch.go`'s dispatcher special-cases exactly one method,
+`workspace/executeCommand`, running it in its own goroutine; every other
+request — `$/cancelRequest` included — is handled inline by the same call that
+reads the next message off the wire (the vendored `jsonrpc2.Conn.readMessages`
+calls `c.h.Handle` synchronously in a loop and does not read the next message
+until `Handle` returns). An inline handler that blocks — for example on
+`connMu.Lock()` — therefore stalls the read loop itself, not just its own
+response: no further message, including a `$/cancelRequest` aimed at the very
+query occupying `connMu`, can even be read until it returns.
+`handleWorkspaceDidChangeConfiguration` takes `connMu.Lock()` inline (across
+`reconnectionDB`'s `Close`/`Open`/`ReCache`) whenever no connection exists yet,
+and that acquisition can queue behind an async `switchConnections` or
+`switchDatabase` already holding the write lock, or behind an in-flight query
+holding the read lock; `handleInitialize` takes the same inline `connMu.Lock()`,
+though in practice no query can be in flight that early. `workspace/executeCommand`
+is the only method the dispatcher runs off the read loop, so it is the only
+place a blocking wait is currently safe — a downstream implementer who adds a
+`connMu` (or any other blocking) acquisition to another inline handler
+reintroduces this stall.
 
 **The cancel registry has no ordering relationship with `connMu`/`stateMu` —
 and that is deliberate, so do not invent one.** `Server.cancels`

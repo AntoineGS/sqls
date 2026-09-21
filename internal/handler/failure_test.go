@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func TestCancellationNoticeForContextCancellation(t *testing.T) {
@@ -28,6 +30,26 @@ func TestCancellationNoticeForContextCancellation(t *testing.T) {
 func TestCancellationNoticeIsEmptyForOrdinaryFailure(t *testing.T) {
 	if got := cancellationNotice(context.Background(), errors.New("syntax error")); got != "" {
 		t.Errorf("cancellationNotice = %q, want \"\"", got)
+	}
+}
+
+// TestMessageForFailureKindMapsEachKindToItsOwnMessage drives the
+// FailureKind-to-message mapping directly, bypassing database.ClassifyFailure
+// entirely. ClassifyFailure is stubbed to always return FailureNone outside
+// the interbase build tag, so cancellationNotice can never reach the
+// FailureUncertain/FailureCanceled branches through the untagged
+// `go test ./...` CI runs; calling messageForFailureKind directly is the only
+// way this mapping is exercised in that build.
+func TestMessageForFailureKindMapsEachKindToItsOwnMessage(t *testing.T) {
+	err := errors.New("boom")
+	if got := messageForFailureKind(database.FailureUncertain, "execute statement", err); got != uncertainOutcomeMessage {
+		t.Errorf("messageForFailureKind(FailureUncertain, ...) = %q, want %q", got, uncertainOutcomeMessage)
+	}
+	if got := messageForFailureKind(database.FailureCanceled, "execute statement", err); got != canceledMessage {
+		t.Errorf("messageForFailureKind(FailureCanceled, ...) = %q, want %q", got, canceledMessage)
+	}
+	if got := messageForFailureKind(database.FailureNone, "execute statement", err); got != "" {
+		t.Errorf("messageForFailureKind(FailureNone, ...) = %q, want \"\"", got)
 	}
 }
 

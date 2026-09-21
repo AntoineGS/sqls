@@ -34,16 +34,31 @@ querying the affected rows.`
 // stoppedWaitingMessage, which keeps the path reachable on every driver and on
 // an ordinary, untagged build without claiming a confirmation nobody gave.
 func cancellationNotice(ctx context.Context, err error) string {
-	switch kind, operation := database.ClassifyFailure(err); kind {
+	kind, operation := database.ClassifyFailure(err)
+	if msg := messageForFailureKind(kind, operation, err); msg != "" {
+		return msg
+	}
+	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return stoppedWaitingMessage
+	}
+	return ""
+}
+
+// messageForFailureKind renders the notice for an already-classified failure
+// kind, or "" when kind is not a cancellation outcome. Split out of
+// cancellationNotice as its own seam because database.ClassifyFailure is
+// stubbed to always return FailureNone outside the interbase build tag: no
+// value of err can drive the FailureUncertain/FailureCanceled branches through
+// cancellationNotice in the build CI actually runs, so this kind-to-message
+// mapping must be exercised directly to be tested at all.
+func messageForFailureKind(kind database.FailureKind, operation string, err error) string {
+	switch kind {
 	case database.FailureUncertain:
 		log.Printf("interbase: %s outcome is uncertain: %v", operation, err)
 		return uncertainOutcomeMessage
 	case database.FailureCanceled:
 		log.Printf("interbase: %s canceled: %v", operation, err)
 		return canceledMessage
-	}
-	if ctx.Err() != nil && errors.Is(err, context.Canceled) {
-		return stoppedWaitingMessage
 	}
 	return ""
 }
