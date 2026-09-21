@@ -15,7 +15,7 @@ func TestInterBaseDialect1LanguageServerCompletion(t *testing.T) {
 	tx.initServer(t)
 	defer tx.tearDown()
 	defer tx.server.worker.Stop()
-	configureInterBaseTestServer(t, tx)
+	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	cases := []struct {
 		name string
@@ -73,30 +73,167 @@ func handlerCompletionLabels(items []lsp.CompletionItem) map[string]bool {
 	return labels
 }
 
-func TestInterBaseDialect1LanguageServerFormatting(t *testing.T) {
-	tx := newTestContext()
-	tx.initServer(t)
-	defer tx.tearDown()
-	defer tx.server.worker.Stop()
-	configureInterBaseTestServer(t, tx)
-
-	input := `select "literal" from rdb$database`
-	tx.textDocumentDidOpen(t, testFileURI, input)
-	params := lsp.DocumentFormattingParams{
-		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+func TestInterBaseLanguageServerFormattingByVariant(t *testing.T) {
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+		input   string
+		want    string
+	}{
+		{
+			name:    "dialect 1 treats double quotes as a string",
+			variant: dialect.SQLVariantInterBase1,
+			input:   `select "literal", 'c''d' from rdb$database`,
+			want:    "SELECT\n\t\"literal\",\n\t'c''d'\nFROM\n\trdb$database",
+		},
+		{
+			name:    "dialect 3 treats double quotes as a delimited identifier",
+			variant: dialect.SQLVariantInterBase3,
+			input:   `select "literal", 'c''d' from rdb$database`,
+			want:    "SELECT\n\t\"literal\",\n\t'c''d'\nFROM\n\trdb$database",
+		},
+		{
+			name:    "dialect 3 keeps a space inside a delimited identifier",
+			variant: dialect.SQLVariantInterBase3,
+			input:   `select "My Column" from rdb$database`,
+			want:    "SELECT\n\t\"My Column\"\nFROM\n\trdb$database",
+		},
 	}
 
-	var got []lsp.TextEdit
-	if err := tx.conn.Call(tx.ctx, "textDocument/formatting", params, &got); err != nil {
-		t.Fatal("conn.Call textDocument/formatting:", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := newTestContext()
+			tx.initServer(t)
+			defer tx.tearDown()
+			defer tx.server.worker.Stop()
+			configureInterBaseTestServer(t, tx, tt.variant)
+
+			tx.textDocumentDidOpen(t, testFileURI, tt.input)
+			params := lsp.DocumentFormattingParams{
+				TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+			}
+
+			var got []lsp.TextEdit
+			if err := tx.conn.Call(tx.ctx, "textDocument/formatting", params, &got); err != nil {
+				t.Fatal("conn.Call textDocument/formatting:", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d text edits, want 1", len(got))
+			}
+			if got[0].NewText != tt.want {
+				t.Fatalf("formatted query = %q, want %q", got[0].NewText, tt.want)
+			}
+			if strings.Contains(tt.input, `'c''d'`) && !strings.Contains(got[0].NewText, `'c''d'`) {
+				t.Fatalf("the language server corrupted an escaped string literal: %q", got[0].NewText)
+			}
+		})
 	}
-	if len(got) != 1 {
-		t.Fatalf("got %d text edits, want 1", len(got))
+}
+
+func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
+	// The variant on the connection must reach the completer, not just the
+	// formatter: this is the end of the propagation chain that plan 1 builds.
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+	}{
+		{name: "dialect 1", variant: dialect.SQLVariantInterBase1},
+		{name: "dialect 3", variant: dialect.SQLVariantInterBase3},
 	}
 
-	want := "SELECT\n\t\"literal\"\nFROM\n\trdb$database"
-	if got[0].NewText != want {
-		t.Fatalf("formatted InterBase Dialect 1 query = %q, want %q", got[0].NewText, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := newTestContext()
+			tx.initServer(t)
+			defer tx.tearDown()
+			defer tx.server.worker.Stop()
+			configureInterBaseTestServer(t, tx, tt.variant)
+
+			const text = "select rdb$ from rdb$database"
+			tx.textDocumentDidOpen(t, testFileURI, text)
+
+			var completions []lsp.CompletionItem
+			if err := tx.conn.Call(tx.ctx, "textDocument/completion", lsp.CompletionParams{
+				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+					TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+					Position:     lsp.Position{Line: 0, Character: 11},
+				},
+			}, &completions); err != nil {
+				t.Fatal("conn.Call textDocument/completion:", err)
+			}
+			if labels := handlerCompletionLabels(completions); !labels["RDB$RELATION_ID"] {
+				t.Errorf("missing catalog column completion under %s: %v", tt.variant, labels)
+			}
+
+			var hover lsp.Hover
+			if err := tx.conn.Call(tx.ctx, "textDocument/hover", lsp.HoverParams{
+				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+					TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+					Position:     lsp.Position{Line: 0, Character: 11},
+				},
+			}, &hover); err != nil {
+				t.Fatal("conn.Call textDocument/hover:", err)
+			}
+			_ = hover
+		})
+	}
+
+	// The dialect-dependent half: a Dialect 3 connection offers TIMESTAMP,
+	// a Dialect 1 connection does not, because the type does not exist there.
+	keywordTests := []struct {
+		variant dialect.SQLVariant
+		want    bool
+	}{
+		{variant: dialect.SQLVariantInterBase3, want: true},
+		{variant: dialect.SQLVariantInterBase1, want: false},
+	}
+	for _, tt := range keywordTests {
+		t.Run("TIMESTAMP offered for "+string(tt.variant), func(t *testing.T) {
+			tx := newTestContext()
+			tx.initServer(t)
+			defer tx.tearDown()
+			defer tx.server.worker.Stop()
+			configureInterBaseTestServer(t, tx, tt.variant)
+
+			const text = "TIM"
+			tx.textDocumentDidOpen(t, testFileURI, text)
+
+			var completions []lsp.CompletionItem
+			if err := tx.conn.Call(tx.ctx, "textDocument/completion", lsp.CompletionParams{
+				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+					TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+					Position:     lsp.Position{Line: 0, Character: len(text)},
+				},
+			}, &completions); err != nil {
+				t.Fatal("conn.Call textDocument/completion:", err)
+			}
+			if got := handlerCompletionLabels(completions)["TIMESTAMP"]; got != tt.want {
+				t.Errorf("TIMESTAMP offered = %v, want %v under %s", got, tt.want, tt.variant)
+			}
+		})
+	}
+}
+
+func TestParserVariantDefaultsToDialect3WithoutConnection(t *testing.T) {
+	s := NewServer()
+	if s.dbConn != nil {
+		t.Fatal("a fresh server must have no connection")
+	}
+	dv := s.parserDriverVariant()
+	if dv != (dialect.DriverVariant{}) {
+		t.Fatalf("parserDriverVariant() = %#v, want the zero value", dv)
+	}
+
+	// The zero DriverVariant with the InterBase driver resolves to Dialect 3,
+	// matching the interbase-go default. This is what fixes the bug offline.
+	ib, ok := dialect.DialectForDriverVariant(dialect.DriverVariant{
+		Driver: dialect.DatabaseDriverInterBase,
+	}).(*dialect.InterBaseDialect)
+	if !ok {
+		t.Fatal("the InterBase driver must resolve to *InterBaseDialect")
+	}
+	if got, want := ib.SQLDialect, 3; got != want {
+		t.Fatalf("offline InterBase SQLDialect = %d, want %d", got, want)
 	}
 }
 
@@ -122,7 +259,7 @@ func TestInterBaseDialect1LanguageServerHover(t *testing.T) {
 	tx.initServer(t)
 	defer tx.tearDown()
 	defer tx.server.worker.Stop()
-	configureInterBaseTestServer(t, tx)
+	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	input := "select rdb$relation_id from rdb$database"
 	tx.textDocumentDidOpen(t, testFileURI, input)
@@ -195,7 +332,7 @@ func TestInterBaseStatementParsingByVariant(t *testing.T) {
 	}
 }
 
-func configureInterBaseTestServer(t *testing.T, tx *TestContext) {
+func configureInterBaseTestServer(t *testing.T, tx *TestContext, variant dialect.SQLVariant) {
 	t.Helper()
 
 	columns := []*database.ColumnDesc{
@@ -222,5 +359,8 @@ func configureInterBaseTestServer(t *testing.T, tx *TestContext) {
 	if err := tx.server.worker.ReCache(context.Background(), repo); err != nil {
 		t.Fatal("worker.ReCache:", err)
 	}
-	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.dbConn = &database.DBConnection{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: variant,
+	}
 }
