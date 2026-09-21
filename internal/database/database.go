@@ -35,6 +35,15 @@ type DBRepository interface {
 	DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error)
 }
 
+// ReadOnlyQuerier is an optional repository capability: a repository that can
+// run a read statement inside an explicit read-only transaction and materialise
+// the whole result itself. Handlers type-assert it rather than checking the
+// driver name, so any driver that later implements it gets the behaviour for
+// free.
+type ReadOnlyQuerier interface {
+	QueryReadOnly(ctx context.Context, query string) (*QueryResult, error)
+}
+
 type DBOption struct {
 	MaxIdleConns int
 	MaxOpenConns int

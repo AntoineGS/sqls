@@ -525,3 +525,39 @@ func (db *InterBaseDBRepository) Query(ctx context.Context, query string) (*sql.
 	}
 	return db.Conn.QueryContext(ctx, query)
 }
+
+// QueryReadOnly runs a read statement inside an explicit read-only,
+// read-committed transaction and materialises the whole result before
+// returning, so the transaction's lifetime never escapes this method and an
+// early return in the handler cannot leak it.
+//
+// EXECUTE PROCEDURE deliberately never reaches this path: per the driver's
+// documented boundary an implicit procedure query commits its write
+// transaction, so a procedure call is a write even when it returns a row.
+func (db *InterBaseDBRepository) QueryReadOnly(ctx context.Context, query string) (*QueryResult, error) {
+	if db == nil || db.Conn == nil {
+		return nil, errors.New("interbase: database connection is nil")
+	}
+
+	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{
+		ReadOnly:  true,
+		Isolation: sql.LevelReadCommitted,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A read-only transaction is released by rolling it back; there is nothing
+	// to commit, and the rollback must run on every path including a partial
+	// fetch.
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	return ScanRowsWithTypes(rows, RenderOptionsFor(dialect.DatabaseDriverInterBase))
+}
+
+var _ ReadOnlyQuerier = (*InterBaseDBRepository)(nil)
