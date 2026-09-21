@@ -74,7 +74,10 @@ type keywordMatcher interface {
 // implements it decides directly whether a doubled quote inside a single-quoted
 // string keeps its source spelling, instead of having that derived from the
 // delimited-identifier rule. Dialects that reprint tokens verbatim — as the
-// formatter does — must preserve the spelling or they rewrite 'c”d' as 'c'd'.
+// formatter does — must preserve the spelling, or a doubled apostrophe escape
+// collapses into a single apostrophe and changes what the string means:
+//
+//	'c''d'  ->  'c'd'
 type quotedStringEscapePreserver interface {
 	PreservesQuotedStringEscapes() bool
 }
