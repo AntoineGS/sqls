@@ -139,3 +139,33 @@ func (r *scanRowsTestRows) Next(dest []driver.Value) error {
 		return io.EOF
 	}
 }
+
+func TestScanRowsDiscardsPartialRows(t *testing.T) {
+	// Characterisation test, deliberately green. It pins the behaviour
+	// ScanRowsWithTypes was introduced to replace, so that
+	// TestScanRowsWithTypesReturnsPartialRowsOnFetchFailure is demonstrably a
+	// change rather than a restatement: on the same fixture ScanRows throws
+	// away both rows it scanned and returns a nil slice.
+	stringRows, err := scanLegacyFailingFetch(t)
+	if !errors.Is(err, errFetchTest) {
+		t.Fatalf("ScanRows() error = %v, want %v", err, errFetchTest)
+	}
+	if stringRows != nil {
+		t.Errorf("ScanRows() rows = %#v, want nil — it discards what it scanned", stringRows)
+	}
+}
+
+func scanLegacyFailingFetch(t *testing.T) ([][]string, error) {
+	t.Helper()
+	db := openResultTestDB(t, newFailingFetchFixture)
+	rows, err := db.QueryContext(context.Background(), "SELECT")
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v", err)
+	}
+	defer func() { _ = rows.Close() }()
+	columns, err := Columns(rows)
+	if err != nil {
+		t.Fatalf("Columns() error = %v", err)
+	}
+	return ScanRows(rows, len(columns))
+}

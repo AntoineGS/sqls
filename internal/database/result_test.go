@@ -475,3 +475,119 @@ func TestDefaultMaxCellRunesIsFiveHundredTwelve(t *testing.T) {
 		t.Errorf("DefaultMaxCellRunes = %d, want 512", DefaultMaxCellRunes)
 	}
 }
+
+var errFetchTest = errors.New("interbase: BLOB result exceeds the materialization limit")
+
+func newFailingFetchFixture() *resultTestRows {
+	rows := newResultTestRows(
+		[]resultTestColumn{
+			{name: "ID", databaseType: "INTEGER", scanType: reflect.TypeOf(int64(0))},
+			{name: "BODY", databaseType: "BLOB", scanType: reflect.TypeOf([]byte(nil))},
+		},
+		[][]driver.Value{
+			{int64(1), []byte("one")},
+			{int64(2), []byte("two")},
+			{int64(3), []byte("three")},
+		},
+	)
+	// The third Next fails instead of yielding a row, which is what an
+	// oversized BLOB does: a hard fetch error, not a truncated value.
+	rows.failAt = 2
+	rows.failErr = errFetchTest
+	return rows
+}
+
+func TestScanRowsWithTypesReturnsPartialRowsOnFetchFailure(t *testing.T) {
+	result, err := scanFixture(t, newFailingFetchFixture, RenderOptions{DistinguishNull: true})
+
+	if !errors.Is(err, errFetchTest) {
+		t.Fatalf("error = %v, want %v", err, errFetchTest)
+	}
+	if result == nil {
+		t.Fatal("result = nil alongside a fetch error, want the rows scanned before it")
+	}
+	if got := len(result.Rows); got != 2 {
+		t.Fatalf("len(Rows) = %d, want the 2 rows that preceded the failure", got)
+	}
+	want := [][]string{
+		{"1", "<BLOB 3 bytes>"},
+		{"2", "<BLOB 3 bytes>"},
+	}
+	if !reflect.DeepEqual(result.Rows, want) {
+		t.Errorf("Rows = %#v, want %#v", result.Rows, want)
+	}
+	if result.Complete {
+		t.Error("Complete = true after a fetch failure, want false")
+	}
+	// Column metadata is available before the first row, so a caller can still
+	// render a header and still tell that a BLOB column was involved.
+	if got := len(result.Columns); got != 2 {
+		t.Fatalf("len(Columns) = %d, want 2", got)
+	}
+	if got := result.Columns[1].DatabaseTypeName; got != "BLOB" {
+		t.Errorf("Columns[1].DatabaseTypeName = %q, want %q", got, "BLOB")
+	}
+}
+
+func TestScanRowsWithTypesReturnsPartialRowsOnScanFailure(t *testing.T) {
+	// A value that cannot convert into its column's destination fails inside
+	// rows.Scan rather than rows.Err, which is the other return point that has
+	// to carry the partial result.
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "N", databaseType: "INTEGER", scanType: reflect.TypeOf(int64(0))}},
+			[][]driver.Value{{int64(1)}, {"not a number"}},
+		)
+	}, RenderOptions{})
+
+	if err == nil {
+		t.Fatal("error = nil, want a scan conversion failure")
+	}
+	if result == nil {
+		t.Fatal("result = nil alongside a scan error, want the row scanned before it")
+	}
+	if want := [][]string{{"1"}}; !reflect.DeepEqual(result.Rows, want) {
+		t.Errorf("Rows = %#v, want %#v", result.Rows, want)
+	}
+	if result.Complete {
+		t.Error("Complete = true after a scan failure, want false")
+	}
+}
+
+func TestScanRowsWithTypesReturnsNilOnlyWhenColumnTypesFails(t *testing.T) {
+	// The single case with nothing to report: the metadata call itself fails,
+	// so there are no columns and no rows to hand back.
+	//
+	// This test pins the (nil, err) BOUNDARY rather than a change, so unlike
+	// its two siblings it stays green under the "return nil, err" mutation in
+	// Step 4 — do not read its passing as evidence for the partial-result
+	// contract.
+	//
+	// It also depends on (*sql.Rows).ColumnTypes returning an error after
+	// Close, which is database/sql behaviour rather than a documented
+	// contract (verified on Go 1.27.1). If a future toolchain makes
+	// ColumnTypes succeed on closed rows, this test fails at "error = nil"
+	// and the fix is a fixture whose ColumnTypeScanType path errors, not
+	// deleting the assertion.
+	db := openResultTestDB(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "N", databaseType: "INTEGER", scanType: reflect.TypeOf(int64(0))}},
+			[][]driver.Value{{int64(1)}},
+		)
+	})
+	rows, err := db.QueryContext(context.Background(), "SELECT")
+	if err != nil {
+		t.Fatalf("QueryContext() error = %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("rows.Close() error = %v", err)
+	}
+
+	result, err := ScanRowsWithTypes(rows, RenderOptions{})
+	if err == nil {
+		t.Fatal("error = nil for closed rows, want a ColumnTypes failure")
+	}
+	if result != nil {
+		t.Errorf("result = %#v, want nil when ColumnTypes fails", result)
+	}
+}
