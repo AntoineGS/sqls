@@ -173,3 +173,25 @@ func TestInterBaseLiveExplicitDialectMismatchWarnsAndConnects(t *testing.T) {
 		t.Errorf("warning %q does not name the connection alias %q", warning, cfg.Alias)
 	}
 }
+
+func TestInterBaseCharsetAllowlistMatchesDriverNormalizer(t *testing.T) {
+	// NewConnector validates and returns without dialing (interbase.go:114-139),
+	// so this test needs no server. It fails the moment the driver's allowlist and
+	// interBaseCharsets disagree in either direction.
+	for _, charset := range interBaseCharsets {
+		if _, err := interbase.NewConnector(interbase.Config{
+			Database: "/tmp/sqls-allowlist.ib",
+			User:     "sqls",
+			Charset:  charset,
+		}); err != nil {
+			t.Errorf("driver rejected charset %q that sqls accepts: %v", charset, err)
+		}
+	}
+	if _, err := interbase.NewConnector(interbase.Config{
+		Database: "/tmp/sqls-allowlist.ib",
+		User:     "sqls",
+		Charset:  "LATIN1",
+	}); err == nil {
+		t.Error("driver accepted charset LATIN1 that sqls rejects; the allowlists have drifted")
+	}
+}

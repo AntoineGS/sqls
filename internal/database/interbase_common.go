@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -63,6 +64,12 @@ func interBaseAttachment(cfg *DBConfig) (string, error) {
 	return fmt.Sprintf("%s/%d:%s", cfg.Host, port, databasePath), nil
 }
 
+// interBaseCharsets mirrors the driver's normalizeCharset allowlist
+// (interbase-go interbase.go:383-392). The driver's normalizer is unexported and
+// its package only builds with cgo, so sqls keeps this copy in order to validate
+// a connection on an untagged build.
+var interBaseCharsets = []string{"UTF8", "WIN1250", "WIN1252", "ISO8859_1", "ASCII"}
+
 func interBaseCharset(cfg *DBConfig) (string, error) {
 	if cfg == nil {
 		return "", errors.New("interbase: connection config is nil")
@@ -81,14 +88,14 @@ func interBaseCharset(cfg *DBConfig) (string, error) {
 		found = true
 	}
 
-	switch strings.ToUpper(strings.TrimSpace(charset)) {
-	case "":
+	normalized := strings.ToUpper(strings.TrimSpace(charset))
+	if normalized == "" {
 		return "UTF8", nil
-	case "UTF8", "WIN1250":
-		return strings.ToUpper(strings.TrimSpace(charset)), nil
-	default:
-		return "", fmt.Errorf("interbase: unsupported charset %q", charset)
 	}
+	if slices.Contains(interBaseCharsets, normalized) {
+		return normalized, nil
+	}
+	return "", fmt.Errorf("interbase: unsupported charset %q", charset)
 }
 
 type InterBaseDBRepository struct {
