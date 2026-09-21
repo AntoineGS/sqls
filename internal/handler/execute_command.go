@@ -215,21 +215,28 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			continue
 		}
 
-		if _, isQuery := database.QueryExecType(query, ""); isQuery {
-			res, err := s.query(ctx, query, showVertical)
-			if err != nil {
-				return nil, err
+		res, err := s.runStatement(ctx, query, showVertical)
+		if err != nil {
+			if notice := cancellationNotice(ctx, err); notice != "" {
+				fmt.Fprintln(buf, notice)
+				// Reported as a cancelledError, not as (string, nil): the
+				// command wrapper must be able to tell this apart from a
+				// statement that completed before a late cancellation, or it
+				// prepends a note saying the opposite of this one.
+				return nil, &cancelledError{rendered: buf.String()}
 			}
-			fmt.Fprintln(buf, res)
-		} else {
-			res, err := s.exec(ctx, query, showVertical)
-			if err != nil {
-				return nil, err
-			}
-			fmt.Fprintln(buf, res)
+			return nil, err
 		}
+		fmt.Fprintln(buf, res)
 	}
 	return buf.String(), nil
+}
+
+func (s *Server) runStatement(ctx context.Context, query string, vertical bool) (string, error) {
+	if _, isQuery := database.QueryExecType(query, ""); isQuery {
+		return s.query(ctx, query, vertical)
+	}
+	return s.exec(ctx, query, vertical)
 }
 
 func extractRangeText(text string, startLine, startChar, endLine, endChar int) string {

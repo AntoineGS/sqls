@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sourcegraph/jsonrpc2"
+
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -206,5 +208,63 @@ func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T)
 	case <-commandDone:
 	case <-time.After(10 * time.Second):
 		t.Fatal("switchDatabase never completed")
+	}
+}
+
+func TestCancelledQueryRendersTheCancelledMessage(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	backend := installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	gate := backend.gate("Query")
+	requestID := jsonrpc2.ID{Str: "render-cancel", IsString: true}
+
+	type callResult struct {
+		out string
+		err error
+	}
+	done := make(chan callResult, 1)
+	go func() {
+		var got string
+		err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+			Command:   CommandExecuteQuery,
+			Arguments: []interface{}{testFileURI},
+		}, &got, jsonrpc2.PickID(requestID))
+		done <- callResult{out: got, err: err}
+	}()
+	gate.waitEntered(t)
+
+	if err := tx.conn.Notify(tx.ctx, "$/cancelRequest", cancelParams{ID: requestID}); err != nil {
+		t.Fatal("conn.Notify $/cancelRequest:", err)
+	}
+
+	select {
+	case res := <-done:
+		if res.err != nil {
+			t.Fatal("conn.Call workspace/executeCommand:", res.err)
+		}
+		// This is an untagged build, so ClassifyFailure reports FailureNone and
+		// the notice degrades to the stopped-waiting wording.
+		if !strings.Contains(res.out, "sqls stopped waiting for this statement") {
+			t.Errorf("result = %q, want the stopped-waiting message", res.out)
+		}
+		if strings.Contains(res.out, "42") {
+			t.Errorf("result = %q, want no rows for a cancelled statement", res.out)
+		}
+		// The regression assertion: a cancelled statement must never also be
+		// told that it completed and the cancellation arrived too late.
+		if strings.Contains(res.out, "arrived after the statement completed") {
+			t.Errorf("result = %q, want no late-arrival note on a cancelled statement", res.out)
+		}
+		if strings.Contains(res.out, lateCancellationNote) {
+			t.Errorf("result = %q, want the late-cancellation note absent", res.out)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the cancelled command never completed")
 	}
 }
