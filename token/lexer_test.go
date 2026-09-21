@@ -973,3 +973,146 @@ func TestTokenizer_GenericDoubleQuotesRemainDelimitedIdentifiers(t *testing.T) {
 		t.Fatalf("generic double-quoted token = %#v, want a delimited SQLWord", tokens[0].Value)
 	}
 }
+
+// optionalHookDialect is a generic dialect that opts into the optional lexer
+// interfaces, so the hooks can be tested without depending on any real dialect.
+type optionalHookDialect struct {
+	dialect.GenericSQLDialect
+	preserve  bool
+	scanWhole bool
+}
+
+func (d *optionalHookDialect) PreservesQuotedStringEscapes() bool  { return d.preserve }
+func (d *optionalHookDialect) ScansWholeDelimitedIdentifier() bool { return d.scanWhole }
+
+func TestTokenizerOptionalQuotedStringEscapePreserver(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect dialect.Dialect
+		src     string
+		want    string
+	}{
+		{
+			name:    "generic dialect decodes the doubled quote",
+			dialect: &dialect.GenericSQLDialect{},
+			src:     `'c''d'`,
+			want:    `'c'd'`,
+		},
+		{
+			name:    "opting out matches the generic dialect",
+			dialect: &optionalHookDialect{preserve: false},
+			src:     `'c''d'`,
+			want:    `'c'd'`,
+		},
+		{
+			name:    "opting in preserves the source spelling",
+			dialect: &optionalHookDialect{preserve: true},
+			src:     `'c''d'`,
+			want:    `'c''d'`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, err := NewTokenizer(bytes.NewBufferString(tt.src), tt.dialect).Tokenize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tokens) != 1 {
+				t.Fatalf("got %d tokens, want 1: %s", len(tokens), pp.Sprint(tokens))
+			}
+			if got, want := tokens[0].Kind, SingleQuotedString; got != want {
+				t.Fatalf("token kind = %v, want %v", got, want)
+			}
+			if got := tokens[0].Value; got != tt.want {
+				t.Fatalf("token value = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTokenizerOptionalDelimitedIdentifierScanner(t *testing.T) {
+	tests := []struct {
+		name       string
+		scanWhole  bool
+		src        string
+		wantValues []string
+		wantQuote  rune
+	}{
+		{
+			name:       "opting out stops at a space, as today",
+			scanWhole:  false,
+			src:        `"My Column"`,
+			wantValues: []string{`"My`, "Column", `"`},
+			wantQuote:  0,
+		},
+		{
+			name:       "opting in scans the whole identifier",
+			scanWhole:  true,
+			src:        `"My Column"`,
+			wantValues: []string{"My Column"},
+			wantQuote:  '"',
+		},
+		{
+			name:       "opting in keeps a doubled quote in the identifier",
+			scanWhole:  true,
+			src:        `"a""b"`,
+			wantValues: []string{`a""b`},
+			wantQuote:  '"',
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &optionalHookDialect{scanWhole: tt.scanWhole}
+			tokens, err := NewTokenizer(bytes.NewBufferString(tt.src), d).Tokenize()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var got []string
+			for _, tok := range tokens {
+				if tok.Kind == Whitespace {
+					continue
+				}
+				word, ok := tok.Value.(*SQLWord)
+				if !ok {
+					t.Fatalf("token value = %T, want *SQLWord: %s", tok.Value, pp.Sprint(tokens))
+				}
+				got = append(got, word.Value)
+			}
+			if !cmp.Equal(got, tt.wantValues) {
+				t.Fatalf("identifier values = %#v, want %#v", got, tt.wantValues)
+			}
+
+			first, ok := tokens[0].Value.(*SQLWord)
+			if !ok {
+				t.Fatalf("first token value = %T, want *SQLWord", tokens[0].Value)
+			}
+			if got, want := first.QuoteStyle, tt.wantQuote; got != want {
+				t.Fatalf("first token quote style = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestTokenizerUnclosedDelimitedIdentifierStopsAtNewline(t *testing.T) {
+	d := &optionalHookDialect{scanWhole: true}
+	tokens, err := NewTokenizer(bytes.NewBufferString("\"abc\nfrom"), d).Tokenize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	word, ok := tokens[0].Value.(*SQLWord)
+	if !ok {
+		t.Fatalf("token value = %T, want *SQLWord", tokens[0].Value)
+	}
+	if got, want := word.Value, `"abc`; got != want {
+		t.Fatalf("unclosed identifier value = %q, want %q", got, want)
+	}
+	if got, want := word.QuoteStyle, rune(0); got != want {
+		t.Fatalf("unclosed identifier quote style = %q, want %q", got, want)
+	}
+	if got, want := tokens[1].Value, "\n"; got != want {
+		t.Fatalf("token after unclosed identifier = %#v, want %q", tokens[1].Value, want)
+	}
+}

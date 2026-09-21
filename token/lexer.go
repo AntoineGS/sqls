@@ -70,6 +70,23 @@ type keywordMatcher interface {
 	MatchKeyword(string) dialect.KeywordKind
 }
 
+// quotedStringEscapePreserver is an optional dialect interface. A dialect that
+// implements it decides directly whether a doubled quote inside a single-quoted
+// string keeps its source spelling, instead of having that derived from the
+// delimited-identifier rule. Dialects that reprint tokens verbatim — as the
+// formatter does — must preserve the spelling or they rewrite 'c”d' as 'c'd'.
+type quotedStringEscapePreserver interface {
+	PreservesQuotedStringEscapes() bool
+}
+
+// delimitedIdentifierScanner is an optional dialect interface. A dialect that
+// returns true scans a delimited identifier to its closing quote rather than
+// stopping at the first space, and treats a doubled closing quote as an escaped
+// quote within the identifier. An unclosed identifier still ends at a newline.
+type delimitedIdentifierScanner interface {
+	ScansWholeDelimitedIdentifier() bool
+}
+
 type Token struct {
 	Kind  Kind
 	Value interface{}
@@ -440,7 +457,11 @@ func (t *Tokenizer) tokenizeWord(f rune) string {
 }
 
 func (t *Tokenizer) tokenizeSingleQuotedString() string {
-	return t.tokenizeQuotedString('\'', !t.Dialect.IsDelimitedIdentifierStart('"'))
+	preserve := !t.Dialect.IsDelimitedIdentifierStart('"')
+	if p, ok := t.Dialect.(quotedStringEscapePreserver); ok {
+		preserve = p.PreservesQuotedStringEscapes()
+	}
+	return t.tokenizeQuotedString('\'', preserve)
 }
 
 func (t *Tokenizer) tokenizeQuotedString(quote rune, preserveEscapes bool) string {
@@ -491,18 +512,31 @@ func (t *Tokenizer) tokenizeDelimitedIdentifier(r rune) *SQLWord {
 	end := matchingEndQuote(r)
 	isClosed := false
 
+	scanWhole := false
+	if sc, ok := t.Dialect.(delimitedIdentifierScanner); ok {
+		scanWhole = sc.ScansWholeDelimitedIdentifier()
+	}
+
 	var s []rune
 	for {
-		n := t.Scanner.Next()
-		if n == scanner.EOF {
+		n := t.Scanner.Peek()
+		if n == scanner.EOF || (scanWhole && n == '\n') {
 			break
 		}
+		t.Scanner.Next()
 		if n == end {
+			if scanWhole && t.Scanner.Peek() == end {
+				// A doubled quote is an escaped quote inside the identifier.
+				// Keep the source spelling so the formatter reprints it verbatim.
+				t.Scanner.Next()
+				s = append(s, end, end)
+				continue
+			}
 			isClosed = true
 			break
 		}
 		s = append(s, n)
-		if t.Scanner.Peek() == ' ' {
+		if !scanWhole && t.Scanner.Peek() == ' ' {
 			break
 		}
 	}
