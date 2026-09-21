@@ -18,9 +18,9 @@ func init() {
 	RegisterOpen("mysql57", mysqlOpen)
 	RegisterOpen("mysql56", mysqlOpen)
 	RegisterFactory("mysql", NewMySQLDBRepository)
-	RegisterFactory("mysql8", NewMySQLDBRepository)
-	RegisterFactory("mysql57", NewMySQLDBRepository)
-	RegisterFactory("mysql56", NewMySQLDBRepository)
+	RegisterFactory("mysql8", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL8))
+	RegisterFactory("mysql57", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL57))
+	RegisterFactory("mysql56", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL56))
 }
 
 func mysqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
@@ -133,7 +133,16 @@ type MySQLDBRepository struct {
 }
 
 func NewMySQLDBRepository(conn *sql.DB) DBRepository {
-	return &MySQLDBRepository{Conn: conn}
+	return &MySQLDBRepository{Conn: conn, driver: dialect.DatabaseDriverMySQL}
+}
+
+// newMySQLVariantDBRepository returns a Factory for a MySQL driver alias
+// (mysql8, mysql57, mysql56). Factory's signature carries no driver name, so
+// each alias needs its own closure to report the right one from Driver().
+func newMySQLVariantDBRepository(driver dialect.DatabaseDriver) Factory {
+	return func(conn *sql.DB) DBRepository {
+		return &MySQLDBRepository{Conn: conn, driver: driver}
+	}
 }
 
 func (db *MySQLDBRepository) Driver() dialect.DatabaseDriver {

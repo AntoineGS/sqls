@@ -11,15 +11,39 @@ import (
 
 var driverOpeners = make(map[dialect.DatabaseDriver]Opener)
 var driverFactories = make(map[dialect.DatabaseDriver]Factory)
+var driverConnFactories = make(map[dialect.DatabaseDriver]ConnFactory)
 
 type Opener func(*DBConfig) (*DBConnection, error)
 type Factory func(*sql.DB) DBRepository
+
+// ConnFactory builds a repository from the whole connection rather than from
+// the *sql.DB alone, for drivers whose repository needs connection-level
+// context such as a resolved SQL variant. It is optional: a driver that
+// registers none keeps using Factory.
+type ConnFactory func(*DBConnection) DBRepository
 
 type DBConnection struct {
 	Conn    *sql.DB
 	SSHConn *ssh.Client
 	Tunnel  io.Closer
 	Driver  dialect.DatabaseDriver
+
+	// Variant is the server-side SQL variant resolved at connect. It is empty
+	// for drivers that have no variants.
+	Variant dialect.SQLVariant
+	// DatabaseName identifies the attached database for drivers with a single
+	// attachment per connection. Empty when the driver enumerates databases.
+	DatabaseName string
+	// Warnings are non-fatal connect-time diagnostics for the user.
+	Warnings []string
+}
+
+// DriverVariant pairs the driver with the resolved variant. Nil-safe.
+func (db *DBConnection) DriverVariant() dialect.DriverVariant {
+	if db == nil {
+		return dialect.DriverVariant{}
+	}
+	return dialect.DriverVariant{Driver: db.Driver, Variant: db.Variant}
 }
 
 func (db *DBConnection) Close() error {
@@ -81,4 +105,31 @@ func CreateRepository(driver dialect.DatabaseDriver, db *sql.DB) (DBRepository, 
 		return nil, fmt.Errorf("driver not found, %s", driver)
 	}
 	return FactoryFn(db), nil
+}
+
+func RegisterConnFactory(name dialect.DatabaseDriver, factory ConnFactory) {
+	if _, ok := driverConnFactories[name]; ok {
+		panic(fmt.Sprintf("driver conn factory %s already registered", name))
+	}
+	driverConnFactories[name] = factory
+}
+
+// CreateRepositoryFromConnection builds a repository for a connection,
+// preferring a registered ConnFactory and falling back to the *sql.DB factory
+// so that drivers which register no ConnFactory are unaffected.
+//
+// The driver is passed in rather than read from conn.Driver because that field
+// is not populated by every opener: openPostgreSQL (postgresql.go:55),
+// openSQLite3 (sqlite3.go:24) and the "mock" opener (database_mock.go:549) all
+// return a DBConnection with an empty Driver. The caller's configured driver is
+// always populated, so keying the lookup off conn.Driver would return
+// "driver not found" for PostgreSQL, SQLite3 and every handler test.
+func CreateRepositoryFromConnection(driver dialect.DatabaseDriver, conn *DBConnection) (DBRepository, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("connection is nil")
+	}
+	if factory, ok := driverConnFactories[driver]; ok {
+		return factory(conn), nil
+	}
+	return CreateRepository(driver, conn.Conn)
 }

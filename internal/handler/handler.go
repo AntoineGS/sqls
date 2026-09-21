@@ -474,7 +474,7 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 	if curDBCfg == nil || dbConn == nil {
 		return nil, ErrNoConnection
 	}
-	repo, err := database.CreateRepository(curDBCfg.Driver, dbConn.Conn)
+	repo, err := database.CreateRepositoryFromConnection(curDBCfg.Driver, dbConn)
 	if err != nil {
 		return nil, err
 	}

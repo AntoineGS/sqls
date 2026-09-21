@@ -416,3 +416,112 @@ func openInterBaseCatalogFixture(t *testing.T) *sql.DB {
 func interBaseFixed(value string) string {
 	return value + strings.Repeat(" ", 31-len(value))
 }
+
+func TestDBConnectionDriverVariant(t *testing.T) {
+	var nilConn *DBConnection
+	if got, want := nilConn.DriverVariant(), (dialect.DriverVariant{}); got != want {
+		t.Errorf("(*DBConnection)(nil).DriverVariant() = %#v, want %#v", got, want)
+	}
+
+	conn := &DBConnection{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase1,
+	}
+	want := dialect.DriverVariant{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase1,
+	}
+	if got := conn.DriverVariant(); got != want {
+		t.Errorf("DriverVariant() = %#v, want %#v", got, want)
+	}
+
+	noVariant := &DBConnection{Driver: dialect.DatabaseDriverPostgreSQL}
+	if got, want := noVariant.DriverVariant().Variant, dialect.SQLVariantDefault; got != want {
+		t.Errorf("a driver with no variants must report %q, got %q", want, got)
+	}
+}
+
+func TestCreateRepositoryFromConnectionPrefersConnFactory(t *testing.T) {
+	conn := &DBConnection{
+		Driver:       dialect.DatabaseDriverInterBase,
+		Variant:      dialect.SQLVariantInterBase1,
+		DatabaseName: "db.example.test/3050:/srv/interbase/example.ib",
+	}
+
+	repo, err := CreateRepositoryFromConnection(dialect.DatabaseDriverInterBase, conn)
+	if err != nil {
+		t.Fatalf("CreateRepositoryFromConnection() error = %v", err)
+	}
+	ib, ok := repo.(*InterBaseDBRepository)
+	if !ok {
+		t.Fatalf("CreateRepositoryFromConnection() = %T, want *InterBaseDBRepository", repo)
+	}
+	if got, want := ib.SQLDialect, 1; got != want {
+		t.Errorf("repository SQLDialect = %d, want %d", got, want)
+	}
+	if got, want := ib.DatabaseName, conn.DatabaseName; got != want {
+		t.Errorf("repository DatabaseName = %q, want %q", got, want)
+	}
+}
+
+func TestCreateRepositoryFromConnectionFallsBackToFactory(t *testing.T) {
+	// Drivers that register no ConnFactory fall back to the *sql.DB factory and
+	// stay untouched by this change.
+	//
+	// Every case here leaves DBConnection.Driver EMPTY on purpose. That is what
+	// the real openers produce: openPostgreSQL (postgresql.go:55), openSQLite3
+	// (sqlite3.go:24) and the "mock" opener (database_mock.go:549) all return a
+	// DBConnection with no Driver set. A lookup keyed off conn.Driver passes a
+	// hand-built {Driver: postgresql} literal and fails every real connection,
+	// so constructing one here would make this test agree with the bug.
+	for _, driver := range []dialect.DatabaseDriver{
+		dialect.DatabaseDriverPostgreSQL,
+		dialect.DatabaseDriverSQLite3,
+		dialect.DatabaseDriverMySQL,
+	} {
+		t.Run(string(driver), func(t *testing.T) {
+			conn := &DBConnection{}
+			if conn.Driver != "" {
+				t.Fatalf("this test is only meaningful with an empty conn.Driver, got %q", conn.Driver)
+			}
+			repo, err := CreateRepositoryFromConnection(driver, conn)
+			if err != nil {
+				t.Fatalf("CreateRepositoryFromConnection(%q) error = %v", driver, err)
+			}
+			if repo == nil {
+				t.Fatal("CreateRepositoryFromConnection() returned a nil repository")
+			}
+			if got := repo.Driver(); got != driver {
+				t.Errorf("repository driver = %q, want %q", got, driver)
+			}
+		})
+	}
+}
+
+func TestCreateRepositoryFromConnectionRejectsNil(t *testing.T) {
+	if _, err := CreateRepositoryFromConnection(dialect.DatabaseDriverPostgreSQL, nil); err == nil {
+		t.Fatal("CreateRepositoryFromConnection(nil) returned a nil error")
+	}
+	if _, err := CreateRepositoryFromConnection("nope", &DBConnection{}); err == nil {
+		t.Fatal("CreateRepositoryFromConnection() with an unknown driver returned a nil error")
+	}
+}
+
+func TestInterBaseRepositoryDefaultsToDialect3(t *testing.T) {
+	// The *sql.DB factory has no connection to read, so it leaves the zero
+	// value, which means Dialect 3 exactly as it does for interbase.Config.
+	repo, err := CreateRepository(dialect.DatabaseDriverInterBase, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ib, ok := repo.(*InterBaseDBRepository)
+	if !ok {
+		t.Fatalf("CreateRepository() = %T, want *InterBaseDBRepository", repo)
+	}
+	if got, want := ib.SQLDialect, 0; got != want {
+		t.Errorf("repository SQLDialect = %d, want %d (zero means dialect 3)", got, want)
+	}
+	if got, want := ib.DatabaseName, ""; got != want {
+		t.Errorf("repository DatabaseName = %q, want %q", got, want)
+	}
+}

@@ -15,6 +15,7 @@ const interBaseDefaultPort = 3050
 func init() {
 	RegisterOpen(dialect.DatabaseDriverInterBase, interBaseOpen)
 	RegisterFactory(dialect.DatabaseDriverInterBase, NewInterBaseDBRepository)
+	RegisterConnFactory(dialect.DatabaseDriverInterBase, NewInterBaseDBRepositoryFromConnection)
 }
 
 // interBaseAttachment converts the existing DBConfig fields to the native
@@ -92,12 +93,32 @@ func interBaseCharset(cfg *DBConfig) (string, error) {
 
 type InterBaseDBRepository struct {
 	Conn *sql.DB
+	// SQLDialect is 1 or 3; zero is treated as 3, matching the driver default.
+	SQLDialect int
+	// DatabaseName is the attachment string; empty when unknown.
+	DatabaseName string
 }
 
 var _ DBRepository = (*InterBaseDBRepository)(nil)
 
+// NewInterBaseDBRepository builds a repository from a pooled *sql.DB alone.
+// It has no connection context, so it leaves SQLDialect zero (dialect 3) and
+// DatabaseName empty.
 func NewInterBaseDBRepository(conn *sql.DB) DBRepository {
 	return &InterBaseDBRepository{Conn: conn}
+}
+
+// NewInterBaseDBRepositoryFromConnection builds a repository that knows the
+// SQL dialect resolved at connect and the attachment it was resolved for.
+func NewInterBaseDBRepositoryFromConnection(conn *DBConnection) DBRepository {
+	if conn == nil {
+		return &InterBaseDBRepository{}
+	}
+	return &InterBaseDBRepository{
+		Conn:         conn.Conn,
+		SQLDialect:   conn.Variant.InterBaseSQLDialect(),
+		DatabaseName: conn.DatabaseName,
+	}
 }
 
 func (db *InterBaseDBRepository) Driver() dialect.DatabaseDriver {
