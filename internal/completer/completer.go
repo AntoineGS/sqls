@@ -72,12 +72,19 @@ func (ct completionType) String() string {
 type Completer struct {
 	DBCache *database.DBCache
 	Driver  dialect.DatabaseDriver
+	// Variant is the server-side SQL variant resolved for the active
+	// connection. The empty variant selects the driver's default.
+	Variant dialect.SQLVariant
 }
 
 func NewCompleter(dbCache *database.DBCache) *Completer {
 	return &Completer{
 		DBCache: dbCache,
 	}
+}
+
+func (c *Completer) driverVariant() dialect.DriverVariant {
+	return dialect.DriverVariant{Driver: c.Driver, Variant: c.Variant}
 }
 
 func completionTypeIs(completionTypes []completionType, expect completionType) bool {
@@ -90,7 +97,7 @@ func completionTypeIs(completionTypes []completionType, expect completionType) b
 }
 
 func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercaseKeywords bool) ([]lsp.CompletionItem, error) {
-	parsed, err := parser.ParseWithDriver(text, c.Driver)
+	parsed, err := parser.ParseWithDriverVariant(text, c.driverVariant())
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +122,7 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 		return nil, err
 	}
 
-	lastWord := getLastWordWithDriver(text, params.Position.Line+1, params.Position.Character, c.Driver)
+	lastWord := getLastWordWithVariant(text, params.Position.Line+1, params.Position.Character, c.driverVariant())
 	withBackQuote := strings.HasPrefix(lastWord, "`")
 
 	var items []lsp.CompletionItem
@@ -186,11 +193,11 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 	}
 
 	if completionTypeIs(ctx.types, CompletionTypeKeyword) {
-		drivers := dialect.DataBaseKeywords(c.Driver)
+		drivers := dialect.DataBaseKeywordsForVariant(c.driverVariant())
 		items = append(items, c.keywordCandidates(lowercaseKeywords, drivers)...)
 	}
 	if completionTypeIs(ctx.types, CompletionTypeFunction) {
-		drivers := dialect.DataBaseFunctions(c.Driver)
+		drivers := dialect.DataBaseFunctionsForVariant(c.driverVariant())
 		items = append(items, c.functionCandidates(lowercaseKeywords, drivers)...)
 	}
 
@@ -435,12 +442,19 @@ func getLastWord(text string, line, char int) string {
 	return getLastWordWithDriver(text, line, char, "")
 }
 
+// getLastWordWithDriver returns the word before the cursor using a driver's
+// default variant. It is retained with its exact signature; see
+// getLastWordWithVariant.
 func getLastWordWithDriver(text string, line, char int, driver dialect.DatabaseDriver) string {
+	return getLastWordWithVariant(text, line, char, dialect.DriverVariant{Driver: driver})
+}
+
+func getLastWordWithVariant(text string, line, char int, dv dialect.DriverVariant) string {
 	t := getBeforeCursorText(text, line, char)
 	s := getLine(t, line)
 
 	wordPattern := "[\\w`]+$"
-	if driver == dialect.DatabaseDriverInterBase {
+	if dv.Driver == dialect.DatabaseDriverInterBase {
 		wordPattern = "[\\w$`]+$"
 	}
 	reg := regexp.MustCompile(wordPattern)

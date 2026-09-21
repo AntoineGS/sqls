@@ -185,6 +185,7 @@ func TestComplete(t *testing.T) {
 func TestCompleteInterBaseDialect1DollarIdentifier(t *testing.T) {
 	c := NewCompleter(interBaseCompletionCache(t))
 	c.Driver = dialect.DatabaseDriverInterBase
+	c.Variant = dialect.SQLVariantInterBase1
 
 	got, err := c.Complete("select rdb$ from rdb$database", lsp.CompletionParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -207,6 +208,7 @@ func TestCompleteInterBaseDialect1DollarIdentifier(t *testing.T) {
 func TestCompleteInterBaseDialect1KeepsLowercaseUserNames(t *testing.T) {
 	c := NewCompleter(interBaseCompletionCache(t))
 	c.Driver = dialect.DatabaseDriverInterBase
+	c.Variant = dialect.SQLVariantInterBase1
 
 	got, err := c.Complete("select u. from users u", lsp.CompletionParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -264,6 +266,7 @@ func TestCompleteInterBaseJoinMatchesUppercaseCatalogNames(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := NewCompleter(interBaseJoinCompletionCache(t))
 			c.Driver = dialect.DatabaseDriverInterBase
+			c.Variant = dialect.SQLVariantInterBase1
 
 			got, err := c.Complete(tt.text, lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -306,6 +309,7 @@ func TestCompleteInterBaseJoinEscapesDollarInSnippet(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			c := NewCompleter(interBaseDollarJoinCompletionCache(t))
 			c.Driver = dialect.DatabaseDriverInterBase
+			c.Variant = dialect.SQLVariantInterBase1
 
 			got, err := c.Complete(tt.text, lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -330,6 +334,128 @@ func TestCompleteInterBaseJoinEscapesDollarInSnippet(t *testing.T) {
 				t.Fatalf("completion %q InsertText = %q, want %q", tt.wantLabel, candidate.InsertText, tt.wantInsert)
 			}
 		})
+	}
+}
+
+func TestCompleteInterBaseKeywordsByVariant(t *testing.T) {
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+		prefix  string
+		want    []string
+		absent  []string
+	}{
+		{
+			name:    "dialect 1 has no TIME or TIMESTAMP type",
+			variant: dialect.SQLVariantInterBase1,
+			absent:  []string{"TIME", "TIMESTAMP"},
+		},
+		{
+			// Absence alone would also hold if completion returned nothing at
+			// all, so this case proves the pipeline runs under dialect 1.
+			// TRIGGER is in the shared InterBase keyword list, not the
+			// dialect 3 delta, so it must be offered under both variants.
+			name:    "dialect 1 still offers its own keywords",
+			variant: dialect.SQLVariantInterBase1,
+			prefix:  "TRI",
+			want:    []string{"TRIGGER"},
+		},
+		{
+			name:    "dialect 3 offers TIME and TIMESTAMP",
+			variant: dialect.SQLVariantInterBase3,
+			want:    []string{"TIME", "TIMESTAMP"},
+		},
+		{
+			name:    "dialect 3 keeps the shared keywords too",
+			variant: dialect.SQLVariantInterBase3,
+			prefix:  "TRI",
+			want:    []string{"TRIGGER"},
+		},
+		{
+			name:    "the default variant is dialect 3",
+			variant: dialect.SQLVariantDefault,
+			want:    []string{"TIME", "TIMESTAMP"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewCompleter(interBaseCompletionCache(t))
+			c.Driver = dialect.DatabaseDriverInterBase
+			c.Variant = tt.variant
+
+			text := tt.prefix
+			if text == "" {
+				text = "TIM"
+			}
+			got, err := c.Complete(text, lsp.CompletionParams{
+				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+					Position: lsp.Position{Line: 0, Character: len(text)},
+				},
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			labels := completionLabels(got)
+			for _, want := range tt.want {
+				if !labels[want] {
+					t.Errorf("missing keyword %q in %v", want, labels)
+				}
+			}
+			for _, absent := range tt.absent {
+				if labels[absent] {
+					t.Errorf("unexpected keyword %q in %v", absent, labels)
+				}
+			}
+		})
+	}
+}
+
+func TestCompleteInterBaseDialect3DelimitedIdentifierPrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+		wantCol bool
+	}{
+		{name: "dialect 3 treats the double quote as an identifier start", variant: dialect.SQLVariantInterBase3, wantCol: true},
+		{name: "dialect 1 treats it as a string", variant: dialect.SQLVariantInterBase1, wantCol: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewCompleter(interBaseCompletionCache(t))
+			c.Driver = dialect.DatabaseDriverInterBase
+			c.Variant = tt.variant
+
+			const text = `select rdb$ from rdb$database`
+			got, err := c.Complete(text, lsp.CompletionParams{
+				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+					Position: lsp.Position{Line: 0, Character: 11},
+				},
+			}, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Catalog column completion must keep working under both dialects:
+			// the '$' word pattern is a driver property, not a dialect one.
+			if !completionLabels(got)["RDB$RELATION_ID"] {
+				t.Fatalf("missing InterBase catalog column in completions: %v", completionLabels(got))
+			}
+		})
+	}
+}
+
+func TestGetLastWordWithVariantMatchesDriverForm(t *testing.T) {
+	dv := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
+	if got, want := getLastWordWithVariant("select rdb$", 1, 11, dv), "rdb$"; got != want {
+		t.Errorf("getLastWordWithVariant() = %q, want %q", got, want)
+	}
+	if got, want := getLastWordWithVariant("select rdb$", 1, 11, dialect.DriverVariant{}), ""; got != want {
+		t.Errorf("getLastWordWithVariant() with no driver = %q, want %q", got, want)
+	}
+	if got, want := getLastWordWithDriver("select rdb$", 1, 11, dialect.DatabaseDriverInterBase), "rdb$"; got != want {
+		t.Errorf("getLastWordWithDriver() = %q, want %q", got, want)
 	}
 }
 
