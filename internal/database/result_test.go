@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -386,5 +387,91 @@ func TestRenderOptionsForOnlyInterBaseDistinguishesNull(t *testing.T) {
 		if got := RenderOptionsFor(name); got.DistinguishNull {
 			t.Errorf("RenderOptionsFor(%s).DistinguishNull = true, want false", name)
 		}
+	}
+}
+
+func TestScanRowsWithTypesRendersBlobPlaceholder(t *testing.T) {
+	// Subtype 0 BLOBs scan as []byte and must never be spilled into the pane;
+	// subtype 1 BLOBs scan as string and are capped like any other text.
+	long := strings.Repeat("x", 600)
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{
+				{name: "BINARY_BLOB", databaseType: "BLOB", scanType: reflect.TypeOf([]byte(nil))},
+				{name: "TEXT_BLOB", databaseType: "BLOB", scanType: reflect.TypeOf("")},
+			},
+			[][]driver.Value{{[]byte("hello"), long}},
+		)
+	}, RenderOptions{DistinguishNull: true})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+
+	if got, want := result.Rows[0][0], "<BLOB 5 bytes>"; got != want {
+		t.Errorf("binary BLOB cell = %q, want %q", got, want)
+	}
+	wantText := strings.Repeat("x", DefaultMaxCellRunes) + "…(truncated, 600 characters)"
+	if got := result.Rows[0][1]; got != wantText {
+		t.Errorf("text BLOB cell = %q, want %q", got, wantText)
+	}
+	if got := result.Columns[0].DatabaseTypeName; got != "BLOB" {
+		t.Errorf("Columns[0].DatabaseTypeName = %q, want %q", got, "BLOB")
+	}
+}
+
+func TestScanRowsWithTypesNullBlobIsNotAPlaceholder(t *testing.T) {
+	// A NULL BLOB arrives as a nil []byte. Rendering it as "<BLOB 0 bytes>"
+	// would claim an empty value exists where there is none.
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "B", databaseType: "BLOB", scanType: reflect.TypeOf([]byte(nil))}},
+			[][]driver.Value{{nil}},
+		)
+	}, RenderOptions{DistinguishNull: true})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+	if got, want := result.Rows[0][0], "NULL"; got != want {
+		t.Errorf("NULL BLOB cell = %q, want %q", got, want)
+	}
+}
+
+func TestScanRowsWithTypesCapsLongCellsByRunes(t *testing.T) {
+	// Eight multi-byte runes: a byte-based cap would slice mid-rune and emit
+	// replacement characters, and would report the wrong total.
+	value := strings.Repeat("é", 12)
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "S", databaseType: "VARCHAR", scanType: reflect.TypeOf("")}},
+			[][]driver.Value{{value}},
+		)
+	}, RenderOptions{MaxCellRunes: 8})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+	want := strings.Repeat("é", 8) + "…(truncated, 12 characters)"
+	if got := result.Rows[0][0]; got != want {
+		t.Errorf("cell = %q, want %q", got, want)
+	}
+}
+
+func TestScanRowsWithTypesLeavesShortCellsAlone(t *testing.T) {
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "S", databaseType: "VARCHAR", scanType: reflect.TypeOf("")}},
+			[][]driver.Value{{"short"}},
+		)
+	}, RenderOptions{MaxCellRunes: 8})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+	if got := result.Rows[0][0]; got != "short" {
+		t.Errorf("cell = %q, want it untouched", got)
+	}
+}
+
+func TestDefaultMaxCellRunesIsFiveHundredTwelve(t *testing.T) {
+	if DefaultMaxCellRunes != 512 {
+		t.Errorf("DefaultMaxCellRunes = %d, want 512", DefaultMaxCellRunes)
 	}
 }
