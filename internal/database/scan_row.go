@@ -27,6 +27,12 @@ func Columns(rows *sql.Rows) ([]string, error) {
 	return cols, nil
 }
 
+// ScanRows stringifies every column through reflection, which renders a NULL
+// and an empty string identically and discards every row it scanned when the
+// fetch fails partway. ScanRowsWithTypes is the replacement: it renders from
+// the driver's column metadata and returns the rows it did scan alongside the
+// error. ScanRows is retained because it is upstream code and because
+// TestScanRowsDiscardsPartialRows pins the contrast.
 func ScanRows(rows *sql.Rows, columnLength int) ([][]string, error) {
 	stringRows := [][]string{}
 	for rows.Next() {
