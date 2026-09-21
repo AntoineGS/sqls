@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
+	"interbase-go/schema"
 )
 
 const interBaseDefaultPort = 3050
@@ -292,7 +293,17 @@ func interBaseColumnDescription(row interBaseColumnRow) (*ColumnDesc, error) {
 	if !row.fieldType.Valid {
 		return nil, errors.New("interbase: catalog returned a column without a field type")
 	}
-	typ := interBaseColumnType(row)
+	// Throwaway adapter: the retained switch now reads schema.Domain, and this
+	// function is deleted whole in the next task together with
+	// interBaseColumnRow. Do not build anything else on it.
+	typ := interBaseColumnType(&schema.Domain{
+		FieldType:       row.fieldType,
+		FieldSubType:    row.fieldSubtype,
+		FieldLength:     row.fieldLength,
+		FieldScale:      row.fieldScale,
+		FieldPrecision:  row.fieldPrecision,
+		CharacterLength: row.characterLength,
+	})
 	key := strings.TrimSpace(row.primaryKey.String)
 	if key != "YES" {
 		key = "NO"
@@ -343,91 +354,6 @@ func interBaseEffectiveDefault(columnSource, domainSource sql.NullString) sql.Nu
 		return interBaseDefault(columnSource)
 	}
 	return interBaseDefault(domainSource)
-}
-
-func interBaseColumnType(row interBaseColumnRow) string {
-	fieldType := row.fieldType.Int64
-	switch fieldType {
-	case 7:
-		return interBaseNumericType("SMALLINT", 4, row)
-	case 8:
-		return interBaseNumericType("INTEGER", 9, row)
-	case 9:
-		return "QUAD"
-	case 10:
-		return "FLOAT"
-	case 12:
-		return "DATE"
-	case 13:
-		return "TIME"
-	case 14:
-		return fmt.Sprintf("CHAR(%d)", interBaseCharacterLength(row))
-	case 16:
-		return interBaseNumericType("BIGINT", 18, row)
-	case 17:
-		return "BOOLEAN"
-	case 27:
-		// In Dialect 1, scaled NUMERIC/DECIMAL values can use DOUBLE
-		// PRECISION as their underlying field type. A subtype without a
-		// negative scale does not carry a fixed-point declaration, so keep
-		// the underlying DOUBLE PRECISION rather than inventing (15, 0).
-		if row.fieldScale.Valid && row.fieldScale.Int64 < 0 {
-			return interBaseNumericType("DOUBLE PRECISION", 15, row)
-		}
-		return "DOUBLE PRECISION"
-	case 35:
-		// Dialect 1 uses field type 35 for DATE. Dialect 3's timestamp
-		// distinction is deliberately not inferred by this fixed-dialect
-		// adapter.
-		return "DATE"
-	case 37:
-		return fmt.Sprintf("VARCHAR(%d)", interBaseCharacterLength(row))
-	case 40:
-		return fmt.Sprintf("CSTRING(%d)", interBaseCharacterLength(row))
-	case 45:
-		return "BLOB_ID"
-	case 261:
-		return "BLOB"
-	default:
-		return fmt.Sprintf("TYPE(%d)", fieldType)
-	}
-}
-
-func interBaseCharacterLength(row interBaseColumnRow) int64 {
-	if row.characterLength.Valid {
-		return row.characterLength.Int64
-	}
-	if row.fieldLength.Valid {
-		return row.fieldLength.Int64
-	}
-	return 0
-}
-
-func interBaseNumericType(base string, naturalPrecision int64, row interBaseColumnRow) string {
-	subtype := int64(0)
-	if row.fieldSubtype.Valid {
-		subtype = row.fieldSubtype.Int64
-	}
-	scale := int64(0)
-	if row.fieldScale.Valid {
-		scale = row.fieldScale.Int64
-	}
-	if subtype == 0 && scale >= 0 {
-		return base
-	}
-
-	precision := naturalPrecision
-	if row.fieldPrecision.Valid && row.fieldPrecision.Int64 > 0 {
-		precision = row.fieldPrecision.Int64
-	}
-	numericName := "NUMERIC"
-	if subtype == 2 {
-		numericName = "DECIMAL"
-	}
-	if scale < 0 {
-		scale = -scale
-	}
-	return fmt.Sprintf("%s(%d, %d)", numericName, precision, scale)
 }
 
 const interBaseForeignKeysQuery = `

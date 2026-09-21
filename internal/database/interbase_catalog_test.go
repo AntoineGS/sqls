@@ -395,3 +395,234 @@ func TestInterBaseSchemaFixtureSupportsReadOnlyTransactions(t *testing.T) {
 		t.Fatalf("second connection saw %d relations, want 5 (shared-cache memory database)", count)
 	}
 }
+
+func interBaseNullInt(value int64) sql.NullInt64 {
+	return sql.NullInt64{Int64: value, Valid: true}
+}
+
+func interBaseNullString(value string) sql.NullString {
+	return sql.NullString{String: value, Valid: true}
+}
+
+func TestInterBaseTypeRenderingByDialect(t *testing.T) {
+	tests := []struct {
+		name         string
+		domain       *schema.Domain
+		wantDialect1 string
+		wantDialect3 string
+	}{
+		// The spec's core table.
+		{
+			name:         "field type 35 is the only dialect-dependent rule",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(35)},
+			wantDialect1: "DATE",
+			wantDialect3: "TIMESTAMP",
+		},
+		{
+			name:         "field type 12 is DATE in both dialects",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(12)},
+			wantDialect1: "DATE", wantDialect3: "DATE",
+		},
+		{
+			name:         "field type 13 is TIME in both dialects",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(13)},
+			wantDialect1: "TIME", wantDialect3: "TIME",
+		},
+		{
+			name: "integer with a numeric subtype renders NUMERIC",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(8), FieldSubType: interBaseNullInt(1),
+				FieldScale: interBaseNullInt(-2), FieldPrecision: interBaseNullInt(9)},
+			wantDialect1: "NUMERIC(9, 2)", wantDialect3: "NUMERIC(9, 2)",
+		},
+		{
+			name: "scaled DOUBLE without a numeric subtype is dialect 1 fixed point",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(27), FieldSubType: interBaseNullInt(0),
+				FieldScale: interBaseNullInt(-2)},
+			wantDialect1: "NUMERIC(15, 2)", wantDialect3: "NUMERIC(15, 2)",
+		},
+		{
+			name: "DOUBLE with subtype 2 renders DECIMAL",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(27), FieldSubType: interBaseNullInt(2),
+				FieldScale: interBaseNullInt(-4), FieldPrecision: interBaseNullInt(18)},
+			wantDialect1: "DECIMAL(18, 4)", wantDialect3: "DECIMAL(18, 4)",
+		},
+		{
+			name: "unscaled DOUBLE stays DOUBLE PRECISION",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(27), FieldSubType: interBaseNullInt(0),
+				FieldScale: interBaseNullInt(0)},
+			wantDialect1: "DOUBLE PRECISION", wantDialect3: "DOUBLE PRECISION",
+		},
+		{
+			name: "CHAR reports its character length without the charset suffix",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(14), CharacterLength: interBaseNullInt(10),
+				CharacterSetID: interBaseNullInt(4), CharacterSetName: interBaseNullString(interBaseFixed("UTF8"))},
+			wantDialect1: "CHAR(10)", wantDialect3: "CHAR(10)",
+		},
+		{
+			name:         "VARCHAR reports its character length",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(37), CharacterLength: interBaseNullInt(20)},
+			wantDialect1: "VARCHAR(20)", wantDialect3: "VARCHAR(20)",
+		},
+		{
+			name:         "a text BLOB reports its subtype",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(261), FieldSubType: interBaseNullInt(1)},
+			wantDialect1: "BLOB SUB_TYPE TEXT", wantDialect3: "BLOB SUB_TYPE TEXT",
+		},
+		{
+			name:         "QUAD survives through the retained switch",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(9)},
+			wantDialect1: "QUAD", wantDialect3: "QUAD",
+		},
+		{
+			name:         "BLOB_ID survives through the retained switch",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(45)},
+			wantDialect1: "BLOB_ID", wantDialect3: "BLOB_ID",
+		},
+		{
+			name:         "CSTRING survives through the retained switch",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(40), CharacterLength: interBaseNullInt(32)},
+			wantDialect1: "CSTRING(32)", wantDialect3: "CSTRING(32)",
+		},
+		{
+			name:         "an unrecognized field type is named, not dropped",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(99)},
+			wantDialect1: "TYPE(99)", wantDialect3: "TYPE(99)",
+		},
+		{name: "a nil domain renders nothing", domain: nil, wantDialect1: "", wantDialect3: ""},
+
+		// Every remaining path on which Domain.SQLType() returns
+		// ErrUnsupportedDDL and the retained switch must catch it. Spec §4.3.
+		{
+			name:         "an array falls back to its base type name",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(8), Dimensions: interBaseNullInt(1)},
+			wantDialect1: "INTEGER", wantDialect3: "INTEGER",
+		},
+		{
+			name: "a numeric subtype with no precision uses the natural precision",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(8), FieldSubType: interBaseNullInt(1),
+				FieldScale: interBaseNullInt(-2)},
+			wantDialect1: "NUMERIC(9, 2)", wantDialect3: "NUMERIC(9, 2)",
+		},
+		{
+			name: "a numeric subtype with no scale renders scale zero",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(8), FieldSubType: interBaseNullInt(1),
+				FieldPrecision: interBaseNullInt(9)},
+			wantDialect1: "NUMERIC(9, 0)", wantDialect3: "NUMERIC(9, 0)",
+		},
+		{
+			name:         "a positive scale on subtype 0 renders the plain base name",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(8), FieldScale: interBaseNullInt(2)},
+			wantDialect1: "INTEGER", wantDialect3: "INTEGER",
+		},
+		{
+			name:         "CHAR with a NULL character length falls back to the field length",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(14), FieldLength: interBaseNullInt(10)},
+			wantDialect1: "CHAR(10)", wantDialect3: "CHAR(10)",
+		},
+		{
+			name: "an unavailable charset name still renders a plain CHAR",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(14), CharacterLength: interBaseNullInt(5),
+				CharacterSetID: interBaseNullInt(4)},
+			wantDialect1: "CHAR(5)", wantDialect3: "CHAR(5)",
+		},
+		{
+			name: "an unavailable collation name still renders a plain CHAR",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(14), CharacterLength: interBaseNullInt(5),
+				CollationID: interBaseNullInt(2)},
+			wantDialect1: "CHAR(5)", wantDialect3: "CHAR(5)",
+		},
+		{
+			name:         "an invalid field type renders nothing rather than TYPE(0)",
+			domain:       &schema.Domain{Name: "D"},
+			wantDialect1: "", wantDialect3: "",
+		},
+
+		// The remaining switch arms, so a later edit cannot drop one.
+		{
+			name:         "SMALLINT with a negative scale",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(7), FieldScale: interBaseNullInt(-1)},
+			wantDialect1: "NUMERIC(4, 1)", wantDialect3: "NUMERIC(4, 1)",
+		},
+		{
+			name: "BIGINT", domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(16)},
+			wantDialect1: "BIGINT", wantDialect3: "BIGINT",
+		},
+		{
+			name: "FLOAT", domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(10)},
+			wantDialect1: "FLOAT", wantDialect3: "FLOAT",
+		},
+		{
+			name: "BOOLEAN", domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(17)},
+			wantDialect1: "BOOLEAN", wantDialect3: "BOOLEAN",
+		},
+
+		// Two cases where SQLType() succeeds and disagrees with the old
+		// switch. They are upgrades, not regressions, but they change text a
+		// user sees, so they are pinned rather than discovered. See the
+		// "documented divergences" note under this task.
+		{
+			name: "a numeric subtype with zero scale is NUMERIC, not DOUBLE PRECISION",
+			domain: &schema.Domain{Name: "D", FieldType: interBaseNullInt(27), FieldSubType: interBaseNullInt(1),
+				FieldScale: interBaseNullInt(0), FieldPrecision: interBaseNullInt(15)},
+			wantDialect1: "NUMERIC(15, 0)", wantDialect3: "NUMERIC(15, 0)",
+		},
+		{
+			name:         "a binary BLOB names its subtype",
+			domain:       &schema.Domain{Name: "D", FieldType: interBaseNullInt(261), FieldSubType: interBaseNullInt(0)},
+			wantDialect1: "BLOB SUB_TYPE BINARY", wantDialect3: "BLOB SUB_TYPE BINARY",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := interBaseColumnTypeName(test.domain, 1); got != test.wantDialect1 {
+				t.Errorf("dialect 1 column type = %q, want %q", got, test.wantDialect1)
+			}
+			if got := interBaseColumnTypeName(test.domain, 3); got != test.wantDialect3 {
+				t.Errorf("dialect 3 column type = %q, want %q", got, test.wantDialect3)
+			}
+			// Zero means dialect 3, matching the driver's normalizeDialect and
+			// the zero value of InterBaseDBRepository.SQLDialect.
+			if got := interBaseColumnTypeName(test.domain, 0); got != test.wantDialect3 {
+				t.Errorf("dialect 0 column type = %q, want the dialect 3 rendering %q", got, test.wantDialect3)
+			}
+		})
+	}
+}
+
+func TestInterBaseTypeNameKeepsCharsetAndCollationOutOfTheColumnForm(t *testing.T) {
+	// The full rendering is what DomainDesc.Type and DDL carry; the trimmed
+	// one is what the completion detail line carries. Both come from the same
+	// renderer, so this pins the cut rather than a second code path.
+	domain := &schema.Domain{
+		Name:             "EMAIL_ADDRESS",
+		FieldType:        interBaseNullInt(14),
+		CharacterLength:  interBaseNullInt(10),
+		CharacterSetID:   interBaseNullInt(4),
+		CharacterSetName: interBaseNullString(interBaseFixed("UTF8")),
+		CollationID:      interBaseNullInt(2),
+		CollationName:    interBaseNullString(interBaseFixed("UNICODE")),
+	}
+
+	wantFull := `CHAR(10) CHARACTER SET "UTF8" COLLATE "UNICODE"`
+	if got := interBaseTypeName(domain, 3); got != wantFull {
+		t.Errorf("interBaseTypeName() = %q, want %q", got, wantFull)
+	}
+	if got := interBaseColumnTypeName(domain, 3); got != "CHAR(10)" {
+		t.Errorf("interBaseColumnTypeName() = %q, want %q", got, "CHAR(10)")
+	}
+
+	charsetOnly := &schema.Domain{
+		Name:             "CODE",
+		FieldType:        interBaseNullInt(37),
+		CharacterLength:  interBaseNullInt(20),
+		CharacterSetID:   interBaseNullInt(4),
+		CharacterSetName: interBaseNullString(interBaseFixed("UTF8")),
+	}
+	if got, want := interBaseTypeName(charsetOnly, 3), `VARCHAR(20) CHARACTER SET "UTF8"`; got != want {
+		t.Errorf("interBaseTypeName() = %q, want %q", got, want)
+	}
+	if got := interBaseColumnTypeName(charsetOnly, 3); got != "VARCHAR(20)" {
+		t.Errorf("interBaseColumnTypeName() = %q, want %q", got, "VARCHAR(20)")
+	}
+}
