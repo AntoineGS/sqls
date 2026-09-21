@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/sqls-server/sqls/dialect"
 )
@@ -96,6 +97,98 @@ func interBaseCharset(cfg *DBConfig) (string, error) {
 		return normalized, nil
 	}
 	return "", fmt.Errorf("interbase: unsupported charset %q", charset)
+}
+
+// interBaseMaxRoleBytes mirrors the driver's credential length limit
+// (interbase-go interbase.go:165-169, math.MaxUint8).
+const interBaseMaxRoleBytes = 255
+
+// interBaseTLSSettings is the validated projection of InterBaseTLSConfig. It
+// exists separately so the untagged package never names interbase.TLSConfig.
+type interBaseTLSSettings struct {
+	Enabled              bool
+	ServerPublicFile     string
+	ServerPublicPath     string
+	ClientCertFile       string
+	ClientPassPhrase     string
+	ClientPassPhraseFile string
+}
+
+// hasOptions mirrors interbase.TLSConfig.hasOptions (interbase.go:32-36): an
+// enabled flag alone already counts as a TLS option.
+func (t interBaseTLSSettings) hasOptions() bool {
+	return t.Enabled || t.ServerPublicFile != "" || t.ServerPublicPath != "" ||
+		t.ClientCertFile != "" || t.ClientPassPhrase != "" || t.ClientPassPhraseFile != ""
+}
+
+func interBaseRole(cfg *DBConfig) (string, error) {
+	if cfg == nil {
+		return "", errors.New("interbase: connection config is nil")
+	}
+	if cfg.InterBase == nil {
+		return "", nil
+	}
+	role := cfg.InterBase.Role
+	if strings.IndexByte(role, 0) >= 0 {
+		return "", errors.New("invalid: connections[].interbase.role cannot contain NUL bytes")
+	}
+	if len(role) > interBaseMaxRoleBytes {
+		return "", fmt.Errorf("invalid: connections[].interbase.role cannot exceed %d bytes", interBaseMaxRoleBytes)
+	}
+	return role, nil
+}
+
+func interBaseConnectTimeout(cfg *DBConfig) (time.Duration, error) {
+	if cfg == nil {
+		return 0, errors.New("interbase: connection config is nil")
+	}
+	if cfg.InterBase == nil {
+		return 0, nil
+	}
+	value := strings.TrimSpace(cfg.InterBase.ConnectTimeout)
+	if value == "" {
+		return 0, nil
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("invalid: connections[].interbase.connectTimeout %q is not a Go duration such as \"10s\"", value)
+	}
+	if timeout < 0 {
+		return 0, errors.New("invalid: connections[].interbase.connectTimeout cannot be negative")
+	}
+	return timeout, nil
+}
+
+// interBaseTLS validates the TLS block and returns it in driver terms. TLS needs
+// a structured host because the driver composes the attachment itself and
+// rejects TLS options when Config.Host is empty (interbase.go:190-195); a
+// hand-built dataSourceName therefore cannot carry TLS. Failing here rather than
+// at attach time gives the user the offending configuration key.
+func interBaseTLS(cfg *DBConfig) (interBaseTLSSettings, error) {
+	if cfg == nil {
+		return interBaseTLSSettings{}, errors.New("interbase: connection config is nil")
+	}
+	if cfg.InterBase == nil || cfg.InterBase.TLS == nil {
+		return interBaseTLSSettings{}, nil
+	}
+	tls := interBaseTLSSettings{
+		Enabled:              cfg.InterBase.TLS.Enabled,
+		ServerPublicFile:     cfg.InterBase.TLS.ServerPublicFile,
+		ServerPublicPath:     cfg.InterBase.TLS.ServerPublicPath,
+		ClientCertFile:       cfg.InterBase.TLS.ClientCertFile,
+		ClientPassPhrase:     cfg.InterBase.TLS.ClientPassPhrase,
+		ClientPassPhraseFile: cfg.InterBase.TLS.ClientPassPhraseFile,
+	}
+	if !tls.hasOptions() {
+		return interBaseTLSSettings{}, nil
+	}
+	if !tls.Enabled {
+		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls options require connections[].interbase.tls.enabled")
+	}
+	if cfg.DataSourceName != "" || cfg.Host == "" {
+		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls requires connections[].host")
+	}
+	return tls, nil
 }
 
 type InterBaseDBRepository struct {

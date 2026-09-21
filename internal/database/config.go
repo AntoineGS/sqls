@@ -33,7 +33,8 @@ type DBConfig struct {
 	SSHCfg         *SSHConfig             `json:"sshConfig" yaml:"sshConfig"`
 	// Dialect selects the server-side SQL dialect. Only the interbase driver
 	// supports it: 0 auto-detects from the database, 1 and 3 pin a dialect.
-	Dialect int `json:"dialect" yaml:"dialect"`
+	Dialect   int              `json:"dialect" yaml:"dialect"`
+	InterBase *InterBaseConfig `json:"interbase" yaml:"interbase"`
 }
 
 func (c *DBConfig) Validate() error {
@@ -45,6 +46,9 @@ func (c *DBConfig) Validate() error {
 	}
 	if c.Dialect != 0 && c.Driver != dialect.DatabaseDriverInterBase {
 		return errors.New("invalid: connections[].dialect is only supported by the interbase driver")
+	}
+	if c.InterBase != nil && c.Driver != dialect.DatabaseDriverInterBase {
+		return errors.New("invalid: connections[].interbase is only supported by the interbase driver")
 	}
 
 	switch c.Driver {
@@ -163,6 +167,15 @@ func (c *DBConfig) Validate() error {
 		if _, err := interBaseCharset(c); err != nil {
 			return err
 		}
+		if _, err := interBaseRole(c); err != nil {
+			return err
+		}
+		if _, err := interBaseConnectTimeout(c); err != nil {
+			return err
+		}
+		if _, err := interBaseTLS(c); err != nil {
+			return err
+		}
 
 	default:
 		return errors.New("invalid: connections[].driver")
@@ -224,4 +237,28 @@ func (s *SSHConfig) ClientConfig() (*ssh.ClientConfig, error) {
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 	return sshConfig, nil
+}
+
+// InterBaseConfig holds settings that only the InterBase driver understands.
+// The nested block keeps InterBase-only keys out of the shared DBConfig surface,
+// matching the existing sshConfig precedent.
+type InterBaseConfig struct {
+	Role string `json:"role" yaml:"role"`
+	// ConnectTimeout bounds the native attachment handshake. It is a Go duration
+	// string, for example "10s"; empty leaves the InterBase client default. It is
+	// a string because YAML has no duration type and a bare integer is ambiguous.
+	ConnectTimeout string              `json:"connectTimeout" yaml:"connectTimeout"`
+	TLS            *InterBaseTLSConfig `json:"tls" yaml:"tls"`
+}
+
+// InterBaseTLSConfig holds the InterBase native client TLS attachment options.
+// Enabling TLS encrypts the connection; it is not proof of server identity. See
+// the TLS note in README.md before relying on it.
+type InterBaseTLSConfig struct {
+	Enabled              bool   `json:"enabled" yaml:"enabled"`
+	ServerPublicFile     string `json:"serverPublicFile" yaml:"serverPublicFile"`
+	ServerPublicPath     string `json:"serverPublicPath" yaml:"serverPublicPath"`
+	ClientCertFile       string `json:"clientCertFile" yaml:"clientCertFile"`
+	ClientPassPhrase     string `json:"clientPassPhrase" yaml:"clientPassPhrase"`
+	ClientPassPhraseFile string `json:"clientPassPhraseFile" yaml:"clientPassPhraseFile"`
 }

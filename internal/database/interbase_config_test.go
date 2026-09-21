@@ -4,8 +4,10 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sqls-server/sqls/dialect"
+	"gopkg.in/yaml.v2"
 )
 
 func TestInterBaseConfigValidatesCharset(t *testing.T) {
@@ -90,5 +92,216 @@ func TestInterBaseCharsetMatchesDriverAllowlist(t *testing.T) {
 	}
 	if got, err := interBaseCharset(&DBConfig{}); err != nil || got != "UTF8" {
 		t.Fatalf("interBaseCharset(empty) = (%q, %v), want (\"UTF8\", nil)", got, err)
+	}
+}
+
+func TestInterBaseConfigValidatesConnectionOptions(t *testing.T) {
+	const passphrase = "phrase-do-not-log"
+	base := func() *DBConfig {
+		return &DBConfig{
+			Driver: dialect.DatabaseDriverInterBase,
+			Host:   "db.example.test",
+			Path:   "/srv/interbase/example.ib",
+			User:   "alice",
+			Passwd: "do-not-log",
+		}
+	}
+
+	rejected := []struct {
+		name   string
+		mutate func(*DBConfig)
+		want   string
+	}{
+		{
+			name:   "role longer than the driver's 255-byte limit",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{Role: strings.Repeat("R", 256)} },
+			want:   "role",
+		},
+		{
+			name:   "role containing a NUL byte",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{Role: "SQLS\x00READONLY"} },
+			want:   "role",
+		},
+		{
+			name:   "connectTimeout is not a Go duration",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{ConnectTimeout: "abc"} },
+			want:   "connecttimeout",
+		},
+		{
+			name:   "negative connectTimeout",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{ConnectTimeout: "-1s"} },
+			want:   "connecttimeout",
+		},
+		{
+			name: "tls with a raw attachment string",
+			mutate: func(c *DBConfig) {
+				c.Host = ""
+				c.Path = ""
+				c.DataSourceName = "db.example.test/3050:/srv/interbase/example.ib"
+				c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{Enabled: true, ClientPassPhrase: passphrase}}
+			},
+			want: "tls",
+		},
+		{
+			// The thinnest TLS request there is: Enabled alone, no certificate
+			// options, no host. It needs its own case because it is the shape an
+			// implementer is most likely to let slip past hasOptions. The driver
+			// does reject it — TLSConfig.hasOptions counts Enabled itself
+			// (interbase.go:32-36) — but only at NewConnector time and with the
+			// message "TLS options require a host", which names no configuration
+			// key. sqls must reject it in Validate, naming connections[].host.
+			name: "tls enabled with no other option and no host",
+			mutate: func(c *DBConfig) {
+				c.Host = ""
+				c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{Enabled: true}}
+			},
+			want: "host",
+		},
+		{
+			name: "tls options without enabled",
+			mutate: func(c *DBConfig) {
+				c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{
+					ServerPublicFile: "/etc/interbase/server.pem",
+					ClientPassPhrase: passphrase,
+				}}
+			},
+			want: "enabled",
+		},
+		{
+			name: "interbase block on another driver",
+			mutate: func(c *DBConfig) {
+				c.Driver = dialect.DatabaseDriverMySQL
+				c.Proto = ProtoTCP
+				c.InterBase = &InterBaseConfig{Role: "SQLS_READONLY"}
+			},
+			want: "interbase",
+		},
+	}
+	for _, test := range rejected {
+		t.Run("rejects "+test.name, func(t *testing.T) {
+			cfg := base()
+			test.mutate(cfg)
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("DBConfig.Validate() returned nil error")
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), test.want) {
+				t.Fatalf("DBConfig.Validate() error = %q, want mention %q", err, test.want)
+			}
+			if strings.Contains(err.Error(), cfg.Passwd) {
+				t.Fatalf("DBConfig.Validate() leaked the password: %q", err)
+			}
+			if strings.Contains(err.Error(), passphrase) {
+				t.Fatalf("DBConfig.Validate() leaked the client passphrase: %q", err)
+			}
+		})
+	}
+
+	accepted := []struct {
+		name   string
+		mutate func(*DBConfig)
+	}{
+		{name: "no interbase block", mutate: func(*DBConfig) {}},
+		{name: "empty interbase block", mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{} }},
+		{
+			name:   "role at the 255-byte limit",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{Role: strings.Repeat("R", 255)} },
+		},
+		{
+			name:   "connectTimeout in seconds",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{ConnectTimeout: " 10s "} },
+		},
+		{
+			name:   "zero connectTimeout keeps the client default",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{ConnectTimeout: "0s"} },
+		},
+		{
+			name: "tls enabled with a host",
+			mutate: func(c *DBConfig) {
+				c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{
+					Enabled:              true,
+					ServerPublicFile:     "/etc/interbase/server.pem",
+					ClientPassPhraseFile: "/etc/interbase/client.pass",
+				}}
+			},
+		},
+		{
+			name:   "tls block present but empty",
+			mutate: func(c *DBConfig) { c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{}} },
+		},
+	}
+	for _, test := range accepted {
+		t.Run("accepts "+test.name, func(t *testing.T) {
+			cfg := base()
+			test.mutate(cfg)
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("DBConfig.Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestInterBaseConfigStillRejectsSSHTunnelling(t *testing.T) {
+	cfg := &DBConfig{
+		Driver:    dialect.DatabaseDriverInterBase,
+		Path:      "/srv/interbase/example.ib",
+		User:      "alice",
+		SSHCfg:    &SSHConfig{Host: "bastion", User: "alice", PrivateKey: "/dev/null"},
+		InterBase: &InterBaseConfig{Role: "SQLS_READONLY"},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "SSH") {
+		t.Fatalf("DBConfig.Validate() error = %v, want the unsupported-SSH refusal", err)
+	}
+}
+
+func TestInterBaseConnectionOptionsUnmarshalFromYAML(t *testing.T) {
+	const document = `
+driver: interbase
+host: db.example.test
+port: 3050
+path: /srv/interbase/centrale.ib
+user: sqls_reader
+passwd: "your-password"
+params:
+  charset: WIN1252
+interbase:
+  role: SQLS_READONLY
+  connectTimeout: 10s
+  tls:
+    enabled: true
+    serverPublicFile: /etc/interbase/server.pem
+    clientPassPhraseFile: /etc/interbase/client.pass
+`
+	var cfg DBConfig
+	if err := yaml.Unmarshal([]byte(document), &cfg); err != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", err)
+	}
+	if cfg.InterBase == nil {
+		t.Fatal("yaml.Unmarshal() left DBConfig.InterBase nil; check the yaml tag")
+	}
+	if cfg.InterBase.Role != "SQLS_READONLY" {
+		t.Errorf("role = %q, want SQLS_READONLY", cfg.InterBase.Role)
+	}
+	if cfg.InterBase.ConnectTimeout != "10s" {
+		t.Errorf("connectTimeout = %q, want 10s", cfg.InterBase.ConnectTimeout)
+	}
+	if cfg.InterBase.TLS == nil {
+		t.Fatal("tls block did not unmarshal")
+	}
+	want := InterBaseTLSConfig{
+		Enabled:              true,
+		ServerPublicFile:     "/etc/interbase/server.pem",
+		ClientPassPhraseFile: "/etc/interbase/client.pass",
+	}
+	if !reflect.DeepEqual(*cfg.InterBase.TLS, want) {
+		t.Errorf("tls = %#v, want %#v", *cfg.InterBase.TLS, want)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("DBConfig.Validate() error = %v", err)
+	}
+	timeout, err := interBaseConnectTimeout(&cfg)
+	if err != nil || timeout != 10*time.Second {
+		t.Fatalf("interBaseConnectTimeout() = (%v, %v), want (10s, nil)", timeout, err)
 	}
 }
