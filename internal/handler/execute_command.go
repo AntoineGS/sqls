@@ -31,6 +31,8 @@ const (
 	CommandShowTables       = "showTables"
 )
 
+const lateCancellationNote = "Note: the cancellation request arrived after the statement completed; the result\nbelow is the real result.\n\n"
+
 func (s *Server) handleTextDocumentCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
 	if req.Params == nil {
 		return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams}
@@ -91,6 +93,54 @@ func (s *Server) handleWorkspaceExecuteCommand(ctx context.Context, conn *jsonrp
 		return nil, err
 	}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	entry := s.cancels.register(req.ID, cancel)
+	defer s.cancels.unregister(req.ID)
+
+	result, err = s.dispatchCommand(ctx, params)
+
+	// A statement that actually stopped reports itself through cancelledError.
+	// It is rendered as its own notice and never carries the late-arrival note:
+	// the two messages contradict each other, and Task 9 adds the regression
+	// test that asserts they never appear together.
+	var cancelled *cancelledError
+	if errors.As(err, &cancelled) {
+		return cancelled.rendered, nil
+	}
+
+	if err != nil || !entry.cancelRequested() {
+		return result, err
+	}
+	// The statement finished before the native cancellation took effect. The
+	// executing result stays authoritative, so it is rendered with a note.
+	if text, ok := result.(string); ok {
+		return lateCancellationNote + text, nil
+	}
+	return result, nil
+}
+
+// cancelledError carries the results-pane text for a statement that stopped
+// because its request was cancelled. The outcome travels as an error rather
+// than as a plain string so the wrapper above can tell "this statement was
+// cancelled" apart from "this statement completed, and a cancellation arrived
+// too late". Task 9 populates it; until then nothing returns one.
+//
+// It deliberately carries only the rendered text: nothing in this plan needs
+// the underlying driver error past this boundary, so adding an Unwrap now
+// would be speculative. A later plan that wants to log why a statement
+// stopped should add a cause field here rather than reconstructing it from
+// the rendered string, because the cause is otherwise discarded at
+// executeQuery.
+type cancelledError struct {
+	rendered string
+}
+
+func (e *cancelledError) Error() string {
+	return e.rendered
+}
+
+func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
 	switch params.Command {
 	case CommandExecuteQuery:
 		return s.executeQuery(ctx, params)

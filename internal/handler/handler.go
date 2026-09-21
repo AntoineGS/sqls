@@ -48,8 +48,9 @@ type Server struct {
 	// other configuration sources (workspace and user).
 	initOptionDBConfig *database.DBConfig
 
-	worker *database.Worker
-	files  map[string]*File
+	worker  *database.Worker
+	files   map[string]*File
+	cancels *cancelRegistry
 }
 
 type File struct {
@@ -62,8 +63,9 @@ func NewServer() *Server {
 	worker.Start()
 
 	return &Server{
-		files:  make(map[string]*File),
-		worker: worker,
+		files:   make(map[string]*File),
+		worker:  worker,
+		cancels: newCancelRegistry(),
 	}
 }
 
@@ -134,6 +136,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		return s.handleWorkspaceExecuteCommand(ctx, conn, req)
 	case "workspace/didChangeConfiguration":
 		return s.handleWorkspaceDidChangeConfiguration(ctx, conn, req)
+	case "$/cancelRequest":
+		return s.handleCancelRequest(ctx, conn, req)
 	case "textDocument/formatting":
 		return s.handleTextDocumentFormatting(ctx, conn, req)
 	case "textDocument/rangeFormatting":
@@ -389,6 +393,18 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 		}
 	}
 
+	return nil, nil
+}
+
+func (s *Server) handleCancelRequest(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
+	if req.Params == nil {
+		return nil, nil
+	}
+	var params cancelParams
+	if err := json.Unmarshal(*req.Params, &params); err != nil {
+		return nil, err
+	}
+	s.cancels.cancel(params.ID)
 	return nil, nil
 }
 
