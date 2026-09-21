@@ -632,6 +632,38 @@ func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams
 	return strings.Join(results, "\n"), nil
 }
 
+// interBaseProcedureName returns the procedure named by an EXECUTE PROCEDURE
+// statement, or "" when the statement is not one.
+//
+// It reads the statement text rather than the parse tree because grouping
+// EXECUTE PROCEDURE into a single ast.MultiKeyword is a change to shared,
+// dialect-independent parser state that a later plan owns. Returning "" is
+// always safe: it routes to Exec, which is today's unconditional behaviour.
+func interBaseProcedureName(query string) string {
+	fields := strings.Fields(query)
+	if len(fields) < 3 {
+		return ""
+	}
+	if !strings.EqualFold(fields[0], "EXECUTE") || !strings.EqualFold(fields[1], "PROCEDURE") {
+		return ""
+	}
+
+	name := fields[2]
+	if index := strings.IndexAny(name, "(;"); index >= 0 {
+		name = name[:index]
+	}
+	if strings.HasPrefix(name, `"`) {
+		// A quoted name is only recoverable here when it contains no
+		// whitespace; otherwise strings.Fields has already split it and the
+		// caller falls back to Exec.
+		if !strings.HasSuffix(name, `"`) || len(name) < 2 {
+			return ""
+		}
+		return name[1 : len(name)-1]
+	}
+	return name
+}
+
 func getStatementsWithDriver(text string, driver dialect.DatabaseDriver) ([]*ast.Statement, error) {
 	return getStatementsWithDriverVariant(text, dialect.DriverVariant{Driver: driver})
 }
