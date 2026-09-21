@@ -108,6 +108,44 @@ effect could not be established is reported loudly:
 
 Do not blindly re-run a cancelled write.
 
+### Query results
+
+Results are rendered from the column metadata the driver reports, so the pane
+shows what the database actually returned.
+
+- **`NULL` is not an empty string.** For InterBase, a SQL `NULL` renders as the
+  literal `NULL` and an empty value renders as an empty cell. Other drivers are
+  unchanged.
+- **Exact decimals stay exact.** A scaled `NUMERIC`/`DECIMAL` column is rendered
+  from the driver's exact decimal text, never through a float.
+- **Large cells are display-capped at 512 characters.** A longer value is cut at
+  the cap and marked `…(truncated, N characters)`, where `N` is the real length.
+  This is a display limit in sqls, not data loss and not a database limit. A
+  binary BLOB is shown as `<BLOB N bytes>` rather than dumped into the table.
+- **A failed fetch still shows what it fetched.** If the query dies partway —
+  most often because a BLOB exceeds the InterBase driver's 64 MiB
+  materialisation limit, which is a hard error rather than a truncation — the
+  pane shows the rows that preceded the failure, a `N rows in set (incomplete)`
+  footer, and the driver's error text. When the result has a BLOB column, it
+  also suggests re-running without that column or selecting a substring of it.
+- **Read statements run in a read-only transaction.** For InterBase, `SELECT`
+  and friends run inside an explicit read-committed, read-only transaction that
+  is opened and released entirely inside sqls.
+
+### `EXECUTE PROCEDURE` limitation
+
+sqls does not yet look at a procedure's signature, so every `EXECUTE PROCEDURE`
+statement is currently run the same way a write statement is run, whether or
+not the procedure returns anything.
+
+- A procedure that returns **no output** works today.
+- A procedure that **does** return output currently fails: the driver rejects
+  running an output-producing procedure this way rather than silently
+  discarding its output. If you hit this, the statement is not malformed — sqls
+  is just not yet routing `EXECUTE PROCEDURE` by output arity. There is no
+  workaround in this version; routing based on the procedure's cached signature
+  is planned.
+
 ## Editor Plugins
 
 - [sqls.vim](https://github.com/sqls-server/sqls.vim)
