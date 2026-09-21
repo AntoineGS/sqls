@@ -11,7 +11,10 @@ import (
 
 func TestParseWithInterBaseDialect1(t *testing.T) {
 	input := `SELECT "a""b", 'c''d' FROM RDB$DATABASE WHERE ID = ?`
-	parsed, err := ParseWithDialect(input, &dialect.InterBaseDialect{SQLDialect: 1})
+	parsed, err := ParseWithDriverVariant(input, dialect.DriverVariant{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase1,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1623,4 +1626,62 @@ func testPos(t *testing.T, node ast.Node, pos, end token.Pos) {
 
 func genPosOneline(col int) token.Pos {
 	return token.Pos{Line: 0, Col: col}
+}
+
+func TestParseWithDriverVariant(t *testing.T) {
+	const input = `SELECT "My Column" FROM T`
+
+	dialect1, err := ParseWithDriverVariant(input, dialect.DriverVariant{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialect3, err := ParseWithDriverVariant(input, dialect.DriverVariant{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if quotedTokenKind(t, dialect1) != token.SingleQuotedString {
+		t.Error("Dialect 1 must lex a double-quoted word as a string")
+	}
+	if quotedTokenKind(t, dialect3) != token.SQLKeyword {
+		t.Error("Dialect 3 must lex a double-quoted word as a delimited identifier")
+	}
+
+	// The default variant resolves to Dialect 3, and ParseWithDriver agrees.
+	defaultVariant, err := ParseWithDriverVariant(input, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quotedTokenKind(t, defaultVariant) != token.SQLKeyword {
+		t.Error("the default InterBase variant must lex as Dialect 3")
+	}
+	viaDriver, err := ParseWithDriver(input, dialect.DatabaseDriverInterBase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if quotedTokenKind(t, viaDriver) != quotedTokenKind(t, defaultVariant) {
+		t.Error("ParseWithDriver must match the default-variant result")
+	}
+}
+
+func quotedTokenKind(t *testing.T, parsed ast.TokenList) token.Kind {
+	t.Helper()
+	var sqlTokens []*ast.SQLToken
+	collectSQLTokens(parsed, &sqlTokens)
+	for _, sqlToken := range sqlTokens {
+		if word, ok := sqlToken.Value.(*token.SQLWord); ok && word.Value == "My Column" {
+			return sqlToken.Kind
+		}
+		if text, ok := sqlToken.Value.(string); ok && text == `"My Column"` {
+			return sqlToken.Kind
+		}
+	}
+	t.Fatalf("no token matched the double-quoted text")
+	return token.ILLEGAL
 }

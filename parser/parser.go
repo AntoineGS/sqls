@@ -57,8 +57,17 @@ func Parse(text string) (ast.TokenList, error) {
 	return ParseWithDialect(text, &dialect.GenericSQLDialect{})
 }
 
+// ParseWithDriver parses text using a driver's default variant. It is retained
+// with its exact signature; callers that have resolved a server-side variant
+// should use ParseWithDriverVariant instead.
 func ParseWithDriver(text string, driver dialect.DatabaseDriver) (ast.TokenList, error) {
-	return ParseWithDialect(text, dialect.DialectForDriver(driver))
+	return ParseWithDriverVariant(text, dialect.DriverVariant{Driver: driver})
+}
+
+// ParseWithDriverVariant parses text using the lexical rules of a driver and
+// its resolved server-side SQL variant.
+func ParseWithDriverVariant(text string, dv dialect.DriverVariant) (ast.TokenList, error) {
+	return ParseWithDialect(text, dialect.DialectForDriverVariant(dv))
 }
 
 func ParseWithDialect(text string, d dialect.Dialect) (ast.TokenList, error) {
