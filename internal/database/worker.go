@@ -10,9 +10,10 @@ type Worker struct {
 	dbRepo  DBRepository
 	dbCache *DBCache
 
-	done   chan struct{}
-	update chan struct{}
-	lock   sync.Mutex
+	done     chan struct{}
+	update   chan struct{}
+	lock     sync.Mutex
+	stopOnce sync.Once
 }
 
 func NewWorker() *Worker {
@@ -32,6 +33,21 @@ func (w *Worker) setCache(c *DBCache) {
 	w.lock.Lock()
 	defer w.lock.Unlock()
 	w.dbCache = c
+}
+
+// repo returns the repository the worker goroutine should use. ReCache runs on
+// the handler goroutine and may replace it while the worker goroutine is
+// servicing an update, so both sides go through w.lock.
+func (w *Worker) repo() DBRepository {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	return w.dbRepo
+}
+
+func (w *Worker) setRepo(repo DBRepository) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	w.dbRepo = repo
 }
 
 func (w *Worker) setColumnCache(col map[string][]*ColumnDesc) {
@@ -55,7 +71,7 @@ func (w *Worker) Start() {
 				log.Println("db worker: done")
 				return
 			case <-w.update:
-				generator := NewDBCacheUpdater(w.dbRepo)
+				generator := NewDBCacheUpdater(w.repo())
 				col, err := generator.GenerateDBCacheSecondary(context.Background())
 				if err != nil {
 					log.Println(err)
@@ -68,12 +84,14 @@ func (w *Worker) Start() {
 	}()
 }
 
+// Stop is safe to call more than once: handleExit and the deferred Stop in
+// main both reach it on an ordinary shutdown.
 func (w *Worker) Stop() {
-	close(w.done)
+	w.stopOnce.Do(func() { close(w.done) })
 }
 
 func (w *Worker) ReCache(ctx context.Context, repo DBRepository) error {
-	w.dbRepo = repo
+	w.setRepo(repo)
 	if err := w.updateAllCache(ctx); err != nil {
 		return err
 	}
@@ -82,7 +100,7 @@ func (w *Worker) ReCache(ctx context.Context, repo DBRepository) error {
 }
 
 func (w *Worker) updateAllCache(ctx context.Context) error {
-	generator := NewDBCacheUpdater(w.dbRepo)
+	generator := NewDBCacheUpdater(w.repo())
 	cache, err := generator.GenerateDBCachePrimary(ctx)
 	if err != nil {
 		return err
