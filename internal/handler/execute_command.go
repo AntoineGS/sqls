@@ -112,7 +112,10 @@ func (s *Server) handleWorkspaceExecuteCommand(ctx context.Context, conn *jsonrp
 
 func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
 	// parse execute command arguments
-	if s.dbConn == nil {
+	s.stateMu.RLock()
+	connected := s.dbConn != nil
+	s.stateMu.RUnlock()
+	if !connected {
 		return nil, errors.New("database connection is not open")
 	}
 	if len(params.Arguments) == 0 {
@@ -387,7 +390,9 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	}
 
 	// Change current database
+	s.stateMu.Lock()
 	s.curDBName = dbName
+	s.stateMu.Unlock()
 
 	// close and reconnection to database
 	if err := s.reconnectionDB(ctx); err != nil {
@@ -455,7 +460,9 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 	index = index - 1
 
 	// Reconnect database
+	s.stateMu.Lock()
 	s.curConnectionIndex = index
+	s.stateMu.Unlock()
 
 	// close and reconnection to database
 	if err := s.reconnectionDB(ctx); err != nil {

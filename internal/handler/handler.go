@@ -76,11 +76,16 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 }
 
 // Stop closes the database connection and always stops the worker, including
-// when closing the connection fails. Shutdown deliberately does not take
-// connMu: a runaway query must not be able to hold the process open.
+// when closing the connection fails. It deliberately takes no connMu — a
+// runaway query must not be able to hold the process open — but it does take
+// stateMu for the pointer read, because a concurrent switch may be reassigning
+// it.
 func (s *Server) Stop() error {
 	defer s.worker.Stop()
-	return s.dbConn.Close()
+	s.stateMu.RLock()
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	return dbConn.Close()
 }
 
 func (s *Server) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
@@ -174,7 +179,9 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 		},
 	}
 
+	s.stateMu.Lock()
 	s.initOptionDBConfig = params.InitializationOptions.ConnectionConfig
+	s.stateMu.Unlock()
 
 	// Initialize database database connection
 	// NOTE: If no connection is found at this point, it is possible that the connection settings are sent to workspace config, so don't make an error
@@ -196,15 +203,21 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 }
 
 func (s *Server) handleShutdown(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
-	if s.dbConn != nil {
-		s.dbConn.Close()
+	s.stateMu.RLock()
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	if dbConn != nil {
+		dbConn.Close()
 	}
 	return nil, nil
 }
 
 func (s *Server) handleExit(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
-	if s.dbConn != nil {
-		s.dbConn.Close()
+	s.stateMu.RLock()
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	if dbConn != nil {
+		dbConn.Close()
 	}
 	err = s.Stop()
 	return nil, err
@@ -337,10 +350,15 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
+	s.stateMu.Lock()
 	s.WSCfg = params.Settings.SQLS
+	s.stateMu.Unlock()
 
 	// Skip database connection
-	if s.dbConn != nil {
+	s.stateMu.RLock()
+	connected := s.dbConn != nil
+	s.stateMu.RUnlock()
+	if connected {
 		return nil, nil
 	}
 
@@ -364,7 +382,10 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 }
 
 func (s *Server) reconnectionDB(ctx context.Context) error {
-	if err := s.dbConn.Close(); err != nil {
+	s.stateMu.RLock()
+	oldConn := s.dbConn
+	s.stateMu.RUnlock()
+	if err := oldConn.Close(); err != nil {
 		return err
 	}
 
@@ -372,7 +393,10 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.stateMu.Lock()
 	s.dbConn = dbConn
+	s.stateMu.Unlock()
+
 	dbRepo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return err
@@ -389,16 +413,23 @@ func (s *Server) newDBConnection(ctx context.Context) (*database.DBConnection, e
 	if connCfg == nil {
 		return nil, ErrNoConnection
 	}
-	if s.curConnectionIndex != 0 {
-		connCfg = s.getConnection(s.curConnectionIndex)
+	s.stateMu.RLock()
+	index := s.curConnectionIndex
+	dbName := s.curDBName
+	s.stateMu.RUnlock()
+
+	if index != 0 {
+		connCfg = s.getConnection(index)
 	}
 	if connCfg == nil {
-		return nil, fmt.Errorf("not found database connection config, index %d", s.curConnectionIndex+1)
+		return nil, fmt.Errorf("not found database connection config, index %d", index+1)
 	}
-	if s.curDBName != "" {
-		connCfg.DBName = s.curDBName
+	if dbName != "" {
+		connCfg.DBName = dbName
 	}
+	s.stateMu.Lock()
 	s.curDBCfg = connCfg
+	s.stateMu.Unlock()
 
 	// Connect database
 	conn, err := database.Open(connCfg)
@@ -409,10 +440,14 @@ func (s *Server) newDBConnection(ctx context.Context) (*database.DBConnection, e
 }
 
 func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, error) {
-	if s.curDBCfg == nil || s.dbConn == nil {
+	s.stateMu.RLock()
+	curDBCfg := s.curDBCfg
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	if curDBCfg == nil || dbConn == nil {
 		return nil, ErrNoConnection
 	}
-	repo, err := database.CreateRepository(s.curDBCfg.Driver, s.dbConn.Conn)
+	repo, err := database.CreateRepository(curDBCfg.Driver, dbConn.Conn)
 	if err != nil {
 		return nil, err
 	}
@@ -421,8 +456,11 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 
 func (s *Server) topConnection() *database.DBConfig {
 	// if the init config is set, ignore all other connection configs
-	if s.initOptionDBConfig != nil {
-		return s.initOptionDBConfig
+	s.stateMu.RLock()
+	initCfg := s.initOptionDBConfig
+	s.stateMu.RUnlock()
+	if initCfg != nil {
+		return initCfg
 	}
 
 	cfg := s.getConfig()
@@ -441,6 +479,8 @@ func (s *Server) getConnection(index int) *database.DBConfig {
 }
 
 func (s *Server) getConfig() *config.Config {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	var cfg *config.Config
 	switch {
 	case validConfig(s.SpecificFileCfg):
@@ -456,6 +496,8 @@ func (s *Server) getConfig() *config.Config {
 }
 
 func (s *Server) parserDriver() dialect.DatabaseDriver {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
 	if s.dbConn == nil {
 		return ""
 	}

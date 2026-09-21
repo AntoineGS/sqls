@@ -63,3 +63,40 @@ func TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText(t *testing.T) {
 		t.Fatalf("fileText = (%q, %v), want (\"SELECT 49;\", true)", got, ok)
 	}
 }
+
+// switchDatabase reads WSCfg through getConfig and then parks inside the cache
+// rebuild, so an inline didChangeConfiguration writes WSCfg while the async
+// command's read is still unordered against it. Meaningful under -race.
+//
+// As in the file-text test, the wait is a sleep rather than gate.waitEntered:
+// getConfig reads WSCfg at handler.go:423, well before the gated CurrentSchema
+// call, so receiving the gate's signal would order the read ahead of the write
+// below and hide the race.
+func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	backend := installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+
+	gate := backend.gate("CurrentSchema")
+	commandDone := make(chan error, 1)
+	go func() {
+		commandDone <- tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+			Command:   CommandSwitchDatabase,
+			Arguments: []interface{}{"other"},
+		}, nil)
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	tx.addWorkspaceConfig(t, stubConnections("primary", "secondary"))
+
+	gate.release()
+	select {
+	case <-commandDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("switchDatabase never completed")
+	}
+}
