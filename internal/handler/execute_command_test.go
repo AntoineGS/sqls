@@ -7,8 +7,6 @@ import (
 
 	"github.com/olekukonko/tablewriter"
 	"github.com/olekukonko/tablewriter/tw"
-	"github.com/sqls-server/sqls/internal/config"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -16,47 +14,30 @@ func Test_executeQuery(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
+	defer tx.server.worker.Stop()
 
-	didChangeConfigurationParams := lsp.DidChangeConfigurationParams{
-		Settings: struct {
-			SQLS *config.Config "json:\"sqls\""
-		}{
-			SQLS: &config.Config{
-				Connections: []*database.DBConfig{
-					{
-						Driver:         "mock",
-						DataSourceName: "",
-					},
-				},
-			},
-		},
-	}
-	if err := tx.conn.Call(tx.ctx, "workspace/didChangeConfiguration", didChangeConfigurationParams, nil); err != nil {
-		t.Fatal("conn.Call workspace/didChangeConfiguration:", err)
+	backend := installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	var got string
+	if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+		Command:   CommandExecuteQuery,
+		Arguments: []interface{}{testFileURI},
+	}, &got); err != nil {
+		t.Fatal("conn.Call workspace/executeCommand:", err)
 	}
 
-	uri := "file:///test.sql"
-	text := "SELECT 1; SELECT 2;"
-	didOpenParams := lsp.DidOpenTextDocumentParams{
-		TextDocument: lsp.TextDocumentItem{
-			URI:        uri,
-			LanguageID: "sql",
-			Version:    0,
-			Text:       text,
-		},
+	if !strings.Contains(got, "42") {
+		t.Errorf("query result = %q, want it to contain the row value 42", got)
 	}
-	if err := tx.conn.Call(tx.ctx, "textDocument/didOpen", didOpenParams, nil); err != nil {
-		t.Fatal("conn.Call textDocument/didOpen:", err)
+	if !strings.Contains(got, "1 rows in set") {
+		t.Errorf("query result = %q, want the row-count footer", got)
 	}
-	tx.testFile(t, didOpenParams.TextDocument.URI, didOpenParams.TextDocument.Text)
-
-	// executeCommandParams := lsp.ExecuteCommandParams{
-	// 	Command:   CommandExecuteQuery,
-	// 	Arguments: []interface{}{uri},
-	// }
-	// var got interface{}
-	// tx.conn.Call(tx.ctx, "workspace/executeCommand", executeCommandParams, &got)
-	// pass error
+	if queries := backend.queries(); len(queries) != 1 {
+		t.Fatalf("repository served %d queries, want 1", len(queries))
+	}
 }
 
 func Test_queryResultHeaderPreservesColumnNames(t *testing.T) {
