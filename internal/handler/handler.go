@@ -522,13 +522,22 @@ func (s *Server) getConfig() *config.Config {
 	return cfg
 }
 
+// parserDriver returns the active connection's driver. It is retained with its
+// exact signature for callers that do not care about the SQL variant.
 func (s *Server) parserDriver() dialect.DatabaseDriver {
+	return s.parserDriverVariant().Driver
+}
+
+// parserDriverVariant returns the active connection's driver and its resolved
+// server-side SQL variant. With no connection it returns the zero value, which
+// selects each driver's default variant — for InterBase, SQL Dialect 3.
+func (s *Server) parserDriverVariant() dialect.DriverVariant {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
 	if s.dbConn == nil {
-		return ""
+		return dialect.DriverVariant{}
 	}
-	return s.dbConn.Driver
+	return s.dbConn.DriverVariant()
 }
 
 func validConfig(cfg *config.Config) bool {

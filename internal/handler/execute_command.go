@@ -202,7 +202,7 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	stmts, err := getStatementsWithDriver(text, s.parserDriver())
+	stmts, err := getStatementsWithDriverVariant(text, s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}
@@ -573,7 +573,11 @@ func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams
 }
 
 func getStatementsWithDriver(text string, driver dialect.DatabaseDriver) ([]*ast.Statement, error) {
-	parsed, err := parser.ParseWithDriver(text, driver)
+	return getStatementsWithDriverVariant(text, dialect.DriverVariant{Driver: driver})
+}
+
+func getStatementsWithDriverVariant(text string, dv dialect.DriverVariant) ([]*ast.Statement, error) {
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return nil, err
 	}

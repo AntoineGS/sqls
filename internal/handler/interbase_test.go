@@ -141,6 +141,60 @@ func TestInterBaseDialect1LanguageServerHover(t *testing.T) {
 	}
 }
 
+func TestParserDriverVariant(t *testing.T) {
+	s := NewServer()
+
+	if got, want := s.parserDriverVariant(), (dialect.DriverVariant{}); got != want {
+		t.Errorf("parserDriverVariant() without a connection = %#v, want %#v", got, want)
+	}
+	if got := s.parserDriver(); got != "" {
+		t.Errorf("parserDriver() without a connection = %q, want empty", got)
+	}
+
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	if got, want := s.parserDriverVariant().Driver, dialect.DatabaseDriverInterBase; got != want {
+		t.Errorf("parserDriverVariant().Driver = %q, want %q", got, want)
+	}
+	if got, want := s.parserDriver(), dialect.DatabaseDriverInterBase; got != want {
+		t.Errorf("parserDriver() = %q, want %q", got, want)
+	}
+}
+
+func TestInterBaseStatementParsingByVariant(t *testing.T) {
+	const input = `select "a"";""b", 'c'';''d'; select rdb$database`
+
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+	}{
+		{name: "dialect 1", variant: dialect.SQLVariantInterBase1},
+		{name: "dialect 3", variant: dialect.SQLVariantInterBase3},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			statements, err := getStatementsWithDriverVariant(input, dialect.DriverVariant{
+				Driver:  dialect.DatabaseDriverInterBase,
+				Variant: tt.variant,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A semicolon inside a quoted run must not split the statement,
+			// under either dialect.
+			if len(statements) != 2 {
+				t.Fatalf("got %d statements, want 2", len(statements))
+			}
+			if got, want := statements[0].String(), `select "a"";""b", 'c'';''d';`; got != want {
+				t.Errorf("first statement = %q, want %q", got, want)
+			}
+			if got, want := statements[1].String(), " select rdb$database"; got != want {
+				t.Errorf("second statement = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func configureInterBaseTestServer(t *testing.T, tx *TestContext) {
 	t.Helper()
 

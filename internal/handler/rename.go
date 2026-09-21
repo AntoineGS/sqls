@@ -30,7 +30,7 @@ func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Co
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := renameWithDriver(text, params, s.parserDriver())
+	res, err := renameWithDriverVariant(text, params, s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}
@@ -42,7 +42,11 @@ func rename(text string, params lsp.RenameParams) (*lsp.WorkspaceEdit, error) {
 }
 
 func renameWithDriver(text string, params lsp.RenameParams, driver dialect.DatabaseDriver) (*lsp.WorkspaceEdit, error) {
-	parsed, err := parser.ParseWithDriver(text, driver)
+	return renameWithDriverVariant(text, params, dialect.DriverVariant{Driver: driver})
+}
+
+func renameWithDriverVariant(text string, params lsp.RenameParams, dv dialect.DriverVariant) (*lsp.WorkspaceEdit, error) {
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return nil, err
 	}

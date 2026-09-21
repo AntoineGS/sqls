@@ -29,7 +29,7 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := SignatureHelpWithDriver(text, params, s.worker.Cache(), s.parserDriver())
+	res, err := SignatureHelpWithDriverVariant(text, params, s.worker.Cache(), s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}
@@ -41,11 +41,15 @@ func SignatureHelp(text string, params lsp.SignatureHelpParams, dbCache *databas
 }
 
 func SignatureHelpWithDriver(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.SignatureHelp, error) {
+	return SignatureHelpWithDriverVariant(text, params, dbCache, dialect.DriverVariant{Driver: driver})
+}
+
+func SignatureHelpWithDriverVariant(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.SignatureHelp, error) {
 	if dbCache == nil {
 		return nil, nil
 	}
 
-	parsed, err := parser.ParseWithDriver(text, driver)
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return nil, err
 	}

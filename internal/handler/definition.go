@@ -31,7 +31,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	return definitionWithDriver(params.TextDocument.URI, text, params, s.worker.Cache(), s.parserDriver())
+	return definitionWithDriverVariant(params.TextDocument.URI, text, params, s.worker.Cache(), s.parserDriverVariant())
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {
@@ -39,11 +39,15 @@ func definition(url, text string, params lsp.DefinitionParams, dbCache *database
 }
 
 func definitionWithDriver(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (lsp.Definition, error) {
+	return definitionWithDriverVariant(url, text, params, dbCache, dialect.DriverVariant{Driver: driver})
+}
+
+func definitionWithDriverVariant(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache, dv dialect.DriverVariant) (lsp.Definition, error) {
 	pos := token.Pos{
 		Line: params.Position.Line,
 		Col:  params.Position.Character + 1,
 	}
-	parsed, err := parser.ParseWithDriver(text, driver)
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return nil, err
 	}

@@ -34,7 +34,7 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := hoverWithDriver(text, params, s.worker.Cache(), s.parserDriver())
+	res, err := hoverWithDriverVariant(text, params, s.worker.Cache(), s.parserDriverVariant())
 	if err != nil {
 		if errors.Is(err, ErrNoHover) {
 			return nil, nil
@@ -49,6 +49,10 @@ func hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp
 }
 
 func hoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.Hover, error) {
+	return hoverWithDriverVariant(text, params, dbCache, dialect.DriverVariant{Driver: driver})
+}
+
+func hoverWithDriverVariant(text string, params lsp.HoverParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.Hover, error) {
 	if dbCache == nil {
 		return nil, nil
 	}
@@ -57,7 +61,7 @@ func hoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCa
 		Line: params.Position.Line,
 		Col:  params.Position.Character + 1,
 	}
-	parsed, err := parser.ParseWithDriver(text, driver)
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return nil, err
 	}
