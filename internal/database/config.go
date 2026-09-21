@@ -31,6 +31,9 @@ type DBConfig struct {
 	DBName         string                 `json:"dbName" yaml:"dbName"`
 	Params         map[string]string      `json:"params" yaml:"params"`
 	SSHCfg         *SSHConfig             `json:"sshConfig" yaml:"sshConfig"`
+	// Dialect selects the server-side SQL dialect. Only the interbase driver
+	// supports it: 0 auto-detects from the database, 1 and 3 pin a dialect.
+	Dialect int `json:"dialect" yaml:"dialect"`
 }
 
 func (c *DBConfig) Validate() error {
@@ -39,6 +42,9 @@ func (c *DBConfig) Validate() error {
 	}
 	if c.Driver == "" {
 		return errors.New("required: connections[].driver")
+	}
+	if c.Dialect != 0 && c.Driver != dialect.DatabaseDriverInterBase {
+		return errors.New("invalid: connections[].dialect is only supported by the interbase driver")
 	}
 
 	switch c.Driver {
@@ -145,6 +151,11 @@ func (c *DBConfig) Validate() error {
 		}
 		if c.SSHCfg != nil {
 			return errors.New("InterBase connections via SSH are not supported")
+		}
+		switch c.Dialect {
+		case 0, 1, 3:
+		default:
+			return errors.New("invalid: connections[].dialect must be 0 (auto), 1, or 3")
 		}
 		if _, err := interBaseAttachment(c); err != nil {
 			return err

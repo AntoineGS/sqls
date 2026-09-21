@@ -525,3 +525,75 @@ func TestInterBaseRepositoryDefaultsToDialect3(t *testing.T) {
 		t.Errorf("repository DatabaseName = %q, want %q", got, want)
 	}
 }
+
+func TestInterBaseConfigValidatesDialect(t *testing.T) {
+	accepted := []int{0, 1, 3}
+	for _, sqlDialect := range accepted {
+		cfg := DBConfig{
+			Driver:  dialect.DatabaseDriverInterBase,
+			Path:    "/tmp/example.ib",
+			User:    "alice",
+			Dialect: sqlDialect,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("dialect %d: Validate() error = %v, want nil", sqlDialect, err)
+		}
+	}
+
+	rejected := []int{2, 4, -1, 100}
+	for _, sqlDialect := range rejected {
+		cfg := DBConfig{
+			Driver:  dialect.DatabaseDriverInterBase,
+			Path:    "/tmp/example.ib",
+			User:    "alice",
+			Passwd:  "secret",
+			Dialect: sqlDialect,
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Errorf("dialect %d: Validate() returned a nil error", sqlDialect)
+			continue
+		}
+		if !strings.Contains(strings.ToLower(err.Error()), "dialect") {
+			t.Errorf("dialect %d: Validate() error = %q, want it to mention dialect", sqlDialect, err)
+		}
+		if strings.Contains(err.Error(), cfg.Passwd) {
+			t.Errorf("dialect %d: Validate() leaked the password: %q", sqlDialect, err)
+		}
+	}
+}
+
+func TestDialectIsRejectedForNonInterBaseDrivers(t *testing.T) {
+	drivers := []dialect.DatabaseDriver{
+		dialect.DatabaseDriverMySQL,
+		dialect.DatabaseDriverPostgreSQL,
+		dialect.DatabaseDriverSQLite3,
+	}
+	for _, driver := range drivers {
+		cfg := DBConfig{
+			Driver:         driver,
+			DataSourceName: "whatever",
+			Proto:          ProtoTCP,
+			Host:           "localhost",
+			User:           "alice",
+			Dialect:        3,
+		}
+		err := cfg.Validate()
+		if err == nil {
+			t.Errorf("%s: Validate() with a dialect returned a nil error", driver)
+			continue
+		}
+		message := strings.ToLower(err.Error())
+		if !strings.Contains(message, "dialect") || !strings.Contains(message, "interbase") {
+			t.Errorf("%s: Validate() error = %q, want it to mention dialect and interbase", driver, err)
+		}
+	}
+
+	// Zero is the default and must stay silent for every driver.
+	for _, driver := range drivers {
+		cfg := DBConfig{Driver: driver, DataSourceName: "whatever"}
+		if err := cfg.Validate(); err != nil && strings.Contains(strings.ToLower(err.Error()), "dialect") {
+			t.Errorf("%s: a zero dialect must not be rejected: %v", driver, err)
+		}
+	}
+}
