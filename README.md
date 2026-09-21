@@ -89,6 +89,25 @@ Ordinary builds do not link the InterBase client. Selecting an InterBase
 connection in such a build reports that the native build is required. The
 upstream `go install ...@latest` command does not include this local integration.
 
+### Cancelling a running query
+
+`workspace/executeCommand` runs off the request-handling loop, so sqls keeps
+answering completion, hover and formatting while a query runs, and an editor
+that sends `$/cancelRequest` stops it.
+
+Cancellation is **best effort, not a hard deadline**. A statement that finished
+before the cancellation took effect returns its real result, with a note saying
+the cancellation arrived too late. For InterBase, a cancelled statement whose
+effect could not be established is reported loudly:
+
+> Cancelled, but the outcome is UNCERTAIN.
+>
+> InterBase could not confirm whether this statement took effect. Do not re-run
+> it until you have checked the database state — reconcile by operation id or by
+> querying the affected rows.
+
+Do not blindly re-run a cancelled write.
+
 ## Editor Plugins
 
 - [sqls.vim](https://github.com/sqls-server/sqls.vim)
