@@ -189,3 +189,70 @@ func TestFormat(t *testing.T) {
 		}
 	}
 }
+
+func TestFormatWithInterBaseVariantPreservesDoubledQuotes(t *testing.T) {
+	// A format round trip must never rewrite 'c''d' as 'c'd'. Under Dialect 3
+	// the double quote starts a delimited identifier, which is exactly the
+	// condition the lexer previously used to decide escape preservation, so
+	// this case is the regression guard for the optional lexer interface.
+	tests := []struct {
+		name    string
+		variant dialect.SQLVariant
+		want    string
+	}{
+		{
+			name:    "dialect 1 reprints the double-quoted string verbatim",
+			variant: dialect.SQLVariantInterBase1,
+			want:    "SELECT\n\t\"a\"\"b\",\n\t'c''d'\nFROM\n\trdb$database",
+		},
+		{
+			name:    "dialect 3 reprints the delimited identifier verbatim",
+			variant: dialect.SQLVariantInterBase3,
+			want:    "SELECT\n\t\"a\"\"b\",\n\t'c''d'\nFROM\n\trdb$database",
+		},
+		{
+			name:    "the default variant behaves as dialect 3",
+			variant: dialect.SQLVariantDefault,
+			want:    "SELECT\n\t\"a\"\"b\",\n\t'c''d'\nFROM\n\trdb$database",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			const input = `select "a""b", 'c''d' from rdb$database`
+			got, err := FormatWithDriverVariant(
+				input,
+				lsp.DocumentFormattingParams{},
+				&config.Config{LowercaseKeywords: false},
+				dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: tt.variant},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d text edits, want 1", len(got))
+			}
+			if got[0].NewText != tt.want {
+				t.Fatalf("formatted query = %q, want %q", got[0].NewText, tt.want)
+			}
+			if !strings.Contains(got[0].NewText, `'c''d'`) {
+				t.Fatalf("formatting corrupted the escaped string literal: %q", got[0].NewText)
+			}
+		})
+	}
+}
+
+func TestFormatWithInterBaseDialect3DelimitedIdentifierWithSpace(t *testing.T) {
+	got, err := FormatWithDriverVariant(
+		`select "My Column" from t`,
+		lsp.DocumentFormattingParams{},
+		&config.Config{LowercaseKeywords: false},
+		dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "SELECT\n\t\"My Column\"\nFROM\n\tt"; got[0].NewText != want {
+		t.Fatalf("formatted query = %q, want %q", got[0].NewText, want)
+	}
+}

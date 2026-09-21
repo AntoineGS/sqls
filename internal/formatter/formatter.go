@@ -17,8 +17,14 @@ func Format(text string, params lsp.DocumentFormattingParams, cfg *config.Config
 	return formatWithDialect(text, params, cfg, &dialect.GenericSQLDialect{})
 }
 
+// FormatWithDriver formats text using a driver's default variant. It is
+// retained with its exact signature; see FormatWithDriverVariant.
 func FormatWithDriver(text string, params lsp.DocumentFormattingParams, cfg *config.Config, driver dialect.DatabaseDriver) ([]lsp.TextEdit, error) {
-	return formatWithDialect(text, params, cfg, dialect.DialectForDriver(driver))
+	return FormatWithDriverVariant(text, params, cfg, dialect.DriverVariant{Driver: driver})
+}
+
+func FormatWithDriverVariant(text string, params lsp.DocumentFormattingParams, cfg *config.Config, dv dialect.DriverVariant) ([]lsp.TextEdit, error) {
+	return formatWithDialect(text, params, cfg, dialect.DialectForDriverVariant(dv))
 }
 
 func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *config.Config, d dialect.Dialect) ([]lsp.TextEdit, error) {
