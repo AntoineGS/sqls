@@ -364,3 +364,76 @@ func configureInterBaseTestServer(t *testing.T, tx *TestContext, variant dialect
 		Variant: variant,
 	}
 }
+
+type recordingMessenger struct {
+	warnings []string
+	infos    []string
+	errs     []string
+}
+
+func (m *recordingMessenger) ShowLog(context.Context, string) error { return nil }
+
+func (m *recordingMessenger) ShowInfo(_ context.Context, message string) error {
+	m.infos = append(m.infos, message)
+	return nil
+}
+
+func (m *recordingMessenger) ShowWarning(_ context.Context, message string) error {
+	m.warnings = append(m.warnings, message)
+	return nil
+}
+
+func (m *recordingMessenger) ShowError(_ context.Context, message string) error {
+	m.errs = append(m.errs, message)
+	return nil
+}
+
+func TestShowConnectionWarnings(t *testing.T) {
+	const warning = `interbase: connection "centrale" is configured for SQL dialect 1 but the database reports SQL dialect 3; sqls will lex and render types as dialect 1. Remove ` + "`dialect`" + ` or set ` + "`dialect: 0`" + ` to follow the database.`
+
+	t.Run("warnings reach the messenger", func(t *testing.T) {
+		s := NewServer()
+		s.dbConn = &database.DBConnection{
+			Driver:   dialect.DatabaseDriverInterBase,
+			Variant:  dialect.SQLVariantInterBase1,
+			Warnings: []string{warning},
+		}
+		messenger := &recordingMessenger{}
+		s.showConnectionWarnings(context.Background(), messenger)
+
+		if len(messenger.warnings) != 1 {
+			t.Fatalf("got %d warnings, want 1: %v", len(messenger.warnings), messenger.warnings)
+		}
+		if messenger.warnings[0] != warning {
+			t.Errorf("warning = %q, want %q", messenger.warnings[0], warning)
+		}
+		if len(messenger.errs) != 0 || len(messenger.infos) != 0 {
+			t.Error("a connect warning must not be shown as an error or an info")
+		}
+	})
+
+	t.Run("no connection is a no-op", func(t *testing.T) {
+		s := NewServer()
+		messenger := &recordingMessenger{}
+		s.showConnectionWarnings(context.Background(), messenger)
+		if len(messenger.warnings) != 0 {
+			t.Errorf("got %d warnings without a connection, want 0", len(messenger.warnings))
+		}
+	})
+
+	t.Run("no warnings is a no-op", func(t *testing.T) {
+		s := NewServer()
+		s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+		messenger := &recordingMessenger{}
+		s.showConnectionWarnings(context.Background(), messenger)
+		if len(messenger.warnings) != 0 {
+			t.Errorf("got %d warnings, want 0", len(messenger.warnings))
+		}
+	})
+
+	t.Run("a nil messenger does not panic", func(t *testing.T) {
+		s := NewServer()
+		s.dbConn = &database.DBConnection{Warnings: []string{warning}}
+		s.showConnectionWarnings(context.Background(), nil)
+	})
+}

@@ -211,6 +211,7 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 			}
 		}
 	}
+	s.showConnectionWarnings(ctx, messenger)
 	return result, nil
 }
 
@@ -392,6 +393,7 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 			}
 		}
 	}
+	s.showConnectionWarnings(ctx, messenger)
 
 	return nil, nil
 }
@@ -424,6 +426,10 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 	s.dbConn = dbConn
 	s.stateMu.Unlock()
 
+	for _, warning := range dbConn.Warnings {
+		log.Println(warning)
+	}
+
 	dbRepo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return err
@@ -432,6 +438,27 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// showConnectionWarnings sends any non-fatal connect-time diagnostics to the
+// client. It is a no-op without a connection, without warnings, or without a
+// messenger — the two paths that reach reconnectionDB from a command have no
+// *jsonrpc2.Conn, and there those warnings are logged only.
+func (s *Server) showConnectionWarnings(ctx context.Context, messenger lsp.MessageDisplayer) {
+	if messenger == nil {
+		return
+	}
+	s.stateMu.RLock()
+	dbConn := s.dbConn
+	s.stateMu.RUnlock()
+	if dbConn == nil {
+		return
+	}
+	for _, warning := range dbConn.Warnings {
+		if err := messenger.ShowWarning(ctx, warning); err != nil {
+			log.Println("send warning", err.Error())
+		}
+	}
 }
 
 func (s *Server) newDBConnection(ctx context.Context) (*database.DBConnection, error) {
