@@ -20,14 +20,14 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
 	c := completer.NewCompleter(s.worker.Cache())
 	c.Driver = s.parserDriver()
-	completionItems, err := c.Complete(f.Text, params, s.getConfig().LowercaseKeywords)
+	completionItems, err := c.Complete(text, params, s.getConfig().LowercaseKeywords)
 	if err != nil {
 		return nil, err
 	}

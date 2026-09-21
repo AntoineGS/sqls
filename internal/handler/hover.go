@@ -29,12 +29,12 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := hoverWithDriver(f.Text, params, s.worker.Cache(), s.parserDriver())
+	res, err := hoverWithDriver(text, params, s.worker.Cache(), s.parserDriver())
 	if err != nil {
 		if errors.Is(err, ErrNoHover) {
 			return nil, nil

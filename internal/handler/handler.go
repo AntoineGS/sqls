@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"sync"
 
 	"github.com/sourcegraph/jsonrpc2"
 
@@ -24,6 +25,11 @@ type Server struct {
 	SpecificFileCfg *config.Config
 	DefaultFileCfg  *config.Config
 	WSCfg           *config.Config
+
+	// stateMu guards every mutable field below. It is taken for short,
+	// non-blocking accesses only: connMu, not stateMu, is what a command holds
+	// across database I/O.
+	stateMu sync.RWMutex
 
 	dbConn *database.DBConnection
 
@@ -284,16 +290,22 @@ func (s *Server) openFile(uri string, languageID string) error {
 		Text:       "",
 		LanguageID: languageID,
 	}
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	s.files[uri] = f
 	return nil
 }
 
 func (s *Server) closeFile(uri string) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	delete(s.files, uri)
 	return nil
 }
 
 func (s *Server) updateFile(uri string, text string) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	f, ok := s.files[uri]
 	if !ok {
 		return fmt.Errorf("document not found: %v", uri)
@@ -304,6 +316,19 @@ func (s *Server) updateFile(uri string, text string) error {
 
 func (s *Server) saveFile(uri string) error {
 	return nil
+}
+
+// fileText returns a copy of the document text for uri. Callers must never
+// retain the *File: updateFile mutates Text through the stored pointer, so a
+// reader that keeps the pointer races with a concurrent didChange.
+func (s *Server) fileText(uri string) (string, bool) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	f, ok := s.files[uri]
+	if !ok {
+		return "", false
+	}
+	return f.Text, true
 }
 
 func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {

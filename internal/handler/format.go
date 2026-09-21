@@ -20,12 +20,12 @@ func (s *Server) handleTextDocumentFormatting(ctx context.Context, conn *jsonrpc
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	textEdits, err := formatter.FormatWithDriver(f.Text, params, s.getConfig(), s.parserDriver())
+	textEdits, err := formatter.FormatWithDriver(text, params, s.getConfig(), s.parserDriver())
 	if err != nil {
 		return nil, err
 	}
@@ -45,8 +45,7 @@ func (s *Server) handleTextDocumentRangeFormatting(ctx context.Context, conn *js
 		return nil, err
 	}
 
-	_, ok := s.files[params.TextDocument.URI]
-	if !ok {
+	if _, ok := s.fileText(params.TextDocument.URI); !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 

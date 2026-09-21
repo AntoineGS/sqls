@@ -24,12 +24,12 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := SignatureHelpWithDriver(f.Text, params, s.worker.Cache(), s.parserDriver())
+	res, err := SignatureHelpWithDriver(text, params, s.worker.Cache(), s.parserDriver())
 	if err != nil {
 		return nil, err
 	}

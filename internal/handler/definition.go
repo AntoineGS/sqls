@@ -26,12 +26,12 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	return definitionWithDriver(params.TextDocument.URI, f.Text, params, s.worker.Cache(), s.parserDriver())
+	return definitionWithDriver(params.TextDocument.URI, text, params, s.worker.Cache(), s.parserDriver())
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {

@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/lsp"
 )
 
 type failingCloser struct{ err error }
@@ -31,5 +34,48 @@ func TestStopStopsWorkerEvenWhenConnectionCloseFails(t *testing.T) {
 	case <-server.worker.Done():
 	default:
 		t.Fatal("Stop returned without stopping the worker")
+	}
+}
+
+func TestExecuteCommandDispatchesAsynchronously(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	backend := installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	gate := backend.gate("Query")
+	commandDone := make(chan error, 1)
+	go func() {
+		var got string
+		commandDone <- tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+			Command:   CommandExecuteQuery,
+			Arguments: []interface{}{testFileURI},
+		}, &got)
+	}()
+	gate.waitEntered(t)
+
+	// The command is parked inside the repository. A read-only request must
+	// still be served; with inline dispatch this call times out.
+	formatCtx, cancel := context.WithTimeout(tx.ctx, 5*time.Second)
+	defer cancel()
+	var edits []lsp.TextEdit
+	if err := tx.conn.Call(formatCtx, "textDocument/formatting", lsp.DocumentFormattingParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+	}, &edits); err != nil {
+		t.Fatal("second request was not served while a command was in flight:", err)
+	}
+
+	gate.release()
+	select {
+	case err := <-commandDone:
+		if err != nil {
+			t.Fatal("conn.Call workspace/executeCommand:", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the in-flight command never completed")
 	}
 }

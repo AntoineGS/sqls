@@ -122,7 +122,7 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	if !ok {
 		return nil, fmt.Errorf("specify the file uri as a string")
 	}
-	f, ok := s.files[uri]
+	text, ok := s.fileText(uri)
 	if !ok {
 		return nil, fmt.Errorf("document not found, %q", uri)
 	}
@@ -138,7 +138,6 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	}
 
 	// extract target query
-	text := f.Text
 	if params.Range != nil {
 		text = extractRangeText(
 			text,

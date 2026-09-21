@@ -25,12 +25,12 @@ func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Co
 		return nil, err
 	}
 
-	f, ok := s.files[params.TextDocument.URI]
+	text, ok := s.fileText(params.TextDocument.URI)
 	if !ok {
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := renameWithDriver(f.Text, params, s.parserDriver())
+	res, err := renameWithDriver(text, params, s.parserDriver())
 	if err != nil {
 		return nil, err
 	}

@@ -122,7 +122,7 @@ func serve(c *cli.Context) error {
 			log.Println(err)
 		}
 	}()
-	h := jsonrpc2.HandlerWithError(server.Handle)
+	h := handler.NewDispatcher(jsonrpc2.HandlerWithError(server.Handle))
 
 	// Load specific config
 	if configFile != "" {

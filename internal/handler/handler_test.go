@@ -26,7 +26,7 @@ type TestContext struct {
 
 func newTestContext() *TestContext {
 	server := NewServer()
-	handler := jsonrpc2.HandlerWithError(server.Handle)
+	handler := NewDispatcher(jsonrpc2.HandlerWithError(server.Handle))
 	ctx := context.Background()
 	return &TestContext{
 		h:      handler,
@@ -203,18 +203,18 @@ func TestFileWatch(t *testing.T) {
 	if err := tx.conn.Call(tx.ctx, "textDocument/didClose", didCloseParams, nil); err != nil {
 		t.Fatal("conn.Call textDocument/didClose:", err)
 	}
-	_, ok := tx.server.files[didCloseParams.TextDocument.URI]
+	_, ok := tx.server.fileText(didCloseParams.TextDocument.URI)
 	if ok {
 		t.Errorf("found opened file. URI:%s", didCloseParams.TextDocument.URI)
 	}
 }
 
 func (tx *TestContext) testFile(t *testing.T, uri, text string) {
-	f, ok := tx.server.files[uri]
+	got, ok := tx.server.fileText(uri)
 	if !ok {
 		t.Errorf("not found opened file. URI:%s", uri)
 	}
-	if f.Text != text {
-		t.Errorf("not match %s. got: %s", text, f.Text)
+	if got != text {
+		t.Errorf("not match %s. got: %s", text, got)
 	}
 }
