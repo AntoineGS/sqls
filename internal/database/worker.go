@@ -90,6 +90,12 @@ func (w *Worker) Stop() {
 	w.stopOnce.Do(func() { close(w.done) })
 }
 
+// Done reports the worker's shutdown channel. It exists so callers can assert
+// that Stop has run.
+func (w *Worker) Done() <-chan struct{} {
+	return w.done
+}
+
 func (w *Worker) ReCache(ctx context.Context, repo DBRepository) error {
 	w.setRepo(repo)
 	if err := w.updateAllCache(ctx); err != nil {

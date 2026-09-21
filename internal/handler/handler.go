@@ -69,12 +69,12 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 	return nil
 }
 
+// Stop closes the database connection and always stops the worker, including
+// when closing the connection fails. Shutdown deliberately does not take
+// connMu: a runaway query must not be able to hold the process open.
 func (s *Server) Stop() error {
-	if err := s.dbConn.Close(); err != nil {
-		return err
-	}
-	s.worker.Stop()
-	return nil
+	defer s.worker.Stop()
+	return s.dbConn.Close()
 }
 
 func (s *Server) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
