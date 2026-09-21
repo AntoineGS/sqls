@@ -11,11 +11,11 @@ type Dialect interface {
 type GenericSQLDialect struct {
 }
 
+// DialectForDriver returns the lexical rules for a driver's default variant.
+// It is retained with its exact signature; callers that have resolved a
+// server-side variant should use DialectForDriverVariant instead.
 func DialectForDriver(driver DatabaseDriver) Dialect {
-	if driver == DatabaseDriverInterBase {
-		return &InterBaseDialect{}
-	}
-	return &GenericSQLDialect{}
+	return DialectForDriverVariant(DriverVariant{Driver: driver})
 }
 
 func (*GenericSQLDialect) IsIdentifierStart(r rune) bool {

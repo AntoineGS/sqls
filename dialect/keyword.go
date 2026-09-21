@@ -393,7 +393,20 @@ const (
 	DatabaseDriverInterBase  DatabaseDriver = "interbase"
 )
 
+// DataBaseKeywords returns the completion keyword list for a driver's default
+// variant. It is retained with its exact signature; callers that have resolved
+// a server-side variant should use DataBaseKeywordsForVariant instead.
 func DataBaseKeywords(driver DatabaseDriver) []string {
+	return DataBaseKeywordsForVariant(DriverVariant{Driver: driver})
+}
+
+// DataBaseFunctions returns the completion function list for a driver's default
+// variant. See DataBaseFunctionsForVariant.
+func DataBaseFunctions(driver DatabaseDriver) []string {
+	return DataBaseFunctionsForVariant(DriverVariant{Driver: driver})
+}
+
+func dataBaseKeywords(driver DatabaseDriver) []string {
 	switch driver {
 	case DatabaseDriverMySQL:
 		return mysql8Keyword
@@ -418,13 +431,13 @@ func DataBaseKeywords(driver DatabaseDriver) []string {
 	case DatabaseDriverClickhouse:
 		return clickhouseKeywords
 	case DatabaseDriverInterBase:
-		return interbaseKeywords
+		return interbaseDialect3Keywords
 	default:
 		return sqliteKeywords
 	}
 }
 
-func DataBaseFunctions(driver DatabaseDriver) []string {
+func dataBaseFunctions(driver DatabaseDriver) []string {
 	switch driver {
 	case DatabaseDriverMySQL:
 		return mysql8Function

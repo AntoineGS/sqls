@@ -1,5 +1,7 @@
 package dialect
 
+import "sort"
+
 // InterBaseDialect implements the lexical rules of one InterBase SQL dialect.
 // Dialect 1 uses double quotes for string literals; Dialect 3 uses them for
 // delimited identifiers. Both permit '$' in regular identifiers (for example,
@@ -248,6 +250,17 @@ var interbaseKeywords = []string{
 	"WRITE",
 	"YEAR",
 }
+
+// interbaseDialect3Keywords is interbaseKeywords plus the two types that exist
+// only in SQL Dialect 3. Deriving it from the Dialect 1 list keeps one source
+// of truth, so a word added to interbaseKeywords reaches both dialects.
+var interbaseDialect3Keywords = func() []string {
+	words := make([]string, 0, len(interbaseKeywords)+2)
+	words = append(words, interbaseKeywords...)
+	words = append(words, "TIME", "TIMESTAMP")
+	sort.Strings(words)
+	return words
+}()
 
 // Keep this list to core InterBase functions. Installation-specific UDFs and
 // Firebird builtins are not necessarily available on an InterBase server.
