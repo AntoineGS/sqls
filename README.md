@@ -113,9 +113,11 @@ Do not blindly re-run a cancelled write.
 Results are rendered from the column metadata the driver reports, so the pane
 shows what the database actually returned.
 
-- **`NULL` is not an empty string.** For InterBase, a SQL `NULL` renders as the
-  literal `NULL` and an empty value renders as an empty cell. Other drivers are
-  unchanged.
+- **`NULL` is not an empty string — but only for InterBase.** For InterBase, a
+  SQL `NULL` renders as the literal `NULL` and an empty value renders as an
+  empty cell, so the two stay distinguishable. On every other driver, `NULL`
+  now renders as an empty cell too, indistinguishable from an empty string
+  `''` — previously it rendered as the literal `<nil>`.
 - **Exact decimals stay exact.** A scaled `NUMERIC`/`DECIMAL` column is rendered
   from the driver's exact decimal text, never through a float.
 - **Large cells are display-capped at 512 characters.** A longer value is cut at

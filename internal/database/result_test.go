@@ -470,6 +470,43 @@ func TestScanRowsWithTypesLeavesShortCellsAlone(t *testing.T) {
 	}
 }
 
+func TestScanRowsWithTypesLeavesCellAtExactCapAlone(t *testing.T) {
+	// Exactly at the cap must not be truncated: capCell's boundary check is
+	// <=, not <. Multi-byte runes so a byte-based cap would also fail this.
+	value := strings.Repeat("é", 8)
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "S", databaseType: "VARCHAR", scanType: reflect.TypeOf("")}},
+			[][]driver.Value{{value}},
+		)
+	}, RenderOptions{MaxCellRunes: 8})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+	if got := result.Rows[0][0]; got != value {
+		t.Errorf("cell = %q, want it untouched at exactly the cap", got)
+	}
+}
+
+func TestScanRowsWithTypesCapsCellOneRuneOverLimit(t *testing.T) {
+	// One rune past the cap must be truncated, with the marker and the true
+	// total. Multi-byte runes so a byte-based cap would also fail this.
+	value := strings.Repeat("é", 9)
+	result, err := scanFixture(t, func() *resultTestRows {
+		return newResultTestRows(
+			[]resultTestColumn{{name: "S", databaseType: "VARCHAR", scanType: reflect.TypeOf("")}},
+			[][]driver.Value{{value}},
+		)
+	}, RenderOptions{MaxCellRunes: 8})
+	if err != nil {
+		t.Fatalf("ScanRowsWithTypes() error = %v", err)
+	}
+	want := strings.Repeat("é", 8) + "…(truncated, 9 characters)"
+	if got := result.Rows[0][0]; got != want {
+		t.Errorf("cell = %q, want %q", got, want)
+	}
+}
+
 func TestDefaultMaxCellRunesIsFiveHundredTwelve(t *testing.T) {
 	if DefaultMaxCellRunes != 512 {
 		t.Errorf("DefaultMaxCellRunes = %d, want 512", DefaultMaxCellRunes)
