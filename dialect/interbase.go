@@ -1,10 +1,17 @@
 package dialect
 
-// InterBaseDialect implements the lexical rules that are specific to
-// InterBase SQL Dialect 1. Dialect 1 uses double quotes for string literals
-// rather than delimited identifiers and permits '$' in regular identifiers
-// (for example, RDB$DATABASE).
-type InterBaseDialect struct{}
+// InterBaseDialect implements the lexical rules of one InterBase SQL dialect.
+// Dialect 1 uses double quotes for string literals; Dialect 3 uses them for
+// delimited identifiers. Both permit '$' in regular identifiers (for example,
+// RDB$DATABASE) and use positional '?' placeholders.
+//
+// The zero value is Dialect 3, matching the interbase-go default: the driver's
+// normalizeDialect maps a zero Config.Dialect to 3, so a zero-value dialect and
+// a zero-value interbase.Config agree.
+type InterBaseDialect struct {
+	// SQLDialect is 1 or 3; zero is treated as 3.
+	SQLDialect int
+}
 
 func (*InterBaseDialect) IsIdentifierStart(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
@@ -17,9 +24,20 @@ func (*InterBaseDialect) IsIdentifierPart(r rune) bool {
 		r == '_' || r == '$'
 }
 
-func (*InterBaseDialect) IsDelimitedIdentifierStart(r rune) bool {
-	return false
+func (d *InterBaseDialect) IsDelimitedIdentifierStart(r rune) bool {
+	return r == '"' && d.SQLDialect != 1
 }
+
+// PreservesQuotedStringEscapes keeps doubled quotes in token text for both
+// dialects, because the formatter reprints tokens verbatim. Without it, turning
+// on delimited identifiers for Dialect 3 would make the formatter drop one
+// quote from an escaped string literal and corrupt user SQL.
+func (d *InterBaseDialect) PreservesQuotedStringEscapes() bool { return true }
+
+// ScansWholeDelimitedIdentifier keeps `"My Column"` a single identifier token
+// and keeps a doubled quote inside one. Dialect 1 never reaches the delimited
+// identifier path, so returning true unconditionally is safe for both.
+func (d *InterBaseDialect) ScansWholeDelimitedIdentifier() bool { return true }
 
 func (*InterBaseDialect) IsPlaceHolderStart(r rune) bool {
 	return r == '?'

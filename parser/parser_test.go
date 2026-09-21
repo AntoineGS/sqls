@@ -11,7 +11,7 @@ import (
 
 func TestParseWithInterBaseDialect1(t *testing.T) {
 	input := `SELECT "a""b", 'c''d' FROM RDB$DATABASE WHERE ID = ?`
-	parsed, err := ParseWithDriver(input, dialect.DatabaseDriverInterBase)
+	parsed, err := ParseWithDialect(input, &dialect.InterBaseDialect{SQLDialect: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,6 +51,86 @@ func TestParseWithInterBaseDialect1(t *testing.T) {
 	}
 	if !placeholder {
 		t.Error("parsed Dialect 1 query lost the positional placeholder")
+	}
+}
+
+func TestParseInterBaseDoubleQuotedText(t *testing.T) {
+	const input = `SELECT "My Column", 'c''d' FROM T`
+
+	tests := []struct {
+		name           string
+		sqlDialect     int
+		wantQuotedKind token.Kind
+		wantQuotedText string
+		wantQuoteStyle rune
+	}{
+		{
+			name:           "dialect 1 lexes double quotes as a string",
+			sqlDialect:     1,
+			wantQuotedKind: token.SingleQuotedString,
+			wantQuotedText: `"My Column"`,
+			wantQuoteStyle: 0,
+		},
+		{
+			name:           "dialect 3 lexes double quotes as a delimited identifier",
+			sqlDialect:     3,
+			wantQuotedKind: token.SQLKeyword,
+			wantQuotedText: "My Column",
+			wantQuoteStyle: '"',
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := ParseWithDialect(input, &dialect.InterBaseDialect{SQLDialect: tt.sqlDialect})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var sqlTokens []*ast.SQLToken
+			collectSQLTokens(parsed, &sqlTokens)
+
+			var quoted *ast.SQLToken
+			var escaped string
+			for _, sqlToken := range sqlTokens {
+				if word, ok := sqlToken.Value.(*token.SQLWord); ok && word.Value == tt.wantQuotedText {
+					quoted = sqlToken
+					continue
+				}
+				if sqlToken.Kind == token.SingleQuotedString {
+					text, _ := sqlToken.Value.(string)
+					if text == `"My Column"` {
+						quoted = sqlToken
+						continue
+					}
+					escaped = text
+				}
+			}
+
+			if quoted == nil {
+				t.Fatalf("no token matched %q in %q", tt.wantQuotedText, input)
+			}
+			if got, want := quoted.Kind, tt.wantQuotedKind; got != want {
+				t.Errorf("double-quoted token kind = %v, want %v", got, want)
+			}
+			if word, ok := quoted.Value.(*token.SQLWord); ok {
+				if got, want := word.QuoteStyle, tt.wantQuoteStyle; got != want {
+					t.Errorf("double-quoted token quote style = %q, want %q", got, want)
+				}
+				if got, want := word.Value, tt.wantQuotedText; got != want {
+					t.Errorf("double-quoted token value = %q, want %q", got, want)
+				}
+			}
+
+			// The regression guard for the escape-preservation interface: this
+			// must hold for BOTH dialects, or the formatter corrupts user SQL.
+			if got, want := escaped, `'c''d'`; got != want {
+				t.Errorf("single-quoted token text = %q, want %q", got, want)
+			}
+			if got := parsed.String(); got != input {
+				t.Errorf("round trip String() = %q, want %q", got, input)
+			}
+		})
 	}
 }
 

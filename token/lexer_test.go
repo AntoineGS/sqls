@@ -909,7 +909,7 @@ test
 
 func TestTokenizer_InterBaseDialect1(t *testing.T) {
 	src := `"a""b" 'c''d' RDB$DATABASE ?`
-	tokenizer := NewTokenizer(bytes.NewBufferString(src), &dialect.InterBaseDialect{})
+	tokenizer := NewTokenizer(bytes.NewBufferString(src), &dialect.InterBaseDialect{SQLDialect: 1})
 
 	tokens, err := tokenizer.Tokenize()
 	if err != nil {
@@ -955,6 +955,90 @@ func TestTokenizer_InterBaseDialect1(t *testing.T) {
 	}
 	if got, want := tokens[6].Value, "?"; got != want {
 		t.Errorf("positional placeholder value = %q, want %q", got, want)
+	}
+}
+
+func TestTokenizer_InterBaseDialect3(t *testing.T) {
+	src := `"a""b" 'c''d' RDB$DATABASE ?`
+	tokenizer := NewTokenizer(bytes.NewBufferString(src), &dialect.InterBaseDialect{SQLDialect: 3})
+
+	tokens, err := tokenizer.Tokenize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tokens) != 7 {
+		t.Fatalf("got %d tokens, want 7: %s", len(tokens), pp.Sprint(tokens))
+	}
+
+	word, ok := tokens[0].Value.(*SQLWord)
+	if !ok {
+		t.Fatalf("double-quoted Dialect 3 token value = %T, want *SQLWord", tokens[0].Value)
+	}
+	if got, want := tokens[0].Kind, SQLKeyword; got != want {
+		t.Errorf("double-quoted Dialect 3 token kind = %v, want %v", got, want)
+	}
+	if got, want := word.Value, `a""b`; got != want {
+		t.Errorf("delimited identifier value = %q, want %q", got, want)
+	}
+	if got, want := word.QuoteStyle, '"'; got != want {
+		t.Errorf("delimited identifier quote style = %q, want %q", got, want)
+	}
+	if got, want := word.String(), `"a""b"`; got != want {
+		t.Errorf("delimited identifier reprint = %q, want %q", got, want)
+	}
+	if got, want := tokens[0].To, (Pos{Line: 0, Col: 6}); got != want {
+		t.Errorf("delimited identifier end = %v, want %v", got, want)
+	}
+
+	// The escape-preservation guard: a single-quoted string must survive
+	// unchanged under Dialect 3 even though '"' now delimits identifiers.
+	if got, want := tokens[2].Kind, SingleQuotedString; got != want {
+		t.Errorf("single-quoted Dialect 3 string kind = %v, want %v", got, want)
+	}
+	if got, want := tokens[2].Value, `'c''d'`; got != want {
+		t.Errorf("single-quoted Dialect 3 string value = %q, want %q", got, want)
+	}
+
+	catalog, ok := tokens[4].Value.(*SQLWord)
+	if !ok {
+		t.Fatalf("RDB$DATABASE token value = %T, want *SQLWord", tokens[4].Value)
+	}
+	if got, want := catalog.Value, "RDB$DATABASE"; got != want {
+		t.Errorf("RDB$DATABASE value = %q, want %q", got, want)
+	}
+	if got, want := tokens[6].Value, "?"; got != want {
+		t.Errorf("positional placeholder value = %q, want %q", got, want)
+	}
+}
+
+// TestTokenizeQuotedStringEscapePreservation is the spec's named regression
+// guard: only the generic dialect decodes a doubled quote. Both InterBase
+// dialects keep the source spelling, because the formatter reprints tokens.
+func TestTokenizeQuotedStringEscapePreservation(t *testing.T) {
+	tests := []struct {
+		name    string
+		dialect dialect.Dialect
+		want    string
+	}{
+		{name: "generic decodes", dialect: &dialect.GenericSQLDialect{}, want: `'c'd'`},
+		{name: "interbase dialect 1 preserves", dialect: &dialect.InterBaseDialect{SQLDialect: 1}, want: `'c''d'`},
+		{name: "interbase dialect 3 preserves", dialect: &dialect.InterBaseDialect{SQLDialect: 3}, want: `'c''d'`},
+		{name: "interbase zero value preserves", dialect: &dialect.InterBaseDialect{}, want: `'c''d'`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens, err := NewTokenizer(bytes.NewBufferString(`'c''d'`), tt.dialect).Tokenize()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(tokens) != 1 {
+				t.Fatalf("got %d tokens, want 1: %s", len(tokens), pp.Sprint(tokens))
+			}
+			if got := tokens[0].Value; got != tt.want {
+				t.Fatalf("token value = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
