@@ -351,10 +351,18 @@ func (s *Server) query(ctx context.Context, query string, vertical bool) (string
 	return renderQueryResult(result, vertical, scanErr)
 }
 
+// queryResult materialises a read statement's result. It prefers an explicit
+// read-only transaction when the repository offers one; that transaction's
+// lifetime stays inside the repository, so an early return here cannot leak it.
+// Every path renders through ScanRowsWithTypes, so the partial-result contract
+// is the same on every driver.
 func (s *Server) queryResult(ctx context.Context, query string) (*database.QueryResult, error) {
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if readOnly, ok := repo.(database.ReadOnlyQuerier); ok {
+		return readOnly.QueryReadOnly(ctx, query)
 	}
 	rows, err := repo.Query(ctx, query)
 	if err != nil {

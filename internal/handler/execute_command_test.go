@@ -140,6 +140,66 @@ func TestQuerySucceedsWithCompleteFooter(t *testing.T) {
 	}
 }
 
+func TestExecuteQueryUsesReadOnlyTransactionForSelect(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	backend := installStubBackend(t)
+	backend.enableReadOnlyQuerier()
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	var got string
+	if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+		Command:   CommandExecuteQuery,
+		Arguments: []interface{}{testFileURI},
+	}, &got); err != nil {
+		t.Fatal("conn.Call workspace/executeCommand:", err)
+	}
+
+	readOnly := backend.readOnlyQueries()
+	if len(readOnly) != 1 {
+		t.Fatalf("QueryReadOnly served %d statements, want 1", len(readOnly))
+	}
+	if !strings.Contains(readOnly[0], "SELECT 1") {
+		t.Errorf("QueryReadOnly received %q, want the SELECT statement", readOnly[0])
+	}
+	if !strings.Contains(got, "42") || !strings.Contains(got, "1 rows in set") {
+		t.Errorf("result = %q, want the rendered table and footer", got)
+	}
+}
+
+func TestExecuteQueryFallsBackWhenReadOnlyQuerierAbsent(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+
+	backend := installStubBackend(t)
+	tx.addWorkspaceConfig(t, stubConnections("primary"))
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT 1;")
+
+	var got string
+	if err := tx.conn.Call(tx.ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{
+		Command:   CommandExecuteQuery,
+		Arguments: []interface{}{testFileURI},
+	}, &got); err != nil {
+		t.Fatal("conn.Call workspace/executeCommand:", err)
+	}
+
+	if served := backend.readOnlyQueries(); len(served) != 0 {
+		t.Errorf("QueryReadOnly served %d statements on a repository without the capability, want 0", len(served))
+	}
+	if queries := backend.queries(); len(queries) != 1 {
+		t.Fatalf("Query served %d statements, want 1", len(queries))
+	}
+	if !strings.Contains(got, "42") || !strings.Contains(got, "1 rows in set") {
+		t.Errorf("result = %q, want the rendered table and footer", got)
+	}
+}
+
 func Test_queryResultHeaderPreservesColumnNames(t *testing.T) {
 	// Regression test: column names with underscores should not be
 	// auto-formatted (e.g. "user_name" must not become "USER NAME").

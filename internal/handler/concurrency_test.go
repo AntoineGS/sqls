@@ -149,10 +149,12 @@ type stubQuery struct {
 }
 
 type stubBackend struct {
-	mu       sync.Mutex
-	gates    map[string]*stubGate
-	served   []stubQuery
-	openedDB []*sql.DB
+	mu             sync.Mutex
+	gates          map[string]*stubGate
+	served         []stubQuery
+	openedDB       []*sql.DB
+	readOnly       bool
+	readOnlyServed []string
 }
 
 func (b *stubBackend) newGate(method string, ignoreCancel bool) *stubGate {
@@ -195,6 +197,34 @@ func (b *stubBackend) queries() []stubQuery {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]stubQuery(nil), b.served...)
+}
+
+// enableReadOnlyQuerier makes the next repository the factory builds implement
+// database.ReadOnlyQuerier. Call it before the connection is established —
+// before tx.addWorkspaceConfig — because the factory runs at that point and a
+// method set cannot be changed afterwards.
+func (b *stubBackend) enableReadOnlyQuerier() {
+	b.mu.Lock()
+	b.readOnly = true
+	b.mu.Unlock()
+}
+
+func (b *stubBackend) readOnlyEnabled() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.readOnly
+}
+
+func (b *stubBackend) recordReadOnlyQuery(text string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.readOnlyServed = append(b.readOnlyServed, text)
+}
+
+func (b *stubBackend) readOnlyQueries() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.readOnlyServed...)
 }
 
 func (b *stubBackend) recordOpen(db *sql.DB) {
@@ -240,6 +270,23 @@ func (r *stubRepository) Databases(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return r.MockDBRepository.Databases(ctx)
+}
+
+// readOnlyStubRepository is a distinct type rather than a method on
+// stubRepository: if stubRepository itself satisfied ReadOnlyQuerier, every
+// existing command test would silently change path.
+type readOnlyStubRepository struct {
+	*stubRepository
+}
+
+func (r *readOnlyStubRepository) QueryReadOnly(ctx context.Context, query string) (*database.QueryResult, error) {
+	rows, err := r.stubRepository.Query(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	r.backend.recordReadOnlyQuery(query)
+	return database.ScanRowsWithTypes(rows, database.RenderOptions{})
 }
 
 var currentStubBackend struct {
@@ -311,10 +358,14 @@ func init() {
 		if b == nil {
 			return database.NewMockDBRepository(db)
 		}
-		return &stubRepository{
+		repository := &stubRepository{
 			MockDBRepository: database.NewMockDBRepository(db).(*database.MockDBRepository),
 			backend:          b,
 			db:               db,
 		}
+		if b.readOnlyEnabled() {
+			return &readOnlyStubRepository{stubRepository: repository}
+		}
+		return repository
 	})
 }
