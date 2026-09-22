@@ -1,7 +1,7 @@
 # InterBase Procedure Symbol Navigation — Design Spec
 
 Date: 2026-09-22
-Status: proposed; awaiting written-spec review
+Status: approved after review clarification on optional variable prefixes
 
 ## Purpose and agreed scope
 
