@@ -361,3 +361,91 @@ func TestSnapshotStoreFailsCleanlyWhenNameExceedsFilesystemLimit(t *testing.T) {
 		t.Fatal("write with an over-long escaped name unexpectedly succeeded")
 	}
 }
+
+// backdate makes a directory look older than it is. Each fixture below exists
+// to reject a different shortcut: `stale` proves pruning happens at all,
+// `fresh` proves the age check is real, `mine` proves a running process's own
+// directory survives, and `notes.txt` plus `scratch` prove only directories
+// matching the <hash>-<pid> shape are eligible — a store that simply removed
+// every old entry under its root would delete a user file that happened to be
+// sitting there.
+func backdate(t *testing.T, path string) {
+	t.Helper()
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal("Chtimes:", err)
+	}
+}
+
+func TestSnapshotStorePrunesStaleSnapshotDirectories(t *testing.T) {
+	store := newTestSnapshotStore(t)
+
+	stale := filepath.Join(store.root, "0123456789abcdef-4242")
+	fresh := filepath.Join(store.root, "fedcba9876543210-4243")
+	mine := filepath.Join(store.root, snapshotDirName("someone else", os.Getpid()))
+	scratch := filepath.Join(store.root, "scratch")
+	for _, dir := range []string{stale, fresh, mine, scratch} {
+		if err := os.MkdirAll(dir, snapshotDirMode); err != nil {
+			t.Fatal("MkdirAll:", err)
+		}
+	}
+	notes := filepath.Join(store.root, "notes.txt")
+	if err := os.WriteFile(notes, []byte("keep me"), snapshotFileMode); err != nil {
+		t.Fatal("WriteFile:", err)
+	}
+	backdate(t, stale)
+	backdate(t, mine)
+	backdate(t, scratch)
+	backdate(t, notes)
+
+	if _, err := store.write(testSnapshotContext(), "procedure", "MYPROC", "BEGIN END\n"); err != nil {
+		t.Fatal("write:", err)
+	}
+
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale snapshot directory survived pruning (err=%v)", err)
+	}
+	for _, kept := range []string{fresh, mine, scratch, notes} {
+		if _, err := os.Stat(kept); err != nil {
+			t.Errorf("pruning removed %q, which it must not touch: %v", kept, err)
+		}
+	}
+}
+
+func TestSnapshotStorePrunesAtMostOnce(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	sc := testSnapshotContext()
+
+	if _, err := store.write(sc, "procedure", "MYPROC", "BEGIN END\n"); err != nil {
+		t.Fatal("first write:", err)
+	}
+
+	// A directory that becomes stale after the store has already pruned must
+	// survive: pruning is a start-up sweep, not a garbage collector that runs
+	// on every jump.
+	late := filepath.Join(store.root, "00112233445566aa-4244")
+	if err := os.MkdirAll(late, snapshotDirMode); err != nil {
+		t.Fatal("MkdirAll:", err)
+	}
+	backdate(t, late)
+
+	if _, err := store.write(sc, "view", "MYVIEW", "SELECT 1\n"); err != nil {
+		t.Fatal("second write:", err)
+	}
+	if _, err := os.Stat(late); err != nil {
+		t.Errorf("pruning ran a second time and removed %q: %v", late, err)
+	}
+}
+
+func TestSnapshotStorePruneToleratesMissingRoot(t *testing.T) {
+	store := newSourceSnapshotStore(filepath.Join(t.TempDir(), "not", "created", "yet"))
+	store.now = func() time.Time { return time.Date(2026, 9, 19, 10, 4, 11, 0, time.UTC) }
+
+	path, err := store.write(testSnapshotContext(), "procedure", "MYPROC", "BEGIN END\n")
+	if err != nil {
+		t.Fatal("write into a root that does not exist yet:", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal("Stat:", err)
+	}
+}

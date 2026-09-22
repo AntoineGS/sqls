@@ -5,8 +5,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,16 @@ const (
 	snapshotDirMode  os.FileMode = 0o700
 	snapshotFileMode os.FileMode = 0o600
 )
+
+// snapshotMaxAge bounds how long a crashed process's snapshots survive. It is
+// the only thing bounding them: a process that dies without running Stop leaves
+// database source on disk until some later sqls run prunes it.
+const snapshotMaxAge = 24 * time.Hour
+
+// snapshotDirPattern matches the <hash>-<pid> directories this store owns.
+// Pruning removes nothing else: the root is a directory in the user's cache,
+// and an entry that does not match this shape is not ours to delete.
+var snapshotDirPattern = regexp.MustCompile(`^[0-9a-f]{16}-[0-9]+$`)
 
 // snapshotContext identifies the connection a snapshot is written under. It is
 // copied out of the Server under stateMu as one value, so the generation and
@@ -95,6 +107,8 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	s.pruneLocked()
+
 	dir, err := s.connectionDirLocked(sc)
 	if err != nil {
 		return "", err
@@ -118,6 +132,50 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 		return "", fmt.Errorf("set snapshot permissions: %w", err)
 	}
 	return path, nil
+}
+
+// pruneLocked removes sibling snapshot directories older than snapshotMaxAge.
+//
+// It runs once per store, immediately before the first snapshot is written,
+// rather than at server start: NewServer runs in every unit test in this
+// package, and pruning there would walk and delete inside the developer's real
+// cache directory.
+//
+// The cutoff comes from time.Now rather than s.now. s.now exists to pin the
+// banner timestamp in tests; using it here would make a fixed test clock
+// reclassify every real directory on disk.
+func (s *sourceSnapshotStore) pruneLocked() {
+	if s.pruned {
+		return
+	}
+	s.pruned = true
+
+	entries, err := os.ReadDir(s.root)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			log.Printf("sqls: read snapshot root %q: %v", s.root, err)
+		}
+		return
+	}
+
+	self := fmt.Sprintf("-%d", os.Getpid())
+	cutoff := time.Now().Add(-snapshotMaxAge)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.IsDir() || !snapshotDirPattern.MatchString(name) {
+			continue
+		}
+		if strings.HasSuffix(name, self) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.root, name)); err != nil {
+			log.Printf("sqls: prune stale snapshot directory %q: %v", name, err)
+		}
+	}
 }
 
 func (s *sourceSnapshotStore) connectionDirLocked(sc snapshotContext) (string, error) {
