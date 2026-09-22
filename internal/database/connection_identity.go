@@ -2,7 +2,6 @@ package database
 
 import (
 	"errors"
-	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
 )
@@ -11,8 +10,8 @@ import (
 // enough to tell whether "the same connection" from a client's point of view
 // still points at the same server, database and role. It never includes
 // DBConfig.Passwd or any InterBaseTLSConfig secret — the fields are named
-// individually rather than serializing DBConfig wholesale — and it strips a
-// "user:pass@" prefix a caller may have embedded in DataSourceName.
+// individually rather than serializing DBConfig wholesale, which is what
+// keeps them out.
 type ConnectionIdentity struct {
 	Driver            dialect.DatabaseDriver `json:"driver"`
 	Alias             string                 `json:"alias"`
@@ -31,6 +30,14 @@ type ConnectionIdentity struct {
 // InterBase-variant connection. conn supplies EffectiveDatabase, the database
 // name the attachment actually resolved to, which can differ from cfg.DBName
 // when the attachment names a path rather than an alias.
+//
+// Attachment is hashed exactly as interBaseAttachment composes it. An
+// InterBase attachment has no credential component — cfg.DataSourceName is
+// passed through verbatim as the database/attachment name
+// (interBaseConnectionConfig, interbase_common.go), while credentials come
+// only from cfg.User/cfg.Passwd as separate driver fields — so stripping any
+// part of it would discard real identity (for example a legitimate "@" in a
+// filesystem path) without excluding anything that was ever a credential.
 //
 // Both arguments are required: a nil config or connection has no identity of
 // its own, and returning a shared zero-value ConnectionIdentity for either
@@ -54,7 +61,7 @@ func NewInterBaseConnectionIdentity(cfg *DBConfig, conn *DBConnection) (Connecti
 	return ConnectionIdentity{
 		Driver:            cfg.Driver,
 		Alias:             cfg.Alias,
-		Attachment:        redactDSNCredentials(attachment),
+		Attachment:        attachment,
 		Host:              cfg.Host,
 		Port:              cfg.Port,
 		Path:              cfg.Path,
@@ -64,15 +71,4 @@ func NewInterBaseConnectionIdentity(cfg *DBConfig, conn *DBConnection) (Connecti
 		Charset:           charset,
 		EffectiveDatabase: conn.DatabaseName,
 	}, nil
-}
-
-// redactDSNCredentials drops a "user[:password]@" prefix from a raw
-// DataSourceName before it enters the identity tuple, so a credential a
-// caller embedded in a hand-written DSN is excluded exactly like
-// DBConfig.Passwd already is.
-func redactDSNCredentials(attachment string) string {
-	if idx := strings.LastIndexByte(attachment, '@'); idx >= 0 {
-		return attachment[idx+1:]
-	}
-	return attachment
 }

@@ -102,15 +102,29 @@ func TestParameterIdentityPasswordDoesNotAffectConnectionKey(t *testing.T) {
 	}
 }
 
-func TestParameterIdentityDSNCredentialsDoNotAffectConnectionKey(t *testing.T) {
+// TestParameterIdentityDistinctDSNsWithAtSignsProduceDistinctConnectionKeys
+// pins the fix for the redactDSNCredentials defect the round-1 review caught:
+// an InterBase attachment has no "user:pass@" component (interBaseAttachment
+// passes DataSourceName through verbatim as the attachment/database name; the
+// driver never reads a credential out of it), and "@" is legal inside the
+// filesystem path an attachment carries. Two distinct DSNs that each contain
+// an "@" in the path — one server/path pair, one host swapped for another —
+// must not collapse onto the same ConnectionKey.
+func TestParameterIdentityDistinctDSNsWithAtSignsProduceDistinctConnectionKeys(t *testing.T) {
 	dbConn := &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
-	cfg1 := &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, DataSourceName: "alice:secret1@test/3050:db.ib"}
-	cfg2 := &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, DataSourceName: "alice:secret2@test/3050:db.ib"}
+	cfgProd := &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, DataSourceName: "prod.host/3050:/srv/db/sales@2024.ib"}
+	cfgDev := &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, DataSourceName: "dev.host/3050:/srv/db/sales@2024.ib"}
+	cfgOtherPath := &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, DataSourceName: "prod.host/3050:/srv/db/sales@2025.ib"}
 
-	got1 := discoverParams(t, cfg1, dbConn, 1, "SELECT 1", nil)
-	got2 := discoverParams(t, cfg2, dbConn, 1, "SELECT 1", nil)
-	if got1.ConnectionKey != got2.ConnectionKey {
-		t.Errorf("ConnectionKey changed with the DSN's embedded credentials: %q vs %q", got1.ConnectionKey, got2.ConnectionKey)
+	gotProd := discoverParams(t, cfgProd, dbConn, 1, "SELECT 1", nil)
+	gotDev := discoverParams(t, cfgDev, dbConn, 1, "SELECT 1", nil)
+	gotOtherPath := discoverParams(t, cfgOtherPath, dbConn, 1, "SELECT 1", nil)
+
+	if gotProd.ConnectionKey == gotDev.ConnectionKey {
+		t.Errorf("ConnectionKey identical for two different hosts whose paths only differ before the final \"@\": %q", gotProd.ConnectionKey)
+	}
+	if gotProd.ConnectionKey == gotOtherPath.ConnectionKey {
+		t.Errorf("ConnectionKey identical for two different paths containing \"@\": %q", gotProd.ConnectionKey)
 	}
 }
 
@@ -267,6 +281,36 @@ func TestParameterDiscoveryInvalidRangeFails(t *testing.T) {
 				t.Fatal("want error for an invalid range")
 			}
 		})
+	}
+}
+
+// TestParameterSelectionAcceptsUnicodeRangeBoundary pins validateSelectionRange
+// and extractRangeText's shared UTF-16 counting on a non-BMP character: the
+// emoji is a surrogate pair, so "one past it" is two UTF-16 code units past
+// its start, not one. A range ending exactly there must validate (not be
+// rejected as past-line-end) and extractRangeText must cut immediately after
+// the emoji rather than mid-surrogate.
+func TestParameterSelectionAcceptsUnicodeRangeBoundary(t *testing.T) {
+	const text = "SELECT '🙂', :ID FROM T"
+	const prefix = "SELECT '🙂"
+	s := NewServer()
+	defer s.worker.Stop()
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Host: "test", Path: "db.ib", User: "alice"}
+	s.files["file:///query.sql"] = &File{Text: text}
+
+	end := utf16Len(prefix)
+	rng := lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 0, Character: end}}
+	sel, err := s.parameterSelection(lsp.ExecuteCommandParams{
+		Command:   CommandGetQueryParameters,
+		Arguments: []interface{}{"file:///query.sql"},
+		Range:     &rng,
+	})
+	if err != nil {
+		t.Fatalf("parameterSelection() error = %v, want the boundary right after a non-BMP character accepted", err)
+	}
+	if sel.Text != prefix {
+		t.Errorf("sel.Text = %q, want %q", sel.Text, prefix)
 	}
 }
 
