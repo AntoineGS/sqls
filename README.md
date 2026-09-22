@@ -117,16 +117,19 @@ jump.
 **Snapshots contain your database's business logic, and a crash leaves them on
 disk.** They are removed when the server shuts down — including when closing
 the database connection fails — but a process that dies without shutting down
-(a `SIGKILL`, for example) leaves its directory behind, still mode `0600`. That
+(a `SIGKILL`, for example) leaves its directory behind, still mode `0700`. That
 directory is removed by the next sqls run that uses this feature, once it is
-more than 24 hours old. Because process ids are reused, a directory that
-happens to share its pid suffix with the process doing the pruning is skipped
-that round instead of removed — delayed cleanup, never the wrongful deletion of
-a directory still in use. That window is the cost of portable LSP navigation:
-there is no way to hand an editor navigable text without a real file. If it is
-unacceptable in your environment, delete the `sqls/interbase-sources` directory
-under the cache directory above yourself, or do not use go-to-definition on
-database objects.
+more than 24 hours old. A directory that is still being written to cannot reach
+that age: every snapshot write refreshes its connection directory's
+modification time, so a connection genuinely in use never goes stale no matter
+how long ago its directory was first created. Because process ids are reused, a
+dead directory that happens to share its pid suffix with the process doing the
+pruning is skipped that round instead of removed — delayed cleanup of an
+already-abandoned directory, not the wrongful deletion of one still in use.
+That window is the cost of portable LSP navigation: there is no way to hand an
+editor navigable text without a real file. If it is unacceptable in your
+environment, delete the `sqls/interbase-sources` directory under the cache
+directory above yourself, or do not use go-to-definition on database objects.
 
 When InterBase's catalog cannot reproduce executable DDL — most commonly
 because it does not record whether a procedure parameter is nullable — the

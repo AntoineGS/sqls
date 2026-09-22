@@ -416,6 +416,52 @@ func TestSnapshotStorePrunesStaleSnapshotDirectories(t *testing.T) {
 	}
 }
 
+// TestSnapshotStoreWriteRefreshesTheConnectionDirectoryMTime proves the actual
+// liveness protection: a connection directory that is still being written to
+// must never look stale to pruneLocked's mtime cutoff, no matter how long ago
+// the directory itself was created.
+//
+// The second write deliberately reuses the same kind and name as the first.
+// Creating a *new* kind subdirectory bumps dir's own mtime as a side effect
+// (verified empirically: mkdir always bumps its parent), which would make this
+// test pass even without the fix and prove nothing. Overwriting a file inside
+// an already-existing kind directory does not — dir's mtime only ever moves
+// today when write explicitly touches it — so this is the one path that
+// isolates the mechanism this finding is about.
+//
+// A full backdate-write-prune-survives cycle using a second, independently
+// pruning store is not attempted here: any directory this test can create
+// necessarily carries this test process's own real pid (connectionDirLocked
+// always calls os.Getpid()), so any prune pass run from within this same
+// process would exempt it via pruneLocked's pid self-check regardless of
+// mtime, making that broader shape of test pass unconditionally and prove
+// nothing about the mtime mechanism specifically. Asserting directly against
+// pruneLocked's own cutoff expression is the precise, unconfounded proof that
+// the mtime it will see is fresh.
+func TestSnapshotStoreWriteRefreshesTheConnectionDirectoryMTime(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	sc := testSnapshotContext()
+
+	if _, err := store.write(sc, "procedure", "MYPROC", "BEGIN END\n"); err != nil {
+		t.Fatal("first write:", err)
+	}
+
+	dir := filepath.Join(store.root, snapshotDirName(sc.identity, os.Getpid()))
+	backdate(t, dir)
+
+	if _, err := store.write(sc, "procedure", "MYPROC", "BEGIN END updated\n"); err != nil {
+		t.Fatal("second write:", err)
+	}
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal("Stat connection directory:", err)
+	}
+	if cutoff := time.Now().Add(-snapshotMaxAge); info.ModTime().Before(cutoff) {
+		t.Errorf("connection directory mtime = %v, still before pruneLocked's %v cutoff after a write through it — a live connection's directory can cross the staleness cutoff while still in active use", info.ModTime(), cutoff)
+	}
+}
+
 func TestSnapshotStorePrunesAtMostOnce(t *testing.T) {
 	store := newTestSnapshotStore(t)
 	sc := testSnapshotContext()

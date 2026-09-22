@@ -131,6 +131,20 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 	if err := os.Chmod(path, snapshotFileMode); err != nil {
 		return "", fmt.Errorf("set snapshot permissions: %w", err)
 	}
+
+	// A file created or overwritten inside kindDir bumps kindDir's own mtime,
+	// never dir's: a directory's mtime moves only when an entry is added to or
+	// removed from it directly, and dir gains such an entry only the rare time
+	// a kind is written for the first time. Without this, a long-lived
+	// connection's directory can sit past pruneLocked's 24-hour cutoff while
+	// still in active use. Touch it on every write so it cannot. Best effort:
+	// a failure here must not discard a snapshot that was otherwise written
+	// successfully.
+	now := time.Now()
+	if err := os.Chtimes(dir, now, now); err != nil {
+		log.Printf("sqls: touch snapshot connection directory %q: %v", dir, err)
+	}
+
 	return path, nil
 }
 
