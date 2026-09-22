@@ -411,6 +411,10 @@ connections:
         clientPassPhraseFile: /etc/interbase/client.pass
 ```
 
+`connectTimeout` rounds up to whole seconds: `500ms` becomes `1s`. Setting it
+to `0`, or omitting it, leaves the native client's own default handshake
+timeout unchanged rather than setting a timeout of zero.
+
 `interbase.tls` requires `host` and cannot be combined with `dataSourceName`:
 the driver composes the TLS attachment itself from the host and the database
 path, and rejects TLS options when no host is set. `dataSourceName` keeps

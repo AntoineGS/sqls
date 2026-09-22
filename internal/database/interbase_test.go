@@ -198,6 +198,49 @@ func TestInterBaseConfigBuildsLocalAndRemoteAttachmentsWithoutSecrets(t *testing
 	}
 }
 
+// TestInterBaseAttachmentRecomposesADoubledPathWhenFedItsOwnOutput proves the
+// mechanism behind switchDatabase's same-attachment no-op guard
+// (handler.isNoOpDatabaseSwitch): newDBConnection
+// (internal/handler/handler.go) writes switchDatabase's target string into
+// DBConfig.DBName before reconnecting. For a host+dbName connection with no
+// path or dataSourceName, that target is the attachment interBaseAttachment
+// already composed (the string showDatabases prints) — feeding it back in as
+// DBName does not reopen the same attachment, it recomposes a broken, doubled
+// one. This test intentionally does not exercise switchDatabase or
+// newDBConnection: it isolates interBaseAttachment, the pure function where
+// the recomposition actually happens, so it needs no build tag and no live
+// database.
+func TestInterBaseAttachmentRecomposesADoubledPathWhenFedItsOwnOutput(t *testing.T) {
+	cfg := &DBConfig{
+		Driver: dialect.DatabaseDriverInterBase,
+		Host:   "db.example.test",
+		Port:   3307,
+		DBName: "example.ib",
+		User:   "alice",
+	}
+	composed, err := interBaseAttachment(cfg)
+	if err != nil {
+		t.Fatalf("interBaseAttachment() error = %v", err)
+	}
+	const wantComposed = "db.example.test/3307:example.ib"
+	if composed != wantComposed {
+		t.Fatalf("interBaseAttachment() = %q, want %q", composed, wantComposed)
+	}
+
+	// Simulate newDBConnection's connCfg.DBName = curDBName assignment when
+	// curDBName is the attachment just composed above, exactly as switchDatabase
+	// would leave it without the no-op guard.
+	cfg.DBName = composed
+	recomposed, err := interBaseAttachment(cfg)
+	if err != nil {
+		t.Fatalf("interBaseAttachment() on the recomposed config error = %v", err)
+	}
+	const wantBroken = "db.example.test/3307:db.example.test/3307:example.ib"
+	if recomposed != wantBroken {
+		t.Fatalf("interBaseAttachment() on recomposed config = %q, want %q (the mechanism the switchDatabase no-op guard avoids reaching)", recomposed, wantBroken)
+	}
+}
+
 func TestInterBaseConfigRejectsUnsupportedConnectionModes(t *testing.T) {
 	tests := []struct {
 		name string

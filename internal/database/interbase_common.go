@@ -188,7 +188,10 @@ func interBaseTLS(cfg *DBConfig) (interBaseTLSSettings, error) {
 	if !tls.Enabled {
 		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls options require connections[].interbase.tls.enabled")
 	}
-	if cfg.DataSourceName != "" || cfg.Host == "" {
+	if cfg.DataSourceName != "" {
+		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls cannot be used with connections[].dataSourceName; set connections[].host instead")
+	}
+	if cfg.Host == "" {
 		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls requires connections[].host")
 	}
 	return tls, nil

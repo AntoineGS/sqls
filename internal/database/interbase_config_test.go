@@ -144,6 +144,19 @@ func TestInterBaseConfigValidatesConnectionOptions(t *testing.T) {
 			want: "tls",
 		},
 		{
+			// host stays set here (unlike the case above): the refusal must
+			// name dataSourceName, the actual cause, not host, which the user
+			// already supplied. A message blaming host on a TLS refusal is
+			// the kind of confusing error a user is likelier to "fix" by
+			// disabling TLS than by removing dataSourceName.
+			name: "tls with dataSourceName even though host is also set",
+			mutate: func(c *DBConfig) {
+				c.DataSourceName = "db.example.test/3050:/srv/interbase/example.ib"
+				c.InterBase = &InterBaseConfig{TLS: &InterBaseTLSConfig{Enabled: true}}
+			},
+			want: "datasourcename",
+		},
+		{
 			// The thinnest TLS request there is: Enabled alone, no certificate
 			// options, no host. It needs its own case because it is the shape an
 			// implementer is most likely to let slip past hasOptions. The driver
@@ -475,6 +488,44 @@ func TestInterBaseConnectionConfigRejectsInvalidSettings(t *testing.T) {
 	}
 	if _, err := interBaseConnectionConfig(cfg); err == nil {
 		t.Fatal("interBaseConnectionConfig() accepted TLS without a host")
+	}
+}
+
+// TestInterBaseTLSNamesTheActualCause asserts the exact wording of the two
+// distinct refusals interBaseTLS can return for a missing-host-equivalent
+// configuration, so the message always names the setting that actually needs
+// to change rather than a key the user already supplied.
+func TestInterBaseTLSNamesTheActualCause(t *testing.T) {
+	both := &DBConfig{
+		Driver:         dialect.DatabaseDriverInterBase,
+		Host:           "db.example.test",
+		DataSourceName: "db.example.test/3050:/srv/interbase/example.ib",
+		User:           "alice",
+		InterBase:      &InterBaseConfig{TLS: &InterBaseTLSConfig{Enabled: true}},
+	}
+	_, err := interBaseTLS(both)
+	if err == nil {
+		t.Fatal("interBaseTLS() accepted TLS with a raw dataSourceName")
+	}
+	if !strings.Contains(err.Error(), "dataSourceName") {
+		t.Errorf("interBaseTLS() error = %q, want it to name dataSourceName even though host is also set", err)
+	}
+	if strings.Contains(err.Error(), "tls requires connections[].host") {
+		t.Errorf("interBaseTLS() error = %q, want it not to claim host is required when the user already set it", err)
+	}
+
+	neither := &DBConfig{
+		Driver:    dialect.DatabaseDriverInterBase,
+		Path:      "/srv/interbase/example.ib",
+		User:      "alice",
+		InterBase: &InterBaseConfig{TLS: &InterBaseTLSConfig{Enabled: true}},
+	}
+	_, err = interBaseTLS(neither)
+	if err == nil {
+		t.Fatal("interBaseTLS() accepted TLS with no host and no dataSourceName")
+	}
+	if !strings.Contains(err.Error(), "connections[].host") {
+		t.Errorf("interBaseTLS() error = %q, want the genuine missing-host refusal preserved", err)
 	}
 }
 

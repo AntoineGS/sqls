@@ -514,6 +514,26 @@ func validateDatabaseSwitch(ctx context.Context, repo database.DBRepository, dbN
 	return switcher.ValidateDatabaseSwitch(ctx, dbName)
 }
 
+// isNoOpDatabaseSwitch reports whether dbName already names the database a
+// single-attachment repository (today, only InterBase) is connected to.
+// ValidateDatabaseSwitch accepts that same name on the understanding that
+// switching to it is a harmless refresh, but actually reconnecting would feed
+// the already-composed attachment string back into newDBConnection, which
+// writes it into DBConfig.DBName and lets interBaseAttachment recompose it —
+// turning an already-valid attachment into a broken, doubled one
+// (host/port:host/port:path). switchDatabase short-circuits on this instead
+// of reconnecting.
+func isNoOpDatabaseSwitch(ctx context.Context, repo database.DBRepository, dbName string) bool {
+	if _, ok := repo.(database.DatabaseSwitchRepository); !ok {
+		return false
+	}
+	current, err := repo.CurrentDatabase(ctx)
+	if err != nil || current == "" {
+		return false
+	}
+	return strings.TrimSpace(current) == strings.TrimSpace(dbName)
+}
+
 func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
@@ -538,6 +558,11 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	default:
 		if err := validateDatabaseSwitch(ctx, repo, dbName); err != nil {
 			return nil, err
+		}
+		if isNoOpDatabaseSwitch(ctx, repo, dbName) {
+			// Already open: see isNoOpDatabaseSwitch for why reconnecting
+			// would break rather than refresh it.
+			return nil, nil
 		}
 	}
 

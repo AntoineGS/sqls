@@ -481,3 +481,37 @@ func TestSwitchDatabaseRefusesAnotherAttachmentAndLeavesStateUnchanged(t *testin
 		t.Fatal("dbConn was replaced by a refused switch")
 	}
 }
+
+// TestSwitchDatabaseToCurrentAttachmentIsANoOp exercises the reachable path
+// Finding 1 identified: showDatabases prints the composed attachment string,
+// and switching to exactly that string used to fall through to
+// reconnectionDB, which feeds the target back into newDBConnection's
+// connCfg.DBName and lets interBaseAttachment recompose it into a broken,
+// doubled attachment (proven directly, with no build tag, by
+// TestInterBaseAttachmentRecomposesADoubledPathWhenFedItsOwnOutput in the
+// database package). No connection source is configured on this Server, so
+// if switchDatabase ever again falls through to reconnectionDB on this path,
+// topConnection finds no connections and the call fails with ErrNoConnection
+// — asserting success here is only possible because the no-op guard returns
+// before reconnectionDB runs at all, which the dbConn/curDBName assertions
+// below confirm directly rather than inferring it from a nil error alone.
+func TestSwitchDatabaseToCurrentAttachmentIsANoOp(t *testing.T) {
+	const attachment = "db.example.test/3050:/srv/interbase/centrale.ib"
+	s := NewServer()
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase}
+	originalConn := &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, DatabaseName: attachment}
+	s.dbConn = originalConn
+
+	_, err := s.switchDatabase(context.Background(), lsp.ExecuteCommandParams{
+		Arguments: []interface{}{attachment},
+	})
+	if err != nil {
+		t.Fatalf("switchDatabase(current attachment) error = %v, want nil (a no-op)", err)
+	}
+	if s.curDBName != "" {
+		t.Fatalf("curDBName = %q after a no-op switch, want it left unset", s.curDBName)
+	}
+	if s.dbConn != originalConn {
+		t.Fatal("dbConn was replaced by a switch to the already-open attachment; want a no-op")
+	}
+}
