@@ -326,24 +326,37 @@ variable reference and not user input. Bare `?` positional markers are refused
 in this flow as well; a selection with no named markers keeps the ordinary
 unparameterized path, `?` and all.
 
+That last sentence is about the request sqls itself receives. The Neovim
+adapter shipped here goes through discovery first, and when discovery returns
+an error — which is what a refused selection produces — it reports the message
+and stops rather than re-sending the selection unparameterized. So through this
+adapter a refused selection does not execute at all; a legacy client that never
+asks for discovery still reaches the driver exactly as before.
+
 **Explain never prompts.** `Explain SQL` on a parameterized statement compiles
 the markers to positional placeholders and prepares the statement — a plan
 needs no values, and nothing is bound, executed or written.
 
-**Some servers refuse to prepare a `CAST` around a parameter.** Wrapping a
+**On some connections, preparing a `CAST` around a parameter fails.** Wrapping a
 marker in a `CAST` — `CAST(:NAME AS VARCHAR(30))` — is how you pin its SQL type
-when nothing else in the statement implies one, and it works on most
-InterBase servers. On some it does not: the server rejects the *prepare* with
+when nothing else in the statement implies one. On one of the two InterBase
+servers this was tried against, the *prepare* fails for every target type with
 
 > SQLCODE -804: An error was found in the application program input parameters
 > for the SQL statement.
 
-for every target type, while the same server prepares and runs a marker whose
-type it can infer from context, such as `WHERE RDB$RELATION_NAME = :REL_NAME`.
-This is a server-side prepare restriction, not a binding failure: it reproduces
-through `Explain SQL`, which binds nothing at all, and the identical statement
-prepares on another server through the same sqls build. If you hit it, drop the
-`CAST` and let the compared column supply the type.
+while the same server prepares and runs a marker whose type it can infer from
+context, such as `WHERE RDB$RELATION_NAME = :REL_NAME`.
+
+**It is not the parameter binding.** `Explain SQL`, which binds nothing at all,
+fails identically, and the same statement prepares on the other server through
+the same sqls build. Beyond that the cause is undetermined: the driver reports
+every failure in its prepare path — which includes its own input-descriptor
+call — under one "prepare plan failed" label and does not surface InterBase's
+specific reason, and the affected server's engine version was not confirmed.
+Treat it as a difference between connections rather than a known engine
+restriction. If you hit it, drop the `CAST` and let the compared column supply
+the type.
 
 **Values live in the editor, in memory only.** sqls itself keeps nothing: each
 submission arrives with its own values and is forgotten when the command
@@ -354,7 +367,14 @@ by query text, capped at **100 entries with least-recently-used eviction**, and
 never written to disk. Switching connections gives you empty prompts for the
 other connection and switching back restores the first one's values.
 `:SqlsClearParameters` forgets everything remembered for that server, and
-stopping the server clears it too.
+stopping the server clears it too. It also releases a prompt sequence the
+adapter still considers in progress, which is the way out if a discovery
+request never came back and the adapter says a prompt is already running.
+
+"Not written to disk" is about what the adapter stores. The values do travel
+in the `executeQuery` request, so if you turn on LSP debug logging — for
+example `vim.lsp.set_log_level("debug")` — they are written to the editor's LSP
+log like any other request payload.
 
 **Cancelling a prompt executes nothing.** Dismissing any type or value prompt
 ends the run without sending an execution request. Once the statement is

@@ -1,6 +1,9 @@
 # Named query parameters with remembered Neovim prompts
 
-Status: proposed design, awaiting user review.
+Status: approved and implemented on `feat/interbase-query-parameters`. Verified
+by the offline suites and by a read-only live pass against a staged build on the
+authorized connections; installation of that build as the local sqls binary is
+still pending.
 
 ## Intent and agreed behavior
 
