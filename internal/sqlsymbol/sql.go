@@ -95,11 +95,7 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 	active := make([]int, 0, 4)
 	for i, item := range items {
 		if item.Token.Kind == token.Semicolon {
-			for len(active) > 0 {
-				qi := active[len(active)-1]
-				queries[qi].end = i
-				active = active[:len(active)-1]
-			}
+			closeQueries(queries, &active, i)
 			continue
 		}
 		if item.Token.Kind == token.RParen {
@@ -112,8 +108,21 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 				active = active[:len(active)-1]
 			}
 		}
-		if !isQueryStart(item) || (contexts[i].kind != contextSQL && contexts[i].kind != contextExecute) {
+		inSQL := contexts[i].kind == contextSQL || contexts[i].kind == contextExecute
+		if !inSQL {
+			// FOR SELECT returns to procedural context at DO. The SELECT
+			// is not a lexical parent of statements in that body.
+			closeQueries(queries, &active, i)
 			continue
+		}
+		if !isQueryStart(item) {
+			continue
+		}
+		// A query at the same parenthesis depth is a sibling, not a
+		// correlated subquery. This includes UNION arms and an INSERT
+		// ... SELECT source query.
+		for len(active) > 0 && depths[i] <= queries[active[len(active)-1]].baseDepth {
+			closeQueries(queries, &active, i)
 		}
 		parent := -1
 		if len(active) > 0 {
@@ -127,6 +136,14 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 		queries[qi].end = len(items)
 	}
 	return queries
+}
+
+func closeQueries(queries []sqlQuery, active *[]int, end int) {
+	for len(*active) > 0 {
+		qi := (*active)[len(*active)-1]
+		queries[qi].end = end
+		*active = (*active)[:len(*active)-1]
+	}
 }
 
 func isQueryStart(item lexeme) bool {
@@ -147,7 +164,7 @@ func queryRelations(text string, items []lexeme, query sqlQuery, depths []int, m
 	}
 	seen := make(map[int]bool)
 	addAt := func(index int, relations *[]RelationRef) int {
-		ref, next, ok := relationAt(text, items, index, query.end, depths, matching)
+		ref, next, ok := relationAt(text, items, index, query.end, depths, matching, true)
 		if !ok || seen[index] {
 			return index
 		}
@@ -161,7 +178,7 @@ func queryRelations(text string, items []lexeme, query sqlQuery, depths []int, m
 	hasTarget := false
 	if query.kind == "UPDATE" {
 		if index := nextName(items, query.start+1, query.end); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching)
+			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
 			if hasTarget {
 				relations = append(relations, target)
 				seen[index] = true
@@ -169,7 +186,7 @@ func queryRelations(text string, items []lexeme, query sqlQuery, depths []int, m
 		}
 	} else if query.kind == "INSERT" {
 		if index := wordAfter(items, query.start+1, query.end, "INTO"); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching)
+			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
 			if hasTarget {
 				relations = append(relations, target)
 				seen[index] = true
@@ -177,7 +194,7 @@ func queryRelations(text string, items []lexeme, query sqlQuery, depths []int, m
 		}
 	} else if query.kind == "DELETE" {
 		if index := wordAfter(items, query.start+1, query.end, "FROM"); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching)
+			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
 			if hasTarget {
 				relations = append(relations, target)
 				seen[index] = true
@@ -252,7 +269,7 @@ func wordAfter(items []lexeme, start, end int, word string) int {
 	return -1
 }
 
-func relationAt(text string, items []lexeme, start, end int, depths []int, matching map[int]int) (RelationRef, int, bool) {
+func relationAt(text string, items []lexeme, start, end int, depths []int, matching map[int]int, callable bool) (RelationRef, int, bool) {
 	if start < 0 || start >= end {
 		return RelationRef{}, start, false
 	}
@@ -284,6 +301,23 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 	for next+1 < end && items[next].Token.Kind == token.Period && isNameToken(items[next+1]) {
 		name, _ = nameFromLexeme(text, items[next+1])
 		next += 2
+	}
+	if callable && next < end && items[next].Token.Kind == token.LParen {
+		close, ok := matching[next]
+		if !ok || close >= end {
+			return RelationRef{}, start, false
+		}
+		next = close + 1
+		if next < end && isWord(items[next], "AS") {
+			next++
+		}
+		var alias *Name
+		if next < end && depths[next] == depths[start] && isNameToken(items[next]) && !isSQLClause(items[next]) {
+			aliasName, _ := nameFromLexeme(text, items[next])
+			alias = &aliasName
+			next++
+		}
+		return RelationRef{Alias: alias}, next, true
 	}
 	var alias *Name
 	if next < end && isWord(items[next], "AS") {
