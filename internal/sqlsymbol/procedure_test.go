@@ -138,6 +138,47 @@ END`
 	}
 }
 
+func TestAnalyzeProcedureRejectsLocalDeclarationWithoutType(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x;
+BEGIN
+END`
+	if _, err := Analyze(text, interBaseVariant()); err == nil {
+		t.Fatal("Analyze accepted a local declaration without a type")
+	}
+}
+
+func TestAnalyzeProcedureRejectsParameterWithoutType(t *testing.T) {
+	text := `ALTER PROCEDURE p (id) AS
+BEGIN
+END`
+	if _, err := Analyze(text, interBaseVariant()); err == nil {
+		t.Fatal("Analyze accepted a parameter declaration without a type")
+	}
+}
+
+func TestAnalyzeProcedureIncompleteAtEOFUsesEOFScopes(t *testing.T) {
+	text := `ALTER PROCEDURE p (id INTEGER) AS
+DECLARE VARIABLE local INTEGER;
+BEGIN
+  local = id;`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(a.procedures), 1; got != want {
+		t.Fatalf("procedure count = %d, want %d", got, want)
+	}
+	if got, want := a.procedures[0].Span.End, len(text); got != want {
+		t.Fatalf("procedure scope end = %d, want EOF %d", got, want)
+	}
+	for _, symbol := range a.Symbols {
+		if got, want := symbol.Scope.End, len(text); got != want {
+			t.Fatalf("symbol %s scope end = %d, want EOF %d", symbol.Name.Key(), got, want)
+		}
+	}
+}
+
 func TestAnalyzeProcedureInterBaseTerminators(t *testing.T) {
 	tests := []struct {
 		name string

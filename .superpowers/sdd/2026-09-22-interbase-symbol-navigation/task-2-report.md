@@ -51,3 +51,46 @@ git diff --check                         # clean
 - This increment intentionally returns no occurrence bindings (`Uses` remains
   nil); later tasks must add binding before navigation/rename behavior is
   complete.
+
+## Review fix round
+
+### Findings addressed
+
+- Parameter lists now validate each non-empty declaration has a name and a
+  type, reject missing names/types/trailing commas, and reject unterminated
+  lists with an analysis error.
+- Local `DECLARE VARIABLE` entries now require a valid type and terminating
+  semicolon before the body. Missing or structurally incomplete declarations
+  return an analysis error instead of creating an apparently safe symbol.
+- Added a true open-at-EOF procedure fixture and assertions that the
+  procedure and every declaration scope end at `len(text)`.
+
+### Fix-round TDD evidence
+
+RED command:
+
+```text
+go test ./internal/sqlsymbol -run 'TestAnalyze|TestProcedure' -count=1
+```
+
+The new regressions failed before the fix as expected:
+
+```text
+FAIL: TestAnalyzeProcedureRejectsLocalDeclarationWithoutType
+  Analyze accepted a local declaration without a type
+FAIL: TestAnalyzeProcedureRejectsParameterWithoutType
+  Analyze accepted a parameter declaration without a type
+```
+
+GREEN commands and results:
+
+```text
+go test ./internal/sqlsymbol -run 'TestAnalyze|TestProcedure' -count=1  # ok
+go test ./internal/sqlsymbol -count=1                                    # ok
+go test ./...                                                             # all packages passed
+git diff --check                                                          # clean
+```
+
+The fix round changed only `internal/sqlsymbol/procedure.go` and its focused
+regressions in `internal/sqlsymbol/procedure_test.go`; the lexer/source code
+was unchanged, so no additional lexer test run was required.

@@ -1,6 +1,7 @@
 package sqlsymbol
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -69,7 +70,9 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	var frames []bodyFrame
 	bodyStarted := false
 	for i := 0; i < len(items); i++ {
-		if header, ok := procedureHeaderAt(text, items, i); ok {
+		if header, ok, err := procedureHeaderAt(text, items, i); err != nil {
+			return nil, err
+		} else if ok {
 			if current >= 0 {
 				closeProcedure(analysis, current, items[i].Span.Start)
 			}
@@ -86,14 +89,29 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 		item := items[i]
 		if !bodyStarted {
 			if isWord(item, "DECLARE") && i+2 < len(items) && isWord(items[i+1], "VARIABLE") {
-				if name, ok := nameFromLexeme(text, items[i+2]); ok {
-					addSymbol(analysis, current, &Symbol{
-						Name:        name,
-						Kind:        Variable,
-						Declaration: items[i+2].Span,
-					})
-					i += 2
+				name, ok := nameFromLexeme(text, items[i+2])
+				if !ok {
+					return nil, fmt.Errorf("local variable declaration has an invalid name")
 				}
+				if i+3 >= len(items) || !declarationTypeStart(items[i+3]) {
+					return nil, fmt.Errorf("local variable %s is missing a type", name.Key())
+				}
+				declarationEnd := i + 3
+				for declarationEnd < len(items) && items[declarationEnd].Token.Kind != token.Semicolon {
+					if isWord(items[declarationEnd], "BEGIN") {
+						return nil, fmt.Errorf("local variable %s declaration is missing a terminator", name.Key())
+					}
+					declarationEnd++
+				}
+				if declarationEnd == len(items) {
+					return nil, fmt.Errorf("local variable %s declaration is incomplete", name.Key())
+				}
+				addSymbol(analysis, current, &Symbol{
+					Name:        name,
+					Kind:        Variable,
+					Declaration: items[i+2].Span,
+				})
+				i += 2
 				continue
 			}
 			if isWord(item, "BEGIN") {
@@ -123,6 +141,16 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	return analysis, nil
 }
 
+func declarationTypeStart(item lexeme) bool {
+	if item.Token == nil || item.Token.Kind != token.SQLKeyword {
+		return false
+	}
+	return !isWord(item, "BEGIN") && !isWord(item, "END") &&
+		!isWord(item, "AS") && !isWord(item, "DECLARE") &&
+		!isWord(item, "VARIABLE") && !isWord(item, "CREATE") &&
+		!isWord(item, "ALTER")
+}
+
 func significantLexemes(items []lexeme) []lexeme {
 	result := make([]lexeme, 0, len(items))
 	for _, item := range items {
@@ -136,26 +164,27 @@ func significantLexemes(items []lexeme) []lexeme {
 	return result
 }
 
-func procedureHeaderAt(text string, items []lexeme, start int) (procedureHeader, bool) {
+func procedureHeaderAt(text string, items []lexeme, start int) (procedureHeader, bool, error) {
 	if !isWord(items[start], "CREATE") && !isWord(items[start], "ALTER") {
-		return procedureHeader{}, false
+		return procedureHeader{}, false, nil
 	}
 	i := start + 1
 	if isWord(items[start], "CREATE") && i+1 < len(items) && isWord(items[i], "OR") && isWord(items[i+1], "ALTER") {
 		i += 2
 	}
 	if i >= len(items) || !isWord(items[i], "PROCEDURE") || i+1 >= len(items) {
-		return procedureHeader{}, false
+		return procedureHeader{}, false, nil
 	}
 	if _, ok := nameFromLexeme(text, items[i+1]); !ok {
-		return procedureHeader{}, false
+		return procedureHeader{}, false, nil
 	}
 	i += 2
 	var symbols []*Symbol
 	if i < len(items) && items[i].Token.Kind == token.LParen {
-		var end int
-		var names []declaration
-		end, names = parseDeclarationList(text, items, i, InputParameter)
+		end, names, err := parseDeclarationList(text, items, i, InputParameter)
+		if err != nil {
+			return procedureHeader{}, false, err
+		}
 		for _, item := range names {
 			symbols = append(symbols, item.symbol)
 		}
@@ -166,7 +195,10 @@ func procedureHeaderAt(text string, items []lexeme, start int) (procedureHeader,
 	if i < len(items) && isWord(items[i], "RETURNS") {
 		i++
 		if i < len(items) && items[i].Token.Kind == token.LParen {
-			end, names := parseDeclarationList(text, items, i, OutputParameter)
+			end, names, err := parseDeclarationList(text, items, i, OutputParameter)
+			if err != nil {
+				return procedureHeader{}, false, err
+			}
 			for _, item := range names {
 				symbols = append(symbols, item.symbol)
 			}
@@ -179,36 +211,60 @@ func procedureHeaderAt(text string, items []lexeme, start int) (procedureHeader,
 	// unquoted AS after the parameter lists starts the declaration section.
 	for ; i < len(items); i++ {
 		if isWord(items[i], "AS") {
-			return procedureHeader{next: i + 1, symbols: symbols}, true
+			return procedureHeader{next: i + 1, symbols: symbols}, true, nil
 		}
 		if i != start && (isWord(items[i], "CREATE") || isWord(items[i], "ALTER")) {
 			break
 		}
 	}
-	return procedureHeader{next: i, symbols: symbols}, true
+	return procedureHeader{next: i, symbols: symbols}, true, nil
 }
 
 type declaration struct {
 	symbol *Symbol
 }
 
-func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind) (int, []declaration) {
+func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind) (int, []declaration, error) {
 	depth := 0
 	expectName := true
+	sawName := false
+	sawType := false
 	var declarations []declaration
 	for i := open; i < len(items); i++ {
 		item := items[i]
 		switch item.Token.Kind {
 		case token.LParen:
+			if depth == 1 && !expectName {
+				// A type such as NUMERIC(15,2) is structurally complete;
+				// the nested list belongs to that type.
+				if !sawType {
+					return open, nil, fmt.Errorf("procedure parameter is missing a type")
+				}
+			}
 			depth++
 		case token.RParen:
+			if depth == 1 {
+				if expectName && sawName {
+					return open, nil, fmt.Errorf("procedure parameter is missing a name")
+				}
+				if !expectName && !sawType {
+					return open, nil, fmt.Errorf("procedure parameter is missing a type")
+				}
+			}
 			depth--
 			if depth == 0 {
-				return i + 1, declarations
+				return i + 1, declarations, nil
 			}
 		case token.Comma:
 			if depth == 1 {
+				if expectName {
+					return open, nil, fmt.Errorf("procedure parameter is missing a name")
+				}
+				if !sawType {
+					return open, nil, fmt.Errorf("procedure parameter is missing a type")
+				}
 				expectName = true
+				sawType = false
 			}
 		default:
 			if depth == 1 && expectName {
@@ -219,11 +275,16 @@ func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind
 						Declaration: item.Span,
 					}})
 					expectName = false
+					sawName = true
+				} else {
+					return open, nil, fmt.Errorf("procedure parameter has an invalid name")
 				}
+			} else if depth == 1 && !sawType && declarationTypeStart(item) {
+				sawType = true
 			}
 		}
 	}
-	return open, declarations
+	return open, nil, fmt.Errorf("unterminated procedure parameter list")
 }
 
 func isWord(item lexeme, expected string) bool {
