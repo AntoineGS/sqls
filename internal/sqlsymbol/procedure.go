@@ -35,10 +35,13 @@ type procedure struct {
 
 // Analysis is the request-local symbol index for one source document.
 type Analysis struct {
-	Text       string
-	Variant    dialect.DriverVariant
-	Symbols    []*Symbol
-	procedures []procedure
+	Text        string
+	Variant     dialect.DriverVariant
+	Symbols     []*Symbol
+	procedures  []procedure
+	lexemes     []lexeme
+	resolutions []indexedResolution
+	prefixes    []indexedResolution
 }
 
 type procedureHeader struct {
@@ -53,8 +56,8 @@ const (
 	caseFrame
 )
 
-// Analyze discovers InterBase procedure declarations and their source scopes.
-// It does not bind references in the procedure body.
+// Analyze discovers InterBase procedure declarations and binds source
+// occurrences to those declarations.
 func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	analysis := &Analysis{Text: text, Variant: dv}
 	if dv.Driver != dialect.DatabaseDriverInterBase {
@@ -65,6 +68,7 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	if err != nil {
 		return nil, err
 	}
+	analysis.lexemes = items
 	items = significantLexemes(items)
 	current := -1
 	var frames []bodyFrame
@@ -138,6 +142,7 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	if current >= 0 {
 		closeProcedure(analysis, current, len(text))
 	}
+	bindOccurrences(analysis, items)
 	return analysis, nil
 }
 
