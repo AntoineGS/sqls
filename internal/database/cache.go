@@ -171,6 +171,10 @@ type DBCache struct {
 	SchemaTables      map[string][]string
 	ColumnsWithParent map[string][]*ColumnDesc
 	ForeignKeys       map[string]map[string][]*ForeignKey
+	// Catalog holds extended catalog objects. It is nil when the active
+	// repository does not implement CatalogRepository, and also before the
+	// first successful secondary pass.
+	Catalog *CatalogCache
 }
 
 func (dc *DBCache) Database(dbName string) (db string, ok bool) {
@@ -223,4 +227,252 @@ func (dc *DBCache) Column(tableName, colName string) (*ColumnDesc, bool) {
 
 func columnDatabaseKey(dbName, tableName string) string {
 	return strings.ToUpper(dbName) + "\t" + strings.ToUpper(tableName)
+}
+
+// CatalogCache holds extended catalog objects. A nil *CatalogCache means the
+// active repository does not implement CatalogRepository. All maps are keyed by
+// the upper-cased object name.
+type CatalogCache struct {
+	Views           map[string]*ViewDesc
+	Procedures      map[string]*ProcedureDesc
+	Generators      map[string]*GeneratorDesc
+	Domains         map[string]*DomainDesc
+	Functions       map[string]*FunctionDesc
+	Indexes         map[string]*IndexDesc
+	IndexesByTable  map[string][]*IndexDesc
+	Triggers        map[string]*TriggerDesc
+	TriggersByTable map[string][]*TriggerDesc
+}
+
+// catalogCacheKey normalises an object name for cache lookup. InterBase stores
+// catalog names upper-cased while users type them lower-cased, so an
+// exact-match accessor would silently miss for every lower-case identifier and
+// the failure would look like missing metadata rather than a lookup bug. This
+// follows the existing convention: columnDatabaseKey upper-cases its arguments
+// and DBCache.Column matches with strings.EqualFold.
+func catalogCacheKey(name string) string {
+	return strings.ToUpper(strings.TrimSpace(name))
+}
+
+// HasCatalog reports whether the active repository produced an extended
+// catalog. It is the single gate a feature uses before touching catalog data.
+func (dc *DBCache) HasCatalog() bool {
+	return dc != nil && dc.Catalog != nil
+}
+
+func (dc *DBCache) View(name string) (*ViewDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	view, ok := dc.Catalog.Views[catalogCacheKey(name)]
+	return view, ok
+}
+
+func (dc *DBCache) Procedure(name string) (*ProcedureDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	procedure, ok := dc.Catalog.Procedures[catalogCacheKey(name)]
+	return procedure, ok
+}
+
+func (dc *DBCache) Generator(name string) (*GeneratorDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	generator, ok := dc.Catalog.Generators[catalogCacheKey(name)]
+	return generator, ok
+}
+
+func (dc *DBCache) Domain(name string) (*DomainDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	domain, ok := dc.Catalog.Domains[catalogCacheKey(name)]
+	return domain, ok
+}
+
+func (dc *DBCache) Function(name string) (*FunctionDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	function, ok := dc.Catalog.Functions[catalogCacheKey(name)]
+	return function, ok
+}
+
+func (dc *DBCache) Index(name string) (*IndexDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	index, ok := dc.Catalog.Indexes[catalogCacheKey(name)]
+	return index, ok
+}
+
+func (dc *DBCache) Trigger(name string) (*TriggerDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	trigger, ok := dc.Catalog.Triggers[catalogCacheKey(name)]
+	return trigger, ok
+}
+
+func (dc *DBCache) IndexesForTable(table string) []*IndexDesc {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	return dc.Catalog.IndexesByTable[catalogCacheKey(table)]
+}
+
+func (dc *DBCache) TriggersForTable(table string) []*TriggerDesc {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	return dc.Catalog.TriggersByTable[catalogCacheKey(table)]
+}
+
+func (dc *DBCache) SortedProcedures() []string {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	names := make([]string, 0, len(dc.Catalog.Procedures))
+	for _, procedure := range dc.Catalog.Procedures {
+		names = append(names, procedure.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (dc *DBCache) SortedViews() []string {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	names := make([]string, 0, len(dc.Catalog.Views))
+	for _, view := range dc.Catalog.Views {
+		names = append(names, view.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func (dc *DBCache) SortedGenerators() []string {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	names := make([]string, 0, len(dc.Catalog.Generators))
+	for _, generator := range dc.Catalog.Generators {
+		names = append(names, generator.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// SortedFunctions exists because external functions are the one object kind a
+// consumer must enumerate rather than look up.
+func (dc *DBCache) SortedFunctions() []string {
+	if !dc.HasCatalog() {
+		return nil
+	}
+	names := make([]string, 0, len(dc.Catalog.Functions))
+	for _, function := range dc.Catalog.Functions {
+		names = append(names, function.Name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// GenerateCatalogCache returns nil, false, nil when the repository has no
+// extended catalog.
+func (u *DBCacheGenerator) GenerateCatalogCache(ctx context.Context) (*CatalogCache, bool, error) {
+	generator, closeSnapshot := u.snapshot(ctx)
+	defer func() { _ = closeSnapshot() }()
+	return generator.generateCatalogCache(ctx)
+}
+
+func (u *DBCacheGenerator) generateCatalogCache(ctx context.Context) (*CatalogCache, bool, error) {
+	source, ok := u.repo.(CatalogRepository)
+	if !ok {
+		return nil, false, nil
+	}
+
+	catalog := &CatalogCache{
+		Views:           map[string]*ViewDesc{},
+		Procedures:      map[string]*ProcedureDesc{},
+		Generators:      map[string]*GeneratorDesc{},
+		Domains:         map[string]*DomainDesc{},
+		Functions:       map[string]*FunctionDesc{},
+		Indexes:         map[string]*IndexDesc{},
+		IndexesByTable:  map[string][]*IndexDesc{},
+		Triggers:        map[string]*TriggerDesc{},
+		TriggersByTable: map[string][]*TriggerDesc{},
+	}
+
+	views, err := source.DescribeViews(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, view := range views {
+		catalog.Views[catalogCacheKey(view.Name)] = view
+	}
+
+	procedures, err := source.DescribeProcedures(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, procedure := range procedures {
+		catalog.Procedures[catalogCacheKey(procedure.Name)] = procedure
+	}
+
+	generators, err := source.DescribeGenerators(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, generator := range generators {
+		catalog.Generators[catalogCacheKey(generator.Name)] = generator
+	}
+
+	domains, err := source.DescribeDomains(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, domain := range domains {
+		catalog.Domains[catalogCacheKey(domain.Name)] = domain
+	}
+
+	functions, err := source.DescribeFunctions(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, function := range functions {
+		catalog.Functions[catalogCacheKey(function.Name)] = function
+	}
+
+	indexes, err := source.DescribeIndexes(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, index := range indexes {
+		catalog.Indexes[catalogCacheKey(index.Name)] = index
+		if index.RelationName == "" {
+			continue
+		}
+		key := catalogCacheKey(index.RelationName)
+		catalog.IndexesByTable[key] = append(catalog.IndexesByTable[key], index)
+	}
+
+	triggers, err := source.DescribeTriggers(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, trigger := range triggers {
+		catalog.Triggers[catalogCacheKey(trigger.Name)] = trigger
+		// A database-level trigger has no relation and is reachable by name
+		// only; grouping it under the empty table name would be a phantom.
+		if !trigger.RelationName.Valid || strings.TrimSpace(trigger.RelationName.String) == "" {
+			continue
+		}
+		key := catalogCacheKey(trigger.RelationName.String)
+		catalog.TriggersByTable[key] = append(catalog.TriggersByTable[key], trigger)
+	}
+
+	return catalog, true, nil
 }

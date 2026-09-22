@@ -62,6 +62,18 @@ func (w *Worker) setColumnCache(col map[string][]*ColumnDesc) {
 	}
 }
 
+func (w *Worker) setCatalogCache(c *CatalogCache) {
+	w.lock.Lock()
+	defer w.lock.Unlock()
+	if w.dbCache != nil {
+		// Swap in a copy so that readers holding the previous
+		// *DBCache keep seeing a consistent snapshot.
+		newCache := *w.dbCache
+		newCache.Catalog = c
+		w.dbCache = &newCache
+	}
+}
+
 func (w *Worker) Start() {
 	go func() {
 		log.Println("db worker: start")
@@ -72,13 +84,24 @@ func (w *Worker) Start() {
 				return
 			case <-w.update:
 				generator := NewDBCacheUpdater(w.repo())
-				col, err := generator.GenerateDBCacheSecondary(context.Background())
-				if err != nil {
+				// The two passes are independent. This loop used to continue
+				// on a secondary-pass error, so appending the catalog build
+				// after it would silently skip the catalog whenever the column
+				// pass failed.
+				if col, err := generator.GenerateDBCacheSecondary(context.Background()); err != nil {
 					log.Println(err)
-					continue
+				} else {
+					w.setColumnCache(col)
+					log.Println("db worker: Update db cache secondary complete")
 				}
-				w.setColumnCache(col)
-				log.Println("db worker: Update db cache secondary complete")
+				if catalog, ok, err := generator.GenerateCatalogCache(context.Background()); err != nil {
+					// A catalog error leaves the previous *CatalogCache in
+					// place, exactly as the column pass does.
+					log.Println(err)
+				} else if ok {
+					w.setCatalogCache(catalog)
+					log.Println("db worker: Update catalog cache complete")
+				}
 			}
 		}
 	}()
@@ -117,5 +140,13 @@ func (w *Worker) updateAllCache(ctx context.Context) error {
 }
 
 func (w *Worker) updateAdditionalCache() {
-	w.update <- struct{}{}
+	// Non-blocking: this is reached from an LSP handler through ReCache, and a
+	// long catalog pass must not make a configuration change wait. A full slot
+	// already holds a pending request, so dropping a duplicate signal loses
+	// nothing — the in-flight or queued pass will read state that is at least
+	// as fresh.
+	select {
+	case w.update <- struct{}{}:
+	default:
+	}
 }
