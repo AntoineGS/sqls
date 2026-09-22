@@ -48,6 +48,18 @@ type Server struct {
 	// other configuration sources (workspace and user).
 	initOptionDBConfig *database.DBConfig
 
+	// connGeneration advances on every reconnect. It ties per-connection
+	// artefacts — the hover DDL memo, and the go-to-definition snapshot
+	// directory — to the connection they were produced under. Guarded by
+	// stateMu.
+	connGeneration int
+
+	// ddlMemo caches the rendered DDL appendix per connection generation.
+	// Hover fires on every cursor rest over the same token; without this,
+	// each one is a catalog round trip. Guarded by stateMu, and never held
+	// across the round trip itself.
+	ddlMemo map[ddlKey]string
+
 	worker  *database.Worker
 	files   map[string]*File
 	cancels *cancelRegistry
@@ -64,6 +76,7 @@ func NewServer() *Server {
 
 	return &Server{
 		files:   make(map[string]*File),
+		ddlMemo: make(map[ddlKey]string),
 		worker:  worker,
 		cancels: newCancelRegistry(),
 	}
@@ -424,6 +437,10 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 	}
 	s.stateMu.Lock()
 	s.dbConn = dbConn
+	s.connGeneration++
+	// The new connection may be a different database entirely, so nothing
+	// cached against the old one is still true.
+	s.ddlMemo = make(map[ddlKey]string)
 	s.stateMu.Unlock()
 
 	for _, warning := range dbConn.Warnings {

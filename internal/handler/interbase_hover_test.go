@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
@@ -465,5 +466,154 @@ func TestInterBaseHoverEndToEndKeepsExistingColumnHover(t *testing.T) {
 	}
 	if !strings.Contains(got.Contents.Value, "`RDB$RELATION_ID` column") {
 		t.Fatalf("hover = %q, want the existing column metadata", got.Contents.Value)
+	}
+}
+
+func TestInterBaseHoverMemoisesObjectDDL(t *testing.T) {
+	server := interBaseHoverServer(t)
+	cache := interBaseHoverCache(t)
+	repo := database.NewMockCapabilityRepository()
+	repo.MockObjectDDL = func(context.Context, database.ObjectKind, string) (string, error) {
+		return "CREATE PROCEDURE MYPROC AS BEGIN SUSPEND; END", nil
+	}
+
+	first := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	second := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	if first == nil || second == nil {
+		t.Fatal("no hover")
+	}
+	if first.Contents.Value != second.Contents.Value {
+		t.Errorf("the memoised hover differs from the first:\ngot:  %q\nwant: %q", second.Contents.Value, first.Contents.Value)
+	}
+	if calls := repo.ObjectDDLCalls(); len(calls) != 1 {
+		t.Fatalf("ObjectDDL was called %d times for two hovers on the same token, want 1", len(calls))
+	}
+
+	// A reconnect invalidates everything: the new connection may be a
+	// different database entirely.
+	server.stateMu.Lock()
+	server.connGeneration++
+	server.stateMu.Unlock()
+
+	third := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	if third == nil {
+		t.Fatal("no hover after a reconnect")
+	}
+	if calls := repo.ObjectDDLCalls(); len(calls) != 2 {
+		t.Errorf("ObjectDDL was called %d times after a reconnect, want 2", len(calls))
+	}
+}
+
+func TestInterBaseHoverMemoisesTheUnsupportedNote(t *testing.T) {
+	// Unsupported DDL is the common case for procedures, so it is the case
+	// that must not re-query on every cursor rest.
+	server := interBaseHoverServer(t)
+	cache := interBaseHoverCache(t)
+	repo := database.NewMockCapabilityRepository()
+	repo.MockObjectDDL = func(context.Context, database.ObjectKind, string) (string, error) {
+		return "", database.NewUnsupportedDDLError("procedure", "MYPROC", `parameter "IN_AMOUNT" nullability is unknown`)
+	}
+
+	hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	got := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	if got == nil {
+		t.Fatal("no hover")
+	}
+	if !strings.Contains(got.Contents.Value, "_DDL unavailable:") {
+		t.Errorf("the memoised note was lost:\n%s", got.Contents.Value)
+	}
+	if calls := repo.ObjectDDLCalls(); len(calls) != 1 {
+		t.Errorf("ObjectDDL was called %d times, want 1", len(calls))
+	}
+}
+
+func TestInterBaseHoverDoesNotMemoiseTransientFailures(t *testing.T) {
+	server := interBaseHoverServer(t)
+	cache := interBaseHoverCache(t)
+	repo := database.NewMockCapabilityRepository()
+	calls := 0
+	repo.MockObjectDDL = func(context.Context, database.ObjectKind, string) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", errors.New("interbase: connection reset")
+		}
+		return "CREATE PROCEDURE MYPROC AS BEGIN SUSPEND; END", nil
+	}
+
+	if got := hoverAt(t, server, repo, cache, "execute procedure myproc", 20); got == nil {
+		t.Fatal("no hover after a transport failure")
+	}
+	got := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	if got == nil {
+		t.Fatal("no hover on the retry")
+	}
+	// Memoising "" for a transport failure would suppress this object's DDL
+	// until the next reconnect.
+	if !strings.Contains(got.Contents.Value, "CREATE PROCEDURE MYPROC") {
+		t.Errorf("a transient failure was memoised; the retry produced no DDL:\n%s", got.Contents.Value)
+	}
+	if len(repo.ObjectDDLCalls()) != 2 {
+		t.Errorf("ObjectDDL was called %d times, want 2", len(repo.ObjectDDLCalls()))
+	}
+}
+
+func TestInterBaseHoverMemoIsKeyedByObject(t *testing.T) {
+	server := interBaseHoverServer(t)
+	cache := interBaseHoverCache(t)
+	repo := database.NewMockCapabilityRepository()
+	repo.MockObjectDDL = func(_ context.Context, kind database.ObjectKind, name string) (string, error) {
+		return "CREATE " + strings.ToUpper(string(kind)) + " " + name, nil
+	}
+
+	procedure := hoverAt(t, server, repo, cache, "execute procedure myproc", 20)
+	view := hoverAt(t, server, repo, cache, "select * from myview", 16)
+	if procedure == nil || view == nil {
+		t.Fatal("no hover")
+	}
+	if !strings.Contains(procedure.Contents.Value, "CREATE PROCEDURE MYPROC") {
+		t.Errorf("procedure hover:\n%s", procedure.Contents.Value)
+	}
+	// The failure this pins: a memo keyed on the name alone serves the
+	// procedure's DDL for the view.
+	if !strings.Contains(view.Contents.Value, "CREATE VIEW MYVIEW") {
+		t.Errorf("view hover was served the wrong object's DDL:\n%s", view.Contents.Value)
+	}
+}
+
+func TestHoverMemoLockIsNotHeldAcrossObjectDDL(t *testing.T) {
+	server := interBaseHoverServer(t)
+	cache := interBaseHoverCache(t)
+	repo := database.NewMockCapabilityRepository()
+	repo.MockObjectDDL = func(context.Context, database.ObjectKind, string) (string, error) {
+		// Takes the very mutex the memo lives under. If stateMu were held
+		// across the round trip this blocks forever, which is precisely the
+		// invariant "stateMu is never held across any I/O" — and a 3-second
+		// ObjectDDL call is I/O.
+		server.stateMu.Lock()
+		server.stateMu.Unlock()
+		return "CREATE PROCEDURE MYPROC", nil
+	}
+
+	params := lsp.HoverParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+			TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+			Position:     lsp.Position{Line: 0, Character: 20},
+		},
+	}
+	done := make(chan *lsp.Hover, 1)
+	go func() {
+		done <- server.interBaseHover(context.Background(), repo, cache, params, "execute procedure myproc", nil)
+	}()
+
+	select {
+	case got := <-done:
+		if got == nil {
+			t.Fatal("no hover")
+		}
+		if !strings.Contains(got.Contents.Value, "CREATE PROCEDURE MYPROC") {
+			t.Errorf("hover lost the DDL:\n%s", got.Contents.Value)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("hover deadlocked: stateMu was held across the ObjectDDL round trip")
 	}
 }

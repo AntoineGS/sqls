@@ -219,6 +219,55 @@ func (s *Server) objectDDLMarkdown(ctx context.Context, repo database.DBReposito
 	if !ok {
 		return ""
 	}
-	rendered, _ := renderObjectDDL(ctx, ddlRepo, target.kind, target.name)
+	rendered := s.memoisedObjectDDL(ctx, ddlRepo, target)
+	return rendered
+}
+
+// ddlKey identifies one memoised DDL rendering. The generation is part of the
+// key rather than a reason to clear the map, so a hover that started before a
+// reconnect can never write a stale entry into the new connection's view.
+type ddlKey struct {
+	generation int
+	kind       database.ObjectKind
+	name       string
+}
+
+func (s *Server) connectionGeneration() int {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.connGeneration
+}
+
+// memoisedObjectDDL renders the DDL appendix, reusing a previous rendering for
+// the same object on the same connection.
+//
+// The lock is taken twice and released around the round trip, never held
+// across it: stateMu is a server-wide lock on the inline dispatch path, and
+// ObjectDDL is bounded at three seconds. Two hovers on the same cold object
+// can therefore both make the call; that duplicate is much cheaper than
+// freezing every other request for the duration.
+func (s *Server) memoisedObjectDDL(ctx context.Context, repo database.DDLRepository, target hoverTarget) string {
+	key := ddlKey{kind: target.kind, name: target.name}
+
+	s.stateMu.RLock()
+	key.generation = s.connGeneration
+	rendered, hit := s.ddlMemo[key]
+	s.stateMu.RUnlock()
+	if hit {
+		return rendered
+	}
+
+	rendered, cacheable := renderObjectDDL(ctx, repo, target.kind, target.name)
+	if !cacheable {
+		// A transport failure or a timeout may succeed next time. Caching ""
+		// for it would suppress this object's DDL until the next reconnect.
+		return rendered
+	}
+
+	s.stateMu.Lock()
+	if s.connGeneration == key.generation && s.ddlMemo != nil {
+		s.ddlMemo[key] = rendered
+	}
+	s.stateMu.Unlock()
 	return rendered
 }

@@ -109,6 +109,8 @@ be added here and classified, or it ships a race.
 | `WSCfg` | `handleWorkspaceDidChangeConfiguration` (inline) | `getConfig` ← `topConnection`/`showConnections`/`switchConnections` (async) | `stateMu` — a genuine inline-writer/async-reader race |
 | `initOptionDBConfig` | `handleInitialize` (inline, once) | `topConnection` (async-reachable) | `stateMu` — write-once, but read from the async path |
 | `SpecificFileCfg`, `DefaultFileCfg` | `main.go` before `jsonrpc2.NewConn` | `getConfig` | write-once-before-serving; an invariant, not a lock. Any future writer after serving begins must take `stateMu` |
+| `connGeneration` | `reconnectionDB` | `connectionGeneration`, `memoisedObjectDDL` (inline, hover) | `stateMu` |
+| `ddlMemo` | `reconnectionDB`, `memoisedObjectDDL` | `memoisedObjectDDL` (inline, hover) | `stateMu`, **never held across the `ObjectDDL` round trip** |
 | `worker` | `NewServer` | everywhere | pointer never reassigned; the contents are guarded by the worker's own lock |
 | `cancels` | `NewServer` | `handleWorkspaceExecuteCommand`, `handleCancelRequest` | pointer never reassigned; the registry has its own mutex |
 
