@@ -155,6 +155,7 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 	}
 
 	a.contexts, a.procedureAt = buildContexts(a, items)
+	a.sqlScopes = buildSQLOwnership(a.Text, items, a.contexts)
 	for i, item := range items {
 		name, ok := nameFromLexeme(a.Text, item)
 		if !ok || !isNameToken(item) {
@@ -453,7 +454,7 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenCo
 	if prev >= 0 && items[prev].Token.Kind == token.Colon && (context.kind == contextUnsupported || context.kind == contextExecutePending) {
 		if symbol != nil && !duplicate {
 			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
-			return Ambiguous, nil, &SQLReference{Name: name}, colonPrefix(items, i), ""
+			return Ambiguous, nil, a.sqlReference(i, name, nil), colonPrefix(items, i), ""
 		}
 		if duplicate {
 			return Ambiguous, nil, nil, Span{}, ""
@@ -470,35 +471,35 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenCo
 	}
 
 	if context.relation {
-		return Relation, nil, &SQLReference{Name: name}, Span{}, ""
+		return Relation, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if context.alias {
-		return Alias, nil, &SQLReference{Name: name}, Span{}, ""
+		return Alias, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if prev >= 0 && items[prev].Token.Kind == token.Period {
 		qualifier := nameBeforePeriod(a.Text, items, prev)
-		return Column, nil, &SQLReference{Name: name, Qualifier: qualifier}, Span{}, ""
+		return Column, nil, a.sqlReference(i, name, qualifier), Span{}, ""
 	}
 	if next < len(items) && items[next].Token.Kind == token.Period {
-		return Alias, nil, &SQLReference{Name: name}, Span{}, ""
+		return Alias, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if (context.kind == contextUnsupported || context.kind == contextExecutePending) && symbol != nil {
 		if !duplicate {
 			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
-			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+			return Ambiguous, nil, a.sqlReference(i, name, nil), Span{}, ""
 		}
 		return Ambiguous, nil, nil, Span{}, ""
 	}
 	if context.insertColumn || context.updateTarget {
-		return Column, nil, &SQLReference{Name: name}, Span{}, ""
+		return Column, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if isCallable(items, i) || isProcedureCallName(items, i) {
-		return Callable, nil, &SQLReference{Name: name}, Span{}, ""
+		return Callable, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if context.kind == contextUnsupported || context.kind == contextExecutePending {
 		if symbol != nil && !duplicate {
 			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
-			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+			return Ambiguous, nil, a.sqlReference(i, name, nil), Span{}, ""
 		}
 		if duplicate {
 			return Ambiguous, nil, nil, Span{}, ""
@@ -516,7 +517,7 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenCo
 		if duplicate {
 			return Ambiguous, nil, nil, Span{}, ""
 		}
-		return Column, nil, &SQLReference{Name: name}, Span{}, ""
+		return Column, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if context.kind == contextSQL {
 		if context.outputTarget && symbol != nil && !duplicate {
@@ -524,12 +525,12 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenCo
 		}
 		if symbol != nil {
 			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "ambiguous SQL value expression")
-			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+			return Ambiguous, nil, a.sqlReference(i, name, nil), Span{}, ""
 		}
 		if duplicate {
-			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+			return Ambiguous, nil, a.sqlReference(i, name, nil), Span{}, ""
 		}
-		return Column, nil, &SQLReference{Name: name}, Span{}, ""
+		return Column, nil, a.sqlReference(i, name, nil), Span{}, ""
 	}
 	if procIndex >= 0 {
 		if duplicate {
@@ -540,6 +541,14 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenCo
 		}
 	}
 	return Other, nil, nil, Span{}, ""
+}
+
+func (a *Analysis) sqlReference(index int, name Name, qualifier *Name) *SQLReference {
+	var scopes [][]RelationRef
+	if index >= 0 && index < len(a.sqlScopes) {
+		scopes = a.sqlScopes[index]
+	}
+	return &SQLReference{Name: name, Qualifier: qualifier, Scopes: scopes}
 }
 
 func colonPrefix(items []lexeme, i int) Span {

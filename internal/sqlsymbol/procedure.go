@@ -44,6 +44,7 @@ type Analysis struct {
 	prefixes    []indexedResolution
 	contexts    []tokenContext
 	procedureAt []int
+	sqlScopes   [][][]RelationRef
 }
 
 type procedureHeader struct {
