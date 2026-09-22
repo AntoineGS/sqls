@@ -111,6 +111,8 @@ be added here and classified, or it ships a race.
 | `SpecificFileCfg`, `DefaultFileCfg` | `main.go` before `jsonrpc2.NewConn` | `getConfig` | write-once-before-serving; an invariant, not a lock. Any future writer after serving begins must take `stateMu` |
 | `worker` | `NewServer` | everywhere | pointer never reassigned; the contents are guarded by the worker's own lock |
 | `cancels` | `NewServer` | `handleWorkspaceExecuteCommand`, `handleCancelRequest` | pointer never reassigned; the registry has its own mutex |
+| `connGeneration` | `reconnectionDB` | `snapshotContext` (inline, definition) | `stateMu` |
+| `snapshots` | `NewServer` only | `interBaseDefinition` (inline), `Stop` | pointer never reassigned after construction; the store guards its own state with its own mutex, which **is** held across filesystem I/O — it is a leaf lock, unlike `stateMu` |
 
 **The copy rule for `files`.** `updateFile` mutates `File.Text` through the
 stored pointer, so holding `stateMu` only while looking the pointer up is not

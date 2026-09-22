@@ -1,11 +1,15 @@
 package handler
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 // newTestSnapshotStore builds a store rooted at a temporary directory with a
@@ -447,5 +451,125 @@ func TestSnapshotStorePruneToleratesMissingRoot(t *testing.T) {
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatal("Stat:", err)
+	}
+}
+
+func TestSnapshotStoreRemoveAllRemovesOnlyItsOwnDirectories(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	sc := testSnapshotContext()
+
+	path, err := store.write(sc, "procedure", "MYPROC", "BEGIN END\n")
+	if err != nil {
+		t.Fatal("write:", err)
+	}
+	mine := filepath.Dir(filepath.Dir(path))
+
+	// Another sqls process's live directory, sitting in the shared root.
+	theirs := filepath.Join(store.root, "aabbccddeeff0011-4242")
+	if err := os.MkdirAll(theirs, snapshotDirMode); err != nil {
+		t.Fatal("MkdirAll:", err)
+	}
+
+	store.RemoveAll()
+
+	if _, err := os.Stat(mine); !os.IsNotExist(err) {
+		t.Errorf("RemoveAll left this store's directory behind (err=%v)", err)
+	}
+	if _, err := os.Stat(theirs); err != nil {
+		t.Errorf("RemoveAll deleted another process's directory: %v", err)
+	}
+	if _, err := os.Stat(store.root); err != nil {
+		t.Errorf("RemoveAll deleted the shared root: %v", err)
+	}
+}
+
+func TestSnapshotStoreRemoveAllIsSafeOnANilStore(t *testing.T) {
+	var store *sourceSnapshotStore
+	store.RemoveAll()
+}
+
+func TestSnapshotsRemovedOnShutdown(t *testing.T) {
+	server := NewServer()
+	store := newTestSnapshotStore(t)
+	server.snapshots = store
+
+	path, err := store.write(server.snapshotContext(), "procedure", "MYPROC", "BEGIN END\n")
+	if err != nil {
+		t.Fatal("write:", err)
+	}
+
+	if err := server.Stop(); err != nil {
+		t.Fatal("Stop:", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("snapshot survived a clean shutdown (err=%v)", err)
+	}
+}
+
+func TestSnapshotsRemovedEvenWhenConnectionCloseFails(t *testing.T) {
+	closeErr := errors.New("attachment is half dead")
+	server := NewServer()
+	server.dbConn = &database.DBConnection{
+		Driver: "stub",
+		Tunnel: failingCloser{err: closeErr},
+	}
+	store := newTestSnapshotStore(t)
+	server.snapshots = store
+
+	path, err := store.write(server.snapshotContext(), "procedure", "MYPROC", "BEGIN END\n")
+	if err != nil {
+		t.Fatal("write:", err)
+	}
+
+	// Stop must report the close failure *and* still clean up. A half-dead
+	// InterBase attachment is exactly the shutdown that fails, and it must not
+	// be the shutdown that leaves database source on disk.
+	if err := server.Stop(); !errors.Is(err, closeErr) {
+		t.Fatalf("Stop() = %v, want %v", err, closeErr)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Errorf("snapshot survived a failing shutdown (err=%v)", err)
+	}
+	select {
+	case <-server.worker.Done():
+	default:
+		t.Error("Stop returned without stopping the worker")
+	}
+}
+
+func TestSnapshotContextTracksTheConnectionGeneration(t *testing.T) {
+	server := NewServer()
+	defer server.worker.Stop()
+
+	server.curDBCfg = &database.DBConfig{
+		Alias:          "local_ib",
+		Driver:         dialect.DatabaseDriverInterBase,
+		DataSourceName: "localhost/3050:/db/app.ib",
+	}
+
+	sc := server.snapshotContext()
+	if sc.label != "local_ib" {
+		t.Errorf("label = %q, want %q", sc.label, "local_ib")
+	}
+	if !strings.Contains(sc.identity, "localhost/3050:/db/app.ib") {
+		t.Errorf("identity = %q, want it to include the data source name", sc.identity)
+	}
+
+	server.stateMu.Lock()
+	server.connGeneration++
+	server.stateMu.Unlock()
+
+	if got := server.snapshotContext().generation; got != sc.generation+1 {
+		t.Errorf("generation after a reconnect = %d, want %d", got, sc.generation+1)
+	}
+}
+
+func TestSnapshotContextWithoutAConnection(t *testing.T) {
+	server := NewServer()
+	defer server.worker.Stop()
+
+	sc := server.snapshotContext()
+	if sc.label == "" {
+		t.Error("label is empty; the banner must always name something")
 	}
 }

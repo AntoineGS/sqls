@@ -48,6 +48,16 @@ type Server struct {
 	// other configuration sources (workspace and user).
 	initOptionDBConfig *database.DBConfig
 
+	// connGeneration advances on every reconnect. It ties per-connection
+	// artefacts — the snapshot store's directory, and the hover DDL memo — to
+	// the connection they were produced under. Guarded by stateMu.
+	connGeneration int
+
+	// snapshots materialises database-resident source as read-only files. It is
+	// nil when the user cache directory could not be located, which disables
+	// go-to-definition for database objects and nothing else.
+	snapshots *sourceSnapshotStore
+
 	worker  *database.Worker
 	files   map[string]*File
 	cancels *cancelRegistry
@@ -62,11 +72,22 @@ func NewServer() *Server {
 	worker := database.NewWorker()
 	worker.Start()
 
-	return &Server{
+	server := &Server{
 		files:   make(map[string]*File),
 		worker:  worker,
 		cancels: newCancelRegistry(),
 	}
+	// Deliberately no filesystem access here: NewServer runs in every test in
+	// this package, and touching the real cache directory from a unit test is
+	// the hazard the injected root exists to remove. The root is only resolved,
+	// never created or read, until the first snapshot is written.
+	root, err := defaultSnapshotRoot()
+	if err != nil {
+		log.Printf("sqls: go-to-definition snapshots are disabled: %v", err)
+	} else {
+		server.snapshots = newSourceSnapshotStore(root)
+	}
+	return server
 }
 
 func panicf(r interface{}, format string, v ...interface{}) error {
@@ -82,12 +103,16 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 	return nil
 }
 
-// Stop closes the database connection and always stops the worker, including
-// when closing the connection fails. It deliberately takes no connMu — a
-// runaway query must not be able to hold the process open — but it does take
-// stateMu for the pointer read, because a concurrent switch may be reassigning
-// it.
+// Stop closes the database connection, always stops the worker, and always
+// removes this process's snapshots — including when closing the connection
+// fails. A half-dead InterBase attachment is exactly the shutdown that fails,
+// and it must not be the one that leaves database source on disk.
+//
+// It deliberately takes no connMu — a runaway query must not be able to hold
+// the process open — but it does take stateMu for the pointer read, because a
+// concurrent switch may be reassigning it.
 func (s *Server) Stop() error {
+	defer s.snapshots.RemoveAll()
 	defer s.worker.Stop()
 	s.stateMu.RLock()
 	dbConn := s.dbConn
@@ -424,6 +449,7 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 	}
 	s.stateMu.Lock()
 	s.dbConn = dbConn
+	s.connGeneration++
 	s.stateMu.Unlock()
 
 	for _, warning := range dbConn.Warnings {
@@ -553,6 +579,30 @@ func (s *Server) getConfig() *config.Config {
 // exact signature for callers that do not care about the SQL variant.
 func (s *Server) parserDriver() dialect.DatabaseDriver {
 	return s.parserDriverVariant().Driver
+}
+
+// snapshotContext copies the connection identity out from under stateMu.
+// Everything the snapshot store does with the result is filesystem I/O, which
+// stateMu is never held across.
+func (s *Server) snapshotContext() snapshotContext {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+
+	sc := snapshotContext{generation: s.connGeneration, label: "(unnamed)"}
+	cfg := s.curDBCfg
+	if cfg == nil {
+		return sc
+	}
+	if cfg.Alias != "" {
+		sc.label = cfg.Alias
+	}
+	// Every field that can distinguish one attachment from another goes into
+	// the hash. Over-inclusion is free because the result is hashed and never
+	// displayed, and it guarantees two different connections never share a
+	// snapshot directory.
+	sc.identity = fmt.Sprintf("%s|%s|%s|%d|%s|%s",
+		cfg.Driver, cfg.DataSourceName, cfg.Host, cfg.Port, cfg.Path, cfg.DBName)
+	return sc
 }
 
 // parserDriverVariant returns the active connection's driver and its resolved

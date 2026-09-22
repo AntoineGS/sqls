@@ -178,6 +178,35 @@ func (s *sourceSnapshotStore) pruneLocked() {
 	}
 }
 
+// RemoveAll removes every directory this store created. It is safe on a nil
+// store, which is what a server whose cache directory could not be located has.
+//
+// It removes only its own directories, never the root: the root is shared with
+// any other sqls process, whose live snapshots must survive this one's exit.
+// The lock is released before the filesystem work, so a shutdown never waits on
+// an in-flight write beyond the bookkeeping.
+func (s *sourceSnapshotStore) RemoveAll() {
+	if s == nil {
+		return
+	}
+
+	s.mu.Lock()
+	dirs := make([]string, 0, len(s.created))
+	for dir := range s.created {
+		dirs = append(dirs, dir)
+	}
+	s.created = map[string]struct{}{}
+	s.dir = ""
+	s.generation = -1
+	s.mu.Unlock()
+
+	for _, dir := range dirs {
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("sqls: remove snapshot directory %q: %v", dir, err)
+		}
+	}
+}
+
 func (s *sourceSnapshotStore) connectionDirLocked(sc snapshotContext) (string, error) {
 	if s.dir != "" && s.generation == sc.generation {
 		return s.dir, nil
