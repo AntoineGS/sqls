@@ -33,6 +33,11 @@ const (
 
 const lateCancellationNote = "Note: the cancellation request arrived after the statement completed; the result\nbelow is the real result.\n\n"
 
+const executeProcedureOneRowNote = "EXECUTE PROCEDURE returns at most one row."
+
+const unknownProcedureHint = `%s is not in the catalog cache. If it was created after this connection
+opened, switch to this connection again to refresh the cache.`
+
 func (s *Server) handleTextDocumentCodeAction(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
 	if req.Params == nil {
 		return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams}
@@ -236,7 +241,60 @@ func (s *Server) runStatement(ctx context.Context, query string, vertical bool) 
 	if _, isQuery := database.QueryExecType(query, ""); isQuery {
 		return s.query(ctx, query, vertical)
 	}
-	return s.exec(ctx, query, vertical)
+
+	routing := s.interBaseProcedureRouting(query)
+	if routing.returnsRows {
+		return s.queryProcedure(ctx, query, vertical)
+	}
+
+	res, err := s.exec(ctx, query, vertical)
+	// The cache did not know this procedure, so Exec was a fallback rather
+	// than a decision. Say so, instead of letting the driver's rejection read
+	// like a mistake in the user's statement. A cancelled statement is left
+	// alone so Plan 1's cancellation notice still wins.
+	if err != nil && routing.unknown && cancellationNotice(ctx, err) == "" {
+		return fmt.Sprintf("Exec failed: %v\n\n"+unknownProcedureHint+"\n", err, routing.name), nil
+	}
+	return res, err
+}
+
+// procedureRouting is the once-and-only-once routing decision for an
+// EXECUTE PROCEDURE statement.
+type procedureRouting struct {
+	name string
+	// returnsRows is true only when the cache says the procedure has at least
+	// one output parameter.
+	returnsRows bool
+	// unknown is true when the statement is an EXECUTE PROCEDURE call whose
+	// procedure the cache could not resolve.
+	unknown bool
+}
+
+// interBaseProcedureRouting decides how to run an EXECUTE PROCEDURE statement,
+// once. It deliberately never tries one path and falls back to the other: the
+// driver rejects the wrong path at prepare, before execution, but a
+// try-then-retry shape could execute a mutating procedure twice if that
+// reasoning were ever wrong, and a stale cache is not worth that risk.
+func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
+	if s.parserDriver() != dialect.DatabaseDriverInterBase {
+		return procedureRouting{}
+	}
+	name := interBaseProcedureName(query)
+	if name == "" {
+		return procedureRouting{}
+	}
+
+	cache := s.worker.Cache()
+	if cache == nil || !cache.HasCatalog() {
+		return procedureRouting{name: name, unknown: true}
+	}
+	// The accessor normalises the name it is given, so the identifier goes in
+	// exactly as the user typed it.
+	desc, ok := cache.Procedure(name)
+	if !ok {
+		return procedureRouting{name: name, unknown: true}
+	}
+	return procedureRouting{name: name, returnsRows: len(desc.OutputParameters) > 0}
 }
 
 func extractRangeText(text string, startLine, startChar, endLine, endChar int) string {
@@ -338,7 +396,19 @@ func sliceUTF16(s string, start, end int) string {
 }
 
 func (s *Server) query(ctx context.Context, query string, vertical bool) (string, error) {
-	result, scanErr := s.queryResult(ctx, query)
+	return s.renderQuery(ctx, query, vertical, true, nil)
+}
+
+// queryProcedure runs an EXECUTE PROCEDURE statement that the cache says
+// returns output. It never uses ReadOnlyQuerier: an implicit procedure query
+// commits its write transaction, so a procedure call is a write even when it
+// returns a row.
+func (s *Server) queryProcedure(ctx context.Context, query string, vertical bool) (string, error) {
+	return s.renderQuery(ctx, query, vertical, false, []string{executeProcedureOneRowNote})
+}
+
+func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowReadOnly bool, notes []string) (string, error) {
+	result, scanErr := s.queryResult(ctx, query, allowReadOnly)
 	if result == nil {
 		return "", scanErr
 	}
@@ -348,6 +418,7 @@ func (s *Server) query(ctx context.Context, query string, vertical bool) (string
 	if scanErr != nil && cancellationNotice(ctx, scanErr) != "" {
 		return "", scanErr
 	}
+	result.Notes = append(result.Notes, notes...)
 	return renderQueryResult(result, vertical, scanErr)
 }
 
@@ -356,12 +427,12 @@ func (s *Server) query(ctx context.Context, query string, vertical bool) (string
 // lifetime stays inside the repository, so an early return here cannot leak it.
 // Every path renders through ScanRowsWithTypes, so the partial-result contract
 // is the same on every driver.
-func (s *Server) queryResult(ctx context.Context, query string) (*database.QueryResult, error) {
+func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bool) (*database.QueryResult, error) {
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if readOnly, ok := repo.(database.ReadOnlyQuerier); ok {
+	if readOnly, ok := repo.(database.ReadOnlyQuerier); ok && allowReadOnly {
 		return readOnly.QueryReadOnly(ctx, query)
 	}
 	rows, err := repo.Query(ctx, query)
