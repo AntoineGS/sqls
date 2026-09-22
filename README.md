@@ -48,7 +48,8 @@ If the tables are connected with a foreign key sqls can complete ```JOIN``` stat
 ![code_actions](https://github.com/sqls-server/sqls.vim/blob/master/imgs/sqls_vim_demo.gif)
 
 - [x] Execute SQL
-- [ ] Explain SQL
+- [x] Explain SQL
+  - InterBase only; other drivers report that the command is unsupported.
 - [x] Switch Connection(Selected Database Connection)
 - [x] Switch Database
 
@@ -88,6 +89,86 @@ CGO_ENABLED=1 go build -tags interbase -o sqls .
 Ordinary builds do not link the InterBase client. Selecting an InterBase
 connection in such a build reports that the native build is required. The
 upstream `go install ...@latest` command does not include this local integration.
+
+#### InterBase editor features
+
+On an InterBase connection sqls reads the database's own catalog and uses it in
+four editor surfaces. Everything here is automatic: there are no settings, and
+each feature silently falls back to its ordinary behaviour when the catalog is
+not available — on another driver, on a build without the InterBase tag, and in
+the short window after connecting before the catalog has been read.
+
+**Explain SQL.** The `Explain SQL` code action shows the query plan InterBase
+chose. It **prepares the statement without executing it**: nothing is inserted,
+updated or deleted, and a statement that modifies data is shown with a banner
+saying so. `SELECT`, `INSERT`, `UPDATE`, `DELETE` and `EXECUTE PROCEDURE` are
+supported; DDL and transaction control are refused, because their plan is always
+empty and an empty pane reads like a bug. A statement can prepare successfully
+and still have no plan — InterBase simply reports none — and that is shown as
+text rather than as a blank result. A `SELECT` whose result contains an array
+column cannot be explained, because the prepare path sqls uses does not accept
+array results.
+
+**Completion.** Procedures are offered after `EXECUTE PROCEDURE`; procedures
+that return output are offered wherever a table is, because an InterBase
+selectable procedure is legal wherever a relation is; a selectable procedure's
+output parameters are offered as its columns. External functions appear beside
+the built-in functions, and generators are offered inside a `GEN_ID(` call —
+only there, because offering every generator in every expression would bury the
+column candidates. Views are labelled `view` rather than `table`. Identifiers
+match case-insensitively, so `myproc` finds `MYPROC`.
+
+Procedure **input parameter names** are deliberately not completed: InterBase
+DSQL has no named parameters, so a parameter name is never valid text in a
+statement. They appear in signature help and hover instead. Triggers are not
+completed either — no SQL context in which sqls completes ever names one.
+
+**Signature help.** Typing an argument list for a known procedure shows its
+input parameters and highlights the one under the cursor, both for
+`EXECUTE PROCEDURE MYPROC(…)` and for `SELECT * FROM MYPROC(…)`. Output
+parameters are never listed as arguments; their count appears in the tooltip
+text instead, so a selectable procedure can still be told apart from a purely
+executable one. A parameter is marked `NOT NULL` only when the catalog proves
+it. Most InterBase procedure parameters carry no declaration nullability at
+all, and those are shown with no nullability marking rather than a guess. A
+space before the parenthesis — `MYPROC (1, 2)` — is not recognised as a call,
+which matches sqls's existing behaviour for built-in functions.
+
+Known limitation: for a call nested inside another call's argument list, such
+as `MYPROC(OTHERCALL(1, 2), 3)`, sqls keeps showing `MYPROC`'s signature the
+whole time and tracks the active-parameter position from `OTHERCALL`'s own
+argument list instead of `MYPROC`'s once the cursor is inside the inner
+parentheses — the parser never gives the nested call its own node to hang
+correct tracking off. This is misleading in that one case and is not fixable
+from the signature-help code alone.
+
+**Hover.** Hovering a table, view, procedure, trigger or generator shows what
+the catalog knows about it and then, when InterBase can reproduce it, the real
+`CREATE` statement. When it cannot, hover names the reason in one line and
+shows the object's verbatim catalog source instead — unless the cache itself is
+stale and names an object InterBase no longer has, in which case hover shows
+only what the catalog still knows and adds nothing about DDL, rather than a
+footnote the user cannot act on. **sqls never invents a `CREATE` statement it
+did not get from the database.** DDL that cannot be reproduced is the ordinary
+case for procedures: the reference-compatible catalog does not record whether a
+parameter was declared nullable, and without that a faithful declaration cannot
+be written. Hovering an external function shows its declaration metadata and
+never mentions DDL, because InterBase does not reproduce DDL for external
+functions at all.
+
+Some catalog values are simply absent — a trigger's event, an external
+function's return type, and the type of a `CHAR` or `VARCHAR` function argument,
+which InterBase never records. Wherever a value is missing the corresponding
+line is left out rather than filled with a placeholder, and the object itself is
+still shown.
+
+The DDL lookup happens when you hover, not when you connect: the first hover of
+an object makes a database round trip on sqls's own request-handling loop,
+bounded at three seconds, and sqls cannot read or answer any other request
+until it returns. Hovering the same object again is instant: the rendered
+result is kept in memory, one entry per object hovered, for as long as the
+connection lasts, and is only cleared when the connection is switched or
+reopened.
 
 ### Cancelling a running query
 
