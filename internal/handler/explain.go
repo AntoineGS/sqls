@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/queryparams"
 )
 
 const (
@@ -70,7 +72,7 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	stmts, err := getStatementsWithDriver(text, s.parserDriver())
+	queries, err := s.explainQueries(text)
 	if err != nil {
 		return nil, err
 	}
@@ -84,15 +86,6 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 		return nil, err
 	}
 
-	queries := make([]string, 0, len(stmts))
-	for _, stmt := range stmts {
-		query := strings.TrimSpace(stmt.String())
-		if query == "" {
-			continue
-		}
-		queries = append(queries, query)
-	}
-
 	rendered, err := explainStatements(ctx, explainer, queries)
 	if err != nil {
 		if notice := cancellationNotice(ctx, err); notice != "" {
@@ -101,6 +94,39 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 		return nil, err
 	}
 	return rendered, nil
+}
+
+// explainQueries returns the statements to prepare. An InterBase selection
+// carrying genuine named markers is compiled to positional SQL first: a plan
+// only needs a preparable statement, so Explain translates the markers and
+// never prompts for or binds a value. Everything else — including a selection
+// the parameter compiler rejects — takes the ordinary parser path unchanged.
+func (s *Server) explainQueries(text string) ([]string, error) {
+	variant := s.parserDriverVariant()
+	if variant.Driver == dialect.DatabaseDriverInterBase {
+		batch, err := queryparams.Compile(text, variant.Variant.InterBaseSQLDialect())
+		if err == nil && len(batch.Parameters) > 0 {
+			queries := make([]string, 0, len(batch.Statements))
+			for _, stmt := range batch.Statements {
+				queries = append(queries, stmt.SQL)
+			}
+			return queries, nil
+		}
+	}
+
+	stmts, err := getStatementsWithDriver(text, s.parserDriver())
+	if err != nil {
+		return nil, err
+	}
+	queries := make([]string, 0, len(stmts))
+	for _, stmt := range stmts {
+		query := strings.TrimSpace(stmt.String())
+		if query == "" {
+			continue
+		}
+		queries = append(queries, query)
+	}
+	return queries, nil
 }
 
 // explainRepositoryFor reports whether the active repository can explain. The

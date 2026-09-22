@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -185,6 +186,16 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	if !connected {
 		return nil, errors.New("database connection is not open")
 	}
+
+	showVertical := showVerticalRequested(params)
+
+	// A submission carries its own SQL snapshot and the identity it was
+	// prompted under, so it validates, compiles and binds that selection
+	// itself instead of re-parsing the live document here.
+	if params.ParameterValues != nil {
+		return s.executeBoundStatements(ctx, params, showVertical)
+	}
+
 	if len(params.Arguments) == 0 {
 		return nil, fmt.Errorf("required arguments were not provided: <File URI>")
 	}
@@ -197,16 +208,6 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 		return nil, fmt.Errorf("document not found, %q", uri)
 	}
 
-	showVertical := false
-	if len(params.Arguments) > 1 {
-		showVerticalFlag, ok := params.Arguments[1].(string)
-		if ok {
-			if showVerticalFlag == "-show-vertical" {
-				showVertical = true
-			}
-		}
-	}
-
 	// extract target query
 	if params.Range != nil {
 		text = extractRangeText(
@@ -217,20 +218,52 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
+	if err := s.refuseLegacyNamedParameters(text); err != nil {
+		return nil, err
+	}
 	stmts, err := getStatementsWithDriverVariant(text, s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}
 
-	// execute statements
-	buf := new(bytes.Buffer)
+	queries := make([]string, 0, len(stmts))
 	for _, stmt := range stmts {
 		query := strings.TrimSpace(stmt.String())
 		if query == "" {
 			continue
 		}
+		queries = append(queries, query)
+	}
 
-		res, err := s.runStatement(ctx, query, showVertical)
+	// execute statements
+	rendered, err := renderStatements(ctx, len(queries), func(i int) (string, error) {
+		return s.runStatement(ctx, queries[i], showVertical)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return rendered, nil
+}
+
+// showVerticalRequested reports whether the request asked for vertical output.
+func showVerticalRequested(params lsp.ExecuteCommandParams) bool {
+	if len(params.Arguments) > 1 {
+		if flag, ok := params.Arguments[1].(string); ok {
+			return flag == "-show-vertical"
+		}
+	}
+	return false
+}
+
+// renderStatements runs count statements in order through run and
+// concatenates their output, stopping at the first failure. It is the single
+// place the batch result and cancellation semantics live: the legacy path and
+// the parameterized path differ in what they dispatch, never in how a
+// cancelled or failed statement ends the batch.
+func renderStatements(ctx context.Context, count int, run func(int) (string, error)) (string, error) {
+	buf := new(bytes.Buffer)
+	for i := 0; i < count; i++ {
+		res, err := run(i)
 		if err != nil {
 			if notice := cancellationNotice(ctx, err); notice != "" {
 				fmt.Fprintln(buf, notice)
@@ -238,26 +271,31 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 				// command wrapper must be able to tell this apart from a
 				// statement that completed before a late cancellation, or it
 				// prepends a note saying the opposite of this one.
-				return nil, &cancelledError{rendered: buf.String()}
+				return "", &cancelledError{rendered: buf.String()}
 			}
-			return nil, err
+			return "", err
 		}
 		fmt.Fprintln(buf, res)
 	}
 	return buf.String(), nil
 }
 
-func (s *Server) runStatement(ctx context.Context, query string, vertical bool) (string, error) {
-	if _, isQuery := database.QueryExecType(query, ""); isQuery {
-		return s.query(ctx, query, vertical)
-	}
+// runStatement resolves the statement's route once and runs it. A
+// parameterized batch calls runRoutedStatement directly with the decision its
+// preflight already made, so no statement is ever routed twice.
+func (s *Server) runStatement(ctx context.Context, query string, vertical bool, args ...any) (string, error) {
+	return s.runRoutedStatement(ctx, query, vertical, s.statementRouting(query), args...)
+}
 
-	routing := s.interBaseProcedureRouting(query)
+func (s *Server) runRoutedStatement(ctx context.Context, query string, vertical bool, routing procedureRouting, args ...any) (string, error) {
+	if routing.isQuery {
+		return s.query(ctx, query, vertical, args...)
+	}
 	if routing.returnsRows {
-		return s.queryProcedure(ctx, query, vertical)
+		return s.queryProcedure(ctx, query, vertical, args...)
 	}
 
-	res, err := s.exec(ctx, query, vertical)
+	res, err := s.exec(ctx, query, vertical, args...)
 	// The cache did not know this procedure, so Exec was a fallback rather
 	// than a decision. Say so, instead of letting the driver's rejection read
 	// like a mistake in the user's statement. A cancelled statement is left
@@ -268,10 +306,24 @@ func (s *Server) runStatement(ctx context.Context, query string, vertical bool) 
 	return res, err
 }
 
-// procedureRouting is the once-and-only-once routing decision for an
-// EXECUTE PROCEDURE statement.
+// statementRouting is the whole once-and-only-once routing decision for one
+// statement: read versus write first, then — for an InterBase EXECUTE
+// PROCEDURE — which of the two write paths its cached descriptor calls for.
+func (s *Server) statementRouting(query string) procedureRouting {
+	if _, isQuery := database.QueryExecType(query, ""); isQuery {
+		return procedureRouting{isQuery: true}
+	}
+	return s.interBaseProcedureRouting(query)
+}
+
+// procedureRouting is the once-and-only-once routing decision for a
+// statement, including which of the two write paths an EXECUTE PROCEDURE
+// call takes.
 type procedureRouting struct {
 	name string
+	// isQuery is true when the statement is a read and takes the query path,
+	// which may use a read-only transaction.
+	isQuery bool
 	// returnsRows is true only when the cache says the procedure has at least
 	// one output parameter.
 	returnsRows bool
@@ -405,20 +457,20 @@ func sliceUTF16(s string, start, end int) string {
 	return s[startByte:endByte]
 }
 
-func (s *Server) query(ctx context.Context, query string, vertical bool) (string, error) {
-	return s.renderQuery(ctx, query, vertical, true, nil)
+func (s *Server) query(ctx context.Context, query string, vertical bool, args ...any) (string, error) {
+	return s.renderQuery(ctx, query, vertical, true, nil, args...)
 }
 
 // queryProcedure runs an EXECUTE PROCEDURE statement that the cache says
 // returns output. It never uses ReadOnlyQuerier: an implicit procedure query
 // commits its write transaction, so a procedure call is a write even when it
 // returns a row.
-func (s *Server) queryProcedure(ctx context.Context, query string, vertical bool) (string, error) {
-	return s.renderQuery(ctx, query, vertical, false, []string{executeProcedureOneRowNote})
+func (s *Server) queryProcedure(ctx context.Context, query string, vertical bool, args ...any) (string, error) {
+	return s.renderQuery(ctx, query, vertical, false, []string{executeProcedureOneRowNote}, args...)
 }
 
-func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowReadOnly bool, notes []string) (string, error) {
-	result, scanErr := s.queryResult(ctx, query, allowReadOnly)
+func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowReadOnly bool, notes []string, args ...any) (string, error) {
+	result, scanErr := s.queryResult(ctx, query, allowReadOnly, args...)
 	if result == nil {
 		return "", scanErr
 	}
@@ -432,15 +484,48 @@ func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowR
 	return renderQueryResult(result, vertical, scanErr)
 }
 
+// errBoundParametersUnsupported and errParameterizedReadOnlyUnsupported are
+// shared with the preflight that refuses a batch before its first statement,
+// so the message a user sees never depends on which of the two noticed.
+var (
+	errBoundParametersUnsupported       = errors.New("bound parameters are not supported by this repository")
+	errParameterizedReadOnlyUnsupported = errors.New("parameterized read-only queries are not supported by this repository")
+)
+
 // queryResult materialises a read statement's result. It prefers an explicit
 // read-only transaction when the repository offers one; that transaction's
 // lifetime stays inside the repository, so an early return here cannot leak it.
 // Every path renders through ScanRowsWithTypes, so the partial-result contract
 // is the same on every driver.
-func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bool) (*database.QueryResult, error) {
+//
+// A statement with bound arguments takes the parameterized capabilities: the
+// arguments go to the driver, never into the SQL text. A repository that
+// offers a read-only transaction but no parameterized counterpart is an error
+// rather than a silent downgrade to an ordinary transaction.
+func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bool, args ...any) (*database.QueryResult, error) {
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if len(args) > 0 {
+		if allowReadOnly {
+			if readOnly, ok := repo.(database.ParameterizedReadOnlyQuerier); ok {
+				return readOnly.QueryReadOnlyParams(ctx, query, args)
+			}
+			if _, ok := repo.(database.ReadOnlyQuerier); ok {
+				return nil, errParameterizedReadOnlyUnsupported
+			}
+		}
+		bound, ok := repo.(database.ParameterizedRepository)
+		if !ok {
+			return nil, errBoundParametersUnsupported
+		}
+		rows, err := bound.QueryParams(ctx, query, args)
+		if err != nil {
+			return nil, err
+		}
+		defer func() { _ = rows.Close() }()
+		return database.ScanRowsWithTypes(rows, database.RenderOptionsFor(repo.Driver()))
 	}
 	if readOnly, ok := repo.(database.ReadOnlyQuerier); ok && allowReadOnly {
 		return readOnly.QueryReadOnly(ctx, query)
@@ -535,12 +620,21 @@ func hasBlobColumn(result *database.QueryResult) bool {
 	return false
 }
 
-func (s *Server) exec(ctx context.Context, query string, vertical bool) (string, error) {
+func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...any) (string, error) {
 	repo, err := s.newDBRepository(ctx)
 	if err != nil {
 		return "", err
 	}
-	result, err := repo.Exec(ctx, query)
+	var result sql.Result
+	if len(args) > 0 {
+		bound, ok := repo.(database.ParameterizedRepository)
+		if !ok {
+			return "", errBoundParametersUnsupported
+		}
+		result, err = bound.ExecParams(ctx, query, args)
+	} else {
+		result, err = repo.Exec(ctx, query)
+	}
 	if err != nil {
 		return "", err
 	}

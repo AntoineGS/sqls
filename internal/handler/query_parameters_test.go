@@ -301,6 +301,10 @@ func TestParameterSelectionAcceptsUnicodeRangeBoundary(t *testing.T) {
 
 	end := utf16Len(prefix)
 	rng := lsp.Range{Start: lsp.Position{Line: 0, Character: 0}, End: lsp.Position{Line: 0, Character: end}}
+	// parameterSelection documents that its caller holds connMu.RLock; this
+	// test calls it directly, so it takes the lock the command would.
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	sel, err := s.parameterSelection(lsp.ExecuteCommandParams{
 		Command:   CommandGetQueryParameters,
 		Arguments: []interface{}{"file:///query.sql"},
@@ -336,7 +340,7 @@ func TestParameterDiscoveryOverJSONRPCTouchesNoRepository(t *testing.T) {
 	defer tx.tearDown()
 	defer tx.server.worker.Stop()
 
-	recorder := installQueryParametersRecorder(t)
+	backend := installParameterBackend(t)
 	tx.addWorkspaceConfig(t, stubQueryParametersConnections("primary"))
 	tx.textDocumentDidOpen(t, testFileURI, "SELECT :ID FROM T")
 
@@ -360,7 +364,7 @@ func TestParameterDiscoveryOverJSONRPCTouchesNoRepository(t *testing.T) {
 	if got.ConnectionKey == "" {
 		t.Errorf("ConnectionKey is empty, want a populated hash")
 	}
-	if calls := recorder.recordedCalls(); len(calls) != 0 {
-		t.Errorf("repository served %d parameterized calls, want 0 for discovery", len(calls))
+	if calls := backend.calls(); len(calls) != 0 {
+		t.Errorf("repository served %d statements, want 0 for discovery", len(calls))
 	}
 }
