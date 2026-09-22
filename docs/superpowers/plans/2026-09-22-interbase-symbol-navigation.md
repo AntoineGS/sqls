@@ -694,7 +694,7 @@ protocol regression. Update this plan's checkboxes and verification record.
 **Produces:** synthetic end-to-end acceptance, optional external-fixture checks,
 benchmark measurements, documentation, and a tested native build artifact.
 
-- [ ] **Write a combined JSON-RPC regression** using a compact synthetic
+- [x] **Write a combined JSON-RPC regression** using a compact synthetic
   procedure containing HEADEREMPLYID_TEMP, ORDERTOTAL, and the example UPDATE.
   Check local definitions, references with/without declaration, and rename
   applied to source. Send `didChange`, then repeat a definition at its new
@@ -730,7 +730,7 @@ func TestLocalInterBaseExample(t *testing.T) {
   AMOUNTPAID with CUSTOMERINVOICE as its candidate owner. Never write to this
   external fixture or copy its business source into the repository. If the
   fixture changed since review, inspect differences before changing assertions.
-- [ ] **Run the acceptance tests before final documentation:**
+- [x] **Run the acceptance tests before final documentation:**
 
 ```shell
 go test ./internal/handler -run 'TestSymbolDocumentChanges|TestSymbolNavigationAcceptance' -count=1
@@ -739,7 +739,7 @@ SQLS_SYMBOL_EXAMPLE='/home/a.simard@multidev.local/OneDrive/Dev/2026-09-14 - 5-I
 
   Full-file failures remain unmet requirements: reduce them to synthetic
   regressions, fix the resolver, and rerun the relevant tests.
-- [ ] **Add and run benchmarks.** Read input before timing and measure both
+- [x] **Add and run benchmarks.** Read input before timing and measure both
   analysis and representative symbol requests:
 
 ```go
@@ -764,7 +764,7 @@ func BenchmarkProcedureSymbols(b *testing.B) {
   duration/allocations and investigate quadratic scaling or repeated full-text
   scans. Run:
   `go test ./internal/sqlsymbol -run '^$' -bench 'BenchmarkProcedureSymbols' -benchmem`.
-- [ ] **Document the supported behavior in the InterBase editor section:**
+- [x] **Document the supported behavior in the InterBase editor section:**
 
 ```markdown
 ##### Procedure navigation and rename
@@ -788,7 +788,7 @@ reproducible DDL. They use the existing source-snapshot storage and cleanup.
   Update the existing snapshot supported-kinds paragraph to include tables and
   columns. Document that the client needs a rebuilt native sqls binary and a
   restart to obtain the new references capability.
-- [ ] **Format changed Go files and run required checks.** Use `gofmt -w` only
+- [x] **Format changed Go files and run required checks.** Use `gofmt -w` only
   on changed files, then `git diff --check`, followed by:
 
 ```shell
@@ -803,13 +803,13 @@ CGO_ENABLED=1 go build -tags interbase -o /tmp/opencode/sqls-symbol-navigation .
   enable live tests that create or alter database objects. Record environment
   blockers separately from code failures. Repeat tests only after a relevant
   change or to resolve an outstanding concern.
-- [ ] **Verify the editor handoff.** Identify the executable used by the user's
+- [x] **Verify the editor handoff.** Identify the executable used by the user's
   attached sqls client before replacing an installed binary. If the session is
   accessible, restart its client with the built artifact and test the example's
   line 326 rename/references and line 847 definitions. Otherwise report the
   artifact path and remaining editor checks. Do not claim an actual Neovim test
   based only on server-side assertions.
-- [ ] **Commit:** `docs: document and verify InterBase symbol navigation`.
+- [x] **Commit:** `docs: document and verify InterBase symbol navigation`.
 
 ## Self-review coverage map
 
@@ -827,5 +827,15 @@ CGO_ENABLED=1 go build -tags interbase -o /tmp/opencode/sqls-symbol-navigation .
 
 ## Verification record
 
-Implementation has not started. During Task 8, record actual commands/results,
-benchmark measurements, and whether the editor session was tested here.
+Task 8 verification (2026-09-22):
+
+- Synthetic protocol acceptance: `go test ./internal/handler -run 'TestSymbolDocumentChanges|TestSymbolNavigationAcceptance' -count=1` — PASS.
+- Read-only fixture acceptance: `SQLS_SYMBOL_EXAMPLE='/home/a.simard@multidev.local/OneDrive/Dev/2026-09-14 - 5-IMPORTEXTERNALORDER_SHOPIFYPOS.sql' go test ./internal/sqlsymbol -run '^TestLocalInterBaseExample$' -count=1 -v` — PASS; no fixture writes.
+- `go test ./... -count=1` — PASS.
+- `go test -race ./internal/sqlsymbol ./internal/handler -count=1` — PASS.
+- `CGO_ENABLED=1 go test -tags interbase ./internal/sqlsymbol ./internal/handler ./internal/database -count=1` — PASS using existing mocks; no live DB mutation tests.
+- `CGO_ENABLED=1 go build -tags interbase -o /tmp/opencode/sqls-symbol-navigation .` — PASS; ELF x86-64 artifact (46,337,032 bytes), `libgds.so` resolves at `/opt/interbase/lib/libgds.so`.
+- `go test ./internal/sqlsymbol -run '^$' -bench 'BenchmarkProcedureSymbols' -benchmem -count=1` — PASS: 1,000-use benchmark 3,090,557 ns/op, 4,554,607 B/op, 28,147 allocs/op; scaling 250/500/1,000 uses = 758,020 / 1,513,977 / 3,220,494 ns/op, supporting near-linear scaling.
+- With `SQLS_SYMBOL_EXAMPLE` set, `BenchmarkLocalInterBaseExample` — 7,480,066 ns/op, 7,454,051 B/op, 48,032 allocs/op.
+- Editor handoff is discovery-only: Neovim config points at `~/gits/sqls/sqls`, live PID 3091738 uses that binary. It was not replaced or restarted. Actual editor rename/references on line 326 and definitions on line 847 remain unverified; use the artifact above after approval.
+- Additional deferred-minor fixes: standalone CR offset/range conversions now agree; InterBase definition routing reuses request-local sqlsymbol analysis instead of re-analyzing the same document.

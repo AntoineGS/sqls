@@ -2,7 +2,6 @@ package handler
 
 import (
 	"fmt"
-	"strings"
 	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -20,18 +19,21 @@ func symbolOffset(text string, pos lsp.Position) (int, bool) {
 
 	lineStart := 0
 	for line := 0; line < pos.Line; line++ {
-		next := strings.IndexByte(text[lineStart:], '\n')
-		if next < 0 {
+		lineEnd := lineStart
+		for lineEnd < len(text) && text[lineEnd] != '\r' && text[lineEnd] != '\n' {
+			lineEnd++
+		}
+		if lineEnd == len(text) {
 			return 0, false
 		}
-		lineStart += next + 1
+		lineStart = lineEnd + 1
+		if text[lineEnd] == '\r' && lineStart < len(text) && text[lineStart] == '\n' {
+			lineStart++
+		}
 	}
-	lineEnd := len(text)
-	if next := strings.IndexByte(text[lineStart:], '\n'); next >= 0 {
-		lineEnd = lineStart + next
-	}
-	if lineEnd > lineStart && text[lineEnd-1] == '\r' {
-		lineEnd--
+	lineEnd := lineStart
+	for lineEnd < len(text) && text[lineEnd] != '\r' && text[lineEnd] != '\n' {
+		lineEnd++
 	}
 	offset, ok := utf16ByteOffset(text[lineStart:lineEnd], pos.Character)
 	if !ok {
@@ -146,6 +148,10 @@ func localDefinition(uri, text string, pos lsp.Position, dv dialect.DriverVarian
 	if err != nil {
 		return nil, false, err
 	}
+	return localDefinitionWithAnalysis(uri, text, offset, analysis)
+}
+
+func localDefinitionWithAnalysis(uri, text string, offset int, analysis *sqlsymbol.Analysis) (lsp.Definition, bool, error) {
 	resolution := analysis.Resolve(offset)
 	if !resolution.InProcedure {
 		return nil, false, nil
@@ -174,13 +180,21 @@ func contextualSQLTarget(text string, pos lsp.Position, dv dialect.DriverVariant
 	if dv.Driver != dialect.DatabaseDriverInterBase {
 		return false, nil
 	}
-	offset, ok := symbolOffset(text, pos)
+	_, ok := symbolOffset(text, pos)
 	if !ok {
 		return false, nil
 	}
 	analysis, err := sqlsymbol.Analyze(text, dv)
 	if err != nil {
 		return false, err
+	}
+	return contextualSQLTargetWithAnalysis(text, pos, analysis)
+}
+
+func contextualSQLTargetWithAnalysis(text string, pos lsp.Position, analysis *sqlsymbol.Analysis) (bool, error) {
+	offset, ok := symbolOffset(text, pos)
+	if !ok {
+		return false, nil
 	}
 	resolution := analysis.Resolve(offset)
 	return resolution.Role == sqlsymbol.Relation || resolution.Role == sqlsymbol.Column, nil

@@ -93,7 +93,7 @@ upstream `go install ...@latest` command does not include this local integration
 #### InterBase editor features
 
 On an InterBase connection sqls reads the database's own catalog and uses it in
-five editor surfaces. Everything here is automatic: there are no settings, and
+six editor surfaces. Everything here is automatic: there are no settings, and
 each feature silently falls back to its ordinary behaviour when the catalog is
 not available — on another driver, on a build without the InterBase tag, and in
 the short window after connecting before the catalog has been read.
@@ -122,6 +122,25 @@ Procedure **input parameter names** are deliberately not completed: InterBase
 DSQL has no named parameters, so a parameter name is never valid text in a
 statement. They appear in signature help and hover instead. Triggers are not
 completed either — no SQL context in which sqls completes ever names one.
+
+##### Procedure navigation and rename
+
+For the active InterBase dialect, sqls resolves declared procedure variables
+and input/output parameters across the containing procedure. Both bare and
+colon-prefixed references are supported in their applicable statement contexts.
+Rename preserves each occurrence's prefix and distinguishes local assignments
+from SQL column targets.
+
+In Neovim's standard LSP mappings, `grr` finds references and `grn` renames.
+Use your go-to-definition mapping (commonly `gd`) for local declarations or
+catalog-backed table/column definitions. Local references and rename cover the
+containing procedure in the current document. Ambiguous rename requests are
+rejected rather than applying a partial spelling-based replacement.
+
+Table/column definitions require metadata from the active connection and
+reproducible DDL. They use the existing source-snapshot storage and cleanup.
+The client needs a rebuilt native `sqls` binary and a restart to advertise the
+new references capability.
 
 **Signature help.** Typing an argument list for a known procedure shows its
 input parameters and highlights the one under the cursor, both for
@@ -172,11 +191,12 @@ reopened.
 
 ##### Go-to-definition for database-resident source
 
-Procedures, views and triggers keep their source in the database, not in a file
-on disk. `textDocument/definition` therefore materialises that source as a
-**read-only snapshot file** and returns an ordinary `file://` location, so any
-editor that can open a file can follow the jump — no client-side content
-provider and no custom URI scheme.
+Procedures, views, triggers and tables keep their source or DDL in the database,
+not in a file on disk. `textDocument/definition` materialises that source as a
+**read-only snapshot file**; table and column targets resolve to the
+corresponding declaration in that snapshot. It returns an ordinary `file://`
+location, so any editor that can open a file can follow the jump — no
+client-side content provider and no custom URI scheme.
 
 Snapshots live under the user cache directory, in
 `sqls/interbase-sources/<hash>-<pid>/<kind>/<name>.sql`. On Linux that is

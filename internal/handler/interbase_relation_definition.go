@@ -162,6 +162,20 @@ func (s *Server) interBaseRelationDefinition(ctx context.Context, repo database.
 	if s.snapshots == nil || repo == nil {
 		return nil, nil
 	}
+	if _, ok := repo.(database.DDLRepository); !ok {
+		return nil, nil
+	}
+	analysis, err := sqlsymbol.Analyze(text, dv)
+	if err != nil {
+		return nil, err
+	}
+	return s.interBaseRelationDefinitionWithAnalysis(ctx, repo, cache, text, pos, dv, analysis)
+}
+
+func (s *Server) interBaseRelationDefinitionWithAnalysis(ctx context.Context, repo database.DBRepository, cache *database.DBCache, text string, pos lsp.Position, dv dialect.DriverVariant, analysis *sqlsymbol.Analysis) (lsp.Definition, error) {
+	if s.snapshots == nil || repo == nil {
+		return nil, nil
+	}
 	ddlRepo, ok := repo.(database.DDLRepository)
 	if !ok {
 		return nil, nil
@@ -169,10 +183,6 @@ func (s *Server) interBaseRelationDefinition(ctx context.Context, repo database.
 	offset, ok := symbolOffset(text, pos)
 	if !ok {
 		return nil, nil
-	}
-	analysis, err := sqlsymbol.Analyze(text, dv)
-	if err != nil {
-		return nil, err
 	}
 	resolution := analysis.Resolve(offset)
 	if resolution.SQL == nil {
@@ -216,12 +226,26 @@ func (s *Server) interBaseRelationDefinition(ctx context.Context, repo database.
 // catalog source remains a useful definition target. Column references still
 // require a proven declaration span in generated DDL.
 func (s *Server) interBaseContextualDefinition(ctx context.Context, repo database.DBRepository, cache *database.DBCache, text string, pos lsp.Position, dv dialect.DriverVariant) (lsp.Definition, error) {
+	if s.snapshots == nil || repo == nil {
+		return nil, nil
+	}
+	if _, ok := repo.(database.DDLRepository); !ok {
+		return nil, nil
+	}
+	analysis, err := sqlsymbol.Analyze(text, dv)
+	if err != nil {
+		return nil, err
+	}
+	return s.interBaseContextualDefinitionWithAnalysis(ctx, repo, cache, text, pos, dv, analysis)
+}
+
+func (s *Server) interBaseContextualDefinitionWithAnalysis(ctx context.Context, repo database.DBRepository, cache *database.DBCache, text string, pos lsp.Position, dv dialect.DriverVariant, analysis *sqlsymbol.Analysis) (lsp.Definition, error) {
 	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{Position: pos}}
-	target, ok := resolveSnapshotTargetWithVariant(text, params, cache, dv)
+	target, ok := resolveSnapshotTargetWithAnalysis(text, params, cache, dv, analysis)
 	if ok && target.kind == database.ObjectKindView && target.column == nil {
 		return s.interBaseDefinitionWithVariant(ctx, repo, cache, params, text, dv)
 	}
-	return s.interBaseRelationDefinition(ctx, repo, cache, text, pos, dv)
+	return s.interBaseRelationDefinitionWithAnalysis(ctx, repo, cache, text, pos, dv, analysis)
 }
 
 func snapshotBodyOffset(content string, bannerLines int) int {

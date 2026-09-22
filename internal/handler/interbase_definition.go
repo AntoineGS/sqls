@@ -48,12 +48,23 @@ func resolveSnapshotTarget(text string, params lsp.DefinitionParams, dbCache *da
 }
 
 func resolveSnapshotTargetWithVariant(text string, params lsp.DefinitionParams, dbCache *database.DBCache, dv dialect.DriverVariant) (snapshotTarget, bool) {
+	if dv.Driver != dialect.DatabaseDriverInterBase || dbCache == nil {
+		return snapshotTarget{}, false
+	}
+	analysis, err := sqlsymbol.Analyze(text, dv)
+	if err != nil {
+		return snapshotTarget{}, false
+	}
+	return resolveSnapshotTargetWithAnalysis(text, params, dbCache, dv, analysis)
+}
+
+func resolveSnapshotTargetWithAnalysis(text string, params lsp.DefinitionParams, dbCache *database.DBCache, dv dialect.DriverVariant, analysis *sqlsymbol.Analysis) (snapshotTarget, bool) {
 	driver := dv.Driver
 	if driver != dialect.DatabaseDriverInterBase || dbCache == nil {
 		return snapshotTarget{}, false
 	}
 	if offset, valid := symbolOffset(text, params.Position); valid {
-		if analysis, err := sqlsymbol.Analyze(text, dv); err == nil {
+		if analysis != nil {
 			resolution := analysis.Resolve(offset)
 			if resolution.Role == sqlsymbol.Relation || (resolution.Role == sqlsymbol.Column && resolution.SQL != nil && len(resolution.SQL.Scopes) > 0) {
 				if resolution.SQL == nil {
