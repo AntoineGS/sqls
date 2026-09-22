@@ -111,17 +111,27 @@ func Coalesce(str ...string) string {
 
 func TableDoc(tableName string, cols []*ColumnDesc) string {
 	buf := new(bytes.Buffer)
-	fmt.Fprintf(buf, "# `%s` table", tableName)
+	fmt.Fprintf(buf, "# %s table", codeSpan(tableName))
 	fmt.Fprintln(buf)
 	fmt.Fprintln(buf)
 	fmt.Fprintln(buf)
+	writeColumnTable(buf, cols)
+	return buf.String()
+}
+
+func writeColumnTable(buf *bytes.Buffer, cols []*ColumnDesc) {
 	fmt.Fprintln(buf, "| Name&nbsp;&nbsp; | Type&nbsp;&nbsp; | Primary&nbsp;key&nbsp;&nbsp; | Default&nbsp;&nbsp; | Extra&nbsp;&nbsp; |")
 	fmt.Fprintln(buf, "| :--------------- | :--------------- | :---------------------- | :------------------ | :---------------- |")
 	for _, col := range cols {
-		fmt.Fprintf(buf, "| `%s` | `%s` | `%s` | `%s` | %s |", col.Name, col.Type, col.Key, Coalesce(col.Default.String, "-"), col.Extra)
+		fmt.Fprintf(buf, "| %s | %s | %s | %s | %s |",
+			tableCellCode(col.Name),
+			tableCellCode(col.Type),
+			tableCellCode(col.Key),
+			tableCellCode(Coalesce(col.Default.String, "-")),
+			tableCellText(col.Extra),
+		)
 		fmt.Fprintln(buf)
 	}
-	return buf.String()
 }
 
 func SubqueryDoc(name string, views []*parseutil.SubQueryView, dbCache *DBCache) string {
