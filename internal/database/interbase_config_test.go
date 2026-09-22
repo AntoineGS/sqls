@@ -477,3 +477,52 @@ func TestInterBaseConnectionConfigRejectsInvalidSettings(t *testing.T) {
 		t.Fatal("interBaseConnectionConfig() accepted TLS without a host")
 	}
 }
+
+func TestInterBaseValidatesDatabaseSwitch(t *testing.T) {
+	const attachment = "db.example.test/3050:/srv/interbase/centrale.ib"
+	ctx := context.Background()
+	repository := &InterBaseDBRepository{DatabaseName: attachment}
+
+	if err := repository.ValidateDatabaseSwitch(ctx, attachment); err != nil {
+		t.Fatalf("ValidateDatabaseSwitch(current) error = %v, want nil", err)
+	}
+	if err := repository.ValidateDatabaseSwitch(ctx, "  "+attachment+"  "); err != nil {
+		t.Fatalf("ValidateDatabaseSwitch(padded current) error = %v, want nil", err)
+	}
+
+	err := repository.ValidateDatabaseSwitch(ctx, "/srv/interbase/other.ib")
+	if err == nil {
+		t.Fatal("ValidateDatabaseSwitch(other) returned nil error")
+	}
+	for _, want := range []string{"single attachment", "another connection"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("ValidateDatabaseSwitch(other) error = %q, want mention %q", err, want)
+		}
+	}
+
+	// Without a known identity the connection keeps today's permissive behavior
+	// rather than blocking the user on a build path that cannot tell.
+	if err := (&InterBaseDBRepository{}).ValidateDatabaseSwitch(ctx, "anything"); err != nil {
+		t.Fatalf("ValidateDatabaseSwitch() on an anonymous repository error = %v, want nil", err)
+	}
+}
+
+func TestOnlyInterBaseConstrainsDatabaseSwitching(t *testing.T) {
+	var _ DatabaseSwitchRepository = (*InterBaseDBRepository)(nil)
+
+	repositories := map[string]DBRepository{
+		"mysql":      NewMySQLDBRepository(nil),
+		"postgresql": NewPostgreSQLDBRepository(nil),
+		"sqlite3":    NewSQLite3DBRepository(nil),
+		"mssql":      NewMssqlDBRepository(nil),
+		"h2":         NewH2DBRepository(nil),
+		"vertica":    NewVerticaDBRepository(nil),
+		"oracle":     NewOracleDBRepository(nil),
+		"mock":       NewMockDBRepository(nil),
+	}
+	for name, repository := range repositories {
+		if _, ok := repository.(DatabaseSwitchRepository); ok {
+			t.Errorf("%s repository implements DatabaseSwitchRepository; the switch guard must stay InterBase-only", name)
+		}
+	}
+}

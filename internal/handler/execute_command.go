@@ -503,6 +503,17 @@ func (s *Server) showSchemas(ctx context.Context, params lsp.ExecuteCommandParam
 	return strings.Join(schemas, "\n"), nil
 }
 
+// validateDatabaseSwitch asks the repository whether it can serve dbName.
+// Repositories that do not implement database.DatabaseSwitchRepository accept
+// every name, which is the behavior every driver had before InterBase.
+func validateDatabaseSwitch(ctx context.Context, repo database.DBRepository, dbName string) error {
+	switcher, ok := repo.(database.DatabaseSwitchRepository)
+	if !ok {
+		return nil
+	}
+	return switcher.ValidateDatabaseSwitch(ctx, dbName)
+}
+
 func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
@@ -512,6 +523,22 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	dbName, ok := params.Arguments[0].(string)
 	if !ok {
 		return nil, fmt.Errorf("specify the db name as a string")
+	}
+
+	// Only consult an open connection. With none open, switchDatabase is how a
+	// user selects the database to connect to, so there is nothing to validate.
+	// newDBRepository takes stateMu internally, so this is safe to call while
+	// holding only connMu.
+	repo, err := s.newDBRepository(ctx)
+	switch {
+	case errors.Is(err, ErrNoConnection):
+		// fall through: nothing to validate yet.
+	case err != nil:
+		return nil, err
+	default:
+		if err := validateDatabaseSwitch(ctx, repo, dbName); err != nil {
+			return nil, err
+		}
 	}
 
 	// Change current database

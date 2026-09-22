@@ -437,3 +437,47 @@ func TestShowConnectionWarnings(t *testing.T) {
 		s.showConnectionWarnings(context.Background(), nil)
 	})
 }
+
+func TestSwitchDatabaseGuardRefusesAnotherAttachment(t *testing.T) {
+	const attachment = "db.example.test/3050:/srv/interbase/centrale.ib"
+	ctx := context.Background()
+	repository := &database.InterBaseDBRepository{DatabaseName: attachment}
+
+	if err := validateDatabaseSwitch(ctx, repository, attachment); err != nil {
+		t.Fatalf("validateDatabaseSwitch(current) error = %v, want nil", err)
+	}
+	if err := validateDatabaseSwitch(ctx, repository, "/srv/interbase/other.ib"); err == nil {
+		t.Fatal("validateDatabaseSwitch(other) returned nil error")
+	}
+	if err := validateDatabaseSwitch(ctx, &database.MockDBRepository{}, "world"); err != nil {
+		t.Fatalf("a repository without the capability must accept any name: %v", err)
+	}
+}
+
+// TestSwitchDatabaseRefusesAnotherAttachmentAndLeavesStateUnchanged exercises
+// the actual (*Server).switchDatabase, not just the pure guard helpers above:
+// a wiring bug that runs the guard too late, or after curDBName is already
+// mutated, would pass those unit tests but corrupt server state here.
+func TestSwitchDatabaseRefusesAnotherAttachmentAndLeavesStateUnchanged(t *testing.T) {
+	const attachment = "db.example.test/3050:/srv/interbase/centrale.ib"
+	s := NewServer()
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase}
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, DatabaseName: attachment}
+	s.curDBName = attachment
+
+	_, err := s.switchDatabase(context.Background(), lsp.ExecuteCommandParams{
+		Arguments: []interface{}{"/srv/interbase/other.ib"},
+	})
+	if err == nil {
+		t.Fatal("switchDatabase(other) returned nil error")
+	}
+	if !strings.Contains(err.Error(), "single attachment") {
+		t.Errorf("switchDatabase(other) error = %q, want mention of the single-attachment refusal", err)
+	}
+	if s.curDBName != attachment {
+		t.Fatalf("curDBName = %q after a refused switch, want it to stay %q", s.curDBName, attachment)
+	}
+	if s.dbConn == nil || s.dbConn.DatabaseName != attachment {
+		t.Fatal("dbConn was replaced by a refused switch")
+	}
+}

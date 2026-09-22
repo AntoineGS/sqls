@@ -318,6 +318,20 @@ func (db *InterBaseDBRepository) Databases(context.Context) ([]string, error) {
 	return []string{db.DatabaseName}, nil
 }
 
+var _ DatabaseSwitchRepository = (*InterBaseDBRepository)(nil)
+
+// ValidateDatabaseSwitch accepts the attachment this connection already holds —
+// switching to it is a harmless refresh — and refuses anything else, because an
+// InterBase attachment cannot move to another database. Names are compared
+// verbatim apart from surrounding blanks: an attachment string contains a file
+// path, which is case sensitive on the servers sqls supports.
+func (db *InterBaseDBRepository) ValidateDatabaseSwitch(_ context.Context, name string) error {
+	if db.DatabaseName == "" || strings.TrimSpace(name) == strings.TrimSpace(db.DatabaseName) {
+		return nil
+	}
+	return errors.New("interbase: this connection has a single attachment; configure another connection to open a different database")
+}
+
 // InterBase does not have a schema namespace in the same sense as the other
 // supported servers. The empty schema keeps the shared cache and completion
 // paths usable without inventing a server-side name.
