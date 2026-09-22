@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -194,4 +195,133 @@ func TestInterBaseCharsetAllowlistMatchesDriverNormalizer(t *testing.T) {
 	}); err == nil {
 		t.Error("driver accepted charset LATIN1 that sqls rejects; the allowlists have drifted")
 	}
+}
+
+func TestInterBaseDriverConfigIsAcceptedByConnector(t *testing.T) {
+	// NewConnector validates the whole configuration, including the composed
+	// attachment string, without dialing (interbase.go:114-139). This is the
+	// guard that sqls's mapping produces something the driver accepts.
+	cfg := &DBConfig{
+		Driver: dialect.DatabaseDriverInterBase,
+		Host:   "db.example.test",
+		Path:   "/srv/interbase/example.ib",
+		User:   "alice",
+		Passwd: "do-not-log",
+		InterBase: &InterBaseConfig{
+			Role:           "SQLS_READONLY",
+			ConnectTimeout: "10s",
+			TLS: &InterBaseTLSConfig{
+				Enabled:              true,
+				ServerPublicFile:     "/etc/interbase/server.pem",
+				ClientPassPhraseFile: "/etc/interbase/client.pass",
+			},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("DBConfig.Validate() error = %v", err)
+	}
+	connCfg, err := interBaseConnectionConfig(cfg)
+	if err != nil {
+		t.Fatalf("interBaseConnectionConfig() error = %v", err)
+	}
+	if _, err := interbase.NewConnector(interBaseDriverConfig(connCfg, 3)); err != nil {
+		t.Fatalf("driver rejected the mapped TLS configuration: %v", err)
+	}
+
+	// The same settings without a host are what sqls refuses in validation; the
+	// driver refuses them too, so the two agree on the rule.
+	connCfg.Host = ""
+	if _, err := interbase.NewConnector(interBaseDriverConfig(connCfg, 3)); err == nil {
+		t.Fatal("driver accepted TLS options with no host")
+	}
+}
+
+// TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct inspects the actual
+// interbase.Config/interbase.TLSConfig values interBaseDriverConfig builds,
+// field by field, with no network involved. This is deliberately not a
+// "connection accepted" check: NewConnector would happily accept a Host with
+// TLS silently dropped (it just composes a plain, unencrypted attachment), so
+// only inspecting the struct itself proves every setting actually reached the
+// driver's configuration.
+func TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct(t *testing.T) {
+	connCfg := interBaseConnConfig{
+		Database:       "/srv/interbase/example.ib",
+		Host:           "db.example.test/3050",
+		User:           "alice",
+		Password:       "secret",
+		Role:           "SQLS_READONLY",
+		Charset:        "UTF8",
+		ConnectTimeout: 10 * time.Second,
+		TLS: interBaseTLSSettings{
+			Enabled:              true,
+			ServerPublicFile:     "/etc/interbase/server.pem",
+			ServerPublicPath:     "/etc/interbase/certs",
+			ClientCertFile:       "/etc/interbase/client.pem",
+			ClientPassPhrase:     "do-not-log",
+			ClientPassPhraseFile: "/etc/interbase/client.pass",
+		},
+	}
+
+	got := interBaseDriverConfig(connCfg, 3)
+	want := interbase.Config{
+		Database:       "/srv/interbase/example.ib",
+		Host:           "db.example.test/3050",
+		User:           "alice",
+		Password:       "secret",
+		Role:           "SQLS_READONLY",
+		Charset:        "UTF8",
+		Dialect:        3,
+		ConnectTimeout: 10 * time.Second,
+		TLS: interbase.TLSConfig{
+			Enabled:              true,
+			ServerPublicFile:     "/etc/interbase/server.pem",
+			ServerPublicPath:     "/etc/interbase/certs",
+			ClientCertFile:       "/etc/interbase/client.pem",
+			ClientPassPhrase:     "do-not-log",
+			ClientPassPhraseFile: "/etc/interbase/client.pass",
+		},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("interBaseDriverConfig() = %#v, want %#v", got, want)
+	}
+}
+
+// TestInterBaseDriverConfigFieldsAreAllKnown fails the moment interbase.Config
+// or interbase.TLSConfig gains, loses or renames a field. Without this guard a
+// new driver field would silently stay at its zero value forever: the same
+// "validated but never reaches the driver" failure interBaseConnectionConfig
+// and interBaseDriverConfig exist to prevent, generalized to fields sqls
+// hasn't been taught about yet.
+//
+// EncryptedPassword, SystemEncryptionPassword and TransactionOptions are
+// listed but deliberately left unmapped by interBaseDriverConfig: the spec
+// defers all three (docs/superpowers/specs/2026-09-19-interbase-dialect-and-catalog-design.md).
+// If one of those three is ever removed from interbase.Config, or a field
+// this list does not name appears, this test must fail and interBaseDriverConfig
+// must be updated alongside it.
+func TestInterBaseDriverConfigFieldsAreAllKnown(t *testing.T) {
+	wantConfigFields := []string{
+		"Database", "Host", "User", "Password", "Role",
+		"EncryptedPassword", "SystemEncryptionPassword", "Charset", "Dialect",
+		"ConnectTimeout", "TLS", "TransactionOptions",
+	}
+	if got := interBaseStructFieldNames(reflect.TypeOf(interbase.Config{})); !reflect.DeepEqual(got, wantConfigFields) {
+		t.Fatalf("interbase.Config fields = %v, want %v (update interBaseDriverConfig and this list together)", got, wantConfigFields)
+	}
+
+	wantTLSFields := []string{
+		"Enabled", "ServerPublicFile", "ClientCertFile", "ClientPassPhrase",
+		"ClientPassPhraseFile", "ServerPublicPath",
+	}
+	if got := interBaseStructFieldNames(reflect.TypeOf(interbase.TLSConfig{})); !reflect.DeepEqual(got, wantTLSFields) {
+		t.Fatalf("interbase.TLSConfig fields = %v, want %v (update interBaseDriverConfig and this list together)", got, wantTLSFields)
+	}
+}
+
+func interBaseStructFieldNames(t reflect.Type) []string {
+	names := make([]string, t.NumField())
+	for i := range names {
+		names[i] = t.Field(i).Name
+	}
+	return names
 }

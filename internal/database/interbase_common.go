@@ -20,10 +20,13 @@ func init() {
 	RegisterConnFactory(dialect.DatabaseDriverInterBase, NewInterBaseDBRepositoryFromConnection)
 }
 
-// interBaseAttachment converts the existing DBConfig fields to the native
-// InterBase attachment format. DataSourceName is already an attachment
-// string; otherwise Path (or DBName for compatibility with existing configs)
-// is used as the database path.
+// interBaseAttachment composes the display attachment string. Its output is
+// pinned by existing tests and is what the user sees in showDatabases and
+// showConnections, so it must not gain TLS parameters.
+//
+// interBaseConnectionConfig mirrors this composition in structured form for the
+// driver. TestInterBaseDriverConfigMapping pins the two together by recomposing
+// Host + ":" + Database; add a case there when adding a branch here.
 func interBaseAttachment(cfg *DBConfig) (string, error) {
 	if cfg == nil {
 		return "", errors.New("interbase: connection config is nil")
@@ -189,6 +192,81 @@ func interBaseTLS(cfg *DBConfig) (interBaseTLSSettings, error) {
 		return interBaseTLSSettings{}, errors.New("invalid: connections[].interbase.tls requires connections[].host")
 	}
 	return tls, nil
+}
+
+// interBaseConnConfig is the driver-neutral projection of a DBConfig onto the
+// fields interbase.Config exposes. It exists because the driver's package needs
+// cgo and the interbase build tag, while this mapping and its tests must build
+// with plain `go test ./...`; interbase_native.go copies it field-for-field.
+type interBaseConnConfig struct {
+	Database       string
+	Host           string
+	User           string
+	Password       string
+	Role           string
+	Charset        string
+	ConnectTimeout time.Duration
+	TLS            interBaseTLSSettings
+}
+
+// interBaseConnectionConfig maps the connection settings onto the driver's
+// structured configuration. Host and Database are handed over separately so the
+// driver composes the attachment itself, which is the only way TLS options can
+// be carried (interbase.go:185-239). A dataSourceName stays a raw attachment
+// string with no host, exactly as before.
+//
+// This mirrors interBaseAttachment's composition in structured form rather than
+// sharing it, because interBaseAttachment must keep producing the exact display
+// string its existing tests pin. TestInterBaseDriverConfigMapping recomposes
+// Host + ":" + Database and asserts it equals interBaseAttachment's output for
+// every case, so add a case there when adding a branch to either function.
+func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
+	// Shares the proto, port, host and path validation with DBConfig.Validate.
+	if _, err := interBaseAttachment(cfg); err != nil {
+		return interBaseConnConfig{}, err
+	}
+	charset, err := interBaseCharset(cfg)
+	if err != nil {
+		return interBaseConnConfig{}, err
+	}
+	role, err := interBaseRole(cfg)
+	if err != nil {
+		return interBaseConnConfig{}, err
+	}
+	connectTimeout, err := interBaseConnectTimeout(cfg)
+	if err != nil {
+		return interBaseConnConfig{}, err
+	}
+	tls, err := interBaseTLS(cfg)
+	if err != nil {
+		return interBaseConnConfig{}, err
+	}
+
+	conn := interBaseConnConfig{
+		User:           cfg.User,
+		Password:       cfg.Passwd,
+		Role:           role,
+		Charset:        charset,
+		ConnectTimeout: connectTimeout,
+		TLS:            tls,
+	}
+	if cfg.DataSourceName != "" {
+		conn.Database = cfg.DataSourceName
+		return conn, nil
+	}
+
+	conn.Database = cfg.Path
+	if conn.Database == "" {
+		conn.Database = cfg.DBName
+	}
+	if cfg.Host != "" {
+		port := cfg.Port
+		if port == 0 {
+			port = interBaseDefaultPort
+		}
+		conn.Host = fmt.Sprintf("%s/%d", cfg.Host, port)
+	}
+	return conn, nil
 }
 
 type InterBaseDBRepository struct {

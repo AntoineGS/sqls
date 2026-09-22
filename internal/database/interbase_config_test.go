@@ -305,3 +305,151 @@ interbase:
 		t.Fatalf("interBaseConnectTimeout() = (%v, %v), want (10s, nil)", timeout, err)
 	}
 }
+
+func TestInterBaseDriverConfigMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  *DBConfig
+		want interBaseConnConfig
+	}{
+		{
+			name: "local path attaches without a host",
+			cfg: &DBConfig{
+				Driver: dialect.DatabaseDriverInterBase,
+				Path:   "/var/lib/interbase/example.ib",
+				User:   "alice",
+				Passwd: "secret",
+			},
+			want: interBaseConnConfig{
+				Database: "/var/lib/interbase/example.ib",
+				User:     "alice",
+				Password: "secret",
+				Charset:  "UTF8",
+			},
+		},
+		{
+			name: "host and explicit port",
+			cfg: &DBConfig{
+				Driver: dialect.DatabaseDriverInterBase,
+				Host:   "db.example.test",
+				Port:   3307,
+				Path:   "/srv/interbase/example.ib",
+				User:   "alice",
+			},
+			want: interBaseConnConfig{
+				Host:     "db.example.test/3307",
+				Database: "/srv/interbase/example.ib",
+				User:     "alice",
+				Charset:  "UTF8",
+			},
+		},
+		{
+			name: "host defaults the port and falls back to dbName",
+			cfg: &DBConfig{
+				Driver: dialect.DatabaseDriverInterBase,
+				Host:   "db.example.test",
+				DBName: "example.ib",
+				User:   "alice",
+			},
+			want: interBaseConnConfig{
+				Host:     "db.example.test/3050",
+				Database: "example.ib",
+				User:     "alice",
+				Charset:  "UTF8",
+			},
+		},
+		{
+			name: "dataSourceName stays a raw attachment with no host",
+			cfg: &DBConfig{
+				Driver:         dialect.DatabaseDriverInterBase,
+				DataSourceName: "db.example.test/3050:/srv/interbase/example.ib",
+				User:           "alice",
+				Params:         map[string]string{"charset": "ascii"},
+			},
+			want: interBaseConnConfig{
+				Database: "db.example.test/3050:/srv/interbase/example.ib",
+				User:     "alice",
+				Charset:  "ASCII",
+			},
+		},
+		{
+			name: "role, timeout and tls reach the driver",
+			cfg: &DBConfig{
+				Driver: dialect.DatabaseDriverInterBase,
+				Host:   "db.example.test",
+				Path:   "/srv/interbase/example.ib",
+				User:   "alice",
+				InterBase: &InterBaseConfig{
+					Role:           "SQLS_READONLY",
+					ConnectTimeout: "10s",
+					TLS: &InterBaseTLSConfig{
+						Enabled:              true,
+						ServerPublicFile:     "/etc/interbase/server.pem",
+						ClientPassPhraseFile: "/etc/interbase/client.pass",
+					},
+				},
+			},
+			want: interBaseConnConfig{
+				Host:           "db.example.test/3050",
+				Database:       "/srv/interbase/example.ib",
+				User:           "alice",
+				Role:           "SQLS_READONLY",
+				Charset:        "UTF8",
+				ConnectTimeout: 10 * time.Second,
+				TLS: interBaseTLSSettings{
+					Enabled:              true,
+					ServerPublicFile:     "/etc/interbase/server.pem",
+					ClientPassPhraseFile: "/etc/interbase/client.pass",
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := test.cfg.Validate(); err != nil {
+				t.Fatalf("DBConfig.Validate() error = %v", err)
+			}
+			got, err := interBaseConnectionConfig(test.cfg)
+			if err != nil {
+				t.Fatalf("interBaseConnectionConfig() error = %v", err)
+			}
+			if !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("interBaseConnectionConfig() = %#v, want %#v", got, test.want)
+			}
+
+			// Without TLS the driver composes Host + ":" + Database
+			// (interbase.go:209-235), which must reproduce the attachment sqls
+			// built by hand and still displays. This is the behavior-preservation
+			// guard for moving to structured host/database.
+			attachment, err := interBaseAttachment(test.cfg)
+			if err != nil {
+				t.Fatalf("interBaseAttachment() error = %v", err)
+			}
+			composed := got.Database
+			if got.Host != "" {
+				composed = got.Host + ":" + got.Database
+			}
+			if composed != attachment {
+				t.Errorf("structured mapping composes %q, want the display attachment %q", composed, attachment)
+			}
+		})
+	}
+}
+
+func TestInterBaseConnectionConfigRejectsInvalidSettings(t *testing.T) {
+	if _, err := interBaseConnectionConfig(nil); err == nil {
+		t.Fatal("interBaseConnectionConfig(nil) returned nil error")
+	}
+	cfg := &DBConfig{
+		Driver: dialect.DatabaseDriverInterBase,
+		Path:   "/srv/interbase/example.ib",
+		User:   "alice",
+		InterBase: &InterBaseConfig{
+			TLS: &InterBaseTLSConfig{Enabled: true},
+		},
+	}
+	if _, err := interBaseConnectionConfig(cfg); err == nil {
+		t.Fatal("interBaseConnectionConfig() accepted TLS without a host")
+	}
+}
