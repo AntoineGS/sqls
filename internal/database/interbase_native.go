@@ -107,3 +107,29 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 		Warnings:     decision.Warnings,
 	}, nil
 }
+
+var _ ExplainRepository = (*InterBaseDBRepository)(nil)
+
+// ExplainPlan returns the server's query plan without executing the
+// statement's result set. It acquires its own *sql.Conn because the plan is
+// read from the prepared statement on that connection, and it returns the plan
+// text unchanged.
+//
+// This is an interactive one-shot outside any cache build, so it uses the
+// pooled *sql.DB rather than a catalog snapshot.
+func (db *InterBaseDBRepository) ExplainPlan(ctx context.Context, query string) (string, error) {
+	if db == nil || db.Conn == nil {
+		return "", errors.New("interbase: database connection is nil")
+	}
+	conn, err := db.Conn.Conn(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = conn.Close() }()
+
+	plan, err := interbase.Plan(ctx, conn, query)
+	if err != nil {
+		return "", fmt.Errorf("interbase: explain plan: %w", err)
+	}
+	return plan, nil
+}
