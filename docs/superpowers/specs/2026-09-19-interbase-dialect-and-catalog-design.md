@@ -1533,6 +1533,20 @@ configuration API (README.md:328) is replaced by item 3.
    a name-only relation projection for `SchemaTables`, a single-query columns
    projection across all relations, and a constraint projection that returns
    segment names without a per-index round trip.
+
+   **Status, 2026-09-22: the escalation trigger fired.** Measured through this
+   driver in one read-only transaction, the combined catalog APIs cost 98.076 s
+   over 10,295 statements on NRF01 and 6.922 s over 1,162 statements on
+   `centrale`, both above the thresholds above
+   (`~/.local/share/sqls/catalog-loading/`). The fix taken, with the user's
+   decision, is the three projections listed here — relation names, all columns
+   at once, and key fields without a per-index round trip — written in sqls
+   (`internal/database/interbase_cache_bulk.go`) rather than in the driver,
+   because the driver is a separate repository and the existing MDExplorer bulk
+   loaders were available as a proven reference. It is confined to what a
+   `CatalogSnapshot` serves a cache build: every other repository read, and
+   every extended catalog accessor, still goes through the driver's `schema`
+   package. The driver-side projection remains the better long-term home.
 2. **Type-rendering regressions.** Moving from a nine-case switch to
    `Domain.SQLType()` changes strings users see. Mitigated structurally rather
    than by vigilance: the existing switch is *retained* as the fallback (§4.3

@@ -281,9 +281,9 @@ type InterBaseDBRepository struct {
 
 	// snapshot is set only on a repository returned by CatalogSnapshot. It
 	// binds this repository to one read-only transaction that has already read
-	// relations and constraints. The source repository is never mutated, so a
-	// cache build on the worker goroutine cannot race a ReCache on a handler
-	// goroutine.
+	// the cache-visible catalog in bulk. The source repository is never
+	// mutated, so a cache build on the worker goroutine cannot race a ReCache
+	// on a handler goroutine.
 	snapshot *interBaseCatalogSnapshot
 }
 

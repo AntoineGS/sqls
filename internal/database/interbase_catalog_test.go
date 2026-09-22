@@ -1530,11 +1530,15 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 	}
 }
 
-func TestInterBaseCatalogSnapshotHalvesThePerRelationReads(t *testing.T) {
+func TestInterBaseCatalogSnapshotIssuesFewerReadsThanTheDirectPath(t *testing.T) {
 	// The reason CatalogSnapshot exists is round-trip count, so count them
 	// rather than asserting the structure and trusting the arithmetic. The
 	// fixture's driver funnels every statement through PrepareContext, so the
 	// counter is the exact number of statements a cache build issues.
+	//
+	// This pins the comparison against the direct path on the hand-written
+	// fixture. That the snapshot's count is a constant rather than merely
+	// smaller is pinned by TestInterBaseSnapshotCacheReadsDoNotGrowWithTheSchema.
 	db := openInterBaseSchemaFixture(t)
 	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
 	ctx := context.Background()
@@ -1553,7 +1557,7 @@ func TestInterBaseCatalogSnapshotHalvesThePerRelationReads(t *testing.T) {
 	}
 	direct := prepares()
 
-	// The snapshot path: one Relations read shared by both.
+	// The snapshot path: one bulk read shared by all three.
 	prepares = interBaseFixtureCountPrepares(t)
 	snapshot, closeSnapshot, err := repo.CatalogSnapshot(ctx)
 	if err != nil {
@@ -1573,12 +1577,12 @@ func TestInterBaseCatalogSnapshotHalvesThePerRelationReads(t *testing.T) {
 	}
 	snapshotted := prepares()
 
-	// Do not pin an exact number: it moves whenever the fixture gains a
-	// relation or a constraint, and the claim is about growth, not a constant.
-	// The per-relation term is what halves, so the snapshot path must issue
-	// strictly fewer statements than the direct path for the same answers.
+	// Do not pin an exact number here: the direct side moves whenever the
+	// fixture gains a relation or a constraint. The claim this test makes is
+	// the comparison — the snapshot must answer the same three calls in
+	// strictly fewer statements than reading each of them directly.
 	if snapshotted >= direct {
-		t.Errorf("snapshot issued %d statements, direct issued %d; the snapshot must share one relation read",
+		t.Errorf("snapshot issued %d statements, direct issued %d; the snapshot must serve the cache build from one bulk read",
 			snapshotted, direct)
 	}
 	t.Logf("catalog reads: direct %d statements, snapshot %d", direct, snapshotted)

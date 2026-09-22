@@ -156,10 +156,14 @@ func interBaseNumericType(base string, naturalPrecision int64, domain *schema.Do
 // interBaseCatalogSnapshot holds one consistent catalog read. A repository
 // carrying one serves every cache-build read from it instead of issuing fresh
 // queries; see CatalogSnapshot.
+//
+// bulk holds the cache-visible metadata, read in a fixed number of statements
+// by interbase_cache_bulk.go. catalog stays bound to the same transaction so
+// the extended catalog accessors — views, procedures, indexes and the rest —
+// read the same instant through the driver's own APIs.
 type interBaseCatalogSnapshot struct {
-	catalog     *schema.Catalog
-	relations   []schema.Relation
-	constraints []schema.Constraint
+	catalog *schema.Catalog
+	bulk    *interBaseBulkCatalog
 }
 
 // catalogReader returns the catalog to read through: the snapshot's
@@ -178,13 +182,21 @@ func (db *InterBaseDBRepository) catalogReader() (*schema.Catalog, error) {
 	return schema.New(db.Conn), nil
 }
 
-// relations returns every user table and view with its ordered columns.
-// Relations issues one column query per relation, so a snapshot reads it once
-// per cache build rather than once per repository method.
-func (db *InterBaseDBRepository) relations(ctx context.Context) ([]schema.Relation, error) {
-	if db != nil && db.snapshot != nil {
-		return db.snapshot.relations, nil
+// bulkCatalog returns the snapshot's cache-visible catalog, or nil on a
+// repository that is not bound to a snapshot. It is the one test every
+// cache-build read makes before falling back to the driver's catalog APIs.
+func (db *InterBaseDBRepository) bulkCatalog() *interBaseBulkCatalog {
+	if db == nil || db.snapshot == nil {
+		return nil
 	}
+	return db.snapshot.bulk
+}
+
+// relations returns every user table and view with its ordered columns. It
+// issues one column query per relation, which is why a cache build reads
+// through a snapshot's bulk catalog instead; this is the standalone
+// repository's path.
+func (db *InterBaseDBRepository) relations(ctx context.Context) ([]schema.Relation, error) {
 	catalog, err := db.catalogReader()
 	if err != nil {
 		return nil, err
@@ -193,12 +205,9 @@ func (db *InterBaseDBRepository) relations(ctx context.Context) ([]schema.Relati
 }
 
 // constraints returns every user-relation constraint with its resolved
-// columns. Constraints loads the enforcing and referenced index per
-// constraint, so the same snapshot rule applies.
+// columns. It loads the enforcing and referenced index per constraint, so the
+// same rule applies: a cache build never reaches it.
 func (db *InterBaseDBRepository) constraints(ctx context.Context) ([]schema.Constraint, error) {
-	if db != nil && db.snapshot != nil {
-		return db.snapshot.constraints, nil
-	}
 	catalog, err := db.catalogReader()
 	if err != nil {
 		return nil, err
@@ -207,12 +216,16 @@ func (db *InterBaseDBRepository) constraints(ctx context.Context) ([]schema.Cons
 }
 
 func (db *InterBaseDBRepository) SchemaTables(ctx context.Context) (map[string][]string, error) {
+	// Tables and views together, exactly as interBaseRelationsQuery returned
+	// them: the extended view cache is additive metadata, not a replacement.
+	if bulk := db.bulkCatalog(); bulk != nil {
+		return map[string][]string{"": bulk.relationNames()}, nil
+	}
+
 	relations, err := db.relations(ctx)
 	if err != nil {
 		return nil, err
 	}
-	// Tables and views together, exactly as interBaseRelationsQuery returned
-	// them: the extended view cache is additive metadata, not a replacement.
 	names := make([]string, 0, len(relations))
 	for _, relation := range relations {
 		names = append(names, relation.Name)
@@ -229,6 +242,18 @@ func (db *InterBaseDBRepository) DescribeDatabaseTableBySchema(ctx context.Conte
 }
 
 func (db *InterBaseDBRepository) describeColumns(ctx context.Context) ([]*ColumnDesc, error) {
+	if bulk := db.bulkCatalog(); bulk != nil {
+		result := make([]*ColumnDesc, 0, bulk.columnCount())
+		for _, relation := range bulk.relations {
+			for _, column := range relation.columns {
+				// A fresh descriptor per call: the snapshot's own data is
+				// never handed to a cache that may outlive or mutate it.
+				result = append(result, db.columnDescription(relation.name, column, bulk.primaryKeys))
+			}
+		}
+		return result, nil
+	}
+
 	relations, err := db.relations(ctx)
 	if err != nil {
 		return nil, err
@@ -618,8 +643,10 @@ func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*Func
 var _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil)
 
 // CatalogSnapshot returns a read-only repository bound to one transaction that
-// has already read every relation and constraint, so a whole cache build costs
-// one catalog read instead of one per method.
+// has already read every relation name, column, primary-key field and
+// foreign-key field mapping the cache shows. A whole cache build then costs
+// the four bulk statements of interbase_cache_bulk.go, whatever the schema's
+// size, instead of a query per relation and several per constraint.
 //
 // The returned repository is new. The receiver is never mutated, because
 // ReCache runs on a handler goroutine while the worker's secondary pass runs
@@ -638,12 +665,10 @@ func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBReposit
 		return nil, nil, err
 	}
 	catalog := schema.New(tx)
-	relations, err := catalog.Relations(ctx, "")
-	if err != nil {
-		_ = tx.Rollback()
-		return nil, nil, err
-	}
-	constraints, err := catalog.Constraints(ctx, "")
+	// Either the whole catalog or none of it: a failed read rolls the
+	// transaction back and returns, so no partially loaded snapshot is ever
+	// served.
+	bulk, err := loadInterBaseBulkCatalog(ctx, tx)
 	if err != nil {
 		_ = tx.Rollback()
 		return nil, nil, err
@@ -654,39 +679,67 @@ func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBReposit
 		SQLDialect:   db.SQLDialect,
 		DatabaseName: db.DatabaseName,
 		snapshot: &interBaseCatalogSnapshot{
-			catalog:     catalog,
-			relations:   relations,
-			constraints: constraints,
+			catalog: catalog,
+			bulk:    bulk,
 		},
 	}
 	// The snapshot is read-only, so rolling back is the whole of closing it.
 	return bound, tx.Rollback, nil
 }
 
+// interBaseForeignKeyMapping is one foreign key's field pairing: the two
+// column lists are the same length and are paired by position, which is the
+// index segment position in both indexes. It is the single shape both the
+// snapshot's bulk read and the direct constraint read render from, so the two
+// cannot drift apart.
+type interBaseForeignKeyMapping struct {
+	relationName           string
+	referencedRelationName string
+	columns                []string
+	referencedColumns      []string
+}
+
+// interBaseForeignKeys renders field mappings onto the shared descriptor.
+// A mapping whose enforcing or referenced fields could not be resolved is
+// dropped whole, rather than returning half of a foreign key.
+func interBaseForeignKeys(mappings []interBaseForeignKeyMapping) []*ForeignKey {
+	foreignKeys := make([]*ForeignKey, 0, len(mappings))
+	for _, mapping := range mappings {
+		if len(mapping.columns) == 0 || len(mapping.columns) != len(mapping.referencedColumns) {
+			continue
+		}
+		foreignKey := new(ForeignKey)
+		for i, column := range mapping.columns {
+			left := &ColumnBase{Schema: "", Table: mapping.relationName, Name: column}
+			right := &ColumnBase{Schema: "", Table: mapping.referencedRelationName, Name: mapping.referencedColumns[i]}
+			*foreignKey = append(*foreignKey, [2]*ColumnBase{left, right})
+		}
+		foreignKeys = append(foreignKeys, foreignKey)
+	}
+	return foreignKeys
+}
+
 func (db *InterBaseDBRepository) DescribeForeignKeysBySchema(ctx context.Context, _ string) ([]*ForeignKey, error) {
+	if bulk := db.bulkCatalog(); bulk != nil {
+		return interBaseForeignKeys(bulk.foreignKeys), nil
+	}
+
 	constraints, err := db.constraints(ctx)
 	if err != nil {
 		return nil, err
 	}
 
-	foreignKeys := make([]*ForeignKey, 0)
+	mappings := make([]interBaseForeignKeyMapping, 0)
 	for _, constraint := range constraints {
 		if !strings.EqualFold(strings.TrimSpace(constraint.ConstraintType), string(schema.ConstraintForeignKey)) {
 			continue
 		}
-		// A constraint whose enforcing or referenced index could not be
-		// resolved carries no column pairing; skipping it drops one foreign
-		// key rather than returning half of one.
-		if len(constraint.Columns) == 0 || len(constraint.Columns) != len(constraint.ReferencedColumns) {
-			continue
-		}
-		foreignKey := new(ForeignKey)
-		for i, column := range constraint.Columns {
-			left := &ColumnBase{Schema: "", Table: constraint.RelationName, Name: column}
-			right := &ColumnBase{Schema: "", Table: constraint.ReferencedRelationName, Name: constraint.ReferencedColumns[i]}
-			*foreignKey = append(*foreignKey, [2]*ColumnBase{left, right})
-		}
-		foreignKeys = append(foreignKeys, foreignKey)
+		mappings = append(mappings, interBaseForeignKeyMapping{
+			relationName:           constraint.RelationName,
+			referencedRelationName: constraint.ReferencedRelationName,
+			columns:                constraint.Columns,
+			referencedColumns:      constraint.ReferencedColumns,
+		})
 	}
-	return foreignKeys, nil
+	return interBaseForeignKeys(mappings), nil
 }
