@@ -265,6 +265,115 @@ shows what the database actually returned.
   and friends run inside an explicit read-committed, read-only transaction that
   is opened and released entirely inside sqls.
 
+### Named query parameters
+
+On an InterBase connection a statement may carry **named parameters** —
+`:EMPLYID` — and sqls asks for their values before running it. The values are
+bound by the driver: the SQL buffer is never edited, and nothing you type is
+ever spliced into the statement text. This needs an editor client that speaks
+the `getQueryParameters` command described under
+[Query parameter protocol](doc/develop.md#query-parameter-protocol); a client
+that does not is unaffected, and a statement with no markers takes the same
+path it always has.
+
+**Grammar.** A marker is `:` followed by `[A-Za-z_][A-Za-z0-9_$]*`. `::` and
+`:=` are not markers, and neither is anything inside a string literal, a quoted
+identifier, a `--` line comment or a `/* */` block comment. Names are
+case-insensitive: `:EMPLYID`, `:emplyid` and `:EmplyId` are **one** parameter,
+prompted once under the spelling that appeared first, and the single value you
+enter is bound to every occurrence.
+
+**Types.** You choose a type per parameter, and the wire spellings are:
+
+| Type | Value format |
+| --- | --- |
+| `text` | any string, including the empty string. Not trimmed |
+| `integer` | `int64`, optional sign. Full 64-bit range, no float rounding |
+| `number` | finite `float64` decimal, exponent allowed |
+| `date` | `2006-01-02` |
+| `timestamp` | `2006-01-02 15:04:05[.fraction]`, up to nine fractional digits |
+| `boolean` | `true` or `false` |
+| `null` | SQL `NULL`; its value must be empty |
+
+Numeric, date, timestamp and boolean values tolerate surrounding whitespace;
+`text` does not, and `null` requires an empty value rather than a blank one.
+`null` and the text `NULL` are different things: the latter is the
+four-character string. A rejected value names the parameter and its type and
+never echoes what you typed.
+
+**Exact decimals: use `text` plus a `CAST`.** `number` is a binary `float64`,
+so an exact `NUMERIC`/`DECIMAL` target can pick up rounding. Enter the digits as
+`text` and let InterBase parse them:
+
+```sql
+SELECT * FROM INVOICE WHERE TOTAL = CAST(:TOTAL AS NUMERIC(18,2));
+```
+
+The same applies above 2^53: `integer` transports the full `int64` losslessly,
+but the *target* type in your SQL decides what survives. Under Dialect 3,
+`CAST(:BIG_ID AS NUMERIC(18,0))` keeps `9007199254740993` exactly; under
+Dialect 1 that same `NUMERIC(18,0)` is a floating type and does not. Casting
+to `VARCHAR` shows the value the driver actually received either way.
+
+**Scope is the selection, and the whole batch is validated first.** Parameters
+are discovered in the selected range, or in the whole document when nothing is
+selected. Once any statement in that selection carries a marker, the entire
+selection must compile before a single statement runs: named markers are
+accepted in `SELECT`, `INSERT`, `UPDATE`, `DELETE`, `EXECUTE PROCEDURE` and
+`WITH`-prefixed `SELECT` only. A PSQL body or DDL anywhere in a
+marker-bearing selection is refused, because there a leading colon is a local
+variable reference and not user input. Bare `?` positional markers are refused
+in this flow as well; a selection with no named markers keeps the ordinary
+unparameterized path, `?` and all.
+
+**Explain never prompts.** `Explain SQL` on a parameterized statement compiles
+the markers to positional placeholders and prepares the statement — a plan
+needs no values, and nothing is bound, executed or written.
+
+**Some servers refuse to prepare a `CAST` around a parameter.** Wrapping a
+marker in a `CAST` — `CAST(:NAME AS VARCHAR(30))` — is how you pin its SQL type
+when nothing else in the statement implies one, and it works on most
+InterBase servers. On some it does not: the server rejects the *prepare* with
+
+> SQLCODE -804: An error was found in the application program input parameters
+> for the SQL statement.
+
+for every target type, while the same server prepares and runs a marker whose
+type it can infer from context, such as `WHERE RDB$RELATION_NAME = :REL_NAME`.
+This is a server-side prepare restriction, not a binding failure: it reproduces
+through `Explain SQL`, which binds nothing at all, and the identical statement
+prepares on another server through the same sqls build. If you hit it, drop the
+`CAST` and let the compared column supply the type.
+
+**Values live in the editor, in memory only.** sqls itself keeps nothing: each
+submission arrives with its own values and is forgotten when the command
+returns. The client is what remembers, so that re-running the same query
+prefills what you last entered. In the Neovim adapter shipped with this
+integration, that memory is per language-server client, keyed by connection and
+by query text, capped at **100 entries with least-recently-used eviction**, and
+never written to disk. Switching connections gives you empty prompts for the
+other connection and switching back restores the first one's values.
+`:SqlsClearParameters` forgets everything remembered for that server, and
+stopping the server clears it too.
+
+**Cancelling a prompt executes nothing.** Dismissing any type or value prompt
+ends the run without sending an execution request. Once the statement is
+running, `$/cancelRequest` applies with the same best-effort semantics as any
+other query.
+
+**A stale answer is refused, not guessed at.** Every prompt carries the
+connection identity, the connection generation, the selected SQL and a hash of
+the whole document. If any of them changed while you were typing — you switched
+connection, reconnected, or edited the file **anywhere**, including outside the
+selection — the submission is rejected with a message telling you to run the
+command again. Nothing is executed. Editing outside the selection is rejected
+deliberately: it is still a version of the document you did not review.
+
+The slow one-time catalog load after connecting to a large database remains a
+**separate, pre-existing** limitation of the InterBase integration. It is not
+caused by this feature and is not fixed by it: the first command after
+connecting still waits for that load, parameter prompts included.
+
 ### `EXECUTE PROCEDURE` limitation
 
 sqls does not yet look at a procedure's signature, so every `EXECUTE PROCEDURE`
@@ -596,9 +705,10 @@ Dialect 1 and as `TIMESTAMP` under Dialect 3. In both dialects, unquoted
 identifiers may contain `$`, positional parameters use `?`, and doubled
 quotes are preserved verbatim by the formatter, so formatting never rewrites
 `'c''d'`. Parsing, completion and formatting use the resolved dialect's
-rules when the selected connection is InterBase. Parameter binding is a
-driver capability; the sqls execute command does not prompt for parameter
-values.
+rules when the selected connection is InterBase. The execute command also
+prompts for the values of any `:NAME` markers in the selection and binds them
+as driver parameters — see
+[Named query parameters](#named-query-parameters).
 
 Completion and hover use tables, views, columns, and primary and foreign
 keys. The cache also holds procedures with their parameters, triggers,
