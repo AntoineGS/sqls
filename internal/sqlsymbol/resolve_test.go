@@ -383,3 +383,69 @@ func BenchmarkAnalyzeMalformedInsertScaling(b *testing.B) {
 		})
 	}
 }
+
+func TestResolveInsertValuesAreNotColumnList(t *testing.T) {
+	text := `ALTER PROCEDURE p(x INTEGER) AS
+BEGIN
+  INSERT INTO t VALUES (x);
+  INSERT INTO t (x) VALUES (x);
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	valuesX := strings.Index(text, "VALUES (x)") + len("VALUES (")
+	if got := a.Resolve(valuesX); got.Role != Ambiguous || got.Symbol != nil {
+		t.Fatalf("VALUES variable = %+v, want ambiguous SQL value", got)
+	}
+	columnX := strings.Index(text, "INSERT INTO t (x)") + len("INSERT INTO t (")
+	if got := a.Resolve(columnX); got.Role != Column {
+		t.Fatalf("explicit column = %+v, want column", got)
+	}
+	if symbol := a.procedures[0].Symbols["X"][0]; symbol.RenameBlocked == "" {
+		t.Fatal("VALUES variable did not block parameter rename")
+	}
+}
+
+func TestResolveExecuteBlockFramesEndAtBlockAndProcedure(t *testing.T) {
+	text := `ALTER PROCEDURE first AS
+DECLARE VARIABLE x INTEGER;
+DECLARE VARIABLE y INTEGER;
+BEGIN
+  EXECUTE BLOCK AS BEGIN
+    SELECT CASE WHEN 1 = 1 THEN 0 ELSE 0 END FROM t;
+    x = 1;
+  END;
+  y = 2;
+END;
+ALTER PROCEDURE second AS
+DECLARE VARIABLE y INTEGER;
+BEGIN
+  y = 3;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := a.procedures[0].Symbols["X"][0]
+	if got := a.Resolve(strings.Index(text, "x = 1")); got.Role != Ambiguous || got.Symbol != nil {
+		t.Fatalf("execute block x = %+v, want ambiguous", got)
+	}
+	if x.RenameBlocked == "" {
+		t.Fatal("execute block x was not rename-blocked")
+	}
+	firstY := a.procedures[0].Symbols["Y"][0]
+	if got := a.Resolve(strings.Index(text, "y = 2")); got.Role != Local || got.Symbol != firstY {
+		t.Fatalf("post-block y = %+v, want first-procedure local", got)
+	}
+	if firstY.RenameBlocked != "" {
+		t.Fatalf("post-block y unexpectedly blocked: %q", firstY.RenameBlocked)
+	}
+	secondY := a.procedures[1].Symbols["Y"][0]
+	if got := a.Resolve(strings.LastIndex(text, "y = 3")); got.Role != Local || got.Symbol != secondY {
+		t.Fatalf("second-procedure y = %+v, want separate local", got)
+	}
+	if secondY.RenameBlocked != "" {
+		t.Fatalf("second-procedure y unexpectedly blocked: %q", secondY.RenameBlocked)
+	}
+}

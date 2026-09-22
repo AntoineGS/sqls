@@ -262,7 +262,11 @@ func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
 			}
 			if isWord(item, "END") && len(unsupportedFrames) > 0 {
 				last := len(unsupportedFrames) - 1
-				if unsupportedFrames[last] == beginFrame {
+				// CASE and BEGIN are typed frames: END closes only the
+				// innermost matching construct, never the outer block by
+				// accident.
+				switch unsupportedFrames[last] {
+				case beginFrame, caseFrame:
 					unsupportedFrames = unsupportedFrames[:last]
 				}
 				if len(unsupportedFrames) == 0 {
@@ -419,6 +423,11 @@ func markSQLPositions(items []lexeme, contexts []tokenContext) {
 			insertState = 3
 		case insertState == 3 && item.Token.Kind == token.LParen:
 			insertState, insertDepth = 4, 1
+		case insertState == 3:
+			// Only an immediately following parenthesis starts an
+			// explicit INSERT column list. VALUES and aliases end the
+			// discovery state.
+			insertState = 0
 		case insertState == 4:
 			switch item.Token.Kind {
 			case token.LParen:
