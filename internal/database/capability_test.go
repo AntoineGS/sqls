@@ -167,9 +167,9 @@ func TestCapabilityDescriptorShape(t *testing.T) {
 
 func TestInterBaseRepositoryImplementsCapabilities(t *testing.T) {
 	var (
-		_ CatalogRepository = (*InterBaseDBRepository)(nil)
-		// _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil) // Task 8
-		_ DDLRepository = (*InterBaseDBRepository)(nil)
+		_ CatalogRepository         = (*InterBaseDBRepository)(nil)
+		_ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil)
+		_ DDLRepository             = (*InterBaseDBRepository)(nil)
 	)
 
 	repository := DBRepository(&InterBaseDBRepository{})
@@ -179,10 +179,9 @@ func TestInterBaseRepositoryImplementsCapabilities(t *testing.T) {
 	if _, ok := repository.(DDLRepository); !ok {
 		t.Error("*InterBaseDBRepository must implement DDLRepository")
 	}
-	// Task 8:
-	// if _, ok := repository.(CatalogSnapshotRepository); !ok {
-	// 	t.Error("*InterBaseDBRepository must implement CatalogSnapshotRepository")
-	// }
+	if _, ok := repository.(CatalogSnapshotRepository); !ok {
+		t.Error("*InterBaseDBRepository must implement CatalogSnapshotRepository")
+	}
 }
 
 func TestNonInterBaseRepositoriesDoNotImplementCapabilities(t *testing.T) {

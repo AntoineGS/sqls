@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"log"
 	"sort"
 	"strings"
 )
@@ -16,7 +17,44 @@ func NewDBCacheUpdater(repo DBRepository) *DBCacheGenerator {
 	}
 }
 
+// snapshot returns a generator whose reads are served from one consistent
+// catalog read, plus the closer that ends it. A repository without the
+// capability is used directly with a no-op closer, which is the normal case
+// for every driver but InterBase.
+func (u *DBCacheGenerator) snapshot(ctx context.Context) (*DBCacheGenerator, func() error) {
+	noop := func() error { return nil }
+	source, ok := u.repo.(CatalogSnapshotRepository)
+	if !ok {
+		return u, noop
+	}
+	repo, closeSnapshot, err := source.CatalogSnapshot(ctx)
+	if err != nil || repo == nil {
+		// A snapshot is an optimisation, not a requirement: log the reason and
+		// build the cache the slow way rather than failing the whole pass.
+		if closeSnapshot != nil {
+			_ = closeSnapshot()
+		}
+		if err != nil {
+			log.Println("db cache: catalog snapshot unavailable:", err)
+		}
+		return u, noop
+	}
+	return &DBCacheGenerator{repo: repo}, closeSnapshot
+}
+
 func (u *DBCacheGenerator) GenerateDBCachePrimary(ctx context.Context) (*DBCache, error) {
+	generator, closeSnapshot := u.snapshot(ctx)
+	defer func() { _ = closeSnapshot() }()
+	return generator.generateDBCachePrimary(ctx)
+}
+
+func (u *DBCacheGenerator) GenerateDBCacheSecondary(ctx context.Context) (map[string][]*ColumnDesc, error) {
+	generator, closeSnapshot := u.snapshot(ctx)
+	defer func() { _ = closeSnapshot() }()
+	return generator.generateDBCacheSecondary(ctx)
+}
+
+func (u *DBCacheGenerator) generateDBCachePrimary(ctx context.Context) (*DBCache, error) {
 	var err error
 	dbCache := &DBCache{}
 	dbCache.defaultSchema, err = u.repo.CurrentSchema(ctx)
@@ -60,7 +98,7 @@ func (u *DBCacheGenerator) GenerateDBCachePrimary(ctx context.Context) (*DBCache
 	return dbCache, nil
 }
 
-func (u *DBCacheGenerator) GenerateDBCacheSecondary(ctx context.Context) (map[string][]*ColumnDesc, error) {
+func (u *DBCacheGenerator) generateDBCacheSecondary(ctx context.Context) (map[string][]*ColumnDesc, error) {
 	return u.genColumnCacheAll(ctx)
 }
 

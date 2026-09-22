@@ -1363,3 +1363,173 @@ func TestInterBaseUnsupportedDDLWithoutDetailStillMatchesTheSentinel(t *testing.
 		t.Error("interBaseWrapDDLError(nil) must be nil")
 	}
 }
+
+func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	source := &InterBaseDBRepository{Conn: db, SQLDialect: 3, DatabaseName: "/srv/interbase/example.ib"}
+	ctx := context.Background()
+
+	snapshot, closeSnapshot, err := source.CatalogSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CatalogSnapshot() error = %v", err)
+	}
+	if closeSnapshot == nil {
+		t.Fatal("CatalogSnapshot() returned a nil closer")
+	}
+
+	// A new repository, not the receiver: ReCache runs on a handler goroutine
+	// while the worker's secondary pass runs on its own, so a shared mutable
+	// snapshot field would race.
+	if snapshot == DBRepository(source) {
+		t.Fatal("CatalogSnapshot() returned the source repository; it must return a new one")
+	}
+	if source.snapshot != nil {
+		t.Fatal("CatalogSnapshot() mutated the source repository")
+	}
+	bound, ok := snapshot.(*InterBaseDBRepository)
+	if !ok {
+		t.Fatalf("CatalogSnapshot() = %T, want *InterBaseDBRepository", snapshot)
+	}
+	if bound.snapshot == nil {
+		t.Fatal("the returned repository is not bound to a snapshot")
+	}
+	if bound.SQLDialect != source.SQLDialect || bound.DatabaseName != source.DatabaseName {
+		t.Errorf("snapshot repository = (%d, %q), want the source's (%d, %q)",
+			bound.SQLDialect, bound.DatabaseName, source.SQLDialect, source.DatabaseName)
+	}
+
+	// The snapshot serves the same answers as the direct path.
+	directTables, err := source.SchemaTables(ctx)
+	if err != nil {
+		t.Fatalf("SchemaTables() on the source error = %v", err)
+	}
+	snapshotTables, err := snapshot.SchemaTables(ctx)
+	if err != nil {
+		t.Fatalf("SchemaTables() on the snapshot error = %v", err)
+	}
+	if !reflect.DeepEqual(directTables, snapshotTables) {
+		t.Errorf("snapshot SchemaTables() = %#v, want the direct result %#v", snapshotTables, directTables)
+	}
+
+	directColumns, err := source.DescribeDatabaseTableBySchema(ctx, "")
+	if err != nil {
+		t.Fatalf("DescribeDatabaseTableBySchema() on the source error = %v", err)
+	}
+	snapshotColumns, err := snapshot.DescribeDatabaseTableBySchema(ctx, "")
+	if err != nil {
+		t.Fatalf("DescribeDatabaseTableBySchema() on the snapshot error = %v", err)
+	}
+	if len(snapshotColumns) != len(directColumns) {
+		t.Fatalf("snapshot returned %d columns, want %d", len(snapshotColumns), len(directColumns))
+	}
+
+	foreignKeys, err := snapshot.DescribeForeignKeysBySchema(ctx, "")
+	if err != nil {
+		t.Fatalf("DescribeForeignKeysBySchema() on the snapshot error = %v", err)
+	}
+	if len(foreignKeys) != 1 {
+		t.Errorf("snapshot returned %d foreign keys, want 1", len(foreignKeys))
+	}
+
+	// Extended-catalog reads run on the same transaction.
+	if views, err := bound.DescribeViews(ctx); err != nil || len(views) != 1 {
+		t.Errorf("DescribeViews() on the snapshot = (%d views, %v), want (1, nil)", len(views), err)
+	}
+
+	// The source repository is unaffected and remains usable concurrently.
+	if _, err := source.DescribeViews(ctx); err != nil {
+		t.Errorf("the source repository must stay usable while a snapshot is open: %v", err)
+	}
+
+	if err := closeSnapshot(); err != nil {
+		t.Errorf("close() error = %v", err)
+	}
+	if _, err := source.SchemaTables(ctx); err != nil {
+		t.Errorf("the source repository must stay usable after the snapshot closes: %v", err)
+	}
+}
+
+func TestInterBaseCatalogSnapshotHalvesThePerRelationReads(t *testing.T) {
+	// The reason CatalogSnapshot exists is round-trip count, so count them
+	// rather than asserting the structure and trusting the arithmetic. The
+	// fixture's driver funnels every statement through PrepareContext, so the
+	// counter is the exact number of statements a cache build issues.
+	db := openInterBaseSchemaFixture(t)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	// The direct path: SchemaTables and DescribeDatabaseTableBySchema each walk
+	// every relation, because Relations issues one column query per relation.
+	prepares := interBaseFixtureCountPrepares(t)
+	if _, err := repo.SchemaTables(ctx); err != nil {
+		t.Fatalf("SchemaTables() error = %v", err)
+	}
+	if _, err := repo.DescribeDatabaseTableBySchema(ctx, ""); err != nil {
+		t.Fatalf("DescribeDatabaseTableBySchema() error = %v", err)
+	}
+	if _, err := repo.DescribeForeignKeysBySchema(ctx, ""); err != nil {
+		t.Fatalf("DescribeForeignKeysBySchema() error = %v", err)
+	}
+	direct := prepares()
+
+	// The snapshot path: one Relations read shared by both.
+	prepares = interBaseFixtureCountPrepares(t)
+	snapshot, closeSnapshot, err := repo.CatalogSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CatalogSnapshot() error = %v", err)
+	}
+	if _, err := snapshot.SchemaTables(ctx); err != nil {
+		t.Fatalf("snapshot SchemaTables() error = %v", err)
+	}
+	if _, err := snapshot.DescribeDatabaseTableBySchema(ctx, ""); err != nil {
+		t.Fatalf("snapshot DescribeDatabaseTableBySchema() error = %v", err)
+	}
+	if _, err := snapshot.DescribeForeignKeysBySchema(ctx, ""); err != nil {
+		t.Fatalf("snapshot DescribeForeignKeysBySchema() error = %v", err)
+	}
+	if err := closeSnapshot(); err != nil {
+		t.Fatalf("close() error = %v", err)
+	}
+	snapshotted := prepares()
+
+	// Do not pin an exact number: it moves whenever the fixture gains a
+	// relation or a constraint, and the claim is about growth, not a constant.
+	// The per-relation term is what halves, so the snapshot path must issue
+	// strictly fewer statements than the direct path for the same answers.
+	if snapshotted >= direct {
+		t.Errorf("snapshot issued %d statements, direct issued %d; the snapshot must share one relation read",
+			snapshotted, direct)
+	}
+	t.Logf("catalog reads: direct %d statements, snapshot %d", direct, snapshotted)
+}
+
+func TestInterBaseCatalogSnapshotCloseIsSafeToCallTwice(t *testing.T) {
+	// The close contract is a resource release: a caller that calls it twice
+	// (e.g. once explicitly and once via a deferred close) must not panic or
+	// corrupt the repository. The second call is allowed to report an error
+	// (the transaction is already gone), but it must be a clean error return.
+	db := openInterBaseSchemaFixture(t)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	_, closeSnapshot, err := repo.CatalogSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("CatalogSnapshot() error = %v", err)
+	}
+	if err := closeSnapshot(); err != nil {
+		t.Fatalf("first close() error = %v", err)
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("second close() panicked: %v", r)
+			}
+		}()
+		_ = closeSnapshot()
+	}()
+
+	if _, err := repo.SchemaTables(ctx); err != nil {
+		t.Errorf("the source repository must stay usable after a double close: %v", err)
+	}
+}

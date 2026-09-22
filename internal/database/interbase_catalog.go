@@ -585,6 +585,54 @@ func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*Func
 	return result, nil
 }
 
+var _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil)
+
+// CatalogSnapshot returns a read-only repository bound to one transaction that
+// has already read every relation and constraint, so a whole cache build costs
+// one catalog read instead of one per method.
+//
+// The returned repository is new. The receiver is never mutated, because
+// ReCache runs on a handler goroutine while the worker's secondary pass runs
+// on its own; a shared mutable snapshot field would race.
+func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBRepository, func() error, error) {
+	if db == nil || db.Conn == nil {
+		return nil, nil, errors.New("interbase: database connection is nil")
+	}
+	if db.snapshot != nil {
+		// Already bound; nesting would open a second transaction for nothing.
+		return db, func() error { return nil }, nil
+	}
+
+	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	catalog := schema.New(tx)
+	relations, err := catalog.Relations(ctx, "")
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, nil, err
+	}
+	constraints, err := catalog.Constraints(ctx, "")
+	if err != nil {
+		_ = tx.Rollback()
+		return nil, nil, err
+	}
+
+	bound := &InterBaseDBRepository{
+		Conn:         db.Conn,
+		SQLDialect:   db.SQLDialect,
+		DatabaseName: db.DatabaseName,
+		snapshot: &interBaseCatalogSnapshot{
+			catalog:     catalog,
+			relations:   relations,
+			constraints: constraints,
+		},
+	}
+	// The snapshot is read-only, so rolling back is the whole of closing it.
+	return bound, tx.Rollback, nil
+}
+
 func (db *InterBaseDBRepository) DescribeForeignKeysBySchema(ctx context.Context, _ string) ([]*ForeignKey, error) {
 	constraints, err := db.constraints(ctx)
 	if err != nil {
