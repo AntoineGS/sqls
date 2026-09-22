@@ -99,6 +99,19 @@ func TestInterBaseKeywordsAndFunctions(t *testing.T) {
 	}
 }
 
+func TestInterBaseReservedWordsUseDedicatedVendorSet(t *testing.T) {
+	for _, word := range []string{"EXTRACT", "extract", "TYPE", "type", "WEEKDAY", "weekday", "YEARDAY", "yearday"} {
+		if !IsInterBaseReservedWord(word, SQLVariantInterBase3) {
+			t.Errorf("IsInterBaseReservedWord(%q) = false, want true", word)
+		}
+	}
+	for _, word := range []string{"ABS", "abs", "COALESCE", "coalesce"} {
+		if IsInterBaseReservedWord(word, SQLVariantInterBase3) {
+			t.Errorf("IsInterBaseReservedWord(%q) = true, want valid non-reserved function-like word", word)
+		}
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

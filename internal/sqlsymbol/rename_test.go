@@ -86,6 +86,24 @@ func TestRenameRejectsInterBaseReservedWordsCaseInsensitively(t *testing.T) {
 	}
 }
 
+func TestRenameRejectsVendorReservedWordsCaseInsensitively(t *testing.T) {
+	text := "ALTER PROCEDURE p AS DECLARE VARIABLE old_name INTEGER; BEGIN old_name = 1; END"
+	a, err := Analyze(text, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, newName := range []string{"EXTRACT", "extract", "TYPE", "type", "WEEKDAY", "weekday", "YEARDAY", "yearday"} {
+		if _, err := a.Rename(a.Symbols[0], newName); err == nil {
+			t.Errorf("Rename(%q) succeeded, want vendor reserved-word validation error", newName)
+		}
+	}
+	for _, newName := range []string{"ABS", "abs", "COALESCE", "coalesce"} {
+		if _, err := a.Rename(a.Symbols[0], newName); err != nil {
+			t.Errorf("Rename(%q) failed, want valid non-reserved function-like name: %v", newName, err)
+		}
+	}
+}
+
 func TestRenameRejectsEmptyDecodedQuotedName(t *testing.T) {
 	text := `ALTER PROCEDURE p AS
 DECLARE VARIABLE old_name INTEGER;

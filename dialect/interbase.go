@@ -255,20 +255,46 @@ var interbaseKeywords = []string{
 }
 
 // IsInterBaseReservedWord reports whether word is reserved by InterBase's SQL
-// syntax for variant. It deliberately uses the server keyword rules above,
-// rather than the broader completion inventories for other dialects.
+// syntax for variant. It deliberately uses the dedicated vendor list below,
+// rather than the broader completion inventory in interbaseKeywords.
 func IsInterBaseReservedWord(word string, variant SQLVariant) bool {
 	word = strings.ToUpper(word)
-	for _, reserved := range interbaseKeywords {
-		if word == reserved {
-			return true
-		}
+	if interbaseReservedWords[word] {
+		return true
 	}
 	if variant != SQLVariantInterBase1 && (word == "TIME" || word == "TIMESTAMP") {
 		return true
 	}
 	return false
 }
+
+// InterBase 2020 Language Reference Guide, Appendix "InterBase Keywords":
+// https://docwiki.embarcadero.com/docs/products/interbase/2020/LangRef.pdf
+// The vendor list is intentionally separate from interbaseKeywords: the latter
+// is a completion-oriented inventory and must not define rename validity.
+var interbaseReservedWords = func() map[string]bool {
+	words := strings.Fields(`
+ACTIVE ADD ADMIN AFTER ALL ALTER AND ANY AS ASC ASCENDING AT BEFORE BEGIN
+BETWEEN BLOB BOOLEAN BY CASE CAST CHAR CHARACTER CHECK CLOSE COLLATE COLUMN
+COMMIT COMPUTED CONNECT CONSTRAINT CONTAINING CREATE CROSS CURRENT CURRENT_DATE
+CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DATE DAY DEC DECIMAL
+DECLARE DEFAULT DELETE DESC DESCENDING DISTINCT DO DOMAIN DROP ELSE END
+ENTRY_POINT ESCAPE EXCEPTION EXECUTE EXISTS EXIT EXTERNAL EXTRACT FILTER FLOAT
+FOR FOREIGN FROM FULL GENERATOR GRANT GROUP HAVING HOUR IF IN INACTIVE INDEX
+INNER INSERT INTEGER INTO IS JOIN KEY LAST LEADING LEFT LIKE LONG MANUAL MAX MIN
+MINUTE MONTH NATIONAL NATURAL NCHAR NO NOT NULL NUMERIC OF ON ONLY OR ORDER
+OUTER PARAMETER PLAN POST_EVENT PRECISION PRIMARY PROCEDURE RECORD_VERSION
+REFERENCES RETAIN RETURNING_VALUES RETURNS REVOKE RIGHT ROLLBACK ROWS SAVEPOINT
+SECOND SELECT SET SHADOW SMALLINT SOME SORT SQL START SUBSTRING SUSPEND TABLE
+THEN TO TRAILING TRANSACTION TRIGGER TYPE UNCOMMITTED UNION UNIQUE UPDATE USER
+USING VALUE VALUES VARCHAR VARIABLE VARYING VIEW WHEN WHERE WHILE WEEKDAY WITH
+WORK WRITE YEAR YEARDAY`)
+	result := make(map[string]bool, len(words))
+	for _, word := range words {
+		result[word] = true
+	}
+	return result
+}()
 
 // interbaseDialect3Keywords is interbaseKeywords plus the two types that exist
 // only in SQL Dialect 3. Deriving it from the Dialect 1 list keeps one source
