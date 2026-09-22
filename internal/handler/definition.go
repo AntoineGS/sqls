@@ -11,6 +11,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -31,8 +32,53 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
+	dv := s.parserDriverVariant()
+	var analysis *sqlsymbol.Analysis
+	var offset int
+	if dv.Driver == dialect.DatabaseDriverInterBase {
+		var valid bool
+		offset, valid = symbolOffset(text, params.Position)
+		if !valid {
+			return []lsp.Location{}, nil
+		}
+		analysis, err = sqlsymbol.Analyze(text, dv)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var local lsp.Definition
+	var handled bool
+	if analysis != nil {
+		local, handled, err = localDefinitionWithAnalysis(params.TextDocument.URI, text, offset, analysis)
+	} else {
+		local, handled, err = localDefinition(params.TextDocument.URI, text, params.Position, dv)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		return local, nil
+	}
+	var contextual bool
+	if analysis != nil {
+		contextual, err = contextualSQLTargetWithAnalysis(text, params.Position, analysis)
+	} else {
+		contextual, err = contextualSQLTarget(text, params.Position, dv)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if contextual {
+		dbCache := s.worker.Cache()
+		repo, err := s.newDBRepository(ctx)
+		if err != nil {
+			return nil, nil
+		}
+		return s.interBaseContextualDefinitionWithAnalysis(ctx, repo, dbCache, text, params.Position, dv, analysis)
+	}
+
 	dbCache := s.worker.Cache()
-	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, s.parserDriverVariant())
+	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, dv)
 	if err != nil {
 		return nil, err
 	}

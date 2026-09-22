@@ -154,6 +154,24 @@ func TestResolveSnapshotTarget(t *testing.T) {
 	}
 }
 
+func TestResolveSnapshotTargetWithVariantResolvesContextualColumn(t *testing.T) {
+	text := "UPDATE CUSTOMERINVOICE SET BALANCE = 1"
+	params := definitionParamsAt(strings.Index(text, "BALANCE") + 1)
+	got, ok := resolveSnapshotTargetWithVariant(text, params, relationCatalog(), dialect.DriverVariant{
+		Driver:  dialect.DatabaseDriverInterBase,
+		Variant: dialect.SQLVariantInterBase1,
+	})
+	if !ok {
+		t.Fatal("resolveSnapshotTargetWithVariant did not resolve the contextual column")
+	}
+	if got.kind != database.ObjectKindTable || got.name != "CUSTOMERINVOICE" {
+		t.Errorf("target = %+v, want table CUSTOMERINVOICE", got)
+	}
+	if got.column == nil || got.column.Text != "BALANCE" {
+		t.Errorf("column = %+v, want BALANCE", got.column)
+	}
+}
+
 func TestResolveSnapshotTargetIsCaseInsensitiveWithoutUpperCasingAtTheCallSite(t *testing.T) {
 	// The accessors normalise the name they are given. This test fails if the
 	// call site starts upper-casing, because then a mixed-case identifier would

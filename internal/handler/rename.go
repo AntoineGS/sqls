@@ -10,6 +10,7 @@ import (
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -30,11 +31,73 @@ func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Co
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := renameWithDriverVariant(text, params, s.parserDriverVariant())
+	res, handled, err := localRename(text, params, s.parserDriverVariant())
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		return res, nil
+	}
+	res, err = renameWithDriverVariant(text, params, s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
+}
+
+// localRename handles procedure-local InterBase symbols. The boolean is false
+// only when the cursor is outside a recognized procedure and the legacy
+// spelling-based rename may safely try the request.
+func localRename(text string, params lsp.RenameParams, dv dialect.DriverVariant) (*lsp.WorkspaceEdit, bool, error) {
+	if dv.Driver != dialect.DatabaseDriverInterBase {
+		return nil, false, nil
+	}
+	offset, ok := symbolOffset(text, params.Position)
+	if !ok {
+		return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{params.TextDocument.URI: {}}}, true, nil
+	}
+	analysis, err := sqlsymbol.Analyze(text, dv)
+	if err != nil {
+		return nil, true, err
+	}
+	resolution := analysis.Resolve(offset)
+	if !resolution.InProcedure {
+		return nil, false, nil
+	}
+
+	switch resolution.Role {
+	case sqlsymbol.Local:
+		if resolution.Symbol == nil {
+			return nil, true, fmt.Errorf("cannot rename procedure local: unresolved symbol")
+		}
+		edits, err := analysis.Rename(resolution.Symbol, params.NewName)
+		if err != nil {
+			return nil, true, err
+		}
+		return workspaceRename(params.TextDocument.URI, text, edits)
+	case sqlsymbol.Ambiguous:
+		return nil, true, fmt.Errorf("cannot rename procedure target: ambiguous symbol")
+	case sqlsymbol.Relation, sqlsymbol.Column:
+		return nil, true, fmt.Errorf("cannot rename SQL target: database column or relation")
+	case sqlsymbol.Callable:
+		return nil, true, fmt.Errorf("cannot rename procedure target: other procedure or callable")
+	case sqlsymbol.Other:
+		return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{params.TextDocument.URI: {}}}, true, nil
+	default:
+		return nil, true, fmt.Errorf("cannot rename procedure target: unsupported symbol")
+	}
+}
+
+func workspaceRename(uri, text string, edits []sqlsymbol.Edit) (*lsp.WorkspaceEdit, bool, error) {
+	result := make([]lsp.TextEdit, 0, len(edits))
+	for _, edit := range edits {
+		rangeValue, ok := symbolRange(text, edit.Span)
+		if !ok {
+			return nil, true, fmt.Errorf("invalid local rename span")
+		}
+		result = append(result, lsp.TextEdit{Range: rangeValue, NewText: edit.NewText})
+	}
+	return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{uri: result}}, true, nil
 }
 
 func rename(text string, params lsp.RenameParams) (*lsp.WorkspaceEdit, error) {
