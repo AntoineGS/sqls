@@ -104,6 +104,26 @@ func TestRenameRejectsVendorReservedWordsCaseInsensitively(t *testing.T) {
 	}
 }
 
+func TestRenameAllowsNonReservedInterBaseSyntaxWords(t *testing.T) {
+	text := "ALTER PROCEDURE p AS DECLARE VARIABLE old_name INTEGER; BEGIN old_name = 1; END"
+	a, err := Analyze(text, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// These words occur in statement grammar, built-ins, or completion data,
+	// but are not in the vendor's InterBase Keywords appendix. SAVEPOINT is
+	// additionally documented as accepting any valid SQL identifier as its
+	// name (Language Reference Guide, section 9.88).
+	for _, newName := range []string{
+		"CROSS", "CURRENT_USER", "LAST", "LEADING", "PARAMETER",
+		"SAVEPOINT", "SQL", "START", "SUBSTRING", "TRAILING",
+	} {
+		if _, err := a.Rename(a.Symbols[0], newName); err != nil {
+			t.Errorf("Rename(%q) failed, want valid non-reserved identifier: %v", newName, err)
+		}
+	}
+}
+
 func TestRenameRejectsEmptyDecodedQuotedName(t *testing.T) {
 	text := `ALTER PROCEDURE p AS
 DECLARE VARIABLE old_name INTEGER;
