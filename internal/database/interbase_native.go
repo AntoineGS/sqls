@@ -17,14 +17,8 @@ const interBasePingTimeout = 10 * time.Second
 
 // interBaseAttach opens and pings a pooled connection at one SQL dialect.
 // A zero sqlDialect uses the driver default, which normalizeDialect maps to 3.
-func interBaseAttach(cfg *DBConfig, attachment, charset string, sqlDialect int) (*sql.DB, error) {
-	connector, err := interbase.NewConnector(interbase.Config{
-		Database: attachment,
-		User:     cfg.User,
-		Password: cfg.Passwd,
-		Charset:  charset,
-		Dialect:  sqlDialect,
-	})
+func interBaseAttach(connCfg interBaseConnConfig, sqlDialect int) (*sql.DB, error) {
+	connector, err := interbase.NewConnector(interBaseDriverConfig(connCfg, sqlDialect))
 	if err != nil {
 		return nil, fmt.Errorf("interbase: create connector: %w", err)
 	}
@@ -40,6 +34,30 @@ func interBaseAttach(cfg *DBConfig, attachment, charset string, sqlDialect int) 
 		return nil, fmt.Errorf("interbase: ping failed: %w", err)
 	}
 	return conn, nil
+}
+
+// interBaseDriverConfig copies the untagged projection into the driver's
+// configuration. Host and Database stay separate so the driver composes the
+// attachment, including any TLS options.
+func interBaseDriverConfig(cfg interBaseConnConfig, sqlDialect int) interbase.Config {
+	return interbase.Config{
+		Database:       cfg.Database,
+		Host:           cfg.Host,
+		User:           cfg.User,
+		Password:       cfg.Password,
+		Role:           cfg.Role,
+		Charset:        cfg.Charset,
+		Dialect:        sqlDialect,
+		ConnectTimeout: cfg.ConnectTimeout,
+		TLS: interbase.TLSConfig{
+			Enabled:              cfg.TLS.Enabled,
+			ServerPublicFile:     cfg.TLS.ServerPublicFile,
+			ServerPublicPath:     cfg.TLS.ServerPublicPath,
+			ClientCertFile:       cfg.TLS.ClientCertFile,
+			ClientPassPhrase:     cfg.TLS.ClientPassPhrase,
+			ClientPassPhraseFile: cfg.TLS.ClientPassPhraseFile,
+		},
+	}
 }
 
 // interBaseDiagnostics reads the database's own answers over a pooled
@@ -70,7 +88,7 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 	if err != nil {
 		return nil, err
 	}
-	charset, err := interBaseCharset(cfg)
+	connCfg, err := interBaseConnectionConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +100,7 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 
 	// The first attach uses the requested dialect; a requested zero means the
 	// driver default, which is 3.
-	conn, err := interBaseAttach(cfg, attachment, charset, cfg.Dialect)
+	conn, err := interBaseAttach(connCfg, cfg.Dialect)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +111,7 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 	if decision.Reattach {
 		// The single extra attach, paid only by a Dialect 1 database.
 		_ = conn.Close()
-		conn, err = interBaseAttach(cfg, attachment, charset, decision.Resolved)
+		conn, err = interBaseAttach(connCfg, decision.Resolved)
 		if err != nil {
 			return nil, err
 		}

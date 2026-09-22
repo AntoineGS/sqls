@@ -368,8 +368,67 @@ references.
 Alternatively, supply `host`, optional `port` (default `3050`), and `path`
 (or `dbName`) instead of `dataSourceName`. Without a host, the path is used as a
 local attachment. `proto` may be omitted or set to `tcp` for a remote attachment.
-`params.charset` defaults to `UTF8`; `WIN1250` is also supported. Built-in SSH
-tunneling is not supported for this driver.
+`params.charset` accepts `UTF8` (the default), `WIN1250`, `WIN1252`, `ISO8859_1`
+and `ASCII`. Built-in SSH tunneling is not supported for this driver.
+
+##### interbase
+
+Connection settings only the InterBase driver understands, nested under the
+`interbase` key:
+
+| Key            | Description                                                     |
+| -------------- | ---------------------------------------------------------------- |
+| role           | SQL role activated for the attachment. Optional, 255 bytes max.  |
+| connectTimeout | Go duration bounding the native handshake, e.g. `10s`. Optional. |
+| tls            | Native client TLS attachment options. Optional.                  |
+
+| tls key              | Description                                                |
+| -------------------- | ----------------------------------------------------------- |
+| enabled              | Required before any other `tls` key is accepted.           |
+| serverPublicFile     | Server public certificate file.                            |
+| serverPublicPath     | Directory searched for server public certificates.         |
+| clientCertFile       | Client certificate file.                                   |
+| clientPassPhrase     | Client certificate passphrase, stored in the config file.  |
+| clientPassPhraseFile | File holding the client certificate passphrase.            |
+
+```yaml
+connections:
+  - alias: centrale
+    driver: interbase
+    host: db.example.test
+    port: 3050
+    path: /srv/interbase/centrale.ib
+    user: sqls_reader
+    passwd: "your-password"
+    params:
+      charset: WIN1252
+    interbase:
+      role: SQLS_READONLY
+      connectTimeout: 10s
+      tls:
+        enabled: true
+        serverPublicFile: /etc/interbase/server.pem
+        clientPassPhraseFile: /etc/interbase/client.pass
+```
+
+`connectTimeout` rounds up to whole seconds: `500ms` becomes `1s`. Setting it
+to `0`, or omitting it, leaves the native client's own default handshake
+timeout unchanged rather than setting a timeout of zero.
+
+`interbase.tls` requires `host` and cannot be combined with `dataSourceName`:
+the driver composes the TLS attachment itself from the host and the database
+path, and rejects TLS options when no host is set. `dataSourceName` keeps
+working as a raw attachment string for every connection that does not use TLS.
+
+**Enabling TLS does not establish server identity.** The InterBase native client
+tested with this driver (`LI-V15.1.0.42`) does not verify the server hostname:
+with a trusted CA it still accepted an intentionally wrong DNS name, including
+through the vendor `isql`. Enabling `interbase.tls` therefore encrypts the
+connection but is not proof of server identity, and sqls does not add a
+verification step of its own, because a separate Go-side TLS probe would not
+authenticate the native attachment. Treat the network as untrusted accordingly.
+Prefer `clientPassPhraseFile` over `clientPassPhrase` so the passphrase is not
+stored in `config.yml`.
 
 Both SQL Dialect 1 and SQL Dialect 3 are supported. The optional `dialect` key
 accepts `0` (the default, auto-detect from the database), `1` or `3`:
@@ -417,15 +476,18 @@ by the background worker after the first connection rather than on demand.
 sqls can also reproduce object DDL from the catalog; it is unavailable for
 external functions, database files, shadows, tables with computed columns,
 and procedures whose parameter nullability the catalog does not record, and
-no editor-facing feature surfaces it yet. InterBase has no schema namespace
-or database enumeration through this adapter, so switching databases is not
-supported; configure separate connections instead.
+no editor-facing feature surfaces it yet.
+
+An InterBase connection holds a single attachment: `showDatabases` lists that
+attachment string, and `switchDatabase` accepts only that same name. Configure
+a separate connection entry to open another database. InterBase has no schema
+namespace, so `showSchemas` reports one synthetic empty schema.
 
 The native driver is experimental. Context cancellation cannot interrupt an
-in-flight native call, and the driver exposes no TLS configuration API. Use a
-trusted network or independently verified native transport security and a
-least-privilege database account. Executing DML/DDL uses the driver's implicit
-commit behavior; SQL transaction-control statements are not supported.
+in-flight native call. Use a least-privilege database account, and read the TLS
+statement above before relying on `interbase.tls` for transport security.
+Executing DML/DDL uses the driver's implicit commit behavior; SQL
+transaction-control statements are not supported.
 
 Run the offline suite and the native-enabled suite with:
 

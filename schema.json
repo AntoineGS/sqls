@@ -67,6 +67,61 @@
             "type": "object",
             "properties": {}
           },
+          "dialect": {
+            "description": "SQL dialect: 0 auto-detects, 1 and 3 pin an explicit dialect. Only supported by the interbase driver, must be 0 for any other driver. Optional",
+            "type": "number",
+            "enum": [
+              0,
+              1,
+              3
+            ]
+          },
+          "interbase": {
+            "description": "InterBase-only connection settings. Optional",
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "role": {
+                "description": "SQL role activated for the attachment. Optional, 255 bytes maximum",
+                "type": "string"
+              },
+              "connectTimeout": {
+                "description": "Go duration bounding the native attachment handshake, for example 10s. Positive values round up to whole seconds, so 500ms becomes 1s. 0 or omitted leaves the native client's default handshake timeout unchanged. Optional",
+                "type": "string"
+              },
+              "tls": {
+                "description": "Native client TLS attachment options. Requires host; encrypts the connection but does not verify server identity. Optional",
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "enabled": {
+                    "description": "Required for any other tls key to be accepted",
+                    "type": "boolean"
+                  },
+                  "serverPublicFile": {
+                    "description": "Server public certificate file",
+                    "type": "string"
+                  },
+                  "serverPublicPath": {
+                    "description": "Directory searched for server public certificates",
+                    "type": "string"
+                  },
+                  "clientCertFile": {
+                    "description": "Client certificate file",
+                    "type": "string"
+                  },
+                  "clientPassPhrase": {
+                    "description": "Client certificate passphrase. Prefer clientPassPhraseFile so the passphrase is not stored in the config file",
+                    "type": "string"
+                  },
+                  "clientPassPhraseFile": {
+                    "description": "File holding the client certificate passphrase",
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          },
           "sshConfig": {
             "description": "ssh config. Optional",
             "type": "object",
