@@ -22,6 +22,10 @@ type ObjectDDLCall struct {
 // test stubs only the capability it exercises. ObjectDDL and ExplainPlan are
 // always populated by the constructor instead, and record every call under a
 // mutex so a test can assert what was asked for.
+//
+// Driver is inherited from MockDBRepository and reports "mock", not "interbase".
+// Driver-keyed behavior such as RenderOptionsFor therefore takes its generic
+// branch; this mock does not model InterBase-specific result rendering.
 type MockCapabilityRepository struct {
 	*MockDBRepository
 

@@ -203,7 +203,7 @@ The three rules:
 | --- | --- | --- |
 | `internal/database/capability.go` | none | the capability interfaces, `ObjectKind`, the sentinels |
 | `internal/database/catalog_doc.go` | none | markdown rendered from catalog descriptors, shared by the completer and the handler |
-| `internal/database/interbase_mock.go` | none | `MockCapabilityRepository`, deliberately a distinct type from `MockDBRepository` |
+| `internal/database/capability_mock.go` | none | `MockCapabilityRepository`, deliberately distinct from `MockDBRepository`; seven `Describe*` hooks, `ObjectDDL`/`ExplainPlan` call recording, and `NewUnsupportedDDLError` |
 | `internal/handler/explain.go` | none | the `explainQuery` command |
 | `internal/handler/interbase_hover.go` | none | hover target resolution, the DDL appendix and its memo |
 | `internal/completer/interbase_candidates.go` | none | procedure, view, generator and UDF candidates |
