@@ -199,9 +199,39 @@ The three rules:
    `interbase_native.go` / `interbase_stub.go` pair. Nothing in the editor
    features imports `interbase-go`.
 
+The bound-parameter work adds two more optional capabilities, in
+`internal/database/parameter.go`, and follows the same rule — the handler
+asserts the capability, never the driver name:
+
+```go
+type ParameterizedRepository interface {
+	ExecParams(ctx context.Context, query string, args []any) (sql.Result, error)
+	QueryParams(ctx context.Context, query string, args []any) (*sql.Rows, error)
+}
+
+type ParameterizedReadOnlyQuerier interface {
+	QueryReadOnlyParams(ctx context.Context, query string, args []any) (*QueryResult, error)
+}
+```
+
+`ParameterizedReadOnlyQuerier` is `ReadOnlyQuerier`'s bound counterpart, and
+the pair has one rule worth stating: a repository that offers
+`ReadOnlyQuerier` but **not** its parameterized counterpart is refused
+(`errParameterizedReadOnlyUnsupported`) rather than silently downgraded to an
+ordinary transaction — a read that was promised a read-only transaction does
+not lose it because it acquired arguments. `boundReadFor`/`boundExecFor` in
+`internal/handler/execute_command.go` are the single owners of these two
+ladders: the batch preflight and the statement execution both call them, so
+"preflight passed but statement two failed on a missing capability" — a
+half-executed batch — cannot happen.
+
 | File | Tag | Contents |
 | --- | --- | --- |
 | `internal/database/capability.go` | none | the capability interfaces, `ObjectKind`, the sentinels |
+| `internal/database/parameter.go` | none | the two parameterized capabilities above |
+| `internal/queryparams/` | none | the named-marker compiler and the wire value converter; imports no handler, database or lsp package |
+| `internal/lsp/query_parameters.go` | none | the version-1 discovery/submission envelopes |
+| `internal/handler/query_parameters.go` | none | `getQueryParameters`, identity hashing, submission preflight |
 | `internal/database/catalog_doc.go` | none | markdown rendered from catalog descriptors, shared by the completer and the handler |
 | `internal/database/capability_mock.go` | none | `MockCapabilityRepository`, deliberately distinct from `MockDBRepository`; seven `Describe*` hooks, `ObjectDDL`/`ExplainPlan` call recording, and `NewUnsupportedDDLError` |
 | `internal/handler/explain.go` | none | the `explainQuery` command |
@@ -243,3 +273,118 @@ parameter — `explainStatements(ctx, explainer, queries)` and
 `(*Server).interBaseHover(ctx, repo, cache, …)` — and the tests call them
 directly. Features that read only the `*DBCache`, which is completion and
 signature help, need no server at all.
+
+## Query parameter protocol
+
+Named query parameters need a round trip the editor drives: the client asks
+what the selection needs, prompts the user, and sends the answers back with the
+execution request. The command is `getQueryParameters`, advertised next to the
+existing commands in `ServerCapabilities.ExecuteCommandProvider.Commands`.
+There is no experimental capability field: a client detects support by looking
+for the command name, which is what the shipped Neovim adapter does.
+
+**Version 1 is the only version.** `version` is checked on both legs — a
+discovery result announces `1`, and a submission carrying anything else is
+refused rather than interpreted under a contract its client never agreed to.
+Add a field, bump the number.
+
+```go
+// internal/lsp/query_parameters.go
+type QueryParameterContext struct {
+	Version              int    `json:"version"`              // exactly 1
+	ConnectionKey        string `json:"connectionKey"`
+	ConnectionGeneration int    `json:"connectionGeneration"`
+	QueryKey             string `json:"queryKey"`
+	DocumentKey          string `json:"documentKey"`
+}
+
+type QueryParameterDiscovery struct {
+	QueryParameterContext
+	Supported  bool                    `json:"supported"`
+	Parameters []queryparams.Parameter `json:"parameters"`
+}
+
+type QueryParameterSubmission struct {
+	QueryParameterContext
+	Values []queryparams.Value `json:"values"`
+}
+```
+
+`QueryParameterSubmission` reaches the server as
+`ExecuteCommandParams.ParameterValues` (`parameterValues`, omitempty) on the
+ordinary `executeQuery` request. A non-nil `ParameterValues` is what selects
+the bound path; a request without one is a legacy execution and is parsed from
+the live document as before.
+
+**Discovery is stateless and touches nothing.** `getQueryParameters` takes the
+existing URI and `Range` fields, reads the document text, and runs
+`queryparams.Compile` over it. No catalog, no database, no server-side session:
+the server keeps nothing between discovery and submission, and the entered
+values are forgotten as soon as the command returns. A connection that is not
+InterBase — including no connection at all — answers `supported: false` with an
+empty parameter list, which is the client's signal to use the legacy flow. A
+supported selection with no markers still returns the full identity so the
+client can make that choice with the same information.
+
+**The three keys.** All are the hex SHA-256 of a JSON encoding, produced by
+`hashJSON`:
+
+- `connectionKey` hashes an explicit identity tuple — driver, alias, attachment
+  string, host, port, path, database name, user, role, charset, effective
+  connection database name (`database.NewInterBaseConnectionIdentity`). The
+  whole config is deliberately **not** serialized: a password or TLS secret must
+  never enter this hash. Database path case is preserved. A nil config or
+  connection is an error, never a shared empty identity that would make two
+  unrelated connections compare equal.
+- `queryKey` hashes `[resolvedDialect, selectedSQL]`, so the same text under a
+  different dialect is a different query.
+- `documentKey` hashes the complete current document. It is submission
+  validation only.
+
+**What each key is for is not the same as what each key is keyed on.** The
+server compares all five context fields on submission (`validateSubmission`)
+and rejects a mismatch with a message naming *what* changed — the connection,
+the selected SQL, or the document — having executed nothing. The client's
+prefill cache is keyed on `connectionKey` and `queryKey` only:
+
+- `documentKey` is excluded so that identical SQL in another buffer still
+  reuses prefills, while an edit anywhere in the prompting document — including
+  outside the selection — still rejects the submission. Rejecting an
+  outside-selection edit is deliberate: it is a document version the user did
+  not review.
+- `connectionGeneration` is excluded so that switching away from a connection
+  and back recovers the values entered before. It is still checked on
+  submission, so values entered against the pre-reconnect connection cannot be
+  bound to the post-reconnect one. Because the cache lives in the client
+  process and is dropped when that client stops, a restarted server's initial
+  generation cannot make an old prompt valid.
+
+**The whole batch is preflighted before the first statement runs.**
+`preflightBoundBatch` validates the context, compiles the entire selection,
+binds every value, and resolves each statement's route and required capability
+up front. A batch that fails there has executed nothing, which is what makes
+re-running it after fixing one value safe. Routing is decided once and travels
+with the statement in `boundStatement`, so execution never re-asks a
+possibly-replaced worker cache and gets a different answer for a statement
+already under way. A statement with no arguments inside a parameterized batch
+keeps the legacy repository method and is held to no optional capability.
+
+**The two refusals that keep raw marker text away from the driver.**
+`refuseLegacyNamedParameters` rejects an InterBase `executeQuery` that carries
+genuine named markers but no submission, so `:NAME` never reaches the driver as
+SQL. It deliberately only claims text the compiler fully accepts: a PSQL body
+whose `:V` is a local variable, DDL, or a bare `?` keeps the unparameterized
+path it has always had, with the driver as the authority. `explainQueries` is
+the counterpart on the Explain side — a marker-bearing selection is compiled to
+positional SQL and prepared, never prompted for and never bound, because a plan
+needs no values.
+
+**Locking.** `getQueryParameters` and the bound execution both hold
+`connMu.RLock` for the whole call, so no reconnect can land between the
+connection a batch was validated against and the one it runs on.
+`parameterSelection` copies the document text and every identity scalar out
+from under `stateMu` and releases it before extracting the range, hashing or
+compiling: the `*File` is never retained past the lock, and no mutable config
+is hashed once the lock guarding its replacement is gone. No lock and no
+transaction is held while the user answers prompts — the prompts happen in the
+client, between two independent requests.

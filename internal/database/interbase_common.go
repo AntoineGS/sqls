@@ -288,6 +288,7 @@ type InterBaseDBRepository struct {
 }
 
 var _ DBRepository = (*InterBaseDBRepository)(nil)
+var _ ParameterizedRepository = (*InterBaseDBRepository)(nil)
 
 // NewInterBaseDBRepository builds a repository from a pooled *sql.DB alone.
 // It has no connection context, so it leaves SQLDialect zero (dialect 3) and
@@ -388,17 +389,25 @@ func interBaseEffectiveDefault(columnSource, domainSource sql.NullString) sql.Nu
 }
 
 func (db *InterBaseDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
+	return db.ExecParams(ctx, query, nil)
+}
+
+func (db *InterBaseDBRepository) ExecParams(ctx context.Context, query string, args []any) (sql.Result, error) {
 	if db == nil || db.Conn == nil {
 		return nil, errors.New("interbase: database connection is nil")
 	}
-	return db.Conn.ExecContext(ctx, query)
+	return db.Conn.ExecContext(ctx, query, args...)
 }
 
 func (db *InterBaseDBRepository) Query(ctx context.Context, query string) (*sql.Rows, error) {
+	return db.QueryParams(ctx, query, nil)
+}
+
+func (db *InterBaseDBRepository) QueryParams(ctx context.Context, query string, args []any) (*sql.Rows, error) {
 	if db == nil || db.Conn == nil {
 		return nil, errors.New("interbase: database connection is nil")
 	}
-	return db.Conn.QueryContext(ctx, query)
+	return db.Conn.QueryContext(ctx, query, args...)
 }
 
 // QueryReadOnly runs a read statement inside an explicit read-only,
@@ -410,6 +419,12 @@ func (db *InterBaseDBRepository) Query(ctx context.Context, query string) (*sql.
 // documented boundary an implicit procedure query commits its write
 // transaction, so a procedure call is a write even when it returns a row.
 func (db *InterBaseDBRepository) QueryReadOnly(ctx context.Context, query string) (*QueryResult, error) {
+	return db.QueryReadOnlyParams(ctx, query, nil)
+}
+
+// QueryReadOnlyParams is QueryReadOnly with positional arguments forwarded to
+// the driver instead of interpolated into query.
+func (db *InterBaseDBRepository) QueryReadOnlyParams(ctx context.Context, query string, args []any) (*QueryResult, error) {
 	if db == nil || db.Conn == nil {
 		return nil, errors.New("interbase: database connection is nil")
 	}
@@ -426,7 +441,7 @@ func (db *InterBaseDBRepository) QueryReadOnly(ctx context.Context, query string
 	// fetch.
 	defer func() { _ = tx.Rollback() }()
 
-	rows, err := tx.QueryContext(ctx, query)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -436,3 +451,4 @@ func (db *InterBaseDBRepository) QueryReadOnly(ctx context.Context, query string
 }
 
 var _ ReadOnlyQuerier = (*InterBaseDBRepository)(nil)
+var _ ParameterizedReadOnlyQuerier = (*InterBaseDBRepository)(nil)

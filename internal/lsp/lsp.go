@@ -84,7 +84,9 @@ type DocumentOnTypeFormattingOptions struct{}
 
 type DocumentLinkOptions struct{}
 
-type ExecuteCommandOptions struct{}
+type ExecuteCommandOptions struct {
+	Commands []string `json:"commands"`
+}
 
 // https://microsoft.github.io/language-server-protocol/specifications/specification-3-14/#textDocument_didOpen
 
@@ -303,6 +305,10 @@ type ExecuteCommandParams struct {
 	Arguments []interface{} `json:"arguments,omitempty"`
 	// sqls specific option for query execute range
 	Range *Range `json:"range,omitempty"`
+	// ParameterValues carries the client's typed answers to a prior
+	// getQueryParameters discovery, alongside the identity it was prompted
+	// under.
+	ParameterValues *QueryParameterSubmission `json:"parameterValues,omitempty"`
 }
 
 // https://microsoft.github.io/language-server-protocol/specifications/specification-3-14/#workspace_didChangeConfiguration
