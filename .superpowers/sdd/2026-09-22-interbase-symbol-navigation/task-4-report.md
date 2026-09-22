@@ -126,3 +126,47 @@ $ go vet ./internal/sqlsymbol && git diff --check
 - Parent scopes are still retained for genuinely nested parenthesized SELECTs;
   same-depth siblings are never added as outer scopes.
 - Catalog nearest-qualifier behavior remains intentionally deferred to Task 7.
+
+## Fix round 2 review
+
+### Defect addressed
+
+- Same-depth sibling query discovery now closes only active queries at the
+  sibling's depth or deeper. A nested UNION arm no longer drains its shallower
+  correlated parent, and the subsequent outer predicate retains the parent
+  scope.
+- Added a nested UNION regression asserting both second-arm correlation and
+  the later outer predicate. Existing INSERT...SELECT and FOR SELECT/DO
+  isolation regressions remain in the focused suite.
+
+### TDD evidence
+
+RED command:
+
+```text
+$ go test ./internal/sqlsymbol -run 'TestSQL' -count=1
+--- FAIL: TestSQLNestedUnionPreservesCorrelatedOuterScope (0.00s)
+    sql_test.go:102: second UNION correlation: {Role:3 Span:{Start:141 End:143} ...}
+FAIL
+```
+
+GREEN commands and results:
+
+```text
+$ go test ./internal/sqlsymbol -run 'TestSQL' -count=1
+ok   github.com/sqls-server/sqls/internal/sqlsymbol  0.003s
+$ go test ./internal/sqlsymbol -count=1 && go test ./...
+... all packages passed ...
+$ go test ./internal/sqlsymbol -race -count=1
+ok   github.com/sqls-server/sqls/internal/sqlsymbol  1.023s
+$ go vet ./internal/sqlsymbol && git diff --check
+(no output)
+```
+
+### Self-review
+
+- Verified same-depth UNION siblings close their own query while preserving
+  the shallower parent; the second arm sees ARCHIVE then CUSTOMER and the
+  final outer predicate sees CUSTOMER only.
+- Existing INSERT source isolation and FOR SELECT DO-body isolation remain
+  green after the stack-depth change.

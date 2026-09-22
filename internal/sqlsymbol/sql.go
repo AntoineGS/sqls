@@ -121,9 +121,7 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 		// A query at the same parenthesis depth is a sibling, not a
 		// correlated subquery. This includes UNION arms and an INSERT
 		// ... SELECT source query.
-		for len(active) > 0 && depths[i] <= queries[active[len(active)-1]].baseDepth {
-			closeQueries(queries, &active, i)
-		}
+		closeQueriesAtDepth(queries, &active, i, depths[i])
 		parent := -1
 		if len(active) > 0 {
 			parent = active[len(active)-1]
@@ -141,6 +139,17 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 func closeQueries(queries []sqlQuery, active *[]int, end int) {
 	for len(*active) > 0 {
 		qi := (*active)[len(*active)-1]
+		queries[qi].end = end
+		*active = (*active)[:len(*active)-1]
+	}
+}
+
+func closeQueriesAtDepth(queries []sqlQuery, active *[]int, end, depth int) {
+	for len(*active) > 0 {
+		qi := (*active)[len(*active)-1]
+		if queries[qi].baseDepth < depth {
+			return
+		}
 		queries[qi].end = end
 		*active = (*active)[:len(*active)-1]
 	}

@@ -86,6 +86,30 @@ INSERT INTO archive (id) SELECT id FROM live;`
 	}
 }
 
+func TestSQLNestedUnionPreservesCorrelatedOuterScope(t *testing.T) {
+	text := `SELECT c.id FROM customer c WHERE EXISTS (
+  SELECT o.id FROM orders o WHERE o.id = c.id
+  UNION
+  SELECT a.id FROM archive a WHERE a.id = c.id
+) AND c.id > 0;`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondArm := strings.Index(text, "SELECT a.id FROM archive a WHERE a.id = c.id")
+	correlated := a.Resolve(secondArm + strings.Index(text[secondArm:], "c.id") + len("c."))
+	if correlated.Role != Column || correlated.SQL == nil || len(correlated.SQL.Scopes) != 2 {
+		t.Fatalf("second UNION correlation: %+v", correlated)
+	}
+	if correlated.SQL.Scopes[0][0].Name.Key() != "ARCHIVE" || correlated.SQL.Scopes[1][0].Name.Key() != "CUSTOMER" {
+		t.Fatalf("second UNION scope order: %+v", correlated.SQL.Scopes)
+	}
+	outer := a.Resolve(strings.Index(text, "AND c.id") + len("AND c."))
+	if outer.Role != Column || outer.SQL == nil || len(outer.SQL.Scopes) != 1 || len(outer.SQL.Scopes[0]) != 1 || outer.SQL.Scopes[0][0].Name.Key() != "CUSTOMER" {
+		t.Fatalf("outer predicate scope: %+v", outer)
+	}
+}
+
 func TestSQLForSelectScopeEndsAtDo(t *testing.T) {
 	text := `FOR SELECT id FROM customer INTO :v DO BEGIN
   UPDATE audit SET value=:v WHERE id=:v;
