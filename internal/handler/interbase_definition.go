@@ -15,6 +15,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -27,6 +28,7 @@ type snapshotTarget struct {
 	kind   database.ObjectKind
 	name   string
 	source sql.NullString
+	column *sqlsymbol.Name
 }
 
 // resolveSnapshotTarget classifies the identifier under the cursor against the
@@ -42,11 +44,34 @@ type snapshotTarget struct {
 // calls, not a map iteration, so it does not depend on Go's randomised map
 // order.
 func resolveSnapshotTarget(text string, params lsp.DefinitionParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (snapshotTarget, bool) {
+	return resolveSnapshotTargetLegacy(text, params, dbCache, dialect.DriverVariant{Driver: driver})
+}
+
+func resolveSnapshotTargetWithVariant(text string, params lsp.DefinitionParams, dbCache *database.DBCache, dv dialect.DriverVariant) (snapshotTarget, bool) {
+	driver := dv.Driver
+	if driver != dialect.DatabaseDriverInterBase || dbCache == nil {
+		return snapshotTarget{}, false
+	}
+	if offset, valid := symbolOffset(text, params.Position); valid {
+		if analysis, err := sqlsymbol.Analyze(text, dv); err == nil {
+			resolution := analysis.Resolve(offset)
+			if resolution.Role == sqlsymbol.Relation || (resolution.Role == sqlsymbol.Column && resolution.SQL != nil && len(resolution.SQL.Scopes) > 0) {
+				if resolution.SQL == nil {
+					return snapshotTarget{}, false
+				}
+				return resolveRelationTarget(*resolution.SQL, resolution.Role, dbCache)
+			}
+		}
+	}
+	return resolveSnapshotTargetLegacy(text, params, dbCache, dv)
+}
+
+func resolveSnapshotTargetLegacy(text string, params lsp.DefinitionParams, dbCache *database.DBCache, dv dialect.DriverVariant) (snapshotTarget, bool) {
+	driver := dv.Driver
 	if driver != dialect.DatabaseDriverInterBase || !dbCache.HasCatalog() {
 		return snapshotTarget{}, false
 	}
-
-	parsed, err := parser.ParseWithDriver(text, driver)
+	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return snapshotTarget{}, false
 	}
@@ -206,6 +231,10 @@ const definitionDDLTimeout = 3 * time.Second
 // method takes stateMu exactly once, for snapshotContext, and never across the
 // file write that follows.
 func (s *Server) interBaseDefinition(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.DefinitionParams, text string) (lsp.Definition, error) {
+	return s.interBaseDefinitionWithVariant(ctx, repo, dbCache, params, text, s.parserDriverVariant())
+}
+
+func (s *Server) interBaseDefinitionWithVariant(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.DefinitionParams, text string, dv dialect.DriverVariant) (lsp.Definition, error) {
 	if s.snapshots == nil || repo == nil {
 		return nil, nil
 	}
@@ -213,7 +242,7 @@ func (s *Server) interBaseDefinition(ctx context.Context, repo database.DBReposi
 	if !ok {
 		return nil, nil
 	}
-	target, ok := resolveSnapshotTarget(text, params, dbCache, s.parserDriver())
+	target, ok := resolveSnapshotTargetWithVariant(text, params, dbCache, dv)
 	if !ok {
 		return nil, nil
 	}

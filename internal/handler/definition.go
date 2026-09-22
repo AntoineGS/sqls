@@ -44,7 +44,12 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 	if contextual {
-		return lsp.Definition{}, nil
+		dbCache := s.worker.Cache()
+		repo, err := s.newDBRepository(ctx)
+		if err != nil {
+			return nil, nil
+		}
+		return s.interBaseRelationDefinition(ctx, repo, dbCache, text, params.Position, dv)
 	}
 
 	dbCache := s.worker.Cache()
