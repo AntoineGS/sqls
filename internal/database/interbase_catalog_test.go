@@ -952,3 +952,231 @@ func TestInterBaseDescribesViewsGeneratorsDomainsAndIndexes(t *testing.T) {
 		t.Errorf("IDX_CHILD_FK unique = %#v, want a valid false", indexByName["IDX_CHILD_FK"].Unique)
 	}
 }
+
+func TestInterBaseDescribesProceduresTriggersAndFunctions(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	procedures, err := repository.DescribeProcedures(ctx)
+	if err != nil {
+		t.Fatalf("DescribeProcedures() error = %v", err)
+	}
+	if len(procedures) != 1 {
+		t.Fatalf("DescribeProcedures() returned %d procedures, want 1", len(procedures))
+	}
+	procedure := procedures[0]
+	if procedure.Schema != "" || procedure.Name != "ADD_CUSTOMER" {
+		t.Errorf("procedure identity = (%q, %q), want (\"\", \"ADD_CUSTOMER\")", procedure.Schema, procedure.Name)
+	}
+	if got, want := procedure.OwnerName.String, "SYSDBA"; !procedure.OwnerName.Valid || got != want {
+		t.Errorf("procedure owner = %#v, want %q", procedure.OwnerName, want)
+	}
+	if got, want := procedure.Source.String, "BEGIN NEW_ID = 1; END"; !procedure.Source.Valid || got != want {
+		t.Errorf("procedure source = %#v, want the verbatim PSQL body %q", procedure.Source, want)
+	}
+	if len(procedure.InputParameters) != 2 || len(procedure.OutputParameters) != 1 {
+		t.Fatalf("procedure has %d input and %d output parameters, want 2 and 1",
+			len(procedure.InputParameters), len(procedure.OutputParameters))
+	}
+
+	wantInputs := []struct {
+		name     string
+		position int
+		typ      string
+		domain   string
+		nullable sql.NullBool
+	}{
+		{name: "EMAIL", position: 0, typ: "VARCHAR(100)", domain: "EMAIL_ADDRESS", nullable: sql.NullBool{Bool: false, Valid: true}},
+		{name: "CODE", position: 1, typ: "INTEGER", domain: "", nullable: sql.NullBool{}},
+	}
+	for i, want := range wantInputs {
+		got := procedure.InputParameters[i]
+		if got.Name != want.name || got.Position != want.position || got.Type != want.typ || got.Domain != want.domain {
+			t.Errorf("input parameter %d = (%q, %d, %q, %q), want (%q, %d, %q, %q)",
+				i, got.Name, got.Position, got.Type, got.Domain, want.name, want.position, want.typ, want.domain)
+		}
+		if got.Direction != ParameterInput {
+			t.Errorf("input parameter %d direction = %q, want %q", i, got.Direction, ParameterInput)
+		}
+		if got.Nullable != want.nullable {
+			t.Errorf("input parameter %d nullable = %#v, want %#v", i, got.Nullable, want.nullable)
+		}
+	}
+
+	output := procedure.OutputParameters[0]
+	if output.Name != "NEW_ID" || output.Direction != ParameterOutput || output.Type != "INTEGER" {
+		t.Errorf("output parameter = (%q, %q, %q), want (\"NEW_ID\", %q, \"INTEGER\")",
+			output.Name, output.Direction, output.Type, ParameterOutput)
+	}
+	if output.Domain != "CUSTOMER_ID" {
+		t.Errorf("output parameter domain = %q, want %q", output.Domain, "CUSTOMER_ID")
+	}
+
+	triggers, err := repository.DescribeTriggers(ctx)
+	if err != nil {
+		t.Fatalf("DescribeTriggers() error = %v", err)
+	}
+	triggerByName := make(map[string]*TriggerDesc, len(triggers))
+	for _, trigger := range triggers {
+		triggerByName[trigger.Name] = trigger
+	}
+	if len(triggers) != 4 {
+		t.Fatalf("DescribeTriggers() returned %d triggers, want 4: %v", len(triggers), triggerByName)
+	}
+
+	before := triggerByName["CUSTOMER_BI"]
+	if before == nil {
+		t.Fatal("DescribeTriggers() did not return CUSTOMER_BI")
+	}
+	if got, want := before.RelationName.String, "CUSTOMER"; !before.RelationName.Valid || got != want {
+		t.Errorf("CUSTOMER_BI relation = %#v, want %q", before.RelationName, want)
+	}
+	if !before.Active.Valid || !before.Active.Bool {
+		t.Errorf("CUSTOMER_BI active = %#v, want a valid true", before.Active)
+	}
+	if got, want := before.Source.String, "AS BEGIN END"; !before.Source.Valid || got != want {
+		t.Errorf("CUSTOMER_BI source = %#v, want %q", before.Source, want)
+	}
+	if !before.Sequence.Valid || before.Sequence.Int64 != 0 {
+		t.Errorf("CUSTOMER_BI sequence = %#v, want 0", before.Sequence)
+	}
+
+	// RDB$TRIGGER_INACTIVE is an INACTIVE flag, so Active is its inverse.
+	if multi := triggerByName["CUSTOMER_MULTI"]; multi == nil || !multi.Active.Valid || multi.Active.Bool {
+		t.Errorf("CUSTOMER_MULTI active = %#v, want a valid false", multi)
+	}
+	// A database-level trigger has no relation.
+	if database := triggerByName["DB_CONNECT"]; database == nil || database.RelationName.Valid {
+		t.Errorf("DB_CONNECT relation = %#v, want invalid for a database-level trigger", database)
+	}
+
+	functions, err := repository.DescribeFunctions(ctx)
+	if err != nil {
+		t.Fatalf("DescribeFunctions() error = %v", err)
+	}
+	if len(functions) != 1 {
+		t.Fatalf("DescribeFunctions() returned %d functions, want 1", len(functions))
+	}
+	function := functions[0]
+	if function.Name != "F_LTRIM" {
+		t.Errorf("function name = %q, want %q", function.Name, "F_LTRIM")
+	}
+	if got, want := function.ModuleName.String, "ib_udf"; !function.ModuleName.Valid || got != want {
+		t.Errorf("function module = %#v, want %q", function.ModuleName, want)
+	}
+	if got, want := function.EntryPoint.String, "IB_LTRIM"; !function.EntryPoint.Valid || got != want {
+		t.Errorf("function entry point = %#v, want %q", function.EntryPoint, want)
+	}
+	if !function.ReturnPosition.Valid || function.ReturnPosition.Int64 != 1 {
+		t.Errorf("function return position = %#v, want 1", function.ReturnPosition)
+	}
+	// The return argument IS input argument 1, and must still appear exactly
+	// once in Arguments rather than being lifted out of the list.
+	if len(function.Arguments) != 3 {
+		t.Fatalf("function has %d arguments, want 3", len(function.Arguments))
+	}
+	positions := make([]int64, 0, len(function.Arguments))
+	for _, argument := range function.Arguments {
+		if !argument.Position.Valid {
+			t.Fatalf("argument %q has no position", argument.Name)
+		}
+		positions = append(positions, argument.Position.Int64)
+	}
+	if !reflect.DeepEqual(positions, []int64{1, 2, 3}) {
+		t.Errorf("argument positions = %v, want [1 2 3] in catalog order", positions)
+	}
+}
+
+func TestInterBaseProcedureParameterDomainIsUserOnly(t *testing.T) {
+	// The two-condition test from §4.4: a parameter declared with an inline
+	// type gets a system-generated RDB$ domain, which must never be shown as a
+	// domain reference. When Domain is "", Type carries the inline rendering.
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+
+	procedures, err := repository.DescribeProcedures(context.Background())
+	if err != nil {
+		t.Fatalf("DescribeProcedures() error = %v", err)
+	}
+	parameters := procedures[0].InputParameters
+
+	if got, want := parameters[0].Domain, "EMAIL_ADDRESS"; got != want {
+		t.Errorf("a user domain must be reported: Domain = %q, want %q", got, want)
+	}
+	if got, want := parameters[1].Domain, ""; got != want {
+		t.Errorf("an RDB$-prefixed system domain must not be reported: Domain = %q, want %q", got, want)
+	}
+	if got, want := parameters[1].Type, "INTEGER"; got != want {
+		t.Errorf("an inline parameter must still render its type: Type = %q, want %q", got, want)
+	}
+
+	// The second condition, exercised directly because the fixture's system
+	// domain is caught by the name rule first: a user-named domain flagged as
+	// a system object is equally not a domain reference.
+	systemFlagged := &schema.Domain{Name: "LEGACY_FLAG", SystemFlag: interBaseNullInt(1)}
+	if got := interBaseUserDomainName(interBaseNullString(interBaseFixed("LEGACY_FLAG")), systemFlagged); got != "" {
+		t.Errorf("a system-flagged domain must not be reported: got %q, want an empty string", got)
+	}
+	userFlagged := &schema.Domain{Name: "LEGACY_FLAG", SystemFlag: interBaseNullInt(0)}
+	if got, want := interBaseUserDomainName(interBaseNullString(interBaseFixed("LEGACY_FLAG")), userFlagged), "LEGACY_FLAG"; got != want {
+		t.Errorf("a user domain with SystemFlag 0 must be reported: got %q, want %q", got, want)
+	}
+	nullFlagged := &schema.Domain{Name: "LEGACY_FLAG"}
+	if got, want := interBaseUserDomainName(interBaseNullString("LEGACY_FLAG"), nullFlagged), "LEGACY_FLAG"; got != want {
+		t.Errorf("a user domain with a NULL SystemFlag must be reported: got %q, want %q", got, want)
+	}
+	if got := interBaseUserDomainName(interBaseNullString("rdb$99"), nil); got != "" {
+		t.Errorf("the RDB$ prefix test must be case insensitive: got %q, want an empty string", got)
+	}
+	if got := interBaseUserDomainName(sql.NullString{}, nil); got != "" {
+		t.Errorf("a NULL field source must report no domain: got %q", got)
+	}
+}
+
+func TestInterBaseUndecodableFieldsAreEmptyUntilDriverAccessorsLand(t *testing.T) {
+	// TriggerDesc.Event, FunctionArgumentDesc.Type and FunctionDesc.ReturnType
+	// are populated by schema.Trigger.Event, schema.FunctionArgument.SQLType
+	// and schema.Function.ReturnType, specified in the companion driver spec
+	// docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md and
+	// not yet implemented. "" is the documented undecodable value, so every
+	// consumer already handles it. The final task of this plan replaces this
+	// test with the real assertions; until then this pins that the fields
+	// exist, are empty, and that nothing else about the descriptor degrades.
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	triggers, err := repository.DescribeTriggers(ctx)
+	if err != nil {
+		t.Fatalf("DescribeTriggers() error = %v", err)
+	}
+	for _, trigger := range triggers {
+		if trigger.Event != "" {
+			t.Errorf("trigger %q event = %q, want \"\" until schema.Trigger.Event lands", trigger.Name, trigger.Event)
+		}
+		if trigger.Name == "" || !trigger.Source.Valid {
+			t.Errorf("trigger %#v lost surrounding metadata", trigger)
+		}
+	}
+
+	functions, err := repository.DescribeFunctions(ctx)
+	if err != nil {
+		t.Fatalf("DescribeFunctions() error = %v", err)
+	}
+	for _, function := range functions {
+		if function.ReturnType != "" {
+			t.Errorf("function %q return type = %q, want \"\" until schema.Function.ReturnType lands",
+				function.Name, function.ReturnType)
+		}
+		for _, argument := range function.Arguments {
+			if argument.Type != "" {
+				t.Errorf("argument %q type = %q, want \"\" until schema.FunctionArgument.SQLType lands",
+					argument.Name, argument.Type)
+			}
+			if argument.Name == "" || !argument.Position.Valid {
+				t.Errorf("argument %#v lost surrounding metadata", argument)
+			}
+		}
+	}
+}

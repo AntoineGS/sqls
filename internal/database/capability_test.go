@@ -165,6 +165,27 @@ func TestCapabilityDescriptorShape(t *testing.T) {
 	}
 }
 
+func TestInterBaseRepositoryImplementsCapabilities(t *testing.T) {
+	var (
+		_ CatalogRepository = (*InterBaseDBRepository)(nil)
+		// _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil) // Task 8
+		// _ DDLRepository             = (*InterBaseDBRepository)(nil) // Task 7
+	)
+
+	repository := DBRepository(&InterBaseDBRepository{})
+	if _, ok := repository.(CatalogRepository); !ok {
+		t.Error("*InterBaseDBRepository must implement CatalogRepository at run time, not only at compile time")
+	}
+	// Task 7:
+	// if _, ok := repository.(DDLRepository); !ok {
+	// 	t.Error("*InterBaseDBRepository must implement DDLRepository")
+	// }
+	// Task 8:
+	// if _, ok := repository.(CatalogSnapshotRepository); !ok {
+	// 	t.Error("*InterBaseDBRepository must implement CatalogSnapshotRepository")
+	// }
+}
+
 func TestNonInterBaseRepositoriesDoNotImplementCapabilities(t *testing.T) {
 	// The guard that this change stays additive: no other driver's repository
 	// may accidentally satisfy a capability, and MockDBRepository must not

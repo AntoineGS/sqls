@@ -441,6 +441,150 @@ func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexD
 	return result, nil
 }
 
+var _ CatalogRepository = (*InterBaseDBRepository)(nil)
+
+func (db *InterBaseDBRepository) DescribeProcedures(ctx context.Context) ([]*ProcedureDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	procedures, err := catalog.Procedures(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*ProcedureDesc, 0, len(procedures))
+	for _, procedure := range procedures {
+		result = append(result, &ProcedureDesc{
+			Schema:           "",
+			Name:             procedure.Name,
+			OwnerName:        procedure.OwnerName,
+			Source:           procedure.Source,
+			Description:      procedure.Description,
+			InputParameters:  db.parameterDescriptions(procedure.InputParameters, ParameterInput),
+			OutputParameters: db.parameterDescriptions(procedure.OutputParameters, ParameterOutput),
+		})
+	}
+	return result, nil
+}
+
+// parameterDescriptions maps one direction's parameters, already ordered by
+// RDB$PARAMETER_NUMBER by the catalog query. Type keeps the full rendering:
+// a parameter is a declaration, and when Domain is empty the inline type is
+// exactly what the user wrote, charset included.
+func (db *InterBaseDBRepository) parameterDescriptions(parameters []schema.ProcedureParameter, direction ParameterDirection) []*ProcedureParameterDesc {
+	result := make([]*ProcedureParameterDesc, 0, len(parameters))
+	for index := range parameters {
+		parameter := &parameters[index]
+		position := index
+		if parameter.Number.Valid {
+			position = int(parameter.Number.Int64)
+		}
+		result = append(result, &ProcedureParameterDesc{
+			Name:        parameter.Name,
+			Position:    position,
+			Direction:   direction,
+			Type:        interBaseTypeName(parameter.Domain, db.SQLDialect),
+			Domain:      interBaseUserDomainName(parameter.FieldSource, parameter.Domain),
+			Nullable:    parameter.Nullable,
+			Description: parameter.Description,
+		})
+	}
+	return result
+}
+
+// interBaseUserDomainName implements the user-versus-system domain test from
+// §4.4. A parameter declared with an inline type gets a system-generated RDB$
+// domain that must not be shown as a domain reference, so the name is reported
+// only when both conditions hold: it is non-empty and does not begin with
+// "RDB$" (case insensitively, after right-trimming catalog padding), and the
+// domain's SystemFlag is NULL or 0.
+//
+// The driver's own predicate, userDomainReference (schema/ddl.go), is
+// unexported and the companion driver spec declined to export it, so this is a
+// deliberate second copy of a two-condition rule rather than drift. If the
+// driver ever exports it, delete this and call the exported form.
+func interBaseUserDomainName(fieldSource sql.NullString, domain *schema.Domain) string {
+	if !fieldSource.Valid {
+		return ""
+	}
+	name := strings.TrimRight(fieldSource.String, " ")
+	if name == "" {
+		return ""
+	}
+	if len(name) >= len("RDB$") && strings.EqualFold(name[:len("RDB$")], "RDB$") {
+		return ""
+	}
+	if domain != nil && domain.SystemFlag.Valid && domain.SystemFlag.Int64 != 0 {
+		return ""
+	}
+	return name
+}
+
+func (db *InterBaseDBRepository) DescribeTriggers(ctx context.Context) ([]*TriggerDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	triggers, err := catalog.Triggers(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*TriggerDesc, 0, len(triggers))
+	for _, trigger := range triggers {
+		result = append(result, &TriggerDesc{
+			Schema:       "",
+			Name:         trigger.Name,
+			RelationName: trigger.RelationName,
+			// Event is decoded by schema.Trigger.Event, which the companion
+			// driver spec adds. "" is the documented undecodable value.
+			Event:       "",
+			Sequence:    trigger.Sequence,
+			Active:      interBaseFlagIsClear(trigger.Inactive),
+			Source:      trigger.Source,
+			Description: trigger.Description,
+		})
+	}
+	return result, nil
+}
+
+func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*FunctionDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	functions, err := catalog.Functions(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*FunctionDesc, 0, len(functions))
+	for _, function := range functions {
+		arguments := make([]*FunctionArgumentDesc, 0, len(function.Arguments))
+		for _, argument := range function.Arguments {
+			arguments = append(arguments, &FunctionArgumentDesc{
+				Name:     argument.Name,
+				Position: argument.Position,
+				// Rendered by schema.FunctionArgument.SQLType, which the
+				// companion driver spec adds.
+				Type: "",
+			})
+		}
+		result = append(result, &FunctionDesc{
+			Schema: "",
+			Name:   function.Name,
+			// Resolved by schema.Function.ReturnType, which the companion
+			// driver spec adds. RDB$RETURN_ARGUMENT is a position, not an
+			// index into Arguments, so sqls never indexes the slice with it.
+			ReturnType:     "",
+			ReturnPosition: function.ReturnArgument,
+			Arguments:      arguments,
+			ModuleName:     function.ModuleName,
+			EntryPoint:     function.EntryPoint,
+			Description:    function.Description,
+		})
+	}
+	return result, nil
+}
+
 func (db *InterBaseDBRepository) DescribeForeignKeysBySchema(ctx context.Context, _ string) ([]*ForeignKey, error) {
 	constraints, err := db.constraints(ctx)
 	if err != nil {
