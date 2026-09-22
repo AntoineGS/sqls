@@ -2,7 +2,6 @@ package sqlsymbol
 
 import (
 	"fmt"
-	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
@@ -72,41 +71,14 @@ func renameName(source string, dv dialect.DriverVariant) (Name, error) {
 	if !ok {
 		return Name{}, fmt.Errorf("invalid rename %q: expected one identifier", source)
 	}
+	if name.Text == "" {
+		return Name{}, fmt.Errorf("invalid rename %q: identifier cannot be empty", source)
+	}
 	word, _ := items[0].Token.Value.(*token.SQLWord)
-	if !name.Quoted && isInterBaseReserved(word.Keyword, dv) {
+	// The dialect helper is backed by InterBase's syntax keyword list, not the
+	// broad completion inventory, which can include valid function-like names.
+	if !name.Quoted && dialect.IsInterBaseReservedWord(word.Keyword, dv.Variant) {
 		return Name{}, fmt.Errorf("invalid rename %q: reserved InterBase keyword", source)
 	}
 	return name, nil
-}
-
-// This is the InterBase syntax-word set, rather than the completion inventory:
-// completion also includes functions and other words that are valid names.
-var interBaseReserved = func() map[string]bool {
-	words := strings.Fields(`
-ACTIVE ADD ADMIN AFTER ALL ALTER AND ANY ASC ASCENDING AT BEFORE BETWEEN BLOB
-BOOLEAN BY CASE CAST CHARACTER CHECK CLOSE COLLATE COLUMN COMMIT COMPUTED
-CONNECT CONSTRAINT CONTAINING CREATE CROSS CURRENT CURRENT_DATE CURRENT_TIME
-CURRENT_TIMESTAMP CURRENT_USER CURSOR DATABASE DATE DAY DEC DECIMAL DECLARE
-DEFAULT DELETE DESC DESCENDING DISTINCT DO DOMAIN DROP ELSE END ENTRY_POINT
-ESCAPE EXCEPTION EXECUTE EXISTS EXIT EXTERNAL FILTER FLOAT FOR FOREIGN FROM
-FULL GENERATOR GRANT GROUP HAVING HOUR IF IN INACTIVE INDEX INNER INSERT
-INTEGER INTO IS JOIN KEY LAST LEADING LEFT LIKE LONG MANUAL MAX MIN MINUTE
-MONTH NATIONAL NATURAL NCHAR NO NOT NULL NUMERIC OF ON ONLY OR ORDER OUTER
-PARAMETER PLAN POST_EVENT PRECISION PRIMARY PROCEDURE RECORD_VERSION REFERENCES
-RETAIN RETURNING_VALUES RETURNS REVOKE RIGHT ROLLBACK ROWS SAVEPOINT SECOND
-SELECT SET SHADOW SMALLINT SOME SORT SQL START SUBSTRING SUSPEND TABLE THEN TO
-TRAILING TRANSACTION TRIGGER UNCOMMITTED UNION UNIQUE UPDATE USER USING VALUE
-VALUES VARCHAR VARIABLE VARYING VIEW WHEN WHERE WHILE WITH WORK WRITE YEAR`)
-	result := make(map[string]bool, len(words)+2)
-	for _, word := range words {
-		result[word] = true
-	}
-	return result
-}()
-
-func isInterBaseReserved(word string, dv dialect.DriverVariant) bool {
-	if word == "TIME" || word == "TIMESTAMP" {
-		return dv.Variant != dialect.SQLVariantInterBase1
-	}
-	return interBaseReserved[strings.ToUpper(word)]
 }

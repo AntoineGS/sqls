@@ -242,6 +242,27 @@ END`
 	}
 }
 
+func TestLocalRenameAmbiguousTargetIsHandledError(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE duplicate INTEGER;
+DECLARE VARIABLE duplicate INTEGER;
+BEGIN
+  duplicate = 1;
+END`
+	params := lsp.RenameParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 4, Character: 2},
+		NewName:      "renamed",
+	}
+	got, handled, err := localRename(text, params, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if !handled || err == nil {
+		t.Fatalf("localRename = (%#v, %v, %v), want handled ambiguity error", got, handled, err)
+	}
+	if got != nil {
+		t.Fatalf("ambiguous local returned edits: %#v", got)
+	}
+}
+
 func TestRenameJSONRPCUsesCurrentDocumentWithoutVersionZero(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)

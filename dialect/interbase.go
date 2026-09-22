@@ -1,6 +1,9 @@
 package dialect
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // InterBaseDialect implements the lexical rules of one InterBase SQL dialect.
 // Dialect 1 uses double quotes for string literals; Dialect 3 uses them for
@@ -249,6 +252,22 @@ var interbaseKeywords = []string{
 	"WORK",
 	"WRITE",
 	"YEAR",
+}
+
+// IsInterBaseReservedWord reports whether word is reserved by InterBase's SQL
+// syntax for variant. It deliberately uses the server keyword rules above,
+// rather than the broader completion inventories for other dialects.
+func IsInterBaseReservedWord(word string, variant SQLVariant) bool {
+	word = strings.ToUpper(word)
+	for _, reserved := range interbaseKeywords {
+		if word == reserved {
+			return true
+		}
+	}
+	if variant != SQLVariantInterBase1 && (word == "TIME" || word == "TIMESTAMP") {
+		return true
+	}
+	return false
 }
 
 // interbaseDialect3Keywords is interbaseKeywords plus the two types that exist
