@@ -325,3 +325,61 @@ func BenchmarkAnalyzeResolutionScaling(b *testing.B) {
 		})
 	}
 }
+
+func TestResolveParameterOnlyProcedureBody(t *testing.T) {
+	text := `ALTER PROCEDURE p(x INTEGER) AS
+BEGIN
+  x = x + 1;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	symbol := a.procedures[0].Symbols["X"][0]
+	if got := a.Resolve(strings.Index(text, "x = x")); got.Role != Local || got.Symbol != symbol {
+		t.Fatalf("parameter assignment = %+v, want local parameter", got)
+	}
+	if got := a.References(symbol, true); len(got) != 3 {
+		t.Fatalf("parameter references = %v, want declaration and two uses", got)
+	}
+	if symbol.RenameBlocked != "" {
+		t.Fatalf("parameter unexpectedly blocked: %q", symbol.RenameBlocked)
+	}
+}
+
+func TestResolveUnsupportedExecuteBlockKeepsCaseFrames(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x INTEGER;
+BEGIN
+  EXECUTE BLOCK AS BEGIN
+    SELECT CASE WHEN 1 = 1 THEN 0 ELSE 0 END FROM t;
+    x = 2;
+  END;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := a.procedures[0].Symbols["X"][0]
+	got := a.Resolve(strings.Index(text, "x = 2"))
+	if got.Role != Ambiguous || got.Symbol != nil {
+		t.Fatalf("execute block local = %+v, want ambiguous", got)
+	}
+	if x.RenameBlocked == "" {
+		t.Fatal("nested CASE caused execute-block protection to end early")
+	}
+}
+
+func BenchmarkAnalyzeMalformedInsertScaling(b *testing.B) {
+	for _, count := range []int{100, 1000, 5000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			text := "ALTER PROCEDURE p AS BEGIN " + strings.Repeat("INSERT ", count) + " END"
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := Analyze(text, interBaseVariant()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

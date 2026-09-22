@@ -243,21 +243,29 @@ func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
 	outputDepth := -1
 	outputActive := false
 	outputExpect := false
-	executeBlockDepth := 0
+	unsupportedFrames := make([]bodyFrame, 0, 2)
+	bodyStarted := make([]bool, len(a.procedures))
 	head := ""
 	for i, item := range items {
-		if item.Token.Kind == token.Semicolon && executeBlockDepth == 0 {
+		procedureIndex := procedureAt[i]
+		if item.Token.Kind == token.Semicolon && len(unsupportedFrames) == 0 {
 			kind, active, depth, restoreProcedureDepth = contextProcedure, false, 0, -1
 			updateSetDepth, updateExpectTarget, outputDepth, outputActive, outputExpect, head = -1, false, -1, false, false, ""
 		}
-		if executeBlockDepth > 0 {
+		if len(unsupportedFrames) > 0 {
 			contexts[i].kind = contextUnsupported
-			if isWord(item, "BEGIN") {
-				executeBlockDepth++
+			if isWord(item, "CASE") {
+				unsupportedFrames = append(unsupportedFrames, caseFrame)
 			}
-			if isWord(item, "END") {
-				executeBlockDepth--
-				if executeBlockDepth == 0 {
+			if isWord(item, "BEGIN") {
+				unsupportedFrames = append(unsupportedFrames, beginFrame)
+			}
+			if isWord(item, "END") && len(unsupportedFrames) > 0 {
+				last := len(unsupportedFrames) - 1
+				if unsupportedFrames[last] == beginFrame {
+					unsupportedFrames = unsupportedFrames[:last]
+				}
+				if len(unsupportedFrames) == 0 {
 					kind, active = contextUnsupported, true
 				}
 			}
@@ -266,12 +274,17 @@ func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
 		if item.Token.Kind == token.LParen {
 			depth++
 		}
+		if isWord(item, "BEGIN") && procedureIndex >= 0 && !bodyStarted[procedureIndex] && head != "EXECUTE_BLOCK" {
+			bodyStarted[procedureIndex] = true
+			kind, active, head = contextProcedure, false, ""
+		}
 
 		if kind == contextExecutePending {
 			if isWord(item, "PROCEDURE") {
 				kind, active = contextExecute, true
 			} else if isWord(item, "BLOCK") {
 				kind, active = contextUnsupported, true
+				head = "EXECUTE_BLOCK"
 			} else if active {
 				kind = contextUnsupported
 			}
@@ -312,8 +325,8 @@ func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
 		if kind == contextProcedure && (isWord(item, "THEN") || isWord(item, "ELSE") || isWord(item, "DO")) {
 			active = false
 		}
-		if kind == contextUnsupported && isWord(item, "BEGIN") && i > 0 && isWord(items[i-1], "AS") {
-			executeBlockDepth = 1
+		if kind == contextUnsupported && head == "EXECUTE_BLOCK" && isWord(item, "BEGIN") && i > 0 && isWord(items[i-1], "AS") {
+			unsupportedFrames = append(unsupportedFrames, beginFrame)
 		}
 		contexts[i].kind = kind
 
@@ -390,27 +403,34 @@ func markSQLPositions(items []lexeme, contexts []tokenContext) {
 			contexts[alias].alias = true
 		}
 	}
+	insertState := 0 // 1: INSERT, 2: INTO, 3: relation, 4: column list
+	insertDepth := 0
 	for i, item := range items {
-		if !isWord(item, "INSERT") {
-			continue
+		if item.Token.Kind == token.Semicolon {
+			insertState, insertDepth = 0, 0
 		}
-		into := i + 1
-		for into < len(items) && !isWord(items[into], "INTO") && items[into].Token.Kind != token.Semicolon {
-			into++
-		}
-		if into+2 >= len(items) || !isNameToken(items[into+1]) || items[into+2].Token.Kind != token.LParen {
-			continue
-		}
-		depth := 1
-		for j := into + 3; j < len(items) && depth > 0; j++ {
-			switch items[j].Token.Kind {
+		switch {
+		case isWord(item, "INSERT"):
+			insertState, insertDepth = 1, 0
+		case insertState == 1 && isWord(item, "INTO"):
+			insertState = 2
+		case insertState == 2 && isNameToken(item):
+			contexts[i].relation = true
+			insertState = 3
+		case insertState == 3 && item.Token.Kind == token.LParen:
+			insertState, insertDepth = 4, 1
+		case insertState == 4:
+			switch item.Token.Kind {
 			case token.LParen:
-				depth++
+				insertDepth++
 			case token.RParen:
-				depth--
+				insertDepth--
+				if insertDepth == 0 {
+					insertState = 0
+				}
 			default:
-				if depth == 1 && isNameToken(items[j]) {
-					contexts[j].insertColumn = true
+				if insertDepth == 1 && isNameToken(item) {
+					contexts[i].insertColumn = true
 				}
 			}
 		}
