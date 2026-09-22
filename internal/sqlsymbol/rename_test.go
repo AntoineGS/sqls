@@ -92,12 +92,12 @@ func TestRenameRejectsVendorReservedWordsCaseInsensitively(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, newName := range []string{"EXTRACT", "extract", "TYPE", "type", "WEEKDAY", "weekday", "YEARDAY", "yearday"} {
+	for _, newName := range []string{"EXTRACT", "extract", "TYPE", "type", "WEEKDAY", "weekday", "YEARDAY", "yearday", "OPEN", "open", "FALSE", "false", "FETCH", "fetch", "OPTION", "option"} {
 		if _, err := a.Rename(a.Symbols[0], newName); err == nil {
 			t.Errorf("Rename(%q) succeeded, want vendor reserved-word validation error", newName)
 		}
 	}
-	for _, newName := range []string{"ABS", "abs", "COALESCE", "coalesce"} {
+	for _, newName := range []string{"ABS", "abs", "DATEADD", "dateadd"} {
 		if _, err := a.Rename(a.Symbols[0], newName); err != nil {
 			t.Errorf("Rename(%q) failed, want valid non-reserved function-like name: %v", newName, err)
 		}
