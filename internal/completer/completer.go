@@ -27,6 +27,7 @@ const (
 	CompletionTypeTable
 	CompletionTypeReferencedTable
 	CompletionTypeView
+	CompletionTypeProcedureName
 	CompletionTypeSubQuery
 	CompletionTypeSubQueryColumn
 	CompletionTypeChange
@@ -50,6 +51,8 @@ func (ct completionType) String() string {
 		return "ReferencedTable"
 	case CompletionTypeView:
 		return "View"
+	case CompletionTypeProcedureName:
+		return "ProcedureName"
 	case CompletionTypeChange:
 		return "Change"
 	case CompletionTypeUser:
@@ -152,6 +155,19 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
+			// An InterBase selectable procedure is legal wherever a relation
+			// is. Views are deliberately NOT added here: they are already in
+			// SchemaTables, so TableCandidates has offered them once.
+			items = append(items, c.SelectableProcedureCandidates()...)
+		}
+		if completionTypeIs(ctx.types, CompletionTypeProcedureName) {
+			items = append(items, c.ProcedureCandidates()...)
+		}
+		if completionTypeIs(ctx.types, CompletionTypeView) && !completionTypeIs(ctx.types, CompletionTypeTable) {
+			items = append(items, c.ViewCandidates(ctx.parent)...)
+		}
+		if insideGenIDCall(nodeWalker) {
+			items = append(items, c.GeneratorCandidates()...)
 		}
 		if completionTypeIs(ctx.types, CompletionTypeSchema) {
 			candidates := c.SchemaCandidates()
@@ -199,6 +215,9 @@ func (c *Completer) Complete(text string, params lsp.CompletionParams, lowercase
 	if completionTypeIs(ctx.types, CompletionTypeFunction) {
 		drivers := dialect.DataBaseFunctionsForVariant(c.driverVariant())
 		items = append(items, c.functionCandidates(lowercaseKeywords, drivers)...)
+		// A UDF is callable exactly where a built-in function is, so it needs
+		// no new completion type and no new context.
+		items = append(items, c.ExternalFunctionCandidates()...)
 	}
 
 	items = filterCandidates(items, lastWord)
@@ -228,6 +247,12 @@ func getSortTextPrefix(kind lsp.CompletionItemKind) string {
 		return "2"
 	case lsp.FunctionCompletion:
 		return "10"
+	case lsp.MethodCompletion:
+		// Procedures, beside the external functions they resemble.
+		return "10"
+	case lsp.ValueCompletion:
+		// Generators, just below procedures and functions.
+		return "11"
 	case
 		lsp.ColorCompletion,
 		lsp.ConstantCompletion,
@@ -239,7 +264,6 @@ func getSortTextPrefix(kind lsp.CompletionItemKind) string {
 		lsp.FolderCompletion,
 		lsp.InterfaceCompletion,
 		lsp.KeywordCompletion,
-		lsp.MethodCompletion,
 		lsp.OperatorCompletion,
 		lsp.PropertyCompletion,
 		lsp.ReferenceCompletion,
@@ -247,7 +271,6 @@ func getSortTextPrefix(kind lsp.CompletionItemKind) string {
 		lsp.TextCompletion,
 		lsp.TypeParameterCompletion,
 		lsp.UnitCompletion,
-		lsp.ValueCompletion,
 		lsp.VariableCompletion:
 		return "9999"
 	default:
@@ -404,6 +427,16 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 		t = []completionType{
 			CompletionTypeColumn,
 			CompletionTypeView,
+		}
+	case syntaxPos == parseutil.ExecuteProcedure:
+		// CompletionTypeKeyword is retained deliberately. multiKeywordMap is
+		// dialect-independent, so PostgreSQL's legacy
+		// "CREATE TRIGGER ... EXECUTE PROCEDURE f()" reaches this branch too;
+		// without the keywords a PostgreSQL user would receive nothing at all,
+		// because no procedure cache exists for that driver.
+		t = []completionType{
+			CompletionTypeProcedureName,
+			CompletionTypeKeyword,
 		}
 	default:
 		t = []completionType{

@@ -56,10 +56,14 @@ func (c *Completer) columnCandidates(targetTables []*parseutil.TableInfo, parent
 				candidates = append(candidates, generateColumnCandidates(table.Name, columns)...)
 			} else if table.Name != "" {
 				columns, ok := c.DBCache.ColumnDescs(table.Name)
-				if !ok {
+				if ok {
+					candidates = append(candidates, generateColumnCandidates(table.Name, columns)...)
 					continue
 				}
-				candidates = append(candidates, generateColumnCandidates(table.Name, columns)...)
+				// The relation is not a table. On InterBase it may be a
+				// selectable procedure, whose output parameters are its
+				// columns.
+				candidates = append(candidates, c.procedureColumnCandidates(table.Name)...)
 			}
 		}
 	case ParentTypeSchema:
@@ -70,10 +74,11 @@ func (c *Completer) columnCandidates(targetTables []*parseutil.TableInfo, parent
 				continue
 			}
 			columns, ok := c.DBCache.ColumnDescs(table.Name)
-			if !ok {
+			if ok {
+				candidates = append(candidates, generateColumnCandidates(table.Name, columns)...)
 				continue
 			}
-			candidates = append(candidates, generateColumnCandidates(table.Name, columns)...)
+			candidates = append(candidates, c.procedureColumnCandidates(table.Name)...)
 		}
 	case ParentTypeSubQuery:
 		// pass
@@ -389,6 +394,20 @@ func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.C
 			Kind:   lsp.ClassCompletion,
 			Detail: "table",
 		}
+		// Views live in SchemaTables alongside tables, so this candidate is
+		// already the view's only candidate. It is relabelled here rather than
+		// duplicated by a separate view generator. DBCache.View is nil-safe
+		// and returns false for every driver without a catalog, so no other
+		// driver's output changes.
+		if view, ok := dbCache.View(tableName); ok {
+			candidate.Detail = "view"
+			candidate.Documentation = &lsp.MarkupContent{
+				Kind:  lsp.Markdown,
+				Value: database.ViewDoc(view),
+			}
+			candidates = append(candidates, candidate)
+			continue
+		}
 		cols, ok := dbCache.ColumnDescs(tableName)
 		if ok {
 			candidate.Documentation = &lsp.MarkupContent{
@@ -409,6 +428,9 @@ func generateTableCandidatesByInfos(tables []*parseutil.TableInfo, dbCache *data
 		if table.Alias != "" {
 			name = table.Alias
 			detail = "aliased table"
+		}
+		if _, ok := dbCache.View(table.Name); ok {
+			detail = strings.Replace(detail, "table", "view", 1)
 		}
 		candidate := lsp.CompletionItem{
 			Label:  name,
