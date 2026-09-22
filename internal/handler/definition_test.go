@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -13,6 +14,28 @@ import (
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
+
+const task5DefinitionSentinelDriver dialect.DatabaseDriver = "task5-definition-sentinel"
+
+type task5DefinitionSentinelRepository struct {
+	*database.MockDBRepository
+	calls int
+}
+
+func (r *task5DefinitionSentinelRepository) ObjectDDL(context.Context, database.ObjectKind, string) (string, error) {
+	r.calls++
+	return "CREATE PROCEDURE MYPROC AS BEGIN END", nil
+}
+
+var task5DefinitionSentinel = &task5DefinitionSentinelRepository{
+	MockDBRepository: database.NewMockDBRepository(nil).(*database.MockDBRepository),
+}
+
+func init() {
+	database.RegisterConnFactory(task5DefinitionSentinelDriver, func(*database.DBConnection) database.DBRepository {
+		return task5DefinitionSentinel
+	})
+}
 
 var definitionTestCases = []struct {
 	name  string
@@ -256,6 +279,43 @@ func TestDefinitionProtocolValidation(t *testing.T) {
 	}
 }
 
+func TestDefinitionAndReferencesRejectMalformedPayloads(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	tests := []struct {
+		name   string
+		method string
+		body   string
+		syntax bool
+	}{
+		{name: "definition malformed JSON", method: "textDocument/definition", body: `{"textDocument":`, syntax: true},
+		{name: "definition invalid position type", method: "textDocument/definition", body: `{"textDocument":{"uri":"file:///test.sql"},"position":{"line":"zero","character":0}}`},
+		{name: "references malformed JSON", method: "textDocument/references", body: `{"textDocument":`, syntax: true},
+		{name: "references invalid position type", method: "textDocument/references", body: `{"textDocument":{"uri":"file:///test.sql"},"position":{"line":0,"character":false}}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := json.RawMessage(tc.body)
+			_, err := tx.server.handle(context.Background(), nil, &jsonrpc2.Request{Method: tc.method, Params: &raw})
+			if err == nil {
+				t.Fatal("malformed payload returned nil error")
+			}
+			if tc.syntax {
+				var syntaxErr *json.SyntaxError
+				if !errors.As(err, &syntaxErr) {
+					t.Fatalf("error = %T %v, want JSON syntax error", err, err)
+				}
+			} else {
+				var typeErr *json.UnmarshalTypeError
+				if !errors.As(err, &typeErr) {
+					t.Fatalf("error = %T %v, want JSON type error", err, err)
+				}
+			}
+		})
+	}
+}
+
 func TestAmbiguousLocalBeatsSameSpelledCatalogCandidate(t *testing.T) {
 	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE MYPROC INTEGER;\nBEGIN\nSELECT MYPROC FROM t;\nEND"
 	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -271,6 +331,42 @@ func TestAmbiguousLocalBeatsSameSpelledCatalogCandidate(t *testing.T) {
 	}
 	if !handled || len(got) != 0 {
 		t.Fatalf("ambiguous local definition = (%v, %v), want handled empty result", got, handled)
+	}
+}
+
+func TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+	task5DefinitionSentinel.calls = 0
+	backend := installStubBackend(t)
+	backend.setProcedures([]*database.ProcedureDesc{{Name: "MYPROC"}})
+	tx.addWorkspaceConfig(t, stubInterBaseConnections("catalog"))
+	waitForCatalog(t, tx.server.worker)
+	tx.server.snapshots = newTestSnapshotStore(t)
+
+	// Keep the request parser on InterBase while making any mistaken catalog
+	// fallback observable through the registered repository sentinel.
+	tx.server.stateMu.Lock()
+	tx.server.curDBCfg = &database.DBConfig{Driver: task5DefinitionSentinelDriver}
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.stateMu.Unlock()
+	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE MYPROC INTEGER;\nBEGIN\nSELECT MYPROC FROM t;\nEND"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 3, Character: 7},
+	}}
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ambiguous local dispatch returned catalog definition %#v, want empty", got)
+	}
+	if task5DefinitionSentinel.calls != 0 {
+		t.Fatalf("catalog fallback called ObjectDDL %d times, want zero", task5DefinitionSentinel.calls)
 	}
 }
 

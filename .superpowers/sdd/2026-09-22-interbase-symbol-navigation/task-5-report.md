@@ -72,6 +72,43 @@ $ git diff --check
 (no output; exit 0)
 ```
 
+## Fix round 2
+
+Added an actual JSON-RPC definition dispatch regression: an in-memory catalog
+contains `MYPROC`, a registered repository sentinel would materialize its
+snapshot if fallback were reached, and the test asserts both an empty result
+and zero `ObjectDDL` calls for the ambiguous local. Added separate malformed
+JSON and JSON type-error cases for both definition and references.
+
+### Fix round 2 RED mutation check
+
+The dispatch regression was run once with the production guard intentionally
+mutated from `if handled` to `if handled && len(local) > 0`:
+
+```text
+$ go test ./internal/handler -run TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback -count=1
+--- FAIL: TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback (0.01s)
+    definition_test.go:323: ambiguous local dispatch returned catalog definition []lsp.Location{lsp.Location{URI:"file:///tmp/TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback1971690183/001/c7c53a3077d57c12-3142035/procedure/MYPROC.sql", Range:lsp.Range{Start:lsp.Position{Line:3, Character:17}, End:lsp.Position{Line:3, Character:17}}}}, want empty
+FAIL
+FAIL github.com/sqls-server/sqls/internal/handler 0.012s
+```
+
+The production guard was restored unchanged; this mutation was not committed.
+
+### Fix round 2 GREEN
+
+```text
+$ go test ./internal/handler -run 'TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback|TestDefinitionAndReferencesRejectMalformedPayloads|TestDefinitionInvalidInterBasePositionsDoNotUseLegacyFallback|TestDefinitionDispatcherRoutesSQLRoles|TestReferencesDispatcherReturnsEmptyForUnsupportedAndCommentTargets' -count=1
+ok   github.com/sqls-server/sqls/internal/handler 0.024s
+
+$ go test ./internal/handler ./internal/sqlsymbol -count=1
+ok   github.com/sqls-server/sqls/internal/handler 1.113s
+ok   github.com/sqls-server/sqls/internal/sqlsymbol 0.007s
+
+$ git diff --check
+(no output; exit 0)
+```
+
 ## Self-review
 
 - Local references include/exclude declarations through the LSP context and
