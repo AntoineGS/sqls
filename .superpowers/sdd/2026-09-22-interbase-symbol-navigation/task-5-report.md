@@ -87,3 +87,58 @@ $ git diff --check
 Relation/column catalog snapshot materialization is intentionally deferred to
 Task 7; Task 5 now prevents those proven SQL roles from falling through to an
 unrelated alias spelling.
+
+## Fix round 1
+
+Review findings addressed:
+
+- Invalid InterBase UTF-16 positions now return a handled empty definition
+  result before legacy token-column or repository fallback.
+- Added dispatcher-level tests for invalid positions (including a surrogate
+  midpoint that previously resolved an alias), prefixed local reads, protocol
+  validation, missing documents, same-spelled catalog ambiguity, contextual
+  Relation/Column routing, Alias/Callable fallback, and unsupported/comment
+  references.
+
+### Fix RED
+
+```text
+$ go test ./internal/handler -run TestDefinitionInvalidInterBasePositionsDoNotUseLegacyFallback -count=1
+2026/09/22 15:41:30 db worker: start
+2026/09/22 15:41:30 Send Message: no database connection
+--- FAIL: TestDefinitionInvalidInterBasePositionsDoNotUseLegacyFallback (0.00s)
+    definition_test.go:229: invalid position {Line:0 Character:1} got legacy candidate []lsp.Location{lsp.Location{URI:"file:///Users/octref/Code/css-test/test.sql", Range:lsp.Range{Start:lsp.Position{Line:0, Character:20}, End:lsp.Position{Line:0, Character:22}}}}, want empty
+FAIL
+FAIL github.com/sqls-server/sqls/internal/handler 0.008s
+```
+
+### Fix GREEN
+
+```text
+$ go test ./internal/handler -run 'TestReferences|TestLocalDefinition|TestSymbol|TestInitialized|TestDefinition' -count=1
+ok   github.com/sqls-server/sqls/internal/handler 0.017s
+
+$ go test ./internal/handler ./internal/sqlsymbol -count=1
+ok   github.com/sqls-server/sqls/internal/handler 1.085s
+ok   github.com/sqls-server/sqls/internal/sqlsymbol 0.004s
+
+$ go test ./... -count=1
+?    github.com/sqls-server/sqls [no test files]
+?    github.com/sqls-server/sqls/ast [no test files]
+?    github.com/sqls-server/sqls/ast/astutil [no test files]
+ok   github.com/sqls-server/sqls/dialect 0.007s
+ok   github.com/sqls-server/sqls/internal/completer 0.026s
+ok   github.com/sqls-server/sqls/internal/config 0.012s
+ok   github.com/sqls-server/sqls/internal/database 0.300s
+?    github.com/sqls-server/sqls/internal/debug [no test files]
+ok   github.com/sqls-server/sqls/internal/formatter 0.007s
+ok   github.com/sqls-server/sqls/internal/handler 1.081s
+?    github.com/sqls-server/sqls/internal/lsp [no test files]
+ok   github.com/sqls-server/sqls/internal/sqlsymbol 0.007s
+ok   github.com/sqls-server/sqls/parser 0.008s
+ok   github.com/sqls-server/sqls/parser/parseutil 0.018s
+ok   github.com/sqls-server/sqls/token 0.004s
+
+$ git diff --check
+(no output; exit 0)
+```

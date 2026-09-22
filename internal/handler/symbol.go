@@ -138,7 +138,9 @@ func localDefinition(uri, text string, pos lsp.Position, dv dialect.DriverVarian
 	}
 	offset, ok := symbolOffset(text, pos)
 	if !ok {
-		return nil, false, nil
+		// An invalid InterBase position must not fall through to the legacy
+		// parser, whose token columns use a different coordinate system.
+		return []lsp.Location{}, true, nil
 	}
 	analysis, err := sqlsymbol.Analyze(text, dv)
 	if err != nil {

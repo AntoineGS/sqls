@@ -103,3 +103,39 @@ func TestReferencesProcedureAcrossStatements(t *testing.T) {
 		}
 	}
 }
+
+func TestReferencesDispatcherReturnsEmptyForUnsupportedAndCommentTargets(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	text := "SELECT value FROM table_name"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	tx.server.stateMu.Lock()
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverPostgreSQL}
+	tx.server.stateMu.Unlock()
+	params := lsp.ReferenceParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 0, Character: 7},
+	}}
+	var got []lsp.Location
+	if err := tx.conn.Call(tx.ctx, "textDocument/references", params, &got); err != nil {
+		t.Fatal("unsupported driver references:", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("unsupported driver references = %#v, want empty result", got)
+	}
+
+	tx.server.stateMu.Lock()
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.stateMu.Unlock()
+	text = "ALTER PROCEDURE p AS\nDECLARE VARIABLE value INTEGER;\nBEGIN\n-- value\nEND"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	params.Position = lsp.Position{Line: 3, Character: 3}
+	got = nil
+	if err := tx.conn.Call(tx.ctx, "textDocument/references", params, &got); err != nil {
+		t.Fatal("comment references:", err)
+	}
+	if got == nil || len(got) != 0 {
+		t.Fatalf("comment references = %#v, want empty result", got)
+	}
+}
