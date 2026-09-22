@@ -48,12 +48,13 @@ import (
 // driver's SQL_VARYING path takes the wire-provided length prefix as
 // authoritative with no charset-width recomputation, so casting to VARCHAR
 // here reaches that already-correct path instead. interBaseBulkIdentifierCastWidth
-// (67) is the live-confirmed byte width of this catalog's identifier domains
-// (RDB$FIELDS: RDB$FIELD_LENGTH=67, RDB$CHARACTER_SET_ID=3/UNICODE_FSS for
-// RDB$RELATION_NAME's source domain); InterBase draws relation, field,
-// constraint, character-set and collation names from the same system
-// identifier domain family, so one width bounds all of them. This does not
-// fix the driver: the standalone repository and every extended catalog
+// (67) is the live-confirmed byte width of NRF01's relation-name domain
+// (RDB$FIELDS: RDB$FIELD_LENGTH=67, RDB$CHARACTER_SET_ID=3/UNICODE_FSS).
+// Comparing the complete cache to a full-name reference also verified this
+// projection on NRF01 and centrale. A different InterBase catalog with
+// identifiers wider than 67 bytes needs a catalog-derived cast width before
+// using this loader, or the snapshot can fail on an over-length identifier.
+// This does not fix the driver: the standalone repository and every extended catalog
 // accessor still read CHAR identifiers through the driver's unpatched
 // SQL_TEXT decode and remain subject to the same truncation.
 const interBaseBulkIdentifierCastWidth = 67
