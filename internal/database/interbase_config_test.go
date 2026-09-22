@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"reflect"
 	"strings"
 	"testing"
@@ -434,6 +435,29 @@ func TestInterBaseDriverConfigMapping(t *testing.T) {
 				t.Errorf("structured mapping composes %q, want the display attachment %q", composed, attachment)
 			}
 		})
+	}
+}
+
+func TestInterBaseCurrentDatabaseAndDatabases(t *testing.T) {
+	const attachment = "db.example.test/3050:/srv/interbase/centrale.ib"
+	ctx := context.Background()
+
+	named := &InterBaseDBRepository{DatabaseName: attachment}
+	if got, err := named.CurrentDatabase(ctx); err != nil || got != attachment {
+		t.Fatalf("CurrentDatabase() = (%q, %v), want (%q, nil)", got, err, attachment)
+	}
+	if got, err := named.Databases(ctx); err != nil || !reflect.DeepEqual(got, []string{attachment}) {
+		t.Fatalf("Databases() = (%#v, %v), want the single attachment", got, err)
+	}
+
+	// Repositories built from a bare *sql.DB have no identity to report; the
+	// existing assertions in interbase_test.go:18-23 depend on this branch.
+	anonymous := &InterBaseDBRepository{}
+	if got, err := anonymous.CurrentDatabase(ctx); err != nil || got != "" {
+		t.Fatalf("CurrentDatabase() = (%q, %v), want (empty, nil)", got, err)
+	}
+	if got, err := anonymous.Databases(ctx); err != nil || !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("Databases() = (%#v, %v), want an empty list", got, err)
 	}
 }
 

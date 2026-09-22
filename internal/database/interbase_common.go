@@ -303,14 +303,19 @@ func (db *InterBaseDBRepository) Driver() dialect.DatabaseDriver {
 	return dialect.DatabaseDriverInterBase
 }
 
-// InterBase has one database per attachment and has no database catalog that
-// can be enumerated through this repository abstraction.
+// InterBase serves exactly one database per attachment, so the attachment string
+// is the connection's identity. It is used verbatim rather than shortened to a
+// basename, because it is what the user configured and it disambiguates remote
+// attachments: two hosts can serve /srv/data/x.ib.
 func (db *InterBaseDBRepository) CurrentDatabase(context.Context) (string, error) {
-	return "", nil
+	return db.DatabaseName, nil
 }
 
 func (db *InterBaseDBRepository) Databases(context.Context) ([]string, error) {
-	return []string{}, nil
+	if db.DatabaseName == "" {
+		return []string{}, nil
+	}
+	return []string{db.DatabaseName}, nil
 }
 
 // InterBase does not have a schema namespace in the same sense as the other
