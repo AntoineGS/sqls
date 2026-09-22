@@ -1,9 +1,9 @@
 # Named query parameters with remembered Neovim prompts
 
-Status: approved and implemented on `feat/interbase-query-parameters`. Verified
-by the offline suites and by a read-only live pass against a staged build on the
-authorized connections; installation of that build as the local sqls binary is
-still pending.
+Status: approved, implemented and merged locally on 2026-09-22. Verified by the
+offline suites and a read-only live pass on the authorized connections. The
+native sqls binary and Neovim adapter are installed; an installed smoke check
+confirmed repeated binding, prefills, result previews and prepare-only Explain.
 
 ## Intent and agreed behavior
 
