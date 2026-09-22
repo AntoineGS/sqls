@@ -304,6 +304,12 @@ func TestParameterExecutionUsesTheSubmittedSnapshot(t *testing.T) {
 		}
 	}
 
+	// Only now wait for the call to reach the gate. The window above is
+	// unchanged, but a run where the statement never got that far — on a
+	// loaded machine, say — fails loudly here instead of passing green while
+	// exercising none of the concurrency this test exists for.
+	gate.waitEntered(t)
+
 	gate.release()
 	select {
 	case err := <-done:
@@ -361,18 +367,85 @@ func TestParameterSubmissionRejectsAnInvalidValueBeforeTheFirstStatement(t *test
 	}
 }
 
-func TestParameterSubmissionRejectsAnUnsupportedRepositoryBeforeTheFirstStatement(t *testing.T) {
+// The three refusals below are the three tiers of the shared capability
+// ladder (boundReadFor / boundExecFor). Preflight asks that ladder the same
+// question execution would, so each tier must refuse the whole batch before
+// its first statement.
+func TestParameterSubmissionRejectsARepositoryWithoutTheParameterizedReadOnlyQuerier(t *testing.T) {
 	// The first statement needs no capability at all; the second does. The
 	// batch must be refused before the first one runs.
 	f := newParameterFixture(t, "SELECT 1 FROM T;\nSELECT :ID FROM U", func(b *parameterBackend) {
-		b.withoutParameterCapabilities()
+		b.withoutBoundCapabilities()
 	})
 	d := f.discover(t, nil)
 
-	if _, err := f.execute(t, submissionFor(d, textValue("ID", "1")), nil); err == nil {
-		t.Fatal("executeQuery succeeded, want a repository without bound capabilities refused")
+	_, err := f.execute(t, submissionFor(d, textValue("ID", "1")), nil)
+	if err == nil {
+		t.Fatal("executeQuery succeeded, want a read-only repository without its bound counterpart refused")
+	}
+	// A repository offering a read-only transaction must be refused, never
+	// downgraded to an ordinary one behind the user's back.
+	if !strings.Contains(err.Error(), errParameterizedReadOnlyUnsupported.Error()) {
+		t.Errorf("error = %v, want %v", err, errParameterizedReadOnlyUnsupported)
 	}
 	requireNoCalls(t, f.backend)
+}
+
+func TestParameterSubmissionRejectsAReadAgainstARepositoryWithoutAnyBoundCapability(t *testing.T) {
+	f := newParameterFixture(t, "SELECT :ID FROM T", func(b *parameterBackend) {
+		b.withoutAnyOptionalCapabilities()
+	})
+	d := f.discover(t, nil)
+
+	_, err := f.execute(t, submissionFor(d, textValue("ID", "1")), nil)
+	if err == nil {
+		t.Fatal("executeQuery succeeded, want a repository with no bound capability refused")
+	}
+	if !strings.Contains(err.Error(), errBoundParametersUnsupported.Error()) {
+		t.Errorf("error = %v, want %v", err, errBoundParametersUnsupported)
+	}
+	requireNoCalls(t, f.backend)
+}
+
+func TestParameterSubmissionRejectsAProcedureOnTheExecRouteWithoutBoundCapability(t *testing.T) {
+	// No catalog descriptors, so this call routes to Exec as an unknown
+	// procedure — the other route that needs ParameterizedRepository.
+	f := newParameterFixture(t, "EXECUTE PROCEDURE DOWORK(:ID)", func(b *parameterBackend) {
+		b.withoutBoundCapabilities()
+	})
+	d := f.discover(t, nil)
+
+	_, err := f.execute(t, submissionFor(d, textValue("ID", "1")), nil)
+	if err == nil {
+		t.Fatal("executeQuery succeeded, want a bound Exec without ExecParams refused")
+	}
+	if !strings.Contains(err.Error(), errBoundParametersUnsupported.Error()) {
+		t.Errorf("error = %v, want %v", err, errBoundParametersUnsupported)
+	}
+	requireNoCalls(t, f.backend)
+}
+
+func TestParameterExecutionMixedBatchTakesBothPaths(t *testing.T) {
+	// The zero-argument statement in a parameterized batch keeps the legacy
+	// repository method; only the statement that actually has arguments is
+	// bound. Both halves run in the same batch, in order.
+	f := newParameterFixture(t, "SELECT 1 FROM T;\nSELECT :ID FROM U", nil)
+	d := f.discover(t, nil)
+
+	if _, err := f.execute(t, submissionFor(d, textValue("ID", "1")), nil); err != nil {
+		t.Fatal("conn.Call executeQuery:", err)
+	}
+
+	calls := f.backend.calls()
+	if len(calls) != 2 {
+		t.Fatalf("calls = %#v, want both statements executed once", calls)
+	}
+	if calls[0].Args != nil || !strings.Contains(calls[0].SQL, "FROM T") {
+		t.Errorf("first call = %#v, want the legacy method for the unparameterized statement", calls[0])
+	}
+	if !reflect.DeepEqual(calls[1].Args, []any{"1"}) || !strings.Contains(calls[1].SQL, "FROM U") {
+		t.Errorf("second call = %#v, want the bound method for the parameterized statement", calls[1])
+	}
 }
 
 func TestParameterSubmissionRejectsAStaleContext(t *testing.T) {

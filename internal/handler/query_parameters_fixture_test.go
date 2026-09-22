@@ -45,13 +45,25 @@ const (
 // concurrency-safe state: every statement it served, every plan it was asked
 // to prepare, and optional gates a test uses to hold one call open.
 type parameterBackend struct {
-	mu         sync.Mutex
-	recorded   []parameterCall
-	explained  []string
-	gates      map[string]*stubGate
-	procedures []*database.ProcedureDesc
-	plain      bool
+	mu           sync.Mutex
+	recorded     []parameterCall
+	explained    []string
+	gates        map[string]*stubGate
+	procedures   []*database.ProcedureDesc
+	capabilities repositoryCapabilities
 }
+
+// repositoryCapabilities selects which optional capabilities the next
+// repository the factory builds implements. Each level is a distinct Go type,
+// so a repository that is not meant to offer a capability genuinely fails the
+// interface assertion instead of pretending to.
+type repositoryCapabilities int
+
+const (
+	capabilitiesFull         repositoryCapabilities = iota // read-only transaction + both bound capabilities
+	capabilitiesReadOnlyOnly                               // read-only transaction, no bound capability
+	capabilitiesNone                                       // nothing optional at all
+)
 
 func (b *parameterBackend) record(route, sql string, args []any) {
 	b.mu.Lock()
@@ -96,6 +108,10 @@ func (b *parameterBackend) gate(query string) *stubGate {
 	return g
 }
 
+// enterGate parks the call when a gate's key matches its statement. It takes
+// the first match from an unordered map range, which is deterministic only
+// because a test installs at most one gate; installing two gates whose keys
+// both match one statement would park an arbitrary one of them.
 func (b *parameterBackend) enterGate(ctx context.Context, sql string) error {
 	b.mu.Lock()
 	var gate *stubGate
@@ -129,20 +145,30 @@ func (b *parameterBackend) describedProcedures() []*database.ProcedureDesc {
 	return append([]*database.ProcedureDesc(nil), b.procedures...)
 }
 
-// withoutParameterCapabilities makes the next repository the factory builds a
-// plain one: it still serves the unparameterized methods (including
-// ReadOnlyQuerier) but implements neither bound capability. Same timing rule
-// as setProcedures.
-func (b *parameterBackend) withoutParameterCapabilities() {
+// withoutBoundCapabilities makes the next repository the factory builds one
+// that still offers an unparameterized read-only transaction but neither
+// bound capability — the repository shape that must be refused rather than
+// downgraded. Same timing rule as setProcedures.
+func (b *parameterBackend) withoutBoundCapabilities() {
 	b.mu.Lock()
-	b.plain = true
+	b.capabilities = capabilitiesReadOnlyOnly
 	b.mu.Unlock()
 }
 
-func (b *parameterBackend) plainEnabled() bool {
+// withoutAnyOptionalCapabilities makes the next repository the factory builds
+// implement nothing beyond database.DBRepository (plus Explain), so a bound
+// read has no read-only transaction to be refused for and falls to the
+// plain-parameterized tier instead.
+func (b *parameterBackend) withoutAnyOptionalCapabilities() {
+	b.mu.Lock()
+	b.capabilities = capabilitiesNone
+	b.mu.Unlock()
+}
+
+func (b *parameterBackend) capabilityLevel() repositoryCapabilities {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.plain
+	return b.capabilities
 }
 
 var currentParameterBackend struct {
@@ -204,19 +230,17 @@ func stubQueryParametersConnections(aliases ...string) *config.Config {
 }
 
 // parameterFixtureBase serves the unparameterized repository methods and the
-// explain capability. It is a type of its own so a test can ask for a
-// repository that implements no bound capability at all: the bound methods
-// live on the wrapper below, and a wrapper's methods cannot be un-promoted.
+// explain capability, and nothing else. Every optional capability lives on a
+// wrapper around it, because a wrapper's methods cannot be un-promoted: only
+// a type that never had the method can fail the interface assertion the
+// handler makes.
 type parameterFixtureBase struct {
 	*database.MockDBRepository
 	db      *sql.DB
 	backend *parameterBackend
 }
 
-var (
-	_ database.ReadOnlyQuerier   = (*parameterFixtureBase)(nil)
-	_ database.ExplainRepository = (*parameterFixtureBase)(nil)
-)
+var _ database.ExplainRepository = (*parameterFixtureBase)(nil)
 
 func (r *parameterFixtureBase) Query(ctx context.Context, query string) (*sql.Rows, error) {
 	r.backend.record(parameterRouteQuery, query, nil)
@@ -224,11 +248,6 @@ func (r *parameterFixtureBase) Query(ctx context.Context, query string) (*sql.Ro
 		return nil, err
 	}
 	return r.rows(query)
-}
-
-func (r *parameterFixtureBase) QueryReadOnly(ctx context.Context, query string) (*database.QueryResult, error) {
-	r.backend.record(parameterRouteReadOnly, query, nil)
-	return r.scan(ctx, query)
 }
 
 func (r *parameterFixtureBase) Exec(ctx context.Context, query string) (sql.Result, error) {
@@ -278,9 +297,22 @@ func (r *parameterFixtureBase) execute(ctx context.Context, query string) (sql.R
 	return r.MockDBRepository.Exec(ctx, query)
 }
 
-// parameterFixtureRepository adds the two optional bound capabilities.
-type parameterFixtureRepository struct {
+// readOnlyParameterFixture adds the unparameterized read-only transaction.
+type readOnlyParameterFixture struct {
 	*parameterFixtureBase
+}
+
+var _ database.ReadOnlyQuerier = (*readOnlyParameterFixture)(nil)
+
+func (r *readOnlyParameterFixture) QueryReadOnly(ctx context.Context, query string) (*database.QueryResult, error) {
+	r.backend.record(parameterRouteReadOnly, query, nil)
+	return r.scan(ctx, query)
+}
+
+// parameterFixtureRepository adds the two optional bound capabilities, on top
+// of the read-only transaction a real InterBase repository also offers.
+type parameterFixtureRepository struct {
+	*readOnlyParameterFixture
 }
 
 var (
@@ -372,10 +404,15 @@ func init() {
 			db:               db,
 			backend:          b,
 		}
-		if b.plainEnabled() {
+		level := b.capabilityLevel()
+		if level == capabilitiesNone {
 			return base
 		}
-		repository := &parameterFixtureRepository{parameterFixtureBase: base}
+		readOnly := &readOnlyParameterFixture{parameterFixtureBase: base}
+		if level == capabilitiesReadOnlyOnly {
+			return readOnly
+		}
+		repository := &parameterFixtureRepository{readOnlyParameterFixture: readOnly}
 		if len(b.describedProcedures()) > 0 {
 			return &catalogParameterRepository{parameterFixtureRepository: repository}
 		}

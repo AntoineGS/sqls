@@ -306,22 +306,18 @@ func boundRouteSupported(repo database.DBRepository, stmt boundStatement) error 
 	if len(stmt.args) == 0 {
 		return nil
 	}
-	// Mirrors queryResult's own selection exactly: a read may use the
-	// parameterized read-only transaction, and a repository offering the
-	// unparameterized one without its counterpart is refused rather than
-	// silently downgraded.
-	if stmt.routing.isQuery {
-		if _, ok := repo.(database.ParameterizedReadOnlyQuerier); ok {
-			return nil
-		}
-		if _, ok := repo.(database.ReadOnlyQuerier); ok {
-			return errParameterizedReadOnlyUnsupported
-		}
+	// The capability ladders themselves live with the methods that use them,
+	// so preflight asks the very same question execution will ask. Only the
+	// route selection is restated here, and it follows runRoutedStatement:
+	// reads and procedures with output run through queryResult — of those,
+	// only a read may use a read-only transaction — and everything else runs
+	// through exec.
+	if stmt.routing.isQuery || stmt.routing.returnsRows {
+		_, err := boundReadFor(repo, stmt.routing.isQuery)
+		return err
 	}
-	if _, ok := repo.(database.ParameterizedRepository); !ok {
-		return errBoundParametersUnsupported
-	}
-	return nil
+	_, err := boundExecFor(repo)
+	return err
 }
 
 // refuseLegacyNamedParameters rejects an InterBase execution request that

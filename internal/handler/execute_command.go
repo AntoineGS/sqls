@@ -492,6 +492,50 @@ var (
 	errParameterizedReadOnlyUnsupported = errors.New("parameterized read-only queries are not supported by this repository")
 )
 
+// boundRead is the capability a bound read statement will use: exactly one of
+// its fields is non-nil.
+type boundRead struct {
+	readOnly database.ParameterizedReadOnlyQuerier
+	querier  database.ParameterizedRepository
+}
+
+// boundReadFor resolves which parameterized capability repo offers for a read
+// statement on this route, or the error that refuses it.
+//
+// It is the single owner of the read capability ladder. The batch preflight
+// calls it to refuse a whole batch before its first statement, and queryResult
+// calls it to choose the method it actually calls, so the two cannot disagree:
+// a tier added here is seen by both, and "preflight passed but statement two
+// failed" — a partially executed batch — stays impossible.
+func boundReadFor(repo database.DBRepository, allowReadOnly bool) (boundRead, error) {
+	if allowReadOnly {
+		if readOnly, ok := repo.(database.ParameterizedReadOnlyQuerier); ok {
+			return boundRead{readOnly: readOnly}, nil
+		}
+		// A repository that offers a read-only transaction without its
+		// parameterized counterpart is refused rather than silently
+		// downgraded to an ordinary one.
+		if _, ok := repo.(database.ReadOnlyQuerier); ok {
+			return boundRead{}, errParameterizedReadOnlyUnsupported
+		}
+	}
+	querier, ok := repo.(database.ParameterizedRepository)
+	if !ok {
+		return boundRead{}, errBoundParametersUnsupported
+	}
+	return boundRead{querier: querier}, nil
+}
+
+// boundExecFor is boundReadFor's counterpart for a bound write statement, and
+// is shared with the preflight for the same reason.
+func boundExecFor(repo database.DBRepository) (database.ParameterizedRepository, error) {
+	bound, ok := repo.(database.ParameterizedRepository)
+	if !ok {
+		return nil, errBoundParametersUnsupported
+	}
+	return bound, nil
+}
+
 // queryResult materialises a read statement's result. It prefers an explicit
 // read-only transaction when the repository offers one; that transaction's
 // lifetime stays inside the repository, so an early return here cannot leak it.
@@ -508,19 +552,14 @@ func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bo
 		return nil, err
 	}
 	if len(args) > 0 {
-		if allowReadOnly {
-			if readOnly, ok := repo.(database.ParameterizedReadOnlyQuerier); ok {
-				return readOnly.QueryReadOnlyParams(ctx, query, args)
-			}
-			if _, ok := repo.(database.ReadOnlyQuerier); ok {
-				return nil, errParameterizedReadOnlyUnsupported
-			}
+		read, err := boundReadFor(repo, allowReadOnly)
+		if err != nil {
+			return nil, err
 		}
-		bound, ok := repo.(database.ParameterizedRepository)
-		if !ok {
-			return nil, errBoundParametersUnsupported
+		if read.readOnly != nil {
+			return read.readOnly.QueryReadOnlyParams(ctx, query, args)
 		}
-		rows, err := bound.QueryParams(ctx, query, args)
+		rows, err := read.querier.QueryParams(ctx, query, args)
 		if err != nil {
 			return nil, err
 		}
@@ -627,9 +666,9 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...
 	}
 	var result sql.Result
 	if len(args) > 0 {
-		bound, ok := repo.(database.ParameterizedRepository)
-		if !ok {
-			return "", errBoundParametersUnsupported
+		bound, boundErr := boundExecFor(repo)
+		if boundErr != nil {
+			return "", boundErr
 		}
 		result, err = bound.ExecParams(ctx, query, args)
 	} else {
