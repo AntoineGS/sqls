@@ -31,8 +31,24 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
+	dv := s.parserDriverVariant()
+	local, handled, err := localDefinition(params.TextDocument.URI, text, params.Position, dv)
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		return local, nil
+	}
+	contextual, err := contextualSQLTarget(text, params.Position, dv)
+	if err != nil {
+		return nil, err
+	}
+	if contextual {
+		return lsp.Definition{}, nil
+	}
+
 	dbCache := s.worker.Cache()
-	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, s.parserDriverVariant())
+	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, dv)
 	if err != nil {
 		return nil, err
 	}

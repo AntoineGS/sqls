@@ -122,6 +122,7 @@ func TestInitialized(t *testing.T) {
 			},
 			CodeActionProvider:              true,
 			DefinitionProvider:              true,
+			ReferencesProvider:              true,
 			DocumentFormattingProvider:      true,
 			DocumentRangeFormattingProvider: true,
 			RenameProvider:                  true,

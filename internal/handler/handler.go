@@ -181,6 +181,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		return s.handleTextDocumentRename(ctx, conn, req)
 	case "textDocument/definition":
 		return s.handleDefinition(ctx, conn, req)
+	case "textDocument/references":
+		return s.handleReferences(ctx, conn, req)
 	case "textDocument/typeDefinition":
 		return s.handleDefinition(ctx, conn, req)
 	case "window/showMessage":
@@ -215,6 +217,7 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 				},
 			},
 			DefinitionProvider:              true,
+			ReferencesProvider:              true,
 			DocumentFormattingProvider:      true,
 			DocumentRangeFormattingProvider: true,
 			RenameProvider:                  true,

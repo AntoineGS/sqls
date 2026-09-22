@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
@@ -159,5 +160,27 @@ func TestTypeDefinition(t *testing.T) {
 				t.Errorf("unmatch hover contents (- want, + got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestDefinitionProcedureLocalDoesNotNeedRepository(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	tx.server.stateMu.Lock()
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.stateMu.Unlock()
+	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE value INTEGER;\nBEGIN\nvalue = :value;\nEND"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	var got lsp.Definition
+	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 3, Character: 0},
+	}}
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].URI != testFileURI {
+		t.Fatalf("got local definition %#v, want one location in the open document", got)
 	}
 }
