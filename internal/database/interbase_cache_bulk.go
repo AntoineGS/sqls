@@ -32,12 +32,46 @@ import (
 // This replaces nothing else: the standalone repository path and every
 // extended catalog accessor still read through the driver's schema package.
 // Only a CatalogSnapshot serves its cache build from here.
+//
+// Every identifier column below (relation, field, domain, constraint,
+// character-set and collation names) is wrapped in
+// CAST(... AS VARCHAR(interBaseBulkIdentifierCastWidth)). This is a targeted
+// bypass of a confirmed native driver defect, not a driver fix: the native
+// SQL_TEXT decoder caps a CHAR/UNICODE_FSS column's returned length at
+// declaredByteWidth/3 regardless of the value's real length, silently
+// truncating any catalog identifier past ~22 characters and, in the worst
+// case, merging two distinct constraint names that share a 22-byte prefix.
+// See /tmp/opencode/sqls-bulk/native-diagnosis.md for the SQLDA evidence and
+// /tmp/opencode/sqls-bulk/driver-followup.md for why deleting the driver's
+// cap outright is rejected (it would break the CHAR-padding guarantee
+// interbase-go/tests/native_values_test.c:204-243 already pins). The
+// driver's SQL_VARYING path takes the wire-provided length prefix as
+// authoritative with no charset-width recomputation, so casting to VARCHAR
+// here reaches that already-correct path instead. interBaseBulkIdentifierCastWidth
+// (67) is the live-confirmed byte width of this catalog's identifier domains
+// (RDB$FIELDS: RDB$FIELD_LENGTH=67, RDB$CHARACTER_SET_ID=3/UNICODE_FSS for
+// RDB$RELATION_NAME's source domain); InterBase draws relation, field,
+// constraint, character-set and collation names from the same system
+// identifier domain family, so one width bounds all of them. This does not
+// fix the driver: the standalone repository and every extended catalog
+// accessor still read CHAR identifiers through the driver's unpatched
+// SQL_TEXT decode and remain subject to the same truncation.
+const interBaseBulkIdentifierCastWidth = 67
 
-const interBaseBulkRelationsQuery = `
-SELECT r.RDB$RELATION_NAME
+// interBaseBulkIdentifierCast renders CAST(ref AS VARCHAR(n)) for one
+// identifier column reference, so interBaseBulkIdentifierCastWidth has a
+// single point of truth: the width used to validate the fix live against
+// NRF01 and the width every query below actually selects with cannot drift
+// apart.
+func interBaseBulkIdentifierCast(ref string) string {
+	return fmt.Sprintf("CAST(%s AS VARCHAR(%d))", ref, interBaseBulkIdentifierCastWidth)
+}
+
+var interBaseBulkRelationsQuery = fmt.Sprintf(`
+SELECT %s
 FROM RDB$RELATIONS r
 WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-ORDER BY r.RDB$RELATION_NAME`
+ORDER BY r.RDB$RELATION_NAME`, interBaseBulkIdentifierCast("r.RDB$RELATION_NAME"))
 
 // interBaseBulkColumnsQuery is the driver's per-relation column projection
 // restricted to the fields ColumnDesc renders, and widened to every user
@@ -47,15 +81,15 @@ ORDER BY r.RDB$RELATION_NAME`
 // The driver also reads the column's own collation (its rco join); ColumnDesc
 // renders the domain's type alone, so that join is left out rather than paid
 // for on every column of every relation.
-const interBaseBulkColumnsQuery = `
-SELECT rf.RDB$RELATION_NAME, rf.RDB$FIELD_NAME, rf.RDB$FIELD_SOURCE,
+var interBaseBulkColumnsQuery = fmt.Sprintf(`
+SELECT %s, %s, %s,
        rf.RDB$NULL_FLAG, rf.RDB$DEFAULT_SOURCE,
-       f.RDB$FIELD_NAME, f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE,
+       %s, f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE,
        f.RDB$FIELD_LENGTH, f.RDB$FIELD_SCALE, f.RDB$FIELD_TYPE,
        f.RDB$FIELD_SUB_TYPE, f.RDB$SEGMENT_LENGTH, f.RDB$DIMENSIONS,
        f.RDB$NULL_FLAG, f.RDB$CHARACTER_LENGTH, f.RDB$COLLATION_ID,
        f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-       cs.RDB$CHARACTER_SET_NAME, co.RDB$COLLATION_NAME
+       %s, %s
 FROM RDB$RELATION_FIELDS rf
 JOIN RDB$RELATIONS r ON r.RDB$RELATION_NAME = rf.RDB$RELATION_NAME
 LEFT JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
@@ -63,19 +97,36 @@ LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET
 LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                            AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
 WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`
+ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
+	interBaseBulkIdentifierCast("rf.RDB$RELATION_NAME"),
+	interBaseBulkIdentifierCast("rf.RDB$FIELD_NAME"),
+	interBaseBulkIdentifierCast("rf.RDB$FIELD_SOURCE"),
+	interBaseBulkIdentifierCast("f.RDB$FIELD_NAME"),
+	interBaseBulkIdentifierCast("cs.RDB$CHARACTER_SET_NAME"),
+	interBaseBulkIdentifierCast("co.RDB$COLLATION_NAME"))
 
 // interBaseBulkPrimaryKeyFieldsQuery returns one row per primary-key field.
 // The key flag is a membership test, so the fields need no ordering; the
 // enforcing index supplies them exactly as the driver's per-constraint index
 // lookup did.
-const interBaseBulkPrimaryKeyFieldsQuery = `
-SELECT pk.RDB$RELATION_NAME, s.RDB$FIELD_NAME
+//
+// The join onto RDB$INDICES pi filters the enforcing index's own
+// RDB$SYSTEM_FLAG, matching schema.Catalog.Index() (interbase-go's
+// catalog_extended.go), which the bulk read previously did not check
+// (review.md residual concern 1). Unreachable through normal DDL — InterBase
+// itself never flags a user relation's own index system — but cheap to close
+// and closes the one documented divergence from the loader it replaces.
+var interBaseBulkPrimaryKeyFieldsQuery = fmt.Sprintf(`
+SELECT %s, %s
 FROM RDB$RELATION_CONSTRAINTS pk
 JOIN RDB$RELATIONS r ON r.RDB$RELATION_NAME = pk.RDB$RELATION_NAME
+JOIN RDB$INDICES pi ON pi.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
-  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0`
+  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+  AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0`,
+	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
+	interBaseBulkIdentifierCast("s.RDB$FIELD_NAME"))
 
 // interBaseBulkForeignKeyFieldsQuery returns one row per foreign-key field,
 // paired with the referenced field at the same index segment position. That
@@ -86,19 +137,35 @@ WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
 // The referenced segment join is a LEFT JOIN so that an enforcing field with
 // no counterpart is visible to the loader, which then drops the whole
 // constraint rather than reporting half a foreign key.
-const interBaseBulkForeignKeyFieldsQuery = `
-SELECT fk.RDB$CONSTRAINT_NAME, fk.RDB$RELATION_NAME, fs.RDB$FIELD_NAME,
-       pk.RDB$RELATION_NAME, ps.RDB$FIELD_NAME
+//
+// The joins onto RDB$INDICES fi and pi filter both the enforcing and the
+// referenced index's own RDB$SYSTEM_FLAG, matching schema.Catalog.Index()
+// (review.md residual concern 1). pi is an inner JOIN, not LEFT: rc always
+// names a real unique/primary-key constraint with a real index, so a missing
+// pi row means a corrupt catalog, the same "drop the whole key" stance the
+// query already takes for a missing enforcing index.
+var interBaseBulkForeignKeyFieldsQuery = fmt.Sprintf(`
+SELECT %s, %s, %s,
+       %s, %s
 FROM RDB$RELATION_CONSTRAINTS fk
 JOIN RDB$RELATIONS r ON r.RDB$RELATION_NAME = fk.RDB$RELATION_NAME
+JOIN RDB$INDICES fi ON fi.RDB$INDEX_NAME = fk.RDB$INDEX_NAME
 JOIN RDB$REF_CONSTRAINTS rc ON rc.RDB$CONSTRAINT_NAME = fk.RDB$CONSTRAINT_NAME
 JOIN RDB$RELATION_CONSTRAINTS pk ON pk.RDB$CONSTRAINT_NAME = rc.RDB$CONST_NAME_UQ
+JOIN RDB$INDICES pi ON pi.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 JOIN RDB$INDEX_SEGMENTS fs ON fs.RDB$INDEX_NAME = fk.RDB$INDEX_NAME
 LEFT JOIN RDB$INDEX_SEGMENTS ps ON ps.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
                                AND ps.RDB$FIELD_POSITION = fs.RDB$FIELD_POSITION
 WHERE fk.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'
   AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-ORDER BY fk.RDB$CONSTRAINT_NAME, fs.RDB$FIELD_POSITION`
+  AND COALESCE(fi.RDB$SYSTEM_FLAG, 0) = 0
+  AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0
+ORDER BY fk.RDB$CONSTRAINT_NAME, fs.RDB$FIELD_POSITION`,
+	interBaseBulkIdentifierCast("fk.RDB$CONSTRAINT_NAME"),
+	interBaseBulkIdentifierCast("fk.RDB$RELATION_NAME"),
+	interBaseBulkIdentifierCast("fs.RDB$FIELD_NAME"),
+	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
+	interBaseBulkIdentifierCast("ps.RDB$FIELD_NAME"))
 
 // interBaseBulkRelation is one relation with its ordered columns, in the shape
 // columnDescription already consumes. A relation with no columns keeps its
