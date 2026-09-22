@@ -31,7 +31,23 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	return definitionWithDriverVariant(params.TextDocument.URI, text, params, s.worker.Cache(), s.parserDriverVariant())
+	dbCache := s.worker.Cache()
+	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, s.parserDriverVariant())
+	if err != nil {
+		return nil, err
+	}
+	// In-document aliases and subqueries win outright, for every driver.
+	if len(res) > 0 {
+		return res, nil
+	}
+
+	// Not having a repository is not a definition failure: for every driver
+	// without a catalog, the alias path above is the whole feature.
+	repo, err := s.newDBRepository(ctx)
+	if err != nil {
+		return nil, nil
+	}
+	return s.interBaseDefinition(ctx, repo, dbCache, params, text)
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {

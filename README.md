@@ -93,7 +93,7 @@ upstream `go install ...@latest` command does not include this local integration
 #### InterBase editor features
 
 On an InterBase connection sqls reads the database's own catalog and uses it in
-four editor surfaces. Everything here is automatic: there are no settings, and
+five editor surfaces. Everything here is automatic: there are no settings, and
 each feature silently falls back to its ordinary behaviour when the catalog is
 not available — on another driver, on a build without the InterBase tag, and in
 the short window after connecting before the catalog has been read.
@@ -169,6 +169,56 @@ until it returns. Hovering the same object again is instant: the rendered
 result is kept in memory, one entry per object hovered, for as long as the
 connection lasts, and is only cleared when the connection is switched or
 reopened.
+
+##### Go-to-definition for database-resident source
+
+Procedures, views and triggers keep their source in the database, not in a file
+on disk. `textDocument/definition` therefore materialises that source as a
+**read-only snapshot file** and returns an ordinary `file://` location, so any
+editor that can open a file can follow the jump — no client-side content
+provider and no custom URI scheme.
+
+Snapshots live under the user cache directory, in
+`sqls/interbase-sources/<hash>-<pid>/<kind>/<name>.sql`. On Linux that is
+`$XDG_CACHE_HOME/sqls/interbase-sources`, or `~/.cache/sqls/interbase-sources`
+when `XDG_CACHE_HOME` is unset. There is one directory per connection per server
+process; `<hash>` is derived from the connection settings, which are hashed
+rather than written so a host name or database path never lands on disk in
+clear form. Directories are created with mode `0700` and files with mode
+`0600`.
+
+**Editing a snapshot does not change the database.** There is no write-back
+path, and there is no cache: every jump performs a fresh catalog round trip,
+bounded to 3 seconds, and rewrites the file before returning the location. The
+content is therefore never stale, and any local edit is overwritten on the next
+jump.
+
+**Snapshots contain your database's business logic, and a crash leaves them on
+disk.** They are removed when the server shuts down — including when closing
+the database connection fails — but a process that dies without shutting down
+(a `SIGKILL`, for example) leaves its directory behind, still mode `0700`. That
+directory is removed by the next sqls run that uses this feature, once it is
+more than 24 hours old. A directory that is still being written to cannot reach
+that age: every snapshot write refreshes its connection directory's
+modification time, so a connection genuinely in use never goes stale no matter
+how long ago its directory was first created. Because process ids are reused, a
+dead directory that happens to share its pid suffix with the process doing the
+pruning is skipped that round instead of removed — delayed cleanup of an
+already-abandoned directory, not the wrongful deletion of one still in use.
+That window is the cost of portable LSP navigation: there is no way to hand an
+editor navigable text without a real file. If it is unacceptable in your
+environment, delete the `sqls/interbase-sources` directory under the cache
+directory above yourself, or do not use go-to-definition on database objects.
+
+When InterBase's catalog cannot reproduce executable DDL — most commonly
+because it does not record whether a procedure parameter is nullable — the
+snapshot contains the **verbatim catalog source** under a comment naming what
+blocked reproduction. A `CREATE` header is never invented. When the object has
+disappeared from the catalog since the connection was cached, no file is
+written and the editor reports that no definition was found.
+
+Go-to-definition for in-document aliases and subqueries is unchanged and works
+for every driver, with or without a catalog.
 
 ### Cancelling a running query
 

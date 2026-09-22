@@ -136,11 +136,15 @@ func interBaseHoverSummary(target hoverTarget, dbCache *database.DBCache) string
 	return ""
 }
 
-// unsupportedDDLNote is the single italic line appended when the catalog
+// hoverUnsupportedDDLNote is the single italic line appended when the catalog
 // cannot reproduce executable DDL. With no structured detail it degrades to a
 // bare note rather than rendering a driver message: the user asked for
 // documentation.
-func unsupportedDDLNote(err error) string {
+//
+// The snapshot surface renders the same condition as plain prose for a SQL
+// comment banner; see snapshotUnsupportedDDLNote. The two are deliberately
+// worded for their own surface rather than shared.
+func hoverUnsupportedDDLNote(err error) string {
 	object, name, feature, ok := database.UnsupportedDDLDetail(err)
 	if !ok {
 		return "_DDL unavailable._"
@@ -163,7 +167,7 @@ func renderObjectDDL(ctx context.Context, repo database.DDLRepository, kind data
 		}
 		return fmt.Sprintf("\n\n---\n\n```sql\n%s\n```\n", strings.TrimRight(ddl, "\n")), true
 	case errors.Is(err, database.ErrUnsupportedDDL):
-		return "\n\n" + unsupportedDDLNote(err) + "\n", true
+		return "\n\n" + hoverUnsupportedDDLNote(err) + "\n", true
 	case errors.Is(err, database.ErrObjectNotFound):
 		// The cache named an object the catalog does not have, which means the
 		// cache is stale. A stale-cache footnote on a hover popup is noise the
