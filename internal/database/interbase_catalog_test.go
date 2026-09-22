@@ -811,3 +811,144 @@ func TestInterBaseColumnWithoutDomainRowIsRetained(t *testing.T) {
 		t.Errorf("orphan column = %#v, want nullable, non-key, no default", orphan)
 	}
 }
+
+func TestInterBaseDescribesViewsGeneratorsDomainsAndIndexes(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	views, err := repository.DescribeViews(ctx)
+	if err != nil {
+		t.Fatalf("DescribeViews() error = %v", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("DescribeViews() returned %d views, want 1", len(views))
+	}
+	view := views[0]
+	if view.Schema != "" || view.Name != "CUSTOMER_VIEW" {
+		t.Errorf("view identity = (%q, %q), want (\"\", \"CUSTOMER_VIEW\")", view.Schema, view.Name)
+	}
+	if got, want := view.OwnerName.String, "SYSDBA"; !view.OwnerName.Valid || got != want {
+		t.Errorf("view owner = %#v, want %q", view.OwnerName, want)
+	}
+	if got, want := view.ViewSource.String, "SELECT ID FROM CUSTOMER"; !view.ViewSource.Valid || got != want {
+		t.Errorf("view source = %#v, want %q", view.ViewSource, want)
+	}
+	if len(view.Columns) != 1 || view.Columns[0].Name != "VIEW_ID" || view.Columns[0].Type != "INTEGER" {
+		t.Fatalf("view columns = %#v, want one INTEGER VIEW_ID", view.Columns)
+	}
+	if view.Columns[0].Table != "CUSTOMER_VIEW" {
+		t.Errorf("view column table = %q, want %q", view.Columns[0].Table, "CUSTOMER_VIEW")
+	}
+
+	generators, err := repository.DescribeGenerators(ctx)
+	if err != nil {
+		t.Fatalf("DescribeGenerators() error = %v", err)
+	}
+	if len(generators) != 1 || generators[0].Name != "GEN_CUSTOMER_ID" {
+		t.Fatalf("DescribeGenerators() = %#v, want one GEN_CUSTOMER_ID", generators)
+	}
+	if !generators[0].ID.Valid || generators[0].ID.Int64 != 1 {
+		t.Errorf("generator id = %#v, want 1", generators[0].ID)
+	}
+
+	domains, err := repository.DescribeDomains(ctx)
+	if err != nil {
+		t.Fatalf("DescribeDomains() error = %v", err)
+	}
+	byName := make(map[string]*DomainDesc, len(domains))
+	for _, domain := range domains {
+		if strings.HasPrefix(domain.Name, "RDB$") {
+			t.Errorf("DescribeDomains() returned the system domain %q", domain.Name)
+		}
+		byName[domain.Name] = domain
+	}
+
+	email, ok := byName["EMAIL_ADDRESS"]
+	if !ok {
+		t.Fatalf("DescribeDomains() did not return EMAIL_ADDRESS: %v", byName)
+	}
+	if email.Type != "VARCHAR(100)" {
+		t.Errorf("EMAIL_ADDRESS type = %q, want %q", email.Type, "VARCHAR(100)")
+	}
+	if !email.Nullable.Valid || email.Nullable.Bool {
+		t.Errorf("EMAIL_ADDRESS nullable = %#v, want a valid false", email.Nullable)
+	}
+	if got, want := email.DefaultSource.String, " DEFAULT 'a@b' "; email.DefaultSource.String != want {
+		t.Errorf("EMAIL_ADDRESS default = %q, want the verbatim catalog text %q", got, want)
+	}
+	if got, want := email.ValidationSource.String, "CHECK (VALUE LIKE '%@%')"; got != want {
+		t.Errorf("EMAIL_ADDRESS validation = %q, want %q", got, want)
+	}
+
+	// DomainDesc.Type keeps the charset and collation suffix that
+	// ColumnDesc.Type drops, and the charset/collation are separate fields.
+	code, ok := byName["CUSTOMER_CODE"]
+	if !ok {
+		t.Fatalf("DescribeDomains() did not return CUSTOMER_CODE")
+	}
+	if got, want := code.Type, `CHAR(10) CHARACTER SET "UTF8" COLLATE "UNICODE"`; got != want {
+		t.Errorf("CUSTOMER_CODE type = %q, want the full rendering %q", got, want)
+	}
+	if got, want := code.CharacterSetName.String, "UTF8"; !code.CharacterSetName.Valid || got != want {
+		t.Errorf("CUSTOMER_CODE charset = %#v, want %q", code.CharacterSetName, want)
+	}
+	if got, want := code.CollationName.String, "UNICODE"; !code.CollationName.Valid || got != want {
+		t.Errorf("CUSTOMER_CODE collation = %#v, want %q", code.CollationName, want)
+	}
+	if byName["CUSTOMER_LABEL"].Nullable.Valid {
+		t.Errorf("CUSTOMER_LABEL nullable = %#v, want an invalid NullBool when RDB$NULL_FLAG is NULL",
+			byName["CUSTOMER_LABEL"].Nullable)
+	}
+
+	indexes, err := repository.DescribeIndexes(ctx)
+	if err != nil {
+		t.Fatalf("DescribeIndexes() error = %v", err)
+	}
+	indexByName := make(map[string]*IndexDesc, len(indexes))
+	for _, index := range indexes {
+		indexByName[index.Name] = index
+	}
+	if len(indexes) != 4 {
+		t.Fatalf("DescribeIndexes() returned %d indexes, want 4: %v", len(indexes), indexByName)
+	}
+
+	primaryKey := indexByName["IDX_PARENT_PK"]
+	if primaryKey == nil {
+		t.Fatal("DescribeIndexes() did not return IDX_PARENT_PK")
+	}
+	if primaryKey.RelationName != "PARENT" {
+		t.Errorf("IDX_PARENT_PK relation = %q, want %q", primaryKey.RelationName, "PARENT")
+	}
+	if got, want := strings.Join(primaryKey.Columns, ","), "PARENT_B,PARENT_A"; got != want {
+		t.Errorf("IDX_PARENT_PK segments = %q, want them ordered %q", got, want)
+	}
+	if !primaryKey.Unique.Valid || !primaryKey.Unique.Bool {
+		t.Errorf("IDX_PARENT_PK unique = %#v, want a valid true", primaryKey.Unique)
+	}
+	if !primaryKey.Active.Valid || !primaryKey.Active.Bool {
+		t.Errorf("IDX_PARENT_PK active = %#v, want a valid true", primaryKey.Active)
+	}
+	if got, want := primaryKey.ConstraintName.String, "PK_PARENT"; !primaryKey.ConstraintName.Valid || got != want {
+		t.Errorf("IDX_PARENT_PK constraint = %#v, want %q", primaryKey.ConstraintName, want)
+	}
+	if primaryKey.Expression.Valid {
+		t.Errorf("IDX_PARENT_PK expression = %#v, want invalid for a segment index", primaryKey.Expression)
+	}
+
+	// RDB$INDEX_INACTIVE is an INACTIVE flag; Active is its inverse, and a
+	// standalone index has no owning constraint.
+	inactive := indexByName["IDX_CUSTOMER_CODE"]
+	if inactive == nil {
+		t.Fatal("DescribeIndexes() did not return IDX_CUSTOMER_CODE")
+	}
+	if !inactive.Active.Valid || inactive.Active.Bool {
+		t.Errorf("IDX_CUSTOMER_CODE active = %#v, want a valid false", inactive.Active)
+	}
+	if inactive.ConstraintName.Valid && inactive.ConstraintName.String != "" {
+		t.Errorf("IDX_CUSTOMER_CODE constraint = %#v, want invalid for a standalone index", inactive.ConstraintName)
+	}
+	if !indexByName["IDX_CHILD_FK"].Unique.Valid || indexByName["IDX_CHILD_FK"].Unique.Bool {
+		t.Errorf("IDX_CHILD_FK unique = %#v, want a valid false", indexByName["IDX_CHILD_FK"].Unique)
+	}
+}

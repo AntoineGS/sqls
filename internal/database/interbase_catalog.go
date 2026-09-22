@@ -317,6 +317,130 @@ func interBaseRelationColumnKey(relationName, columnName string) string {
 	return strings.ToUpper(strings.TrimSpace(relationName)) + "\t" + strings.ToUpper(strings.TrimSpace(columnName))
 }
 
+// interBaseFlagIsSet renders an InterBase flag as "the flag is set", leaving
+// an unset flag unknown rather than false.
+func interBaseFlagIsSet(flag sql.NullInt64) sql.NullBool {
+	if !flag.Valid {
+		return sql.NullBool{}
+	}
+	return sql.NullBool{Bool: flag.Int64 != 0, Valid: true}
+}
+
+// interBaseFlagIsClear renders an InterBase flag as "the flag is clear". The
+// catalog stores INACTIVE flags, and the descriptors carry Active.
+func interBaseFlagIsClear(flag sql.NullInt64) sql.NullBool {
+	if !flag.Valid {
+		return sql.NullBool{}
+	}
+	return sql.NullBool{Bool: flag.Int64 == 0, Valid: true}
+}
+
+func (db *InterBaseDBRepository) DescribeViews(ctx context.Context) ([]*ViewDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	views, err := catalog.Views(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+
+	// A view has no primary key, so no constraint read is needed: passing an
+	// empty index keeps the column rendering identical to a table's.
+	noPrimaryKeys := map[string]struct{}{}
+	result := make([]*ViewDesc, 0, len(views))
+	for _, view := range views {
+		columns := make([]*ColumnDesc, 0, len(view.Columns))
+		for _, column := range view.Columns {
+			columns = append(columns, db.columnDescription(view.Name, column, noPrimaryKeys))
+		}
+		result = append(result, &ViewDesc{
+			Schema:      "",
+			Name:        view.Name,
+			OwnerName:   view.OwnerName,
+			ViewSource:  view.ViewSource,
+			Description: view.Description,
+			Columns:     columns,
+		})
+	}
+	return result, nil
+}
+
+func (db *InterBaseDBRepository) DescribeGenerators(ctx context.Context) ([]*GeneratorDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	generators, err := catalog.Generators(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*GeneratorDesc, 0, len(generators))
+	for _, generator := range generators {
+		result = append(result, &GeneratorDesc{Schema: "", Name: generator.Name, ID: generator.ID})
+	}
+	return result, nil
+}
+
+func (db *InterBaseDBRepository) DescribeDomains(ctx context.Context) ([]*DomainDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	domains, err := catalog.Domains(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*DomainDesc, 0, len(domains))
+	for index := range domains {
+		domain := &domains[index]
+		result = append(result, &DomainDesc{
+			Schema: "",
+			Name:   domain.Name,
+			// The full rendering: a domain declaration is where the charset
+			// and collation belong, and DDL reproduces it verbatim.
+			Type:             interBaseTypeName(domain, db.SQLDialect),
+			Nullable:         domain.Nullable,
+			DefaultSource:    domain.DefaultSource,
+			ValidationSource: domain.ValidationSource,
+			CharacterSetName: domain.CharacterSetName,
+			CollationName:    domain.CollationName,
+			Description:      domain.Description,
+		})
+	}
+	return result, nil
+}
+
+func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	indexes, err := catalog.Indexes(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*IndexDesc, 0, len(indexes))
+	for _, index := range indexes {
+		columns := make([]string, 0, len(index.Segments))
+		for _, segment := range index.Segments {
+			columns = append(columns, segment.FieldName)
+		}
+		result = append(result, &IndexDesc{
+			Schema:         "",
+			Name:           index.Name,
+			RelationName:   index.RelationName,
+			Columns:        columns,
+			Expression:     index.Expression,
+			Unique:         interBaseFlagIsSet(index.UniqueFlag),
+			Active:         interBaseFlagIsClear(index.Inactive),
+			ConstraintName: index.ConstraintName,
+			Description:    index.Description,
+		})
+	}
+	return result, nil
+}
+
 func (db *InterBaseDBRepository) DescribeForeignKeysBySchema(ctx context.Context, _ string) ([]*ForeignKey, error) {
 	constraints, err := db.constraints(ctx)
 	if err != nil {
