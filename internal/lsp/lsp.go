@@ -84,7 +84,9 @@ type DocumentOnTypeFormattingOptions struct{}
 
 type DocumentLinkOptions struct{}
 
-type ExecuteCommandOptions struct{}
+type ExecuteCommandOptions struct {
+	Commands []string `json:"commands"`
+}
 
 // https://microsoft.github.io/language-server-protocol/specifications/specification-3-14/#textDocument_didOpen
 

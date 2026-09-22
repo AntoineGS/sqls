@@ -169,6 +169,8 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 		return s.showTables(ctx, params)
 	case CommandExplainQuery:
 		return s.explainQuery(ctx, params)
+	case CommandGetQueryParameters:
+		return s.getQueryParameters(ctx, params)
 	}
 	return nil, fmt.Errorf("unsupported command: %v", params.Command)
 }
