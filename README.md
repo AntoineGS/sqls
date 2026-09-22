@@ -400,19 +400,26 @@ either way.
 
 Under Dialect 1, double quotes delimit strings and `DATE` carries a time
 component. Under Dialect 3, double quotes delimit identifiers, so `"My Column"`
-is a column name, and `TIMESTAMP` is distinct from `DATE`. sqls does not yet
-render that distinction: completion and hover show `DATE` for a `TIMESTAMP`
-column under Dialect 3 too. In both dialects, unquoted identifiers may contain
-`$`, positional parameters use `?`, and doubled quotes are preserved verbatim
-by the formatter, so formatting never rewrites `'c''d'`. Parsing, completion
-and formatting use the resolved dialect's rules when the selected connection
-is InterBase. Parameter binding is a driver capability; the sqls execute
-command does not prompt for parameter values.
+is a column name, and `TIMESTAMP` is distinct from `DATE`. Completion and
+hover render that distinction: a `TIMESTAMP` column shows as `DATE` under
+Dialect 1 and as `TIMESTAMP` under Dialect 3. In both dialects, unquoted
+identifiers may contain `$`, positional parameters use `?`, and doubled
+quotes are preserved verbatim by the formatter, so formatting never rewrites
+`'c''d'`. Parsing, completion and formatting use the resolved dialect's
+rules when the selected connection is InterBase. Parameter binding is a
+driver capability; the sqls execute command does not prompt for parameter
+values.
 
-Completion and hover use user table/view, column, primary-key, and foreign-key
-metadata. InterBase has no schema namespace or database enumeration through this
-adapter, so switching databases is not supported; configure separate connections
-instead.
+Completion and hover use tables, views, columns, and primary and foreign
+keys. The cache also holds procedures with their parameters, triggers,
+generators, domains, indexes, and external-function declarations, refreshed
+by the background worker after the first connection rather than on demand.
+sqls can also reproduce object DDL from the catalog; it is unavailable for
+external functions, database files, shadows, tables with computed columns,
+and procedures whose parameter nullability the catalog does not record, and
+no editor-facing feature surfaces it yet. InterBase has no schema namespace
+or database enumeration through this adapter, so switching databases is not
+supported; configure separate connections instead.
 
 The native driver is experimental. Context cancellation cannot interrupt an
 in-flight native call, and the driver exposes no TLS configuration API. Use a
