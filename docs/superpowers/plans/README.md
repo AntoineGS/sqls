@@ -66,7 +66,13 @@ this is the index, not the authority.
 | `parser/parser.go` `multiKeywordMap` | editor surfaces | Editor surfaces owns the `"EXECUTE": {"PROCEDURE"}` entry. Results-pane deliberately parses statement text instead so it does not depend on it. |
 | `internal/database` capability mock | catalog migration, editor surfaces | Both add a capability-bearing mock distinct from `MockDBRepository`. They do not collide, so neither plan is blocked; merge them in a cleanup commit once both have landed — see below. |
 
-## One cleanup after wave 4
+## One cleanup after wave 4 (completed)
+
+Completed by `bde8d68`: `MockCapabilityRepository` now lives in
+`capability_mock.go` with all seven `Describe*` hooks; `interbase_mock.go` is
+removed. The consolidated guard test preserves positive and negative checks
+for all three capability interfaces. The scheduling rationale below is retained
+as historical context.
 
 Catalog migration adds `MockCatalogDBRepository` in `capability_mock.go`;
 editor surfaces adds `MockCapabilityRepository` in `interbase_mock.go`. Both

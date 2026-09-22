@@ -1494,6 +1494,22 @@ Cancelled. The statement was stopped before it finished.
 
 Rendered when `ClassifyFailure` reports `FailureCanceled`. No rows are shown.
 
+**Query cancelled, driver did not confirm the outcome.**
+
+```
+Cancelled. sqls stopped waiting for this statement.
+
+Whether it took effect depends on the database driver, which did not report a
+confirmed outcome. Check the database state before re-running it.
+```
+
+This is `stoppedWaitingMessage`, the fallback when the classifier supplies no
+cancellation notice, the request context has an error, and the statement error
+matches `context.Canceled`. It is reachable with other drivers and in untagged
+builds. Unlike `FailureCanceled`, a bare context cancellation does not confirm
+that the server stopped the statement, so this message makes no such claim.
+A classified cancellation outcome takes precedence over this fallback.
+
 **Query cancelled, outcome uncertain.**
 
 ```
