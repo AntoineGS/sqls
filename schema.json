@@ -67,6 +67,15 @@
             "type": "object",
             "properties": {}
           },
+          "dialect": {
+            "description": "SQL dialect: 0 auto-detects, 1 and 3 pin an explicit dialect. Only supported by the interbase driver, must be 0 for any other driver. Optional",
+            "type": "number",
+            "enum": [
+              0,
+              1,
+              3
+            ]
+          },
           "interbase": {
             "description": "InterBase-only connection settings. Optional",
             "type": "object",
