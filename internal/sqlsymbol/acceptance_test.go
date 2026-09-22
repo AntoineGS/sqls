@@ -55,6 +55,15 @@ func TestLocalInterBaseExample(t *testing.T) {
 	if order.Role != Local || order.Symbol == nil || order.Symbol.Name.Key() != "ORDERTOTAL" {
 		t.Fatalf("ORDERTOTAL resolution: %+v", order)
 	}
+	declaration := order.Symbol.Declaration
+	if declaration.Start < 0 || declaration.End > len(text) || declaration.Start >= declaration.End {
+		t.Fatalf("ORDERTOTAL declaration has invalid span: %+v", declaration)
+	}
+	declarationText := text[declaration.Start:declaration.End]
+	declarationLine := strings.Count(text[:declaration.Start], "\n") + 1
+	if declarationText != "ORDERTOTAL" || declarationLine != 55 {
+		t.Fatalf("ORDERTOTAL resolved from UPDATE to declaration %q on line %d (span %+v), want exact ORDERTOTAL token on line 55", declarationText, declarationLine, declaration)
+	}
 
 	amountPaid := strings.Index(upper[update:], "AMOUNTPAID")
 	if amountPaid < 0 {

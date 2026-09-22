@@ -838,4 +838,4 @@ Task 8 verification (2026-09-22):
 - `go test ./internal/sqlsymbol -run '^$' -bench 'BenchmarkProcedureSymbols' -benchmem -count=1` — PASS: 1,000-use benchmark 3,090,557 ns/op, 4,554,607 B/op, 28,147 allocs/op; scaling 250/500/1,000 uses = 758,020 / 1,513,977 / 3,220,494 ns/op, supporting near-linear scaling.
 - With `SQLS_SYMBOL_EXAMPLE` set, `BenchmarkLocalInterBaseExample` — 7,480,066 ns/op, 7,454,051 B/op, 48,032 allocs/op.
 - Editor handoff is discovery-only: Neovim config points at `~/gits/sqls/sqls`, live PID 3091738 uses that binary. It was not replaced or restarted. Actual editor rename/references on line 326 and definitions on line 847 remain unverified; use the artifact above after approval.
-- Additional deferred-minor fixes: standalone CR offset/range conversions now agree; InterBase definition routing reuses request-local sqlsymbol analysis instead of re-analyzing the same document.
+- Additional deferred-minor fixes: standalone CR offset/range conversions now agree; local and contextual relation-definition routing reuses the request-local sqlsymbol analysis. The ordinary catalog-object snapshot fallback still performs its own resolver analysis.

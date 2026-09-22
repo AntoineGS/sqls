@@ -93,10 +93,13 @@ upstream `go install ...@latest` command does not include this local integration
 #### InterBase editor features
 
 On an InterBase connection sqls reads the database's own catalog and uses it in
-six editor surfaces. Everything here is automatic: there are no settings, and
-each feature silently falls back to its ordinary behaviour when the catalog is
-not available — on another driver, on a build without the InterBase tag, and in
-the short window after connecting before the catalog has been read.
+five catalog-backed editor surfaces. There are no settings; catalog-backed
+behavior falls back to its ordinary behavior when the metadata is unavailable —
+on another driver, on a build without the InterBase tag, and in the short window
+after connecting before the catalog has been read. In-document procedure
+navigation, references and rename are separate document-only features and do not
+require catalog metadata. Table/column definitions do require catalog metadata
+and reproducible DDL, as described below.
 
 **Explain SQL.** The `Explain SQL` code action shows the query plan InterBase
 chose. It **prepares the statement without executing it**: nothing is inserted,

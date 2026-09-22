@@ -41,6 +41,16 @@ END`
 		lineStart := strings.LastIndex(text[:start], "\n") + 1
 		return lsp.Position{Line: line, Character: start - lineStart}
 	}
+	locationAt := func(needle string, occurrence int) lsp.Location {
+		start := callPosition(needle, occurrence)
+		return lsp.Location{
+			URI: uri,
+			Range: lsp.Range{
+				Start: start,
+				End:   lsp.Position{Line: start.Line, Character: start.Character + len(needle)},
+			},
+		}
+	}
 
 	var definition lsp.Definition
 	if err := tx.conn.Call(tx.ctx, "textDocument/definition", lsp.TextDocumentPositionParams{
@@ -49,8 +59,9 @@ END`
 	}, &definition); err != nil {
 		t.Fatal("definition for local parameter:", err)
 	}
-	if len(definition) != 1 || definition[0].Range.Start.Line != 1 {
-		t.Fatalf("local definition = %#v, want declaration on line 1", definition)
+	wantDefinition := lsp.Definition{locationAt("HEADEREMPLYID_TEMP", 0)}
+	if diff := cmp.Diff(wantDefinition, definition); diff != "" {
+		t.Fatalf("local definition mismatch (-want +got):\n%s", diff)
 	}
 
 	for _, includeDeclaration := range []bool{false, true} {
@@ -65,12 +76,15 @@ END`
 		if err := tx.conn.Call(tx.ctx, "textDocument/references", params, &references); err != nil {
 			t.Fatal("references:", err)
 		}
-		want := 2
-		if includeDeclaration {
-			want++
+		wantReferences := []lsp.Location{
+			locationAt("HEADEREMPLYID_TEMP", 1),
+			locationAt("HEADEREMPLYID_TEMP", 2),
 		}
-		if len(references) != want {
-			t.Fatalf("references includeDeclaration=%v: got %d, want %d (%#v)", includeDeclaration, len(references), want, references)
+		if includeDeclaration {
+			wantReferences = append([]lsp.Location{locationAt("HEADEREMPLYID_TEMP", 0)}, wantReferences...)
+		}
+		if diff := cmp.Diff(wantReferences, references); diff != "" {
+			t.Fatalf("references includeDeclaration=%v mismatch (-want +got):\n%s", includeDeclaration, diff)
 		}
 	}
 
@@ -81,8 +95,9 @@ END`
 	}, &orderDefinition); err != nil {
 		t.Fatal("definition for ORDERTOTAL:", err)
 	}
-	if len(orderDefinition) != 1 || orderDefinition[0].Range.Start.Line != 2 {
-		t.Fatalf("ORDERTOTAL definition = %#v, want declaration on line 2", orderDefinition)
+	wantOrderDefinition := lsp.Definition{locationAt("ORDERTOTAL", 0)}
+	if diff := cmp.Diff(wantOrderDefinition, orderDefinition); diff != "" {
+		t.Fatalf("ORDERTOTAL definition mismatch (-want +got):\n%s", diff)
 	}
 
 	var rename lsp.WorkspaceEdit
@@ -126,8 +141,15 @@ END`
 	}, &changedDefinition); err != nil {
 		t.Fatal("definition after didChange:", err)
 	}
-	if len(changedDefinition) != 1 || changedDefinition[0].Range.Start.Line != 1 {
-		t.Fatalf("definition after didChange = %#v, want current declaration on line 1", changedDefinition)
+	wantChangedDefinition := lsp.Definition{{
+		URI: uri,
+		Range: lsp.Range{
+			Start: lsp.Position{Line: 1, Character: 17},
+			End:   lsp.Position{Line: 1, Character: 17 + len("HEADER_EMPLOYEE_TEMP")},
+		},
+	}}
+	if diff := cmp.Diff(wantChangedDefinition, changedDefinition); diff != "" {
+		t.Fatalf("definition after didChange mismatch (-want +got):\n%s", diff)
 	}
 }
 
