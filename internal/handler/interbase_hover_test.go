@@ -573,10 +573,47 @@ func TestInterBaseHoverMemoIsKeyedByObject(t *testing.T) {
 	if !strings.Contains(procedure.Contents.Value, "CREATE PROCEDURE MYPROC") {
 		t.Errorf("procedure hover:\n%s", procedure.Contents.Value)
 	}
+	if !strings.Contains(view.Contents.Value, "CREATE VIEW MYVIEW") {
+		t.Errorf("view hover:\n%s", view.Contents.Value)
+	}
+
+	// MYPROC and MYVIEW have different names, so a name-only key can never
+	// collide between them: that pair alone cannot pin the failure this test
+	// is named for. resolveInterBaseHoverTarget resolves views before
+	// procedures, so one cache can never offer both kinds under the same
+	// name; a procedure and a view both named SHARED are hovered from two
+	// separate cache instances instead, sharing the same server so the memo
+	// is what must still tell them apart.
+	procShared := interBaseHoverCache(t)
+	procShared.Catalog.Procedures["SHARED"] = &database.ProcedureDesc{Name: "SHARED"}
+	viewShared := interBaseHoverCache(t)
+	viewShared.Catalog.Views["SHARED"] = &database.ViewDesc{Name: "SHARED"}
+
+	sharedProcedure := hoverAt(t, server, repo, procShared, "execute procedure shared", 20)
+	sharedView := hoverAt(t, server, repo, viewShared, "select * from shared", 16)
+	if sharedProcedure == nil || sharedView == nil {
+		t.Fatal("no hover for the shared-name pair")
+	}
+	if !strings.Contains(sharedProcedure.Contents.Value, "CREATE PROCEDURE SHARED") {
+		t.Errorf("shared-name procedure hover:\n%s", sharedProcedure.Contents.Value)
+	}
 	// The failure this pins: a memo keyed on the name alone serves the
 	// procedure's DDL for the view.
-	if !strings.Contains(view.Contents.Value, "CREATE VIEW MYVIEW") {
-		t.Errorf("view hover was served the wrong object's DDL:\n%s", view.Contents.Value)
+	if !strings.Contains(sharedView.Contents.Value, "CREATE VIEW SHARED") {
+		t.Errorf("shared-name view hover was served the wrong object's DDL:\n%s", sharedView.Contents.Value)
+	}
+
+	var sharedCalls []database.ObjectDDLCall
+	for _, call := range repo.ObjectDDLCalls() {
+		if call.Name == "SHARED" {
+			sharedCalls = append(sharedCalls, call)
+		}
+	}
+	if len(sharedCalls) != 2 {
+		t.Fatalf("ObjectDDL was called %d times for the shared name, want 2: %+v", len(sharedCalls), sharedCalls)
+	}
+	if sharedCalls[0].Kind == sharedCalls[1].Kind {
+		t.Errorf("both ObjectDDL calls for the shared name used kind %q, want one procedure and one view: %+v", sharedCalls[0].Kind, sharedCalls)
 	}
 }
 
