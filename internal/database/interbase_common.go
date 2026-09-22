@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
-	"interbase-go/schema"
 )
 
 const interBaseDefaultPort = 3050
@@ -98,6 +97,13 @@ type InterBaseDBRepository struct {
 	SQLDialect int
 	// DatabaseName is the attachment string; empty when unknown.
 	DatabaseName string
+
+	// snapshot is set only on a repository returned by CatalogSnapshot. It
+	// binds this repository to one read-only transaction that has already read
+	// relations and constraints. The source repository is never mutated, so a
+	// cache build on the worker goroutine cannot race a ReCache on a handler
+	// goroutine.
+	snapshot *interBaseCatalogSnapshot
 }
 
 var _ DBRepository = (*InterBaseDBRepository)(nil)
@@ -147,181 +153,6 @@ func (db *InterBaseDBRepository) Schemas(context.Context) ([]string, error) {
 	return []string{""}, nil
 }
 
-func (db *InterBaseDBRepository) SchemaTables(ctx context.Context) (map[string][]string, error) {
-	tables, err := db.relationNames(ctx, interBaseRelationsQuery)
-	if err != nil {
-		return nil, err
-	}
-	return map[string][]string{"": tables}, nil
-}
-
-func (db *InterBaseDBRepository) relationNames(ctx context.Context, query string) ([]string, error) {
-	if db == nil || db.Conn == nil {
-		return nil, errors.New("interbase: database connection is nil")
-	}
-	rows, err := db.Conn.QueryContext(ctx, query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make([]string, 0)
-	for rows.Next() {
-		var name sql.NullString
-		if err := rows.Scan(&name); err != nil {
-			return nil, err
-		}
-		if name.Valid {
-			result = append(result, strings.TrimSpace(name.String))
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-const interBaseRelationsQuery = `
-SELECT RDB$RELATION_NAME
-  FROM RDB$RELATIONS
- WHERE COALESCE(RDB$SYSTEM_FLAG, 0) = 0
- ORDER BY RDB$RELATION_NAME
-`
-
-const interBaseColumnsQuery = `
-SELECT
-    rf.RDB$RELATION_NAME,
-    rf.RDB$FIELD_NAME,
-    rf.RDB$NULL_FLAG,
-    rf.RDB$DEFAULT_SOURCE,
-    f.RDB$NULL_FLAG,
-    f.RDB$DEFAULT_SOURCE,
-    f.RDB$FIELD_TYPE,
-    f.RDB$FIELD_SUB_TYPE,
-    f.RDB$FIELD_LENGTH,
-    f.RDB$FIELD_SCALE,
-    f.RDB$FIELD_PRECISION,
-    f.RDB$CHARACTER_LENGTH,
-    CASE WHEN EXISTS (
-        SELECT 1
-          FROM RDB$RELATION_CONSTRAINTS pc
-          JOIN RDB$INDEX_SEGMENTS ps
-            ON ps.RDB$INDEX_NAME = pc.RDB$INDEX_NAME
-         WHERE pc.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
-           AND pc.RDB$RELATION_NAME = rf.RDB$RELATION_NAME
-           AND ps.RDB$FIELD_NAME = rf.RDB$FIELD_NAME
-    ) THEN 'YES' ELSE 'NO' END
-  FROM RDB$RELATION_FIELDS rf
-  JOIN RDB$RELATIONS r
-    ON r.RDB$RELATION_NAME = rf.RDB$RELATION_NAME
-  JOIN RDB$FIELDS f
-    ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
- WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
- ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION
-`
-
-type interBaseColumnRow struct {
-	relationName    sql.NullString
-	fieldName       sql.NullString
-	nullFlag        sql.NullInt64
-	defaultSource   sql.NullString
-	domainNullFlag  sql.NullInt64
-	domainDefault   sql.NullString
-	fieldType       sql.NullInt64
-	fieldSubtype    sql.NullInt64
-	fieldLength     sql.NullInt64
-	fieldScale      sql.NullInt64
-	fieldPrecision  sql.NullInt64
-	characterLength sql.NullInt64
-	primaryKey      sql.NullString
-}
-
-func (db *InterBaseDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
-	return db.describeColumns(ctx)
-}
-
-func (db *InterBaseDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, _ string) ([]*ColumnDesc, error) {
-	return db.describeColumns(ctx)
-}
-
-func (db *InterBaseDBRepository) describeColumns(ctx context.Context) ([]*ColumnDesc, error) {
-	if db == nil || db.Conn == nil {
-		return nil, errors.New("interbase: database connection is nil")
-	}
-	rows, err := db.Conn.QueryContext(ctx, interBaseColumnsQuery)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	result := make([]*ColumnDesc, 0)
-	for rows.Next() {
-		var row interBaseColumnRow
-		if err := rows.Scan(
-			&row.relationName,
-			&row.fieldName,
-			&row.nullFlag,
-			&row.defaultSource,
-			&row.domainNullFlag,
-			&row.domainDefault,
-			&row.fieldType,
-			&row.fieldSubtype,
-			&row.fieldLength,
-			&row.fieldScale,
-			&row.fieldPrecision,
-			&row.characterLength,
-			&row.primaryKey,
-		); err != nil {
-			return nil, err
-		}
-		column, err := interBaseColumnDescription(row)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, column)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return result, nil
-}
-
-func interBaseColumnDescription(row interBaseColumnRow) (*ColumnDesc, error) {
-	if !row.relationName.Valid || !row.fieldName.Valid {
-		return nil, errors.New("interbase: catalog returned a column without a name")
-	}
-	if !row.fieldType.Valid {
-		return nil, errors.New("interbase: catalog returned a column without a field type")
-	}
-	// Throwaway adapter: the retained switch now reads schema.Domain, and this
-	// function is deleted whole in the next task together with
-	// interBaseColumnRow. Do not build anything else on it.
-	typ := interBaseColumnType(&schema.Domain{
-		FieldType:       row.fieldType,
-		FieldSubType:    row.fieldSubtype,
-		FieldLength:     row.fieldLength,
-		FieldScale:      row.fieldScale,
-		FieldPrecision:  row.fieldPrecision,
-		CharacterLength: row.characterLength,
-	})
-	key := strings.TrimSpace(row.primaryKey.String)
-	if key != "YES" {
-		key = "NO"
-	}
-	return &ColumnDesc{
-		ColumnBase: ColumnBase{
-			Schema: "",
-			Table:  strings.TrimSpace(row.relationName.String),
-			Name:   strings.TrimSpace(row.fieldName.String),
-		},
-		Type:    typ,
-		Null:    interBaseNullability(row.nullFlag, row.domainNullFlag),
-		Key:     key,
-		Default: interBaseEffectiveDefault(row.defaultSource, row.domainDefault),
-		Extra:   "",
-	}, nil
-}
-
 func interBaseNullability(columnNullFlag, domainNullFlag sql.NullInt64) string {
 	if (columnNullFlag.Valid && columnNullFlag.Int64 != 0) ||
 		(domainNullFlag.Valid && domainNullFlag.Int64 != 0) {
@@ -354,88 +185,6 @@ func interBaseEffectiveDefault(columnSource, domainSource sql.NullString) sql.Nu
 		return interBaseDefault(columnSource)
 	}
 	return interBaseDefault(domainSource)
-}
-
-const interBaseForeignKeysQuery = `
-SELECT
-    fk.RDB$CONSTRAINT_NAME,
-    fk.RDB$RELATION_NAME,
-    fkseg.RDB$FIELD_NAME,
-    uq.RDB$RELATION_NAME,
-    uqseg.RDB$FIELD_NAME
-  FROM RDB$RELATION_CONSTRAINTS fk
-  JOIN RDB$REF_CONSTRAINTS ref
-    ON ref.RDB$CONSTRAINT_NAME = fk.RDB$CONSTRAINT_NAME
-  JOIN RDB$RELATION_CONSTRAINTS uq
-    ON uq.RDB$CONSTRAINT_NAME = ref.RDB$CONST_NAME_UQ
-  JOIN RDB$RELATIONS fkrel
-    ON fkrel.RDB$RELATION_NAME = fk.RDB$RELATION_NAME
-  JOIN RDB$RELATIONS uqrel
-    ON uqrel.RDB$RELATION_NAME = uq.RDB$RELATION_NAME
-  JOIN RDB$INDEX_SEGMENTS fkseg
-    ON fkseg.RDB$INDEX_NAME = fk.RDB$INDEX_NAME
-  JOIN RDB$INDEX_SEGMENTS uqseg
-    ON uqseg.RDB$INDEX_NAME = uq.RDB$INDEX_NAME
-   AND uqseg.RDB$FIELD_POSITION = fkseg.RDB$FIELD_POSITION
- WHERE fk.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'
-   AND COALESCE(fkrel.RDB$SYSTEM_FLAG, 0) = 0
-   AND COALESCE(uqrel.RDB$SYSTEM_FLAG, 0) = 0
- ORDER BY fk.RDB$CONSTRAINT_NAME, fkseg.RDB$FIELD_POSITION
-`
-
-func (db *InterBaseDBRepository) DescribeForeignKeysBySchema(ctx context.Context, _ string) ([]*ForeignKey, error) {
-	if db == nil || db.Conn == nil {
-		return nil, errors.New("interbase: database connection is nil")
-	}
-	rows, err := db.Conn.QueryContext(ctx, interBaseForeignKeysQuery)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return parseInterBaseForeignKeys(rows)
-}
-
-func parseInterBaseForeignKeys(rows *sql.Rows) ([]*ForeignKey, error) {
-	foreignKeys := make([]*ForeignKey, 0)
-	var currentID string
-	var current *ForeignKey
-
-	for rows.Next() {
-		var rawID, rawTable, rawColumn, rawRefTable, rawRefColumn sql.NullString
-		if err := rows.Scan(&rawID, &rawTable, &rawColumn, &rawRefTable, &rawRefColumn); err != nil {
-			return nil, err
-		}
-		if !rawID.Valid || !rawTable.Valid || !rawColumn.Valid || !rawRefTable.Valid || !rawRefColumn.Valid {
-			return nil, errors.New("interbase: catalog returned an incomplete foreign key")
-		}
-
-		fkID := strings.TrimSpace(rawID.String)
-		if current == nil || fkID != currentID {
-			if current != nil {
-				foreignKeys = append(foreignKeys, current)
-			}
-			current = new(ForeignKey)
-			currentID = fkID
-		}
-		left := &ColumnBase{
-			Schema: "",
-			Table:  strings.TrimSpace(rawTable.String),
-			Name:   strings.TrimSpace(rawColumn.String),
-		}
-		right := &ColumnBase{
-			Schema: "",
-			Table:  strings.TrimSpace(rawRefTable.String),
-			Name:   strings.TrimSpace(rawRefColumn.String),
-		}
-		*current = append(*current, [2]*ColumnBase{left, right})
-	}
-	if current != nil {
-		foreignKeys = append(foreignKeys, current)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return foreignKeys, nil
 }
 
 func (db *InterBaseDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {

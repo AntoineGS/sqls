@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"database/sql/driver"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -624,5 +625,189 @@ func TestInterBaseTypeNameKeepsCharsetAndCollationOutOfTheColumnForm(t *testing.
 	}
 	if got := interBaseColumnTypeName(charsetOnly, 3); got != "VARCHAR(20)" {
 		t.Errorf("interBaseColumnTypeName() = %q, want %q", got, "VARCHAR(20)")
+	}
+}
+
+func TestInterBaseRepositoryReadsTablesViewsColumnsAndCompositeForeignKeys(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	// Preserved verbatim from the pre-migration test: this repository has no
+	// DatabaseName, and CurrentDatabase/Databases stay inert until plan 3
+	// wires §4.7. This is the "no identity" regression guard.
+	if got, err := repository.CurrentDatabase(ctx); err != nil || got != "" {
+		t.Fatalf("CurrentDatabase() = (%q, %v), want (empty, nil)", got, err)
+	}
+	if got, err := repository.Databases(ctx); err != nil || !reflect.DeepEqual(got, []string{}) {
+		t.Fatalf("Databases() = (%#v, %v), want empty list", got, err)
+	}
+	if got, err := repository.CurrentSchema(ctx); err != nil || got != "" {
+		t.Fatalf("CurrentSchema() = (%q, %v), want (empty, nil)", got, err)
+	}
+	if got, err := repository.Schemas(ctx); err != nil || !reflect.DeepEqual(got, []string{""}) {
+		t.Fatalf("Schemas() = (%#v, %v), want synthetic empty schema", got, err)
+	}
+
+	// Views stay in SchemaTables: the extended view cache is additive
+	// metadata, not a replacement, so views keep completing in FROM position.
+	wantSchemaTables := map[string][]string{
+		"": {"CHILD", "CUSTOMER", "CUSTOMER_VIEW", "PARENT"},
+	}
+	gotSchemaTables, err := repository.SchemaTables(ctx)
+	if err != nil {
+		t.Fatalf("SchemaTables() error = %v", err)
+	}
+	if !reflect.DeepEqual(gotSchemaTables, wantSchemaTables) {
+		t.Fatalf("SchemaTables() = %#v, want %#v", gotSchemaTables, wantSchemaTables)
+	}
+
+	gotColumns, err := repository.DescribeDatabaseTable(ctx)
+	if err != nil {
+		t.Fatalf("DescribeDatabaseTable() error = %v", err)
+	}
+	wantColumns := []struct {
+		table, name, typ, nullable, key, extra, defaultValue string
+		defaultValid                                         bool
+	}{
+		{table: "CHILD", name: "CHILD_B", typ: "INTEGER", nullable: "YES", key: "NO"},
+		{table: "CHILD", name: "CHILD_A", typ: "INTEGER", nullable: "YES", key: "NO"},
+		// Kept with an empty type rather than dropped; see the named test below.
+		{table: "CHILD", name: "ORPHAN", typ: "", nullable: "YES", key: "NO"},
+		{table: "CUSTOMER", name: "ID", typ: "INTEGER", nullable: "NO", key: "YES"},
+		{table: "CUSTOMER", name: "CODE", typ: "CHAR(10)", nullable: "YES", key: "NO"},
+		// Documented type change: dialect 3 distinguishes TIMESTAMP from DATE.
+		{table: "CUSTOMER", name: "CREATED", typ: "TIMESTAMP", nullable: "YES", key: "NO"},
+		{table: "CUSTOMER", name: "AMOUNT", typ: "NUMERIC(9, 2)", nullable: "YES", key: "NO"},
+		{table: "CUSTOMER", name: "LABEL", typ: "VARCHAR(20)", nullable: "YES", key: "NO", defaultValue: "'  seeded  '", defaultValid: true},
+		{table: "CUSTOMER", name: "INHERITED", typ: "VARCHAR(20)", nullable: "NO", key: "NO", defaultValue: "'domain'", defaultValid: true},
+		{table: "CUSTOMER", name: "OVERRIDE", typ: "VARCHAR(20)", nullable: "YES", key: "NO", defaultValue: "'column'", defaultValid: true},
+		{table: "CUSTOMER", name: "DEFAULT_NULL", typ: "VARCHAR(20)", nullable: "YES", key: "NO", defaultValue: "NULL", defaultValid: true},
+		{table: "CUSTOMER", name: "REQUIRED", typ: "INTEGER", nullable: "NO", key: "NO"},
+		// Documented type change: the numeric subtype is the declaration.
+		{table: "CUSTOMER", name: "DOUBLE_AMOUNT", typ: "NUMERIC(15, 0)", nullable: "YES", key: "NO"},
+		// New: computed columns are common and hover should say so.
+		{table: "CUSTOMER", name: "TOTAL", typ: "INTEGER", nullable: "YES", key: "NO", extra: "COMPUTED"},
+		{table: "CUSTOMER_VIEW", name: "VIEW_ID", typ: "INTEGER", nullable: "YES", key: "NO"},
+		{table: "PARENT", name: "PARENT_B", typ: "INTEGER", nullable: "YES", key: "YES"},
+		{table: "PARENT", name: "PARENT_A", typ: "INTEGER", nullable: "YES", key: "YES"},
+	}
+	if len(gotColumns) != len(wantColumns) {
+		t.Fatalf("DescribeDatabaseTable() returned %d columns, want %d", len(gotColumns), len(wantColumns))
+	}
+	for i, want := range wantColumns {
+		got := gotColumns[i]
+		if got.Schema != "" {
+			t.Errorf("column %d schema = %q, want synthetic empty schema", i, got.Schema)
+		}
+		if got.Table != want.table || got.Name != want.name || got.Type != want.typ ||
+			got.Null != want.nullable || got.Key != want.key || got.Extra != want.extra {
+			t.Errorf("column %d = (%q, %q, %q, %q, %q, %q), want (%q, %q, %q, %q, %q, %q)",
+				i, got.Table, got.Name, got.Type, got.Null, got.Key, got.Extra,
+				want.table, want.name, want.typ, want.nullable, want.key, want.extra)
+		}
+		if got.Default.Valid != want.defaultValid || got.Default.String != want.defaultValue {
+			t.Errorf("column %d default = %#v, want %#v", i, got.Default,
+				sql.NullString{String: want.defaultValue, Valid: want.defaultValid})
+		}
+	}
+
+	bySchema, err := repository.DescribeDatabaseTableBySchema(ctx, "ignored-schema")
+	if err != nil {
+		t.Fatalf("DescribeDatabaseTableBySchema() error = %v", err)
+	}
+	if len(bySchema) != len(gotColumns) {
+		t.Fatalf("DescribeDatabaseTableBySchema() returned %d columns, want %d", len(bySchema), len(gotColumns))
+	}
+	for i := range gotColumns {
+		if bySchema[i].Table != gotColumns[i].Table || bySchema[i].Name != gotColumns[i].Name {
+			t.Errorf("schema column %d = %s.%s, want %s.%s", i,
+				bySchema[i].Table, bySchema[i].Name, gotColumns[i].Table, gotColumns[i].Name)
+		}
+	}
+
+	foreignKeys, err := repository.DescribeForeignKeysBySchema(ctx, "ignored-schema")
+	if err != nil {
+		t.Fatalf("DescribeForeignKeysBySchema() error = %v", err)
+	}
+	if len(foreignKeys) != 1 || len(*foreignKeys[0]) != 2 {
+		t.Fatalf("DescribeForeignKeysBySchema() = %#v, want one two-column foreign key", foreignKeys)
+	}
+	wantForeignKeyTables := [][2]string{{"CHILD", "PARENT"}, {"CHILD", "PARENT"}}
+	wantForeignKeyNames := [][2]string{{"CHILD_B", "PARENT_B"}, {"CHILD_A", "PARENT_A"}}
+	for i, pair := range *foreignKeys[0] {
+		if pair[0].Schema != "" || pair[1].Schema != "" ||
+			pair[0].Table != wantForeignKeyTables[i][0] || pair[1].Table != wantForeignKeyTables[i][1] ||
+			pair[0].Name != wantForeignKeyNames[i][0] || pair[1].Name != wantForeignKeyNames[i][1] {
+			t.Errorf("foreign key pair %d = %#v, want %s.%s -> %s.%s", i, pair,
+				wantForeignKeyTables[i][0], wantForeignKeyNames[i][0],
+				wantForeignKeyTables[i][1], wantForeignKeyNames[i][1])
+		}
+	}
+}
+
+func TestInterBaseColumnTypesFollowTheRepositoryDialect(t *testing.T) {
+	// The repository's SQLDialect must actually reach the renderer. Plan 1
+	// populates it from the resolved connection variant; a zero value means
+	// dialect 3, matching interbase-go's own normalizeDialect.
+	db := openInterBaseSchemaFixture(t)
+	ctx := context.Background()
+
+	tests := []struct {
+		sqlDialect int
+		want       string
+	}{
+		{sqlDialect: 0, want: "TIMESTAMP"},
+		{sqlDialect: 1, want: "DATE"},
+		{sqlDialect: 3, want: "TIMESTAMP"},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("dialect %d", test.sqlDialect), func(t *testing.T) {
+			repository := &InterBaseDBRepository{Conn: db, SQLDialect: test.sqlDialect}
+			columns, err := repository.DescribeDatabaseTable(ctx)
+			if err != nil {
+				t.Fatalf("DescribeDatabaseTable() error = %v", err)
+			}
+			for _, column := range columns {
+				if column.Table == "CUSTOMER" && column.Name == "CREATED" {
+					if column.Type != test.want {
+						t.Fatalf("CUSTOMER.CREATED type = %q, want %q", column.Type, test.want)
+					}
+					return
+				}
+			}
+			t.Fatal("CUSTOMER.CREATED was not returned")
+		})
+	}
+}
+
+func TestInterBaseColumnWithoutDomainRowIsRetained(t *testing.T) {
+	// A deliberate, asserted behavior change. The old inner JOIN RDB$FIELDS
+	// (interbase_common.go:195-196) silently dropped a column whose
+	// RDB$FIELD_SOURCE had no RDB$FIELDS row; schema LEFT JOINs and yields
+	// Domain == nil. Showing a column with an unknown type beats hiding a
+	// column that exists.
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+
+	columns, err := repository.DescribeDatabaseTable(context.Background())
+	if err != nil {
+		t.Fatalf("DescribeDatabaseTable() error = %v", err)
+	}
+
+	var orphan *ColumnDesc
+	for _, column := range columns {
+		if column.Table == "CHILD" && column.Name == "ORPHAN" {
+			orphan = column
+		}
+	}
+	if orphan == nil {
+		t.Fatal("a column whose field source has no RDB$FIELDS row was dropped; it must be kept with an empty type")
+	}
+	if orphan.Type != "" {
+		t.Errorf("orphan column type = %q, want an empty type", orphan.Type)
+	}
+	if orphan.Null != "YES" || orphan.Key != "NO" || orphan.Default.Valid {
+		t.Errorf("orphan column = %#v, want nullable, non-key, no default", orphan)
 	}
 }
