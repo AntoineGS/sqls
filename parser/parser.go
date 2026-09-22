@@ -274,6 +274,7 @@ var multiKeywordMap = map[string][]string{
 	"GROUP":   {"BY"},
 	"INSERT":  {"INTO"},
 	"DELETE":  {"FROM"},
+	"EXECUTE": {"PROCEDURE"},
 	"INNER":   {"JOIN"},
 	"CROSS":   {"JOIN"},
 	"OUTER":   {"JOIN"},

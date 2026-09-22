@@ -2,6 +2,7 @@ package parser
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/sqls-server/sqls/ast"
@@ -683,6 +684,15 @@ func TestParseMultiKeyword(t *testing.T) {
 		{
 			name:  "delete keyword",
 			input: "delete from",
+			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
+				testStatement(t, stmts[0], 1, input)
+				list := stmts[0].GetTokens()
+				testMultiKeyword(t, list[0], input)
+			},
+		},
+		{
+			name:  "execute procedure keyword",
+			input: "execute procedure",
 			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
 				testStatement(t, stmts[0], 1, input)
 				list := stmts[0].GetTokens()
@@ -1684,4 +1694,117 @@ func quotedTokenKind(t *testing.T, parsed ast.TokenList) token.Kind {
 	}
 	t.Fatalf("no token matched the double-quoted text")
 	return token.ILLEGAL
+}
+
+// TestParseExecuteProcedureCall pins the shape the completion and signature
+// help features depend on: the two keywords collapse into one MultiKeyword and
+// the call itself stays a FunctionLiteral, so the callee name and the argument
+// list are still reachable.
+func TestParseExecuteProcedureCall(t *testing.T) {
+	stmts := parseInit(t, "execute procedure myproc(1, 2)")
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements, want 1", len(stmts))
+	}
+
+	var (
+		multiKeyword *ast.MultiKeyword
+		function     *ast.FunctionLiteral
+	)
+	for _, node := range stmts[0].GetTokens() {
+		switch v := node.(type) {
+		case *ast.MultiKeyword:
+			multiKeyword = v
+		case *ast.FunctionLiteral:
+			function = v
+		}
+	}
+
+	if multiKeyword == nil {
+		t.Fatalf("no MultiKeyword in %v", stmts[0].GetTokens())
+	}
+	if got, want := multiKeyword.String(), "execute procedure"; got != want {
+		t.Errorf("MultiKeyword.String() = %q, want %q", got, want)
+	}
+	if function == nil {
+		t.Fatalf("no FunctionLiteral in %v", stmts[0].GetTokens())
+	}
+	if got, want := function.String(), "myproc(1, 2)"; got != want {
+		t.Errorf("FunctionLiteral.String() = %q, want %q", got, want)
+	}
+}
+
+// TestParseExecuteWithoutProcedureIsNotGrouped keeps PostgreSQL's and MSSQL's
+// `EXECUTE <name>` intact: the group fires only when PROCEDURE follows.
+func TestParseExecuteWithoutProcedureIsNotGrouped(t *testing.T) {
+	stmts := parseInit(t, "execute stmt")
+	for _, node := range stmts[0].GetTokens() {
+		if _, ok := node.(*ast.MultiKeyword); ok {
+			t.Fatalf("EXECUTE alone was grouped into a MultiKeyword: %v", stmts[0].GetTokens())
+		}
+	}
+}
+
+// TestParsePostgreSQLLegacyTriggerStatementStillParsesSensibly proves the
+// real blast radius named in the plan: PostgreSQL's still-valid legacy
+// trigger syntax `CREATE TRIGGER ... EXECUTE PROCEDURE f()` contains the
+// exact "EXECUTE PROCEDURE" sequence multiKeywordMap now groups. Before this
+// task, EXECUTE and PROCEDURE were two independent keyword Items with a
+// Whitespace node between them; after it, they collapse into one
+// MultiKeyword. The statement must still parse without error, still contain
+// exactly one trigger body, and the call `f()` must still be a reachable
+// FunctionLiteral so PostgreSQL's own completion is unaffected beyond the
+// keyword grouping itself.
+func TestParsePostgreSQLLegacyTriggerStatementStillParsesSensibly(t *testing.T) {
+	input := "CREATE TRIGGER x AFTER INSERT ON t FOR EACH ROW EXECUTE PROCEDURE f()"
+	parsed, err := ParseWithDriver(input, dialect.DatabaseDriverPostgreSQL)
+	if err != nil {
+		t.Fatalf("ParseWithDriver(postgresql): %v", err)
+	}
+
+	stmts := []*ast.Statement{}
+	for _, node := range parsed.GetTokens() {
+		stmt, ok := node.(*ast.Statement)
+		if !ok {
+			t.Fatalf("invalid type want Statement parsed %T", node)
+		}
+		stmts = append(stmts, stmt)
+	}
+	if len(stmts) != 1 {
+		t.Fatalf("got %d statements, want 1", len(stmts))
+	}
+	if got := stmts[0].String(); got != input {
+		t.Errorf("statement did not round-trip: got %q, want %q", got, input)
+	}
+
+	var (
+		multiKeyword *ast.MultiKeyword
+		function     *ast.FunctionLiteral
+	)
+	var walk func(node ast.Node)
+	walk = func(node ast.Node) {
+		switch v := node.(type) {
+		case *ast.MultiKeyword:
+			if strings.EqualFold(v.String(), "execute procedure") {
+				multiKeyword = v
+			}
+		case *ast.FunctionLiteral:
+			function = v
+		}
+		if list, ok := node.(ast.TokenList); ok {
+			for _, child := range list.GetTokens() {
+				walk(child)
+			}
+		}
+	}
+	walk(stmts[0])
+
+	if multiKeyword == nil {
+		t.Fatalf("no EXECUTE PROCEDURE MultiKeyword found in %q", stmts[0].String())
+	}
+	if function == nil {
+		t.Fatalf("no FunctionLiteral (the f() call) found in %q", stmts[0].String())
+	}
+	if got, want := function.String(), "f()"; got != want {
+		t.Errorf("FunctionLiteral.String() = %q, want %q", got, want)
+	}
 }

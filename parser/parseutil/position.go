@@ -9,17 +9,18 @@ import (
 type SyntaxPosition string
 
 const (
-	ColName        SyntaxPosition = "col_name"
-	SelectExpr     SyntaxPosition = "select_expr"
-	AliasName      SyntaxPosition = "alias_name"
-	WhereCondition SyntaxPosition = "where_condition"
-	CaseValue      SyntaxPosition = "case_value"
-	TableReference SyntaxPosition = "table_reference"
-	InsertColumn   SyntaxPosition = "insert_column"
-	InsertValue    SyntaxPosition = "insert_value"
-	JoinClause     SyntaxPosition = "join_clause"
-	JoinOn         SyntaxPosition = "join_on"
-	Unknown        SyntaxPosition = "unknown"
+	ColName          SyntaxPosition = "col_name"
+	SelectExpr       SyntaxPosition = "select_expr"
+	AliasName        SyntaxPosition = "alias_name"
+	WhereCondition   SyntaxPosition = "where_condition"
+	CaseValue        SyntaxPosition = "case_value"
+	TableReference   SyntaxPosition = "table_reference"
+	InsertColumn     SyntaxPosition = "insert_column"
+	InsertValue      SyntaxPosition = "insert_value"
+	JoinClause       SyntaxPosition = "join_clause"
+	JoinOn           SyntaxPosition = "join_on"
+	ExecuteProcedure SyntaxPosition = "execute_procedure"
+	Unknown          SyntaxPosition = "unknown"
 )
 
 func CheckSyntaxPosition(nw *NodeWalker) SyntaxPosition {
@@ -102,6 +103,14 @@ func CheckSyntaxPosition(nw *NodeWalker) SyntaxPosition {
 		} else {
 			res = InsertColumn
 		}
+	case nw.PrevNodesIs(true, genKeywordMatcher([]string{
+		// InterBase EXECUTE PROCEDURE. Deliberately last: PrevNodesIs matches
+		// at every path depth, so this keyword pair is also "previous" when
+		// the cursor is inside the call's argument list, and an earlier case
+		// would take that position away from isInsertColumns.
+		"EXECUTE PROCEDURE",
+	})):
+		res = ExecuteProcedure
 	default:
 		res = Unknown
 	}

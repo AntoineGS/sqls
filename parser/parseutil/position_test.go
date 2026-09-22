@@ -185,6 +185,51 @@ func TestCheckSyntaxPosition(t *testing.T) {
 			},
 			want: TableReference,
 		},
+		{
+			name: "execute procedure name position",
+			text: "execute procedure ",
+			pos: token.Pos{
+				Line: 0,
+				Col:  18,
+			},
+			want: ExecuteProcedure,
+		},
+		{
+			name: "execute procedure name partially typed",
+			text: "execute procedure my",
+			pos: token.Pos{
+				Line: 0,
+				Col:  20,
+			},
+			want: ExecuteProcedure,
+		},
+		{
+			// Regression pin. PrevNodesIs checks every path depth, so
+			// "EXECUTE PROCEDURE" is a previous node here too. If the
+			// ExecuteProcedure case is placed before isInsertColumns it steals
+			// this position and the user typing arguments is offered procedure
+			// names instead.
+			name: "execute procedure argument list stays an argument list",
+			text: "execute procedure myproc(1, ",
+			pos: token.Pos{
+				Line: 0,
+				Col:  28,
+			},
+			want: InsertColumn,
+		},
+		{
+			// multiKeywordMap is dialect-independent, so PostgreSQL's legacy
+			// trigger syntax gets this position too. Recorded deliberately:
+			// the completion branch retains CompletionTypeKeyword precisely so
+			// that this costs a PostgreSQL user nothing.
+			name: "postgresql legacy trigger execute procedure",
+			text: "create trigger t after insert on x for each row execute procedure ",
+			pos: token.Pos{
+				Line: 0,
+				Col:  66,
+			},
+			want: ExecuteProcedure,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
