@@ -16,11 +16,14 @@ import (
 // the driver. This fixture records them, which no real database could report
 // back and which asserting against sqlite3 would only obscure.
 type txRecorder struct {
-	mu        sync.Mutex
-	options   []driver.TxOptions
-	commits   int
-	rollbacks int
-	fail      bool
+	mu         sync.Mutex
+	options    []driver.TxOptions
+	commits    int
+	rollbacks  int
+	fail       bool
+	queries    []string
+	queryArgs  [][]driver.NamedValue
+	rowsClosed int
 }
 
 func (r *txRecorder) record(options driver.TxOptions) {
@@ -33,6 +36,30 @@ func (r *txRecorder) snapshot() ([]driver.TxOptions, int, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]driver.TxOptions(nil), r.options...), r.commits, r.rollbacks
+}
+
+// recordQuery captures one ExecContext/QueryContext invocation: the query
+// text it was rewritten to and a defensive copy of the driver.NamedValue
+// slice the sql package built from the caller's []any arguments — the only
+// place that proves an argument actually reached the driver rather than the
+// SQL text.
+func (r *txRecorder) recordQuery(query string, args []driver.NamedValue) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.queries = append(r.queries, query)
+	r.queryArgs = append(r.queryArgs, append([]driver.NamedValue(nil), args...))
+}
+
+func (r *txRecorder) recordRowsClosed() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rowsClosed++
+}
+
+func (r *txRecorder) querySnapshot() ([]string, [][]driver.NamedValue, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.queries...), append([][]driver.NamedValue(nil), r.queryArgs...), r.rowsClosed
 }
 
 var (
@@ -109,8 +136,14 @@ func (c *txRecorderConn) BeginTx(_ context.Context, options driver.TxOptions) (d
 	return &txRecorderTx{recorder: c.recorder}, nil
 }
 
-func (c *txRecorderConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
-	return &txRecorderRows{fail: c.recorder.fail}, nil
+func (c *txRecorderConn) QueryContext(_ context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	c.recorder.recordQuery(query, args)
+	return &txRecorderRows{recorder: c.recorder, fail: c.recorder.fail}, nil
+}
+
+func (c *txRecorderConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.recorder.recordQuery(query, args)
+	return driver.RowsAffected(1), nil
 }
 
 type txRecorderTx struct{ recorder *txRecorder }
@@ -132,12 +165,16 @@ func (t *txRecorderTx) Rollback() error {
 var errReadOnlyFetchTest = errors.New("interbase: BLOB result exceeds the materialization limit")
 
 type txRecorderRows struct {
-	fail bool
-	sent int
+	recorder *txRecorder
+	fail     bool
+	sent     int
 }
 
-func (r *txRecorderRows) Columns() []string                     { return []string{"CODE"} }
-func (r *txRecorderRows) Close() error                          { return nil }
+func (r *txRecorderRows) Columns() []string { return []string{"CODE"} }
+func (r *txRecorderRows) Close() error {
+	r.recorder.recordRowsClosed()
+	return nil
+}
 func (r *txRecorderRows) ColumnTypeDatabaseTypeName(int) string { return "VARCHAR" }
 func (r *txRecorderRows) ColumnTypeScanType(int) reflect.Type   { return reflect.TypeOf("") }
 func (r *txRecorderRows) ColumnTypeNullable(int) (bool, bool)   { return true, true }
@@ -192,6 +229,9 @@ func TestInterBaseQueryReadOnlyUsesReadOnlyReadCommittedTransaction(t *testing.T
 	if rollbacks != 1 {
 		t.Errorf("rolled back %d times, want exactly 1", rollbacks)
 	}
+	if _, _, rowsClosed := recorder.querySnapshot(); rowsClosed != 1 {
+		t.Errorf("closed rows %d times, want exactly 1", rowsClosed)
+	}
 }
 
 func TestInterBaseQueryReadOnlyDistinguishesNull(t *testing.T) {
@@ -228,6 +268,9 @@ func TestInterBaseQueryReadOnlyReturnsPartialRowsOnFetchFailure(t *testing.T) {
 	// The transaction is still released on the failure path.
 	if _, _, rollbacks := recorder.snapshot(); rollbacks != 1 {
 		t.Errorf("rolled back %d times after a failed fetch, want exactly 1", rollbacks)
+	}
+	if _, _, rowsClosed := recorder.querySnapshot(); rowsClosed != 1 {
+		t.Errorf("closed rows %d times after a failed fetch, want exactly 1", rowsClosed)
 	}
 }
 
