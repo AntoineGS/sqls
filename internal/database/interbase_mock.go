@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -73,4 +74,31 @@ func (m *MockCapabilityRepository) ExplainPlanCalls() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.explainPlanCalls...)
+}
+
+// unsupportedDDLError carries the structured detail UnsupportedDDLDetail
+// extracts. It lives here rather than in a test because the interface
+// UnsupportedDDLDetail matches is unexported, so only this package can
+// implement it — and a handler test must be able to build one.
+type unsupportedDDLError struct {
+	object  string
+	name    string
+	feature string
+}
+
+func (e *unsupportedDDLError) Error() string {
+	return fmt.Sprintf("database: DDL is unavailable for %s %q: %s", e.object, e.name, e.feature)
+}
+
+func (e *unsupportedDDLError) Unwrap() error { return ErrUnsupportedDDL }
+
+func (e *unsupportedDDLError) UnsupportedDDLDetail() (object, name, feature string) {
+	return e.object, e.name, e.feature
+}
+
+// NewUnsupportedDDLError builds an error that satisfies
+// errors.Is(err, ErrUnsupportedDDL) and yields ok == true from
+// UnsupportedDDLDetail.
+func NewUnsupportedDDLError(object, name, feature string) error {
+	return &unsupportedDDLError{object: object, name: name, feature: feature}
 }
