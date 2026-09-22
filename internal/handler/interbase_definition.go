@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"time"
 
@@ -183,4 +185,61 @@ func snapshotRange(content string, bannerLines int, name string) lsp.Range {
 		return lsp.Range{Start: pos, End: pos}
 	}
 	return lsp.Range{}
+}
+
+// definitionDDLTimeout bounds the catalog round trip. textDocument/definition
+// stays on the inline dispatch path — Plan 1 moves only workspace/executeCommand
+// off it — so an unbounded catalog read would freeze the whole server. The
+// bound matches the one hover uses for the same reason.
+const definitionDDLTimeout = 3 * time.Second
+
+// interBaseDefinition materialises the source of the catalog object under the
+// cursor and returns its location. Every miss returns (nil, nil): the user
+// asked to navigate, not to be told about the catalog, so nothing here surfaces
+// as a request error.
+//
+// repo and dbCache are parameters rather than reads off the server so this
+// method takes stateMu exactly once, for snapshotContext, and never across the
+// file write that follows.
+func (s *Server) interBaseDefinition(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.DefinitionParams, text string) (lsp.Definition, error) {
+	if s.snapshots == nil || repo == nil {
+		return nil, nil
+	}
+	ddlRepo, ok := repo.(database.DDLRepository)
+	if !ok {
+		return nil, nil
+	}
+	target, ok := resolveSnapshotTarget(text, params, dbCache, s.parserDriver())
+	if !ok {
+		return nil, nil
+	}
+
+	ddlCtx, cancel := context.WithTimeout(ctx, definitionDDLTimeout)
+	defer cancel()
+	ddl, ddlErr := ddlRepo.ObjectDDL(ddlCtx, target.kind, target.name)
+
+	body, note, ok := snapshotBodyFor(ddl, ddlErr, target)
+	if !ok {
+		return nil, nil
+	}
+
+	sc := s.snapshotContext()
+	content, bannerLines := renderSnapshot(target, sc, s.snapshots.now(), body, note)
+	path, err := s.snapshots.write(sc, string(target.kind), target.name, content)
+	if err != nil {
+		log.Printf("sqls: write %s snapshot for %q: %v", target.kind, target.name, err)
+		return nil, nil
+	}
+
+	return []lsp.Location{{
+		URI:   snapshotURI(path),
+		Range: snapshotRange(content, bannerLines, target.name),
+	}}, nil
+}
+
+// snapshotURI turns an absolute path into a file:// URI. The path can contain
+// percent signs, because escapeSnapshotName puts them there; url.URL.String
+// encodes them as %25, so the URI decodes back to the real file name.
+func snapshotURI(path string) string {
+	return (&url.URL{Scheme: "file", Path: path}).String()
 }

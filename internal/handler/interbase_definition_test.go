@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -687,5 +690,430 @@ func TestRenderSnapshotNormalizesExactlyOneTrailingNewline(t *testing.T) {
 	}
 	if strings.HasSuffix(withNewline, "\n\n") {
 		t.Error("content ends with a doubled newline")
+	}
+}
+
+// stubDDLRepository is a DBRepository that also answers ObjectDDL. The embedded
+// mock's other methods are never called on the definition path, so their func
+// fields stay nil.
+type stubDDLRepository struct {
+	*database.MockDBRepository
+	ddl   func(ctx context.Context, kind database.ObjectKind, name string) (string, error)
+	calls int
+}
+
+func (r *stubDDLRepository) ObjectDDL(ctx context.Context, kind database.ObjectKind, name string) (string, error) {
+	r.calls++
+	return r.ddl(ctx, kind, name)
+}
+
+func newStubDDLRepository(ddl func(context.Context, database.ObjectKind, string) (string, error)) *stubDDLRepository {
+	return &stubDDLRepository{MockDBRepository: &database.MockDBRepository{}, ddl: ddl}
+}
+
+// newDefinitionServer builds a server wired for the snapshot path: the
+// InterBase driver, a connection config to hash, and a store rooted at a
+// temporary directory.
+//
+// The store replacement is mandatory, not cosmetic: NewServer roots its store
+// at the real user cache directory, so a test that skipped this line would
+// create files in the developer's home directory.
+func newDefinitionServer(t *testing.T) *Server {
+	t.Helper()
+	server := NewServer()
+	t.Cleanup(server.worker.Stop)
+	server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	server.curDBCfg = &database.DBConfig{
+		Alias:          "local_ib",
+		Driver:         dialect.DatabaseDriverInterBase,
+		DataSourceName: "localhost/3050:/db/app.ib",
+	}
+	server.snapshots = newTestSnapshotStore(t)
+	return server
+}
+
+// snapshotRootIsEmpty reports whether the store wrote nothing at all. The root
+// itself may not exist, which also counts as empty.
+func snapshotRootIsEmpty(t *testing.T, store *sourceSnapshotStore) bool {
+	t.Helper()
+	var files int
+	err := filepath.WalkDir(store.root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			files++
+		}
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal("WalkDir:", err)
+	}
+	return files == 0
+}
+
+func TestInterBaseDefinitionProcedureWritesReadOnlySnapshot(t *testing.T) {
+	server := newDefinitionServer(t)
+	repo := newStubDDLRepository(func(_ context.Context, kind database.ObjectKind, name string) (string, error) {
+		if kind != database.ObjectKindProcedure || name != "MYPROC" {
+			t.Errorf("ObjectDDL(%q, %q), want (procedure, MYPROC)", kind, name)
+		}
+		return "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN\n  SUSPEND;\nEND", nil
+	})
+
+	got, err := server.interBaseDefinition(context.Background(), repo, definitionCatalog(), definitionParamsAt(20), "execute procedure myproc")
+	if err != nil {
+		t.Fatal("interBaseDefinition:", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d locations, want 1", len(got))
+	}
+
+	if !strings.HasPrefix(got[0].URI, "file://") {
+		t.Errorf("URI = %q, want a file:// URI — a client that cannot open the scheme is worse than no location", got[0].URI)
+	}
+
+	path := filepath.Join(server.snapshots.root,
+		snapshotDirName(server.snapshotContext().identity, os.Getpid()), "procedure", "MYPROC.sql")
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal("Stat snapshot:", err)
+	}
+	if got := info.Mode().Perm(); got != snapshotFileMode {
+		t.Errorf("snapshot mode = %#o, want %#o", got, snapshotFileMode)
+	}
+	dirInfo, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatal("Stat snapshot directory:", err)
+	}
+	if got := dirInfo.Mode().Perm(); got != snapshotDirMode {
+		t.Errorf("snapshot directory mode = %#o, want %#o", got, snapshotDirMode)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal("ReadFile:", err)
+	}
+	for _, want := range []string{
+		`-- sqls: read-only snapshot of InterBase PROCEDURE "MYPROC"`,
+		"-- connection: local_ib",
+		"-- Editing this file does not change the database.",
+		`CREATE PROCEDURE "MYPROC" AS`,
+	} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("snapshot does not contain %q:\n%s", want, content)
+		}
+	}
+}
+
+func TestInterBaseDefinitionRangePointsAtObjectName(t *testing.T) {
+	server := newDefinitionServer(t)
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+		return "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN END", nil
+	})
+
+	got, err := server.interBaseDefinition(context.Background(), repo, definitionCatalog(), definitionParamsAt(20), "execute procedure myproc")
+	if err != nil {
+		t.Fatal("interBaseDefinition:", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d locations, want 1", len(got))
+	}
+	// Line 3 is the first body line; MYPROC starts at character 18 of
+	// `CREATE PROCEDURE "MYPROC" AS`.
+	want := lsp.Range{
+		Start: lsp.Position{Line: 3, Character: 18},
+		End:   lsp.Position{Line: 3, Character: 18},
+	}
+	if got[0].Range != want {
+		t.Errorf("range = %+v, want %+v", got[0].Range, want)
+	}
+}
+
+func TestInterBaseDefinitionUnsupportedDDLUsesVerbatimSource(t *testing.T) {
+	cases := []struct {
+		name       string
+		text       string
+		character  int
+		kind       string
+		file       string
+		wantBody   string
+		wantObject string
+	}{
+		{
+			name:       "procedure",
+			text:       "execute procedure myproc",
+			character:  20,
+			kind:       "procedure",
+			file:       "MYPROC.sql",
+			wantBody:   "BEGIN\n  SUSPEND;\nEND",
+			wantObject: "MYPROC",
+		},
+		{
+			name:       "view",
+			text:       "select * from myview",
+			character:  16,
+			kind:       "view",
+			file:       "MYVIEW.sql",
+			wantBody:   "SELECT ID FROM CITY",
+			wantObject: "MYVIEW",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newDefinitionServer(t)
+			repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+				return "", &unsupportedDDLError{
+					object:  tt.kind,
+					name:    tt.wantObject,
+					feature: `parameter "IN_AMOUNT" nullability is unknown`,
+				}
+			})
+
+			got, err := server.interBaseDefinition(context.Background(), repo, definitionCatalog(), definitionParamsAt(tt.character), tt.text)
+			if err != nil {
+				t.Fatal("interBaseDefinition:", err)
+			}
+			if len(got) != 1 {
+				t.Fatalf("got %d locations, want 1", len(got))
+			}
+
+			path := filepath.Join(server.snapshots.root,
+				snapshotDirName(server.snapshotContext().identity, os.Getpid()), tt.kind, tt.file)
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal("ReadFile:", err)
+			}
+			text := string(content)
+
+			if !strings.Contains(text, tt.wantBody) {
+				t.Errorf("snapshot does not contain the verbatim source %q:\n%s", tt.wantBody, text)
+			}
+			if !strings.Contains(text, `parameter "IN_AMOUNT" nullability is unknown`) {
+				t.Errorf("snapshot does not name the blocking feature:\n%s", text)
+			}
+			// Every line before the body must be a comment, and the body must
+			// not have grown a CREATE header.
+			for _, line := range strings.Split(text, "\n") {
+				if strings.HasPrefix(line, "--") || line == "" {
+					continue
+				}
+				if strings.HasPrefix(strings.ToUpper(line), "CREATE ") {
+					t.Errorf("snapshot synthesized a declaration: %q", line)
+				}
+				break
+			}
+		})
+	}
+}
+
+func TestInterBaseDefinitionWritesNoFile(t *testing.T) {
+	cases := []struct {
+		name      string
+		text      string
+		character int
+		ddlErr    error
+	}{
+		{
+			name:      "object not found",
+			text:      "execute procedure myproc",
+			character: 20,
+			ddlErr:    database.ErrObjectNotFound,
+		},
+		{
+			name:      "unsupported DDL with no source",
+			text:      "execute procedure nosource",
+			character: 22,
+			ddlErr:    &unsupportedDDLError{object: "procedure", name: "NOSOURCE", feature: "nullability is unknown"},
+		},
+		{
+			name:      "any other error",
+			text:      "execute procedure myproc",
+			character: 20,
+			ddlErr:    errors.New("connection reset"),
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newDefinitionServer(t)
+			repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+				return "", tt.ddlErr
+			})
+
+			got, err := server.interBaseDefinition(context.Background(), repo, definitionCatalog(), definitionParamsAt(tt.character), tt.text)
+			if err != nil {
+				t.Fatalf("interBaseDefinition returned an error: %v — a definition miss is not a failure", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("got %d locations, want none", len(got))
+			}
+			if !snapshotRootIsEmpty(t, server.snapshots) {
+				t.Error("a file was written; a stale cache entry must never leave a snapshot behind")
+			}
+		})
+	}
+}
+
+func TestInterBaseDefinitionWithoutCapabilityReturnsNil(t *testing.T) {
+	cases := []struct {
+		name    string
+		repo    database.DBRepository
+		dbCache *database.DBCache
+		text    string
+	}{
+		{
+			name:    "repository does not implement DDLRepository",
+			repo:    &database.MockDBRepository{},
+			dbCache: definitionCatalog(),
+			text:    "execute procedure myproc",
+		},
+		{
+			name:    "no repository at all",
+			repo:    nil,
+			dbCache: definitionCatalog(),
+			text:    "execute procedure myproc",
+		},
+		{
+			name: "catalog has not arrived yet",
+			repo: newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+				t.Error("ObjectDDL was called without a catalog")
+				return "", nil
+			}),
+			dbCache: &database.DBCache{},
+			text:    "execute procedure myproc",
+		},
+		{
+			name: "identifier is not a catalog object",
+			repo: newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+				t.Error("ObjectDDL was called for an unknown identifier")
+				return "", nil
+			}),
+			dbCache: definitionCatalog(),
+			text:    "select * from nosuchthing",
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newDefinitionServer(t)
+			got, err := server.interBaseDefinition(context.Background(), tt.repo, tt.dbCache, definitionParamsAt(20), tt.text)
+			if err != nil {
+				t.Fatal("interBaseDefinition:", err)
+			}
+			if len(got) != 0 {
+				t.Fatalf("got %d locations, want none", len(got))
+			}
+			if !snapshotRootIsEmpty(t, server.snapshots) {
+				t.Error("a file was written without a resolved target")
+			}
+		})
+	}
+}
+
+func TestInterBaseDefinitionWithoutASnapshotStoreDegrades(t *testing.T) {
+	server := newDefinitionServer(t)
+	server.snapshots = nil
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+		return "CREATE PROCEDURE \"MYPROC\" AS BEGIN END", nil
+	})
+
+	got, err := server.interBaseDefinition(context.Background(), repo, definitionCatalog(), definitionParamsAt(20), "execute procedure myproc")
+	if err != nil {
+		t.Fatal("interBaseDefinition:", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d locations, want none when the store is disabled", len(got))
+	}
+}
+
+func TestInterBaseDefinitionFallsBackToAliasResolution(t *testing.T) {
+	tx := newTestContext()
+	tx.initServer(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+	configureInterBaseTestServer(t, tx, dialect.SQLVariantDefault)
+	tx.server.snapshots = newTestSnapshotStore(t)
+
+	input := "SELECT ci.ID FROM city AS ci"
+	tx.textDocumentDidOpen(t, testFileURI, input)
+
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", definitionParamsAt(8), &got); err != nil {
+		t.Fatal("conn.Call textDocument/definition:", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d locations, want the in-document alias", len(got))
+	}
+	if got[0].URI != testFileURI {
+		t.Errorf("URI = %q, want the document's own URI %q", got[0].URI, testFileURI)
+	}
+	if !snapshotRootIsEmpty(t, tx.server.snapshots) {
+		t.Error("the alias path wrote a snapshot; it must win outright")
+	}
+}
+
+// TestInterBaseDefinitionWriteFailureDoesNotBreakGoToDefinition is a
+// self-review addition: none of the brief's TestInterBaseDefinitionWritesNoFile
+// cases reach (*sourceSnapshotStore).write at all, since snapshotBodyFor
+// already returns ok=false for every one of them before write is ever called.
+// This pins the dispatch letter's explicit requirement — a failed snapshot
+// write must not break go-to-definition — using a name long enough that
+// escapeSnapshotName's expansion (three bytes per '$') pushes the escaped file
+// name past the filesystem's NAME_MAX, the same technique
+// TestSnapshotStoreFailsCleanlyWhenNameExceedsFilesystemLimit (Task 1) uses.
+// This is a different failure than TestInterBaseDefinitionWithoutASnapshotStoreDegrades,
+// which disables the store outright (s.snapshots == nil) rather than letting a
+// live store's write call fail.
+func TestInterBaseDefinitionWriteFailureDoesNotBreakGoToDefinition(t *testing.T) {
+	longName := "A" + strings.Repeat("$", 100)
+	server := newDefinitionServer(t)
+	dbCache := &database.DBCache{
+		Catalog: &database.CatalogCache{
+			Procedures: map[string]*database.ProcedureDesc{
+				longName: {Name: longName, Source: sql.NullString{String: "BEGIN END", Valid: true}},
+			},
+		},
+	}
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+		return `CREATE PROCEDURE "` + longName + `" AS BEGIN END`, nil
+	})
+
+	text := "execute procedure " + longName
+	got, err := server.interBaseDefinition(context.Background(), repo, dbCache, definitionParamsAt(len("execute procedure ")+1), text)
+	if err != nil {
+		t.Fatalf("interBaseDefinition returned an error on a failed snapshot write: %v — a definition miss is not a failure", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d locations, want none when the snapshot write fails", len(got))
+	}
+	if !snapshotRootIsEmpty(t, server.snapshots) {
+		t.Error("a partial snapshot was left behind after a failed write")
+	}
+}
+
+func TestDefinitionWithoutAConnectionReturnsNoLocations(t *testing.T) {
+	// Step 3's `return nil, nil` when newDBRepository fails is the one wiring
+	// line whose regression is visible to EVERY driver: an identifier that
+	// resolves to no in-document alias, with no connection configured, must
+	// come back as an empty result rather than a request error. Without this
+	// case nothing round-trips that branch, and a later edit that propagates
+	// the error would surface as "go to definition failed" in the editor for
+	// MySQL and PostgreSQL users too.
+	tx := newTestContext()
+	tx.initServer(t)
+	defer tx.tearDown()
+	defer tx.server.worker.Stop()
+	// Deliberately no configureInterBaseTestServer and no connection.
+
+	tx.textDocumentDidOpen(t, testFileURI, "SELECT * FROM MYPROC")
+
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", definitionParamsAt(14), &got); err != nil {
+		t.Fatalf("textDocument/definition returned an error with no connection: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("got %d locations, want none", len(got))
 	}
 }
