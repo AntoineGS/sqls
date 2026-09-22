@@ -136,8 +136,8 @@ func TestCacheBuildWithoutSnapshotCapabilityUsesTheRepositoryDirectly(t *testing
 	}
 }
 
-func catalogTestRepository() *MockCatalogDBRepository {
-	repository := NewMockCatalogDBRepository(nil)
+func catalogTestRepository() *MockCapabilityRepository {
+	repository := NewMockCapabilityRepository()
 	repository.MockDescribeViews = func(context.Context) ([]*ViewDesc, error) {
 		return []*ViewDesc{{Name: "Customer_View", ViewSource: sql.NullString{String: "SELECT 1", Valid: true}}}, nil
 	}
@@ -429,23 +429,29 @@ func TestWorkerUpdateSignalDoesNotBlock(t *testing.T) {
 	}
 }
 
-func TestMockCatalogDBRepositoryIsDistinctFromMockDBRepository(t *testing.T) {
+func TestMockCapabilityRepositoryIsDistinctFromMockDBRepository(t *testing.T) {
 	// If MockDBRepository itself satisfied the capability interfaces, every
 	// existing handler test would start taking the capability branch and panic
 	// on a nil func field.
 	plain := DBRepository(NewMockDBRepository(nil))
-	if _, ok := plain.(CatalogRepository); ok {
-		t.Error("MockDBRepository must not implement CatalogRepository")
+	for name, ok := range map[string]bool{
+		"CatalogRepository": func() bool { _, ok := plain.(CatalogRepository); return ok }(),
+		"DDLRepository":     func() bool { _, ok := plain.(DDLRepository); return ok }(),
+		"ExplainRepository": func() bool { _, ok := plain.(ExplainRepository); return ok }(),
+	} {
+		if ok {
+			t.Errorf("MockDBRepository must not implement %s", name)
+		}
 	}
 
-	capable := DBRepository(NewMockCatalogDBRepository(nil))
+	capable := DBRepository(NewMockCapabilityRepository())
 	for name, ok := range map[string]bool{
 		"CatalogRepository": func() bool { _, ok := capable.(CatalogRepository); return ok }(),
 		"DDLRepository":     func() bool { _, ok := capable.(DDLRepository); return ok }(),
 		"ExplainRepository": func() bool { _, ok := capable.(ExplainRepository); return ok }(),
 	} {
 		if !ok {
-			t.Errorf("MockCatalogDBRepository must implement %s", name)
+			t.Errorf("MockCapabilityRepository must implement %s", name)
 		}
 	}
 	if got, want := capable.Driver(), dialect.DatabaseDriver("mock"); got != want {
@@ -454,12 +460,12 @@ func TestMockCatalogDBRepositoryIsDistinctFromMockDBRepository(t *testing.T) {
 
 	// Unset func fields answer empty rather than panicking, so a test that
 	// exercises one capability need not stub all of them.
-	bare := NewMockCatalogDBRepository(nil)
+	bare := NewMockCapabilityRepository()
 	views, err := bare.DescribeViews(context.Background())
 	if err != nil || len(views) != 0 {
 		t.Errorf("DescribeViews() on an unstubbed mock = (%v, %v), want (empty, nil)", views, err)
 	}
-	if ddl, err := bare.ObjectDDL(context.Background(), ObjectKindTable, "T"); err != nil || ddl != "" {
-		t.Errorf("ObjectDDL() on an unstubbed mock = (%q, %v), want (\"\", nil)", ddl, err)
+	if ddl, err := bare.ObjectDDL(context.Background(), ObjectKindTable, "T"); !errors.Is(err, ErrObjectNotFound) || ddl != "" {
+		t.Errorf("ObjectDDL() on an unstubbed mock = (%q, %v), want (\"\", ErrObjectNotFound)", ddl, err)
 	}
 }
