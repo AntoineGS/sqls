@@ -49,7 +49,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		if err != nil {
 			return nil, nil
 		}
-		return s.interBaseRelationDefinition(ctx, repo, dbCache, text, params.Position, dv)
+		return s.interBaseContextualDefinition(ctx, repo, dbCache, text, params.Position, dv)
 	}
 
 	dbCache := s.worker.Cache()

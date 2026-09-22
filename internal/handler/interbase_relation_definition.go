@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
@@ -26,6 +25,7 @@ func resolveRelationTarget(ref sqlsymbol.SQLReference, role sqlsymbol.Role, cach
 	}
 	if ref.Qualifier != nil {
 		for _, scope := range ref.Scopes {
+			var matches []sqlsymbol.RelationRef
 			for _, binding := range scope {
 				matched := false
 				if binding.Alias != nil {
@@ -34,19 +34,25 @@ func resolveRelationTarget(ref sqlsymbol.SQLReference, role sqlsymbol.Role, cach
 					matched = binding.Name.Key() == ref.Qualifier.Key()
 				}
 				if matched {
-					target, columns, metadata := relationColumns(binding.Name, cache)
-					if !metadata {
-						return snapshotTarget{}, false
-					}
-					for _, column := range columns {
-						if ref.Name.MatchesCatalogName(column) {
-							name := ref.Name
-							target.column = &name
-							return target, true
-						}
-					}
+					matches = append(matches, binding)
+				}
+			}
+			if len(matches) > 0 {
+				if len(matches) != 1 {
 					return snapshotTarget{}, false
 				}
+				target, columns, metadata := relationColumns(matches[0].Name, cache)
+				if !metadata {
+					return snapshotTarget{}, false
+				}
+				for _, column := range columns {
+					if ref.Name.MatchesCatalogName(column) {
+						name := ref.Name
+						target.column = &name
+						return target, true
+					}
+				}
+				return snapshotTarget{}, false
 			}
 		}
 		return snapshotTarget{}, false
@@ -133,18 +139,18 @@ func relationColumns(name sqlsymbol.Name, cache *database.DBCache) (snapshotTarg
 		}
 		return target, cols, true
 	}
-	for key, descriptors := range cache.ColumnsWithParent {
-		parts := strings.Split(key, "\t")
-		if len(parts) < 2 || !name.MatchesCatalogName(parts[len(parts)-1]) {
-			continue
-		}
-		cols := make([]string, 0, len(descriptors))
+	for _, descriptors := range cache.ColumnsWithParent {
+		var cols []string
+		matched := false
 		for _, col := range descriptors {
-			if col != nil {
+			if col != nil && col.Table == target.name {
+				matched = true
 				cols = append(cols, col.Name)
 			}
 		}
-		return target, cols, true
+		if matched {
+			return target, cols, true
+		}
 	}
 	return target, nil, false
 }
@@ -203,6 +209,19 @@ func (s *Server) interBaseRelationDefinition(ctx context.Context, repo database.
 		return nil, nil
 	}
 	return []lsp.Location{{URI: snapshotURI(path), Range: rangeValue}}, nil
+}
+
+// interBaseContextualDefinition preserves the existing view snapshot behavior
+// for relation names: when executable DDL is unavailable, a view's verbatim
+// catalog source remains a useful definition target. Column references still
+// require a proven declaration span in generated DDL.
+func (s *Server) interBaseContextualDefinition(ctx context.Context, repo database.DBRepository, cache *database.DBCache, text string, pos lsp.Position, dv dialect.DriverVariant) (lsp.Definition, error) {
+	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{Position: pos}}
+	target, ok := resolveSnapshotTargetWithVariant(text, params, cache, dv)
+	if ok && target.kind == database.ObjectKindView && target.column == nil {
+		return s.interBaseDefinitionWithVariant(ctx, repo, cache, params, text, dv)
+	}
+	return s.interBaseRelationDefinition(ctx, repo, cache, text, pos, dv)
 }
 
 func snapshotBodyOffset(content string, bannerLines int) int {
