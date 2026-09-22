@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -1178,5 +1179,187 @@ func TestInterBaseUndecodableFieldsAreEmptyUntilDriverAccessorsLand(t *testing.T
 				t.Errorf("argument %#v lost surrounding metadata", argument)
 			}
 		}
+	}
+}
+
+func TestInterBaseObjectDDL(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	rendered := []struct {
+		name     string
+		kind     ObjectKind
+		object   string
+		contains []string
+	}{
+		{
+			name: "a plain table", kind: ObjectKindTable, object: "PARENT",
+			contains: []string{`CREATE TABLE "PARENT"`, `"PARENT_B"`, `CONSTRAINT "PK_PARENT" PRIMARY KEY`},
+		},
+		{
+			name: "a view", kind: ObjectKindView, object: "CUSTOMER_VIEW",
+			contains: []string{`CREATE VIEW "CUSTOMER_VIEW"`, "SELECT ID FROM CUSTOMER"},
+		},
+		{
+			name: "a generator uses InterBase's own keyword", kind: ObjectKindGenerator, object: "GEN_CUSTOMER_ID",
+			contains: []string{`CREATE GENERATOR "GEN_CUSTOMER_ID"`},
+		},
+		{
+			name: "a domain", kind: ObjectKindDomain, object: "EMAIL_ADDRESS",
+			contains: []string{`CREATE DOMAIN "EMAIL_ADDRESS" AS VARCHAR(100)`, "CHECK (VALUE LIKE '%@%')"},
+		},
+		{
+			name: "a trigger", kind: ObjectKindTrigger, object: "CUSTOMER_BI",
+			contains: []string{`CREATE TRIGGER "CUSTOMER_BI" FOR "CUSTOMER"`, "BEFORE INSERT"},
+		},
+		{
+			name: "an index", kind: ObjectKindIndex, object: "IDX_PARENT_PK",
+			contains: []string{`CREATE UNIQUE ASCENDING INDEX "IDX_PARENT_PK" ON "PARENT"`, `"PARENT_B", "PARENT_A"`},
+		},
+	}
+	for _, test := range rendered {
+		t.Run(test.name, func(t *testing.T) {
+			ddl, err := repository.ObjectDDL(ctx, test.kind, test.object)
+			if err != nil {
+				t.Fatalf("ObjectDDL(%s, %q) error = %v", test.kind, test.object, err)
+			}
+			for _, want := range test.contains {
+				if !strings.Contains(ddl, want) {
+					t.Errorf("ObjectDDL(%s, %q) = %q, want it to contain %q", test.kind, test.object, ddl, want)
+				}
+			}
+		})
+	}
+
+	unsupported := []struct {
+		name        string
+		kind        ObjectKind
+		object      string
+		wantObject  string
+		wantFeature string
+	}{
+		{
+			// Computed columns block table DDL, and they are common in the
+			// target database, so this is the normal case rather than an edge.
+			name: "a table with a computed column", kind: ObjectKindTable, object: "CUSTOMER",
+			wantObject: "table", wantFeature: "TOTAL",
+		},
+		{
+			// schema/README.md: procedure parameter nullability is unknown
+			// unless a non-nullable domain proves it.
+			name: "a procedure with unknown parameter nullability", kind: ObjectKindProcedure, object: "ADD_CUSTOMER",
+			wantObject: "procedure", wantFeature: "CODE",
+		},
+		{
+			name: "an external function is never reproducible", kind: ObjectKindFunction, object: "F_LTRIM",
+			wantObject: "external function", wantFeature: "external calling convention",
+		},
+	}
+	for _, test := range unsupported {
+		t.Run(test.name, func(t *testing.T) {
+			ddl, err := repository.ObjectDDL(ctx, test.kind, test.object)
+			if !errors.Is(err, ErrUnsupportedDDL) {
+				t.Fatalf("ObjectDDL(%s, %q) error = %v, want it to satisfy errors.Is(err, ErrUnsupportedDDL)",
+					test.kind, test.object, err)
+			}
+			if errors.Is(err, ErrObjectNotFound) {
+				t.Fatalf("an existing object must not report ErrObjectNotFound: %v", err)
+			}
+			if ddl != "" {
+				t.Errorf("ObjectDDL(%s, %q) = %q, want no text alongside the error", test.kind, test.object, ddl)
+			}
+			// Structural, not a substring match on the message: sub-project 3
+			// renders the reason from these three fields.
+			object, name, feature, ok := UnsupportedDDLDetail(err)
+			if !ok {
+				t.Fatalf("UnsupportedDDLDetail(%v) reported ok == false, want the structured reason", err)
+			}
+			if object != test.wantObject {
+				t.Errorf("detail object = %q, want %q", object, test.wantObject)
+			}
+			if name != test.object {
+				t.Errorf("detail name = %q, want %q", name, test.object)
+			}
+			if !strings.Contains(feature, test.wantFeature) {
+				t.Errorf("detail feature = %q, want it to name %q", feature, test.wantFeature)
+			}
+		})
+	}
+
+	// "No such object" and "the object exists but has no renderable DDL" are
+	// the one distinction sub-project 3 needs in order to choose between
+	// showing nothing and showing a reason, so ("", nil) is never returned.
+	kinds := []ObjectKind{
+		ObjectKindTable, ObjectKindView, ObjectKindProcedure, ObjectKindTrigger,
+		ObjectKindDomain, ObjectKindIndex, ObjectKindGenerator, ObjectKindFunction,
+	}
+	for _, kind := range kinds {
+		t.Run("unknown "+string(kind), func(t *testing.T) {
+			ddl, err := repository.ObjectDDL(ctx, kind, "NO_SUCH_OBJECT")
+			if !errors.Is(err, ErrObjectNotFound) {
+				t.Fatalf("ObjectDDL(%s, unknown) error = %v, want ErrObjectNotFound", kind, err)
+			}
+			if ddl != "" {
+				t.Errorf("ObjectDDL(%s, unknown) = %q, want no text", kind, ddl)
+			}
+		})
+	}
+
+	if _, err := repository.ObjectDDL(ctx, ObjectKindTable, ""); !errors.Is(err, ErrObjectNotFound) {
+		t.Errorf("ObjectDDL with an empty name error = %v, want ErrObjectNotFound", err)
+	}
+	_, err := repository.ObjectDDL(ctx, ObjectKind("nonsense"), "PARENT")
+	if err == nil {
+		t.Fatal("ObjectDDL with an unknown kind returned a nil error")
+	}
+	if errors.Is(err, ErrObjectNotFound) || errors.Is(err, ErrUnsupportedDDL) {
+		t.Errorf("an unknown object kind is a caller bug, not a catalog outcome: %v", err)
+	}
+}
+
+func TestInterBaseObjectDDLDoesNotNormalizeNames(t *testing.T) {
+	// schema matches catalog names exactly and does not case-fold
+	// (Catalog.Table(ctx, "CUSTOMER   ") returns nil for padding; the same
+	// holds for case). ObjectDDL passes the caller's name through unchanged
+	// so a genuinely lower-case delimited identifier stays reachable -
+	// folding to upper case here would make such an identifier permanently
+	// unreachable. Normalization happens once, in DBCache (a later task),
+	// before a caller reaches ObjectDDL with the resolved descriptor's own
+	// catalog spelling.
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	_, err := repository.ObjectDDL(ctx, ObjectKindTable, "parent")
+	if !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("ObjectDDL(table, %q) error = %v, want ErrObjectNotFound: the catalog stores %q and a lower-case name must not match it",
+			"parent", err, "PARENT")
+	}
+}
+
+func TestInterBaseUnsupportedDDLWithoutDetailStillMatchesTheSentinel(t *testing.T) {
+	// The driver may return a bare schema.ErrUnsupportedDDL with no structured
+	// reason. errors.Is must still hold; UnsupportedDDLDetail reports ok ==
+	// false and sub-project 3 degrades to a generic line.
+	wrapped := interBaseWrapDDLError(schema.ErrUnsupportedDDL)
+	if !errors.Is(wrapped, ErrUnsupportedDDL) {
+		t.Fatalf("interBaseWrapDDLError(bare sentinel) = %v, want it to satisfy errors.Is(err, ErrUnsupportedDDL)", wrapped)
+	}
+	if _, _, _, ok := UnsupportedDDLDetail(wrapped); ok {
+		t.Error("a bare sentinel must report ok == false")
+	}
+
+	// An unrelated error passes through untouched: a real catalog fault must
+	// not be relabelled as an unsupported-DDL outcome.
+	fault := errors.New("interbase: connection reset")
+	if got := interBaseWrapDDLError(fault); !errors.Is(got, fault) {
+		t.Errorf("interBaseWrapDDLError(other) = %v, want the original error", got)
+	}
+	if errors.Is(interBaseWrapDDLError(fault), ErrUnsupportedDDL) {
+		t.Error("an unrelated error must not satisfy errors.Is(err, ErrUnsupportedDDL)")
+	}
+	if interBaseWrapDDLError(nil) != nil {
+		t.Error("interBaseWrapDDLError(nil) must be nil")
 	}
 }
