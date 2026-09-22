@@ -520,6 +520,25 @@ func interBaseUserDomainName(fieldSource sql.NullString, domain *schema.Domain) 
 	return name
 }
 
+// interBaseOptionalRendering applies the degradation rule the catalog
+// accessors need. ErrUnsupportedDDL from Trigger.Event,
+// FunctionArgument.SQLType and Function.ReturnType is a normal, expected
+// result rather than a failure — RDB$CHARACTER_LENGTH is never populated for
+// function arguments, so every CHAR and VARCHAR argument reaches it during
+// ordinary operation. It maps to "" for that one field and the catalog build
+// carries on: it never aborts, never propagates to
+// DescribeFunctions/DescribeTriggers, and never drops the surrounding
+// descriptor. Any other error is a real catalog fault and is returned.
+func interBaseOptionalRendering(rendered string, err error) (string, error) {
+	if err == nil {
+		return rendered, nil
+	}
+	if errors.Is(err, schema.ErrUnsupportedDDL) {
+		return "", nil
+	}
+	return "", err
+}
+
 func (db *InterBaseDBRepository) DescribeTriggers(ctx context.Context) ([]*TriggerDesc, error) {
 	catalog, err := db.catalogReader()
 	if err != nil {
@@ -531,13 +550,17 @@ func (db *InterBaseDBRepository) DescribeTriggers(ctx context.Context) ([]*Trigg
 	}
 	result := make([]*TriggerDesc, 0, len(triggers))
 	for _, trigger := range triggers {
+		event, err := interBaseOptionalRendering(trigger.Event())
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, &TriggerDesc{
 			Schema:       "",
 			Name:         trigger.Name,
 			RelationName: trigger.RelationName,
-			// Event is decoded by schema.Trigger.Event, which the companion
-			// driver spec adds. "" is the documented undecodable value.
-			Event:       "",
+			// Taken verbatim: a multi-event trigger yields one joined string
+			// such as "BEFORE INSERT OR UPDATE". sqls does not split it.
+			Event:       event,
 			Sequence:    trigger.Sequence,
 			Active:      interBaseFlagIsClear(trigger.Inactive),
 			Source:      trigger.Source,
@@ -560,21 +583,28 @@ func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*Func
 	for _, function := range functions {
 		arguments := make([]*FunctionArgumentDesc, 0, len(function.Arguments))
 		for _, argument := range function.Arguments {
+			argumentType, err := interBaseOptionalRendering(argument.SQLType())
+			if err != nil {
+				return nil, err
+			}
 			arguments = append(arguments, &FunctionArgumentDesc{
 				Name:     argument.Name,
 				Position: argument.Position,
-				// Rendered by schema.FunctionArgument.SQLType, which the
-				// companion driver spec adds.
-				Type: "",
+				Type:     argumentType,
 			})
 		}
+		// RDB$RETURN_ARGUMENT is an argument position, not an index into
+		// Arguments; the driver resolves it, so sqls never indexes the slice
+		// with it. When the position names an input argument, that argument
+		// legitimately appears both here and in Arguments.
+		returnType, err := interBaseOptionalRendering(function.ReturnType())
+		if err != nil {
+			return nil, err
+		}
 		result = append(result, &FunctionDesc{
-			Schema: "",
-			Name:   function.Name,
-			// Resolved by schema.Function.ReturnType, which the companion
-			// driver spec adds. RDB$RETURN_ARGUMENT is a position, not an
-			// index into Arguments, so sqls never indexes the slice with it.
-			ReturnType:     "",
+			Schema:         "",
+			Name:           function.Name,
+			ReturnType:     returnType,
 			ReturnPosition: function.ReturnArgument,
 			Arguments:      arguments,
 			ModuleName:     function.ModuleName,

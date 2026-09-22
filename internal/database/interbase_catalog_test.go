@@ -1135,50 +1135,131 @@ func TestInterBaseProcedureParameterDomainIsUserOnly(t *testing.T) {
 	}
 }
 
-func TestInterBaseUndecodableFieldsAreEmptyUntilDriverAccessorsLand(t *testing.T) {
-	// TriggerDesc.Event, FunctionArgumentDesc.Type and FunctionDesc.ReturnType
-	// are populated by schema.Trigger.Event, schema.FunctionArgument.SQLType
-	// and schema.Function.ReturnType, specified in the companion driver spec
-	// docs/superpowers/specs/2026-09-19-schema-catalog-accessors-design.md and
-	// not yet implemented. "" is the documented undecodable value, so every
-	// consumer already handles it. The final task of this plan replaces this
-	// test with the real assertions; until then this pins that the fields
-	// exist, are empty, and that nothing else about the descriptor degrades.
+func TestInterBaseTriggerEventIsVerbatim(t *testing.T) {
 	db := openInterBaseSchemaFixture(t)
 	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
-	ctx := context.Background()
 
-	triggers, err := repository.DescribeTriggers(ctx)
+	triggers, err := repository.DescribeTriggers(context.Background())
 	if err != nil {
 		t.Fatalf("DescribeTriggers() error = %v", err)
 	}
+	byName := make(map[string]*TriggerDesc, len(triggers))
 	for _, trigger := range triggers {
-		if trigger.Event != "" {
-			t.Errorf("trigger %q event = %q, want \"\" until schema.Trigger.Event lands", trigger.Name, trigger.Event)
-		}
-		if trigger.Name == "" || !trigger.Source.Valid {
-			t.Errorf("trigger %#v lost surrounding metadata", trigger)
-		}
+		byName[trigger.Name] = trigger
 	}
 
-	functions, err := repository.DescribeFunctions(ctx)
+	if got, want := byName["CUSTOMER_BI"].Event, "BEFORE INSERT"; got != want {
+		t.Errorf("CUSTOMER_BI event = %q, want %q", got, want)
+	}
+	// A multi-event trigger yields one joined string. sqls does not split it,
+	// does not re-decode it, and specifies no parsing of it; a consumer that
+	// wants the parts splits on " OR ".
+	if got, want := byName["CUSTOMER_MULTI"].Event, "BEFORE INSERT OR UPDATE"; got != want {
+		t.Errorf("CUSTOMER_MULTI event = %q, want the joined string %q", got, want)
+	}
+
+	// An undecodable trigger type and a NULL trigger type both yield "" with
+	// the rest of the descriptor intact: ErrUnsupportedDDL from these
+	// accessors is a normal result, not a failure.
+	for _, name := range []string{"CUSTOMER_ODD", "DB_CONNECT"} {
+		trigger := byName[name]
+		if trigger == nil {
+			t.Fatalf("DescribeTriggers() did not return %s", name)
+		}
+		if trigger.Event != "" {
+			t.Errorf("%s event = %q, want an empty string", name, trigger.Event)
+		}
+		if trigger.Name != name || !trigger.Source.Valid || !trigger.Active.Valid {
+			t.Errorf("%s lost surrounding metadata: %#v", name, trigger)
+		}
+	}
+	if len(triggers) != 4 {
+		t.Errorf("DescribeTriggers() returned %d triggers, want 4: an undecodable event must not drop the trigger", len(triggers))
+	}
+}
+
+func TestInterBaseFunctionArgumentTypeDegradesToEmpty(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+
+	// DescribeFunctions must return a nil error: the degradation rule is
+	// asserted, not assumed.
+	functions, err := repository.DescribeFunctions(context.Background())
+	if err != nil {
+		t.Fatalf("DescribeFunctions() error = %v, want nil despite an unrenderable argument", err)
+	}
+	if len(functions) != 1 {
+		t.Fatalf("DescribeFunctions() returned %d functions, want 1", len(functions))
+	}
+	function := functions[0]
+
+	byPosition := make(map[int64]*FunctionArgumentDesc, len(function.Arguments))
+	for _, argument := range function.Arguments {
+		byPosition[argument.Position.Int64] = argument
+	}
+	if len(byPosition) != 3 {
+		t.Fatalf("function has %d arguments, want 3: an unrenderable argument must not be dropped", len(byPosition))
+	}
+
+	// CSTRING renders from RDB$FIELD_LENGTH, which is the shape every measured
+	// production row has: of 357 arguments across three production databases,
+	// 166 were CSTRING and RDB$CHARACTER_LENGTH was NULL in all 357.
+	if got, want := byPosition[1].Type, "CSTRING(255)"; got != want {
+		t.Errorf("CSTRING argument type = %q, want %q", got, want)
+	}
+	// CHAR and VARCHAR arguments render "" permanently, not just until the
+	// accessors land: RDB$CHARACTER_LENGTH is never populated for function
+	// arguments, so the renderer has no length to declare. Measured exposure:
+	// 1 CHAR and 0 VARCHAR arguments in 357.
+	if got := byPosition[2].Type; got != "" {
+		t.Errorf("CHAR argument type = %q, want an empty string: no character length is available", got)
+	}
+	if got, want := byPosition[3].Type, "INTEGER"; got != want {
+		t.Errorf("INTEGER argument type = %q, want %q", got, want)
+	}
+
+	// The surrounding descriptor is still fully populated.
+	if function.Name != "F_LTRIM" || !function.ModuleName.Valid || !function.EntryPoint.Valid {
+		t.Errorf("the surrounding FunctionDesc lost metadata: %#v", function)
+	}
+	if byPosition[2].Name == "" {
+		t.Error("the unrenderable argument lost its name")
+	}
+}
+
+func TestInterBaseFunctionReturnTypeUsesDriverResolution(t *testing.T) {
+	// RDB$RETURN_ARGUMENT holds an argument POSITION, not an index into
+	// Arguments. The fixture's return argument is position 1, which is also an
+	// input argument, so the same argument legitimately appears both in
+	// Arguments and as ReturnType. This guards against indexing Arguments by
+	// ReturnArgument and against lifting the return out of the list.
+	db := openInterBaseSchemaFixture(t)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+
+	functions, err := repository.DescribeFunctions(context.Background())
 	if err != nil {
 		t.Fatalf("DescribeFunctions() error = %v", err)
 	}
-	for _, function := range functions {
-		if function.ReturnType != "" {
-			t.Errorf("function %q return type = %q, want \"\" until schema.Function.ReturnType lands",
-				function.Name, function.ReturnType)
+	function := functions[0]
+
+	if !function.ReturnPosition.Valid || function.ReturnPosition.Int64 != 1 {
+		t.Fatalf("return position = %#v, want 1", function.ReturnPosition)
+	}
+	if got, want := function.ReturnType, "CSTRING(255)"; got != want {
+		t.Errorf("return type = %q, want the rendering of argument 1, %q", got, want)
+	}
+
+	// Indexing Arguments[1] would have picked position 2, the CHAR argument,
+	// and produced "" here — so this assertion is what distinguishes the two
+	// implementations.
+	appearances := 0
+	for _, argument := range function.Arguments {
+		if argument.Position.Valid && argument.Position.Int64 == 1 {
+			appearances++
 		}
-		for _, argument := range function.Arguments {
-			if argument.Type != "" {
-				t.Errorf("argument %q type = %q, want \"\" until schema.FunctionArgument.SQLType lands",
-					argument.Name, argument.Type)
-			}
-			if argument.Name == "" || !argument.Position.Valid {
-				t.Errorf("argument %#v lost surrounding metadata", argument)
-			}
-		}
+	}
+	if appearances != 1 {
+		t.Errorf("the return argument appears %d times in Arguments, want exactly 1", appearances)
 	}
 }
 
