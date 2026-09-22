@@ -303,6 +303,50 @@ func TestCompileRejectsPSQLNamedMarkers(t *testing.T) {
 	}
 }
 
+// TestCompileRejectsPSQLBatchWhenMarkerIsInALaterFragment guards against a
+// PSQL body being split by its internal semicolons into a marker-free
+// CREATE PROCEDURE/BEGIN header fragment and a separate fragment that starts
+// with a supported keyword (SELECT) and happens to carry the marker. The
+// whole batch must still be rejected, because the marker is a PSQL
+// local-variable reference inside a CREATE PROCEDURE body, not a real user
+// parameter — the header fragment alone never reveals that.
+func TestCompileRejectsPSQLBatchWhenMarkerIsInALaterFragment(t *testing.T) {
+	source := "CREATE PROCEDURE P AS BEGIN X = 1; SELECT :x INTO :y FROM T; END"
+	if _, err := Compile(source, 3); err == nil {
+		t.Fatal("want error, got nil")
+	}
+}
+
+// TestCompileNoMarkerDDLPassesThroughUnchanged pins the other side of the
+// same rule: a batch with the identical PSQL/DDL shape but zero named
+// markers anywhere must not be validated at all and must pass through as
+// ordinary SQL, unchanged and unsplit-by-rejection.
+func TestCompileNoMarkerDDLPassesThroughUnchanged(t *testing.T) {
+	source := "CREATE PROCEDURE P AS BEGIN X = 1; SELECT Y INTO Z FROM T; END"
+	batch, err := Compile(source, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.Parameters) != 0 {
+		t.Fatalf("parameters = %#v", batch.Parameters)
+	}
+	var gotSQL []string
+	for _, s := range batch.Statements {
+		if len(s.Keys) != 0 {
+			t.Fatalf("statement %q has keys %#v, want none", s.SQL, s.Keys)
+		}
+		gotSQL = append(gotSQL, s.SQL)
+	}
+	want := []string{
+		"CREATE PROCEDURE P AS BEGIN X = 1",
+		"SELECT Y INTO Z FROM T",
+		"END",
+	}
+	if !reflect.DeepEqual(gotSQL, want) {
+		t.Fatalf("statement SQL = %#v, want %#v", gotSQL, want)
+	}
+}
+
 func TestCompileSupportedStatementForms(t *testing.T) {
 	tests := []struct {
 		name   string

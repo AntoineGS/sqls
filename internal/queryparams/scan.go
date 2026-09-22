@@ -173,12 +173,28 @@ func Compile(text string, sqlDialect int) (Batch, error) {
 	}
 	finishFragment()
 
+	// Once any fragment in the batch carries a named marker, the contract
+	// requires validating the entire selection before anything runs: a
+	// marker-free CREATE PROCEDURE/EXECUTE BLOCK header or trailing END is
+	// still part of the same PSQL batch as the marker-bearing fragment
+	// between them, and must reject the batch just as surely as if the
+	// marker were in that fragment itself. A batch with no marker anywhere
+	// skips this check entirely and lets ordinary SQL (including DDL) pass
+	// through unchanged.
+	hasMarker := false
+	for _, f := range fragments {
+		if len(f.keys) > 0 {
+			hasMarker = true
+			break
+		}
+	}
+
 	for _, f := range fragments {
 		if TrimLeadingTrivia(f.sql) == "" {
 			continue // whitespace/comment-only fragment: nothing to execute
 		}
 		sql := strings.Trim(f.sql, " \t\r\n")
-		if len(f.keys) > 0 && !supportedStatementStart(sql) {
+		if hasMarker && !supportedStatementStart(sql) {
 			return Batch{}, fmt.Errorf("queryparams: named parameters are not supported in this statement form")
 		}
 		batch.Statements = append(batch.Statements, Statement{SQL: sql, Keys: f.keys})
