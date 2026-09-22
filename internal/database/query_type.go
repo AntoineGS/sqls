@@ -2,6 +2,8 @@ package database
 
 import (
 	"strings"
+
+	"github.com/sqls-server/sqls/internal/queryparams"
 )
 
 // queryMap is the map of SQL prefixes use as queries.
@@ -244,6 +246,7 @@ func splitMultiSep(s string, sep []string) []string {
 // QueryExecType is the default way to determine the "EXEC" prefix for a SQL
 // query and whether or not it should be Exec'd or Query'd.
 func QueryExecType(prefix, sqlstr string) (string, bool) {
+	prefix = queryparams.TrimLeadingTrivia(prefix)
 	if prefix == "" {
 		return "EXEC", false
 	}

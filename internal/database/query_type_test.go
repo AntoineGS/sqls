@@ -77,6 +77,41 @@ func TestQueryExecType(t *testing.T) {
 			wantPrefix:   "DELETE",
 			wantExecType: false,
 		},
+		{
+			name:         "block and line comment before select",
+			prefix:       "/* heading */\n-- note\nSELECT 1",
+			sqlstr:       "",
+			wantPrefix:   "SELECT",
+			wantExecType: true,
+		},
+		{
+			name:         "line comment before update",
+			prefix:       "-- note\nUPDATE city SET name = 'x' WHERE id = 1",
+			sqlstr:       "",
+			wantPrefix:   "UPDATE",
+			wantExecType: false,
+		},
+		{
+			name:         "legacy select into unaffected by trivia trimming",
+			prefix:       "select INTO new_city from city",
+			sqlstr:       "",
+			wantPrefix:   "SELECT INTO",
+			wantExecType: false,
+		},
+		{
+			name:         "legacy pragma get unaffected by trivia trimming",
+			prefix:       "PRAGMA foreign_keys",
+			sqlstr:       "",
+			wantPrefix:   "PRAGMA",
+			wantExecType: true,
+		},
+		{
+			name:         "legacy pragma set unaffected by trivia trimming",
+			prefix:       "PRAGMA foreign_keys",
+			sqlstr:       "PRAGMA foreign_keys=1",
+			wantPrefix:   "PRAGMA",
+			wantExecType: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
