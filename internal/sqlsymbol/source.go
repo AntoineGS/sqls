@@ -4,6 +4,7 @@ package sqlsymbol
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 
@@ -52,6 +53,50 @@ type lexeme struct {
 // In particular, scanner offsets are used instead of token values because the
 // tokenizer intentionally normalizes some newlines and escaped strings.
 func lex(text string, dv dialect.DriverVariant) ([]lexeme, error) {
+	// InterBase's SET TERM directive changes the delimiter used by a script.
+	// Split at that delimiter before invoking the SQL tokenizer: a delimiter
+	// such as !! is not a legal standalone SQL token, while it is perfectly
+	// valid in an InterBase script.
+	active := ";"
+	result := make([]lexeme, 0)
+	for offset := 0; offset < len(text); {
+		end, delimiter, err := nextDelimiter(text, offset, active)
+		if err != nil {
+			return nil, err
+		}
+		segment := text[offset:end]
+		next, isDirective := setTermDelimiter(segment)
+		if isDirective {
+			active = next
+		} else {
+			items, err := lexRaw(segment, dv)
+			if err != nil {
+				return nil, err
+			}
+			for _, item := range items {
+				item.Span.Start += offset
+				item.Span.End += offset
+				result = append(result, item)
+			}
+		}
+		if delimiter == "" {
+			break
+		}
+		// Keep ordinary semicolons visible to existing source consumers. Custom
+		// script terminators are deliberately intercepted instead of being sent
+		// to the SQL lexer.
+		if delimiter == ";" && !isDirective {
+			result = append(result, lexeme{
+				Token: &token.Token{Kind: token.Semicolon, Value: delimiter},
+				Span:  Span{Start: end, End: end + len(delimiter)},
+			})
+		}
+		offset = end + len(delimiter)
+	}
+	return result, nil
+}
+
+func lexRaw(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 	tokenizer := token.NewTokenizer(strings.NewReader(text), dialect.DialectForDriverVariant(dv))
 	result := make([]lexeme, 0)
 	for {
@@ -67,6 +112,126 @@ func lex(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 		result = append(result, lexeme{Token: tok, Span: Span{Start: start, End: end}})
 	}
 	return result, nil
+}
+
+// nextDelimiter returns the next active script delimiter outside SQL strings
+// and comments. It also validates those protected regions so an incomplete
+// literal or comment cannot produce a misleading partial symbol index.
+func nextDelimiter(text string, offset int, delimiter string) (int, string, error) {
+	for i := offset; i < len(text); i++ {
+		switch text[i] {
+		case '\'', '"':
+			quote := text[i]
+			i++
+			closed := false
+			for i < len(text) {
+				if text[i] != quote {
+					i++
+					continue
+				}
+				if i+1 < len(text) && text[i+1] == quote {
+					i += 2
+					continue
+				}
+				i++
+				closed = true
+				break
+			}
+			if !closed {
+				return 0, "", fmt.Errorf("unclosed quoted literal")
+			}
+			i--
+		case '-':
+			if i+1 < len(text) && text[i+1] == '-' {
+				i += 2
+				for i < len(text) && text[i] != '\n' {
+					i++
+				}
+				i--
+			}
+		case '/':
+			if i+1 < len(text) && text[i+1] == '*' {
+				i += 2
+				closed := false
+				for i+1 < len(text) {
+					if text[i] == '*' && text[i+1] == '/' {
+						i += 2
+						closed = true
+						break
+					}
+					i++
+				}
+				if !closed {
+					return 0, "", fmt.Errorf("unclosed multiline comment")
+				}
+				i--
+			}
+		default:
+			if delimiter != "" && strings.HasPrefix(text[i:], delimiter) {
+				return i, delimiter, nil
+			}
+		}
+	}
+	return len(text), "", nil
+}
+
+func setTermDelimiter(segment string) (string, bool) {
+	fields := strings.Fields(maskSQLProtected(segment))
+	if len(fields) != 3 || !strings.EqualFold(fields[0], "SET") || !strings.EqualFold(fields[1], "TERM") {
+		return "", false
+	}
+	return fields[2], true
+}
+
+// maskSQLProtected leaves ordinary source bytes intact while hiding strings
+// and comments from the small SET TERM recognizer.
+func maskSQLProtected(text string) string {
+	masked := []byte(text)
+	for i := 0; i < len(masked); i++ {
+		switch masked[i] {
+		case '\'', '"':
+			quote := masked[i]
+			masked[i] = ' '
+			for i+1 < len(masked) {
+				i++
+				ch := masked[i]
+				masked[i] = ' '
+				if ch == quote {
+					if i+1 < len(masked) && masked[i+1] == quote {
+						i++
+						masked[i] = ' '
+						continue
+					}
+					break
+				}
+			}
+		case '-':
+			if i+1 < len(masked) && masked[i+1] == '-' {
+				masked[i], masked[i+1] = ' ', ' '
+				i += 2
+				for i < len(masked) && masked[i] != '\n' {
+					masked[i] = ' '
+					i++
+				}
+				i--
+			}
+		case '/':
+			if i+1 < len(masked) && masked[i+1] == '*' {
+				masked[i], masked[i+1] = ' ', ' '
+				i += 2
+				for i+1 < len(masked) {
+					if masked[i] == '*' && masked[i+1] == '/' {
+						masked[i], masked[i+1] = ' ', ' '
+						i += 2
+						break
+					}
+					masked[i] = ' '
+					i++
+				}
+			}
+		}
+	}
+	return string(masked)
 }
 
 // nameFromLexeme converts an identifier token to its source-level identity.
