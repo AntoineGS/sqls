@@ -179,7 +179,9 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 		return discovery, nil
 	}
 
-	batch, err := queryparams.Compile(sel.Text, sel.Variant.Variant.InterBaseSQLDialect())
+	// Hash the original selection in parameterSelection, but discover only
+	// executable input markers: a PSQL SELECT's INTO targets are outputs.
+	batch, err := queryparams.Compile(queryparams.ExecutableSelects(sel.Text), sel.Variant.Variant.InterBaseSQLDialect())
 	if err != nil {
 		return nil, err
 	}
@@ -242,7 +244,7 @@ func (s *Server) preflightBoundBatch(ctx context.Context, params lsp.ExecuteComm
 		return nil, fmt.Errorf("bound query parameters are not supported on a %s connection", sel.Variant.Driver)
 	}
 
-	batch, err := queryparams.Compile(sel.Text, sel.Variant.Variant.InterBaseSQLDialect())
+	batch, err := queryparams.Compile(queryparams.ExecutableSelects(sel.Text), sel.Variant.Variant.InterBaseSQLDialect())
 	if err != nil {
 		return nil, err
 	}

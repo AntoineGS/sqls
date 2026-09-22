@@ -19,6 +19,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/queryparams"
 	"github.com/sqls-server/sqls/parser"
 )
 
@@ -217,6 +218,9 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Line,
 			params.Range.End.Character,
 		)
+	}
+	if s.parserDriver() == dialect.DatabaseDriverInterBase {
+		text = queryparams.ExecutableSelects(text)
 	}
 	if err := s.refuseLegacyNamedParameters(text); err != nil {
 		return nil, err
