@@ -29,6 +29,7 @@ const (
 	CommandSwitchDatabase   = "switchDatabase"
 	CommandSwitchConnection = "switchConnections"
 	CommandShowTables       = "showTables"
+	CommandExplainQuery     = "explainQuery"
 )
 
 const lateCancellationNote = "Note: the cancellation request arrived after the statement completed; the result\nbelow is the real result.\n\n"
@@ -52,6 +53,11 @@ func (s *Server) handleTextDocumentCodeAction(ctx context.Context, conn *jsonrpc
 		{
 			Title:     "Execute Query",
 			Command:   CommandExecuteQuery,
+			Arguments: []interface{}{params.TextDocument.URI},
+		},
+		{
+			Title:     "Explain SQL",
+			Command:   CommandExplainQuery,
 			Arguments: []interface{}{params.TextDocument.URI},
 		},
 		{
@@ -161,6 +167,8 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 		return s.switchConnections(ctx, params)
 	case CommandShowTables:
 		return s.showTables(ctx, params)
+	case CommandExplainQuery:
+		return s.explainQuery(ctx, params)
 	}
 	return nil, fmt.Errorf("unsupported command: %v", params.Command)
 }
