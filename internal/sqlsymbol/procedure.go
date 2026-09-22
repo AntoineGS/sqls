@@ -42,6 +42,8 @@ type Analysis struct {
 	lexemes     []lexeme
 	resolutions []indexedResolution
 	prefixes    []indexedResolution
+	contexts    []tokenContext
+	procedureAt []int
 }
 
 type procedureHeader struct {

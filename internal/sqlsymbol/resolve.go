@@ -2,6 +2,7 @@ package sqlsymbol
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/sqls-server/sqls/token"
 )
@@ -47,6 +48,25 @@ type Resolution struct {
 type indexedResolution struct {
 	Resolution
 	prefix Span
+}
+
+type contextKind uint8
+
+const (
+	contextProcedure contextKind = iota
+	contextSQL
+	contextExecute
+	contextUnsupported
+	contextExecutePending
+)
+
+type tokenContext struct {
+	kind         contextKind
+	relation     bool
+	alias        bool
+	insertColumn bool
+	updateTarget bool
+	outputTarget bool
 }
 
 func (a *Analysis) addResolution(r Resolution, prefix Span) {
@@ -134,7 +154,7 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 		}, Span{})
 	}
 
-	relations, aliases, insertColumns, updateTargets := sqlPositions(items)
+	a.contexts, a.procedureAt = buildContexts(a, items)
 	for i, item := range items {
 		name, ok := nameFromLexeme(a.Text, item)
 		if !ok || !isNameToken(item) {
@@ -143,7 +163,8 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 		if _, ok := declarations[item.Span]; ok {
 			continue
 		}
-		role, symbol, sqlRef, prefix, blocked := classifyName(a, items, i, name, relations, aliases, insertColumns, updateTargets)
+		procIndex := a.procedureAt[i]
+		role, symbol, sqlRef, prefix, blocked := classifyName(a, items, i, name, a.contexts[i], procIndex)
 		if role == Outside {
 			continue
 		}
@@ -153,7 +174,7 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 		resolution := Resolution{
 			Role:        role,
 			Span:        item.Span,
-			InProcedure: procedureForOffset(a, item.Span.Start) >= 0,
+			InProcedure: procIndex >= 0,
 			Symbol:      symbol,
 			SQL:         sqlRef,
 		}
@@ -187,120 +208,229 @@ func declarationResolutionSymbol(symbol *Symbol) *Symbol {
 	return symbol
 }
 
-func procedureForOffset(a *Analysis, offset int) int {
-	for i := range a.procedures {
-		p := &a.procedures[i]
-		if p.Span.Start <= offset && offset < p.Span.End {
-			return i
-		}
-	}
-	return -1
-}
-
-func symbolFor(a *Analysis, offset int, name Name) (*Symbol, bool) {
-	index := procedureForOffset(a, offset)
-	if index < 0 {
+func symbolFor(a *Analysis, procedureIndex int, name Name) (*Symbol, bool) {
+	if procedureIndex < 0 || procedureIndex >= len(a.procedures) {
 		return nil, false
 	}
-	symbols := a.procedures[index].Symbols[name.Key()]
+	symbols := a.procedures[procedureIndex].Symbols[name.Key()]
 	if len(symbols) != 1 {
 		return nil, len(symbols) > 1
 	}
 	return symbols[0], false
 }
 
-func sqlPositions(items []lexeme) (map[int]bool, map[int]bool, map[int]bool, map[int]bool) {
-	relations := make(map[int]bool)
-	aliases := make(map[int]bool)
-	insertColumns := make(map[int]bool)
-	updateTargets := make(map[int]bool)
-	for i := range items {
-		if !isNameToken(items[i]) {
+func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
+	contexts := make([]tokenContext, len(items))
+	procedureAt := make([]int, len(items))
+	procedure := 0
+	for i, item := range items {
+		for procedure < len(a.procedures) && a.procedures[procedure].Span.End <= item.Span.Start {
+			procedure++
+		}
+		if procedure < len(a.procedures) && a.procedures[procedure].Span.Start <= item.Span.Start {
+			procedureAt[i] = procedure
+		} else {
+			procedureAt[i] = -1
+		}
+	}
+
+	kind := contextProcedure
+	active := false
+	depth := 0
+	restoreProcedureDepth := -1
+	updateSetDepth := -1
+	updateExpectTarget := false
+	outputDepth := -1
+	outputActive := false
+	outputExpect := false
+	executeBlockDepth := 0
+	head := ""
+	for i, item := range items {
+		if item.Token.Kind == token.Semicolon && executeBlockDepth == 0 {
+			kind, active, depth, restoreProcedureDepth = contextProcedure, false, 0, -1
+			updateSetDepth, updateExpectTarget, outputDepth, outputActive, outputExpect, head = -1, false, -1, false, false, ""
+		}
+		if executeBlockDepth > 0 {
+			contexts[i].kind = contextUnsupported
+			if isWord(item, "BEGIN") {
+				executeBlockDepth++
+			}
+			if isWord(item, "END") {
+				executeBlockDepth--
+				if executeBlockDepth == 0 {
+					kind, active = contextUnsupported, true
+				}
+			}
 			continue
 		}
-		if i > 0 && (isWord(items[i-1], "FROM") || isWord(items[i-1], "JOIN") ||
-			isWord(items[i-1], "UPDATE")) {
-			relations[i] = true
+		if item.Token.Kind == token.LParen {
+			depth++
 		}
-		if i > 1 && isWord(items[i-1], "INTO") && isWord(items[i-2], "INSERT") {
-			relations[i] = true
+
+		if kind == contextExecutePending {
+			if isWord(item, "PROCEDURE") {
+				kind, active = contextExecute, true
+			} else if isWord(item, "BLOCK") {
+				kind, active = contextUnsupported, true
+			} else if active {
+				kind = contextUnsupported
+			}
 		}
-		if i > 1 && isWord(items[i-1], "FROM") && isWord(items[i-2], "DELETE") {
-			relations[i] = true
+		if !active {
+			switch {
+			case isWord(item, "BEGIN"):
+				kind, active = contextProcedure, false
+			case isWord(item, "SELECT"), isWord(item, "UPDATE"), isWord(item, "INSERT"), isWord(item, "DELETE"):
+				kind, active = contextSQL, true
+				head = strings.ToUpper(item.Token.Value.(*token.SQLWord).Keyword)
+			case isWord(item, "EXECUTE"):
+				kind, active = contextExecutePending, true
+				head = "EXECUTE"
+			case isWord(item, "MERGE"), isWord(item, "WITH"):
+				kind, active = contextUnsupported, true
+				head = strings.ToUpper(item.Token.Value.(*token.SQLWord).Keyword)
+			case isWord(item, "IF"), isWord(item, "WHILE"), isWord(item, "FOR"), isWord(item, "CASE"):
+				kind, active = contextProcedure, true
+				head = strings.ToUpper(item.Token.Value.(*token.SQLWord).Keyword)
+			case isNameToken(item):
+				active = true
+				if i+1 >= len(items) || items[i+1].Token.Kind != token.Eq {
+					kind = contextUnsupported
+				}
+			}
 		}
-		if i > 0 && isWord(items[i-1], "AS") && isLikelySQLStatement(items, i) {
-			aliases[i] = true
+		if kind == contextProcedure && isWord(item, "SELECT") && depth > 0 {
+			kind, restoreProcedureDepth = contextSQL, depth
 		}
-		if i > 0 && items[i-1].Token.Kind == token.Period {
-			if i > 1 {
-				aliases[i-2] = true
+		if kind == contextProcedure && head == "FOR" && isWord(item, "SELECT") {
+			kind = contextSQL
+		}
+		if kind == contextSQL && head == "FOR" && isWord(item, "DO") {
+			kind, active = contextProcedure, false
+			updateSetDepth, updateExpectTarget, outputDepth, outputActive, outputExpect = -1, false, -1, false, false
+		}
+		if kind == contextProcedure && (isWord(item, "THEN") || isWord(item, "ELSE") || isWord(item, "DO")) {
+			active = false
+		}
+		if kind == contextUnsupported && isWord(item, "BEGIN") && i > 0 && isWord(items[i-1], "AS") {
+			executeBlockDepth = 1
+		}
+		contexts[i].kind = kind
+
+		if kind == contextSQL || kind == contextExecute {
+			if isWord(item, "SET") && kind == contextSQL && head == "UPDATE" {
+				updateSetDepth = depth
+				updateExpectTarget = true
+			}
+			if kind == contextSQL && isSQLClause(item) && depth <= updateSetDepth && !isWord(item, "SET") {
+				updateSetDepth = -1
+			}
+			if kind == contextSQL && isWord(item, "INTO") && head != "INSERT" {
+				outputDepth, outputActive, outputExpect = depth, true, true
+			}
+			if kind == contextExecute && isWord(item, "RETURNING_VALUES") {
+				outputDepth, outputActive, outputExpect = depth, true, true
+			}
+			if outputActive && depth <= outputDepth && (isWord(item, "FROM") || isWord(item, "WHERE") || isWord(item, "RETURNING")) {
+				outputActive, outputExpect = false, false
+			}
+			if outputActive && item.Token.Kind == token.Comma && depth == outputDepth {
+				outputExpect = true
+			}
+			if outputActive && isNameToken(item) && depth == outputDepth && outputExpect {
+				contexts[i].outputTarget = true
+				outputExpect = false
+			}
+			if updateSetDepth >= 0 && kind == contextSQL && depth == updateSetDepth {
+				if item.Token.Kind == token.Comma {
+					updateExpectTarget = true
+				}
+				if updateExpectTarget && isNameToken(item) && i+1 < len(items) && items[i+1].Token.Kind == token.Eq {
+					contexts[i].updateTarget = true
+					updateExpectTarget = false
+				}
+			}
+		}
+		if item.Token.Kind == token.RParen {
+			depth--
+			if restoreProcedureDepth >= 0 && depth < restoreProcedureDepth {
+				kind, active, restoreProcedureDepth = contextProcedure, true, -1
 			}
 		}
 	}
-	for relation := range relations {
-		end := relation + 1
-		if end < len(items) && isWord(items[end], "AS") {
-			end++
+
+	markSQLPositions(items, contexts)
+	return contexts, procedureAt
+}
+
+func markSQLPositions(items []lexeme, contexts []tokenContext) {
+	for i, item := range items {
+		if !isNameToken(item) {
+			continue
 		}
-		if end < len(items) && isNameToken(items[end]) && !isSQLClause(items[end]) {
-			aliases[end] = true
+		if i > 0 && (isWord(items[i-1], "FROM") || isWord(items[i-1], "JOIN") || isWord(items[i-1], "UPDATE")) {
+			contexts[i].relation = true
+		}
+		if i > 1 && isWord(items[i-1], "INTO") && isWord(items[i-2], "INSERT") {
+			contexts[i].relation = true
+		}
+		if i > 1 && isWord(items[i-1], "FROM") && isWord(items[i-2], "DELETE") {
+			contexts[i].relation = true
 		}
 	}
-	for i := range items {
-		if !isWord(items[i], "INSERT") {
+	for relation := range contexts {
+		if !contexts[relation].relation {
+			continue
+		}
+		alias := relation + 1
+		if alias < len(items) && isWord(items[alias], "AS") {
+			alias++
+		}
+		if alias < len(items) && isNameToken(items[alias]) && !isSQLClause(items[alias]) {
+			contexts[alias].alias = true
+		}
+	}
+	for i, item := range items {
+		if !isWord(item, "INSERT") {
 			continue
 		}
 		into := i + 1
 		for into < len(items) && !isWord(items[into], "INTO") && items[into].Token.Kind != token.Semicolon {
 			into++
 		}
-		if into+2 >= len(items) || !isNameToken(items[into+1]) {
-			continue
-		}
-		open := into + 2
-		if items[open].Token.Kind != token.LParen {
+		if into+2 >= len(items) || !isNameToken(items[into+1]) || items[into+2].Token.Kind != token.LParen {
 			continue
 		}
 		depth := 1
-		for j := open + 1; j < len(items) && depth > 0; j++ {
+		for j := into + 3; j < len(items) && depth > 0; j++ {
 			switch items[j].Token.Kind {
 			case token.LParen:
 				depth++
 			case token.RParen:
 				depth--
-			case token.Comma:
-				// The names in this list are all explicit target columns.
 			default:
 				if depth == 1 && isNameToken(items[j]) {
-					insertColumns[j] = true
+					contexts[j].insertColumn = true
 				}
 			}
 		}
 	}
-	update, set := false, false
-	for i, item := range items {
-		if statementBoundary(item) {
-			update, set = false, false
-		}
-		if isWord(item, "UPDATE") {
-			update = true
-		}
-		if update && isWord(item, "SET") {
-			set = true
-		}
-		if update && set && isNameToken(item) && i+1 < len(items) && items[i+1].Token.Kind == token.Eq {
-			updateTargets[i] = true
-		}
-	}
-	return relations, aliases, insertColumns, updateTargets
 }
 
-func classifyName(a *Analysis, items []lexeme, i int, name Name, relations, aliases, insertColumns, updateTargets map[int]bool) (Role, *Symbol, *SQLReference, Span, string) {
-	item := items[i]
-	procIndex := procedureForOffset(a, item.Span.Start)
-	symbol, duplicate := symbolFor(a, item.Span.Start, name)
+func classifyName(a *Analysis, items []lexeme, i int, name Name, context tokenContext, procIndex int) (Role, *Symbol, *SQLReference, Span, string) {
+	symbol, duplicate := symbolFor(a, procIndex, name)
 	prev := i - 1
 	next := i + 1
+	if prev >= 0 && items[prev].Token.Kind == token.Colon && (context.kind == contextUnsupported || context.kind == contextExecutePending) {
+		if symbol != nil && !duplicate {
+			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
+			return Ambiguous, nil, &SQLReference{Name: name}, colonPrefix(items, i), ""
+		}
+		if duplicate {
+			return Ambiguous, nil, nil, Span{}, ""
+		}
+		return Other, nil, nil, Span{}, ""
+	}
 	if prev >= 0 && items[prev].Token.Kind == token.Colon {
 		if duplicate {
 			return Ambiguous, nil, nil, items[prev].Span, ""
@@ -310,10 +440,10 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, relations, alia
 		}
 	}
 
-	if relations[i] {
+	if context.relation {
 		return Relation, nil, &SQLReference{Name: name}, Span{}, ""
 	}
-	if aliases[i] {
+	if context.alias {
 		return Alias, nil, &SQLReference{Name: name}, Span{}, ""
 	}
 	if prev >= 0 && items[prev].Token.Kind == token.Period {
@@ -323,16 +453,32 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, relations, alia
 	if next < len(items) && items[next].Token.Kind == token.Period {
 		return Alias, nil, &SQLReference{Name: name}, Span{}, ""
 	}
-	if insertColumns[i] || updateTargets[i] {
+	if (context.kind == contextUnsupported || context.kind == contextExecutePending) && symbol != nil {
+		if !duplicate {
+			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
+			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+		}
+		return Ambiguous, nil, nil, Span{}, ""
+	}
+	if context.insertColumn || context.updateTarget {
 		return Column, nil, &SQLReference{Name: name}, Span{}, ""
 	}
 	if isCallable(items, i) || isProcedureCallName(items, i) {
 		return Callable, nil, &SQLReference{Name: name}, Span{}, ""
 	}
+	if context.kind == contextUnsupported || context.kind == contextExecutePending {
+		if symbol != nil && !duplicate {
+			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "unsupported syntax may contain a local occurrence")
+			return Ambiguous, nil, &SQLReference{Name: name}, Span{}, ""
+		}
+		if duplicate {
+			return Ambiguous, nil, nil, Span{}, ""
+		}
+		return Other, nil, nil, Span{}, ""
+	}
 
-	kind := statementKind(items, i)
-	if kind == statementExecute {
-		if isReturningTarget(items, i) && symbol != nil && !duplicate {
+	if context.kind == contextExecute {
+		if context.outputTarget && symbol != nil && !duplicate {
 			return Local, symbol, nil, colonPrefix(items, i), ""
 		}
 		if symbol != nil && !duplicate {
@@ -343,8 +489,8 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, relations, alia
 		}
 		return Column, nil, &SQLReference{Name: name}, Span{}, ""
 	}
-	if kind == statementSQL {
-		if isReturningTarget(items, i) && symbol != nil && !duplicate {
+	if context.kind == contextSQL {
+		if context.outputTarget && symbol != nil && !duplicate {
 			return Local, symbol, nil, colonPrefix(items, i), ""
 		}
 		if symbol != nil {
@@ -361,78 +507,10 @@ func classifyName(a *Analysis, items []lexeme, i int, name Name, relations, alia
 			return Ambiguous, nil, nil, Span{}, ""
 		}
 		if symbol != nil {
-			if unsupportedProcedureSegment(items, i) {
-				return Local, symbol, nil, Span{}, "unsupported syntax may contain a local occurrence"
-			}
 			return Local, symbol, nil, Span{}, ""
 		}
 	}
 	return Other, nil, nil, Span{}, ""
-}
-
-const (
-	statementProc = iota
-	statementSQL
-	statementExecute
-)
-
-func statementKind(items []lexeme, index int) int {
-	start := index
-	for start > 0 && !statementBoundary(items[start-1]) {
-		start--
-	}
-	if start >= len(items) {
-		return statementProc
-	}
-	if isWord(items[start], "EXECUTE") {
-		return statementExecute
-	}
-	if isWord(items[start], "SELECT") || isWord(items[start], "UPDATE") ||
-		isWord(items[start], "INSERT") || isWord(items[start], "DELETE") {
-		return statementSQL
-	}
-	if isWord(items[start], "FOR") {
-		for j := start + 1; j < index && !statementBoundary(items[j]); j++ {
-			if isWord(items[j], "SELECT") {
-				return statementSQL
-			}
-		}
-	}
-	for j := start; j < index; j++ {
-		if isWord(items[j], "SELECT") {
-			return statementSQL
-		}
-	}
-	return statementProc
-}
-
-func statementBoundary(item lexeme) bool {
-	return item.Token.Kind == token.Semicolon || isWord(item, "BEGIN") ||
-		isWord(item, "END") || isWord(item, "THEN") || isWord(item, "ELSE") ||
-		isWord(item, "DO")
-}
-
-func unsupportedProcedureSegment(items []lexeme, index int) bool {
-	start := index
-	for start > 0 && !statementBoundary(items[start-1]) {
-		start--
-	}
-	if start >= index || !isNameToken(items[start]) {
-		return false
-	}
-	for _, word := range []string{"IF", "WHILE", "FOR", "CASE", "SUSPEND", "EXIT", "LEAVE", "BREAK", "CONTINUE", "EXCEPTION"} {
-		if isWord(items[start], word) {
-			return false
-		}
-	}
-	if start+1 < len(items) && items[start+1].Token.Kind == token.Eq {
-		return false
-	}
-	return true
-}
-
-func isReturningTarget(items []lexeme, i int) bool {
-	return i > 0 && (isWord(items[i-1], "INTO") || isWord(items[i-1], "RETURNING_VALUES"))
 }
 
 func colonPrefix(items []lexeme, i int) Span {
@@ -477,15 +555,6 @@ var syntaxWords = map[string]bool{
 	"WHERE": true, "WHILE": true, "WITH": true,
 	"BREAK": true, "CONTINUE": true, "EXIT": true, "EXCEPTION": true,
 	"LEAVE": true, "SUSPEND": true,
-}
-
-func isLikelySQLStatement(items []lexeme, i int) bool {
-	for j := i - 1; j >= 0 && !statementBoundary(items[j]); j-- {
-		if isWord(items[j], "SELECT") || isWord(items[j], "UPDATE") || isWord(items[j], "INSERT") || isWord(items[j], "DELETE") {
-			return true
-		}
-	}
-	return false
 }
 
 func isSQLClause(item lexeme) bool {

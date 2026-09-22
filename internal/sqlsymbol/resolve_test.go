@@ -3,6 +3,7 @@ package sqlsymbol
 import (
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -195,5 +196,132 @@ END`
 	}
 	if got := a.Resolve(strings.Index(text, "HEADEREMPLYID_TEMP = 2")); got.Symbol == first {
 		t.Fatal("same-named symbol from another procedure leaked into first procedure")
+	}
+}
+
+func TestResolveUpdatePredicateIsNotSetTarget(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x INTEGER;
+BEGIN
+  UPDATE t SET c = (SELECT y FROM u WHERE x = 1) WHERE x = 2;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := a.procedures[0].Symbols["X"][0]
+	for _, marker := range []string{"WHERE x = 1", "WHERE x = 2"} {
+		got := a.Resolve(strings.Index(text, marker) + len("WHERE "))
+		if got.Role != Ambiguous || got.Symbol != nil {
+			t.Fatalf("predicate %q = %+v, want ambiguous SQL value", marker, got)
+		}
+	}
+	if x.RenameBlocked == "" {
+		t.Fatal("predicate ambiguity did not block rename")
+	}
+	if got := a.Resolve(strings.Index(text, "SET c") + len("SET ")); got.Role != Column {
+		t.Fatalf("SET target = %+v, want column", got)
+	}
+}
+
+func TestResolveSQLCaseAndNestedSelectKeepSQLContext(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x INTEGER;
+BEGIN
+  SELECT CASE WHEN 1 = 1 THEN x ELSE 0 END FROM t;
+  SELECT y FROM (SELECT x FROM u) q WHERE q.y = x;
+  FOR SELECT x FROM t INTO :x DO x = x + 1;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int{
+		strings.Index(text, "THEN x") + len("THEN "),
+		strings.Index(text, "SELECT x FROM u") + len("SELECT "),
+		strings.Index(text, "= x;") + 2,
+		strings.Index(text, "FOR SELECT x") + len("FOR SELECT "),
+	} {
+		if got := a.Resolve(offset); got.Role != Ambiguous {
+			t.Fatalf("SQL x at %d = %+v, want ambiguous", offset, got)
+		}
+	}
+}
+
+func TestResolveAllIntoAndReturningValuesTargets(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x INTEGER;
+DECLARE VARIABLE y INTEGER;
+BEGIN
+  SELECT c1, c2 FROM t INTO x, y;
+  EXECUTE PROCEDURE f() RETURNING_VALUES x, :y;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"x", "y"} {
+		symbol := a.procedures[0].Symbols[strings.ToUpper(name)][0]
+		var want []Span
+		if name == "x" {
+			into := strings.Index(text, "INTO x") + len("INTO ")
+			returned := strings.Index(text, "RETURNING_VALUES x") + len("RETURNING_VALUES ")
+			want = []Span{{Start: into, End: into + 1}, {Start: returned, End: returned + 1}}
+		} else {
+			into := strings.Index(text, "x, y") + len("x, ")
+			returned := strings.Index(text, ":y") + 1
+			want = []Span{{Start: into, End: into + 1}, {Start: returned, End: returned + 1}}
+		}
+		if got := a.References(symbol, false); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%s uses = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestResolveUnsupportedSQLAndExecuteBlockRenameSafety(t *testing.T) {
+	text := `ALTER PROCEDURE p AS
+DECLARE VARIABLE x INTEGER;
+DECLARE VARIABLE unrelated INTEGER;
+BEGIN
+  MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN x = 1;
+  WITH q AS (SELECT 1) SELECT x FROM q;
+  EXECUTE BLOCK AS BEGIN x = 2; END;
+  unrelated = 3;
+END`
+	a, err := Analyze(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := a.procedures[0].Symbols["X"][0]
+	for _, marker := range []string{"THEN x", "SELECT x FROM q", "BEGIN x"} {
+		if got := a.Resolve(strings.Index(text, marker) + strings.Index(marker, "x")); got.Role != Ambiguous {
+			t.Fatalf("unsupported %q = %+v, want ambiguous", marker, got)
+		}
+	}
+	if x.RenameBlocked == "" {
+		t.Fatal("unsupported syntax did not block x")
+	}
+	if got := a.Resolve(strings.Index(text, "unrelated = 3")); got.Role != Local {
+		t.Fatalf("unrelated local = %+v, want local", got)
+	}
+}
+
+func BenchmarkAnalyzeResolutionScaling(b *testing.B) {
+	for _, count := range []int{100, 1000, 5000} {
+		b.Run(strconv.Itoa(count), func(b *testing.B) {
+			var source strings.Builder
+			source.WriteString("ALTER PROCEDURE p AS\nDECLARE VARIABLE x INTEGER;\nBEGIN\n")
+			for i := 0; i < count; i++ {
+				source.WriteString("x = x + 1;\n")
+			}
+			source.WriteString("END")
+			text := source.String()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if _, err := Analyze(text, interBaseVariant()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
 	}
 }
