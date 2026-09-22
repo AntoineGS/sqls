@@ -17,6 +17,10 @@ The user approved this scope:
 - Case-aware symbol identity, SQL/procedural context awareness, and exclusion of
   comments and strings from references and edits.
 
+Review clarification: `:` is optional for variable references where the language
+permits it, and is absent from the left-hand side of a procedural assignment.
+Presence or absence of `:` is not a sufficient variable-versus-column rule.
+
 Reference example, inspected locally:
 `OneDrive/Dev/2026-09-14 - 5-IMPORTEXTERNALORDER_SHOPIFYPOS.sql`.
 
@@ -114,21 +118,47 @@ every occurrence.
   it resolves to, not merely its spelling.
 - `:name` resolves to a procedure variable/parameter when declared. The editable
   span covers `name`, excluding the colon.
+- A reference without `:` can resolve to exactly the same local declaration.
+  Resolve identifier roles from statement context and declaration scope first;
+  never classify every bare identifier as a column. A colon is explicit variable
+  reference syntax, not part of the symbol's identity.
 - Bare identifiers in procedural assignment targets and procedural expressions
   resolve to declared locals. This includes conditions and arguments to scalar
-  functions in procedural expressions.
+  functions in procedural expressions. The assignment target is written without
+  `:`: `amountpaid = 0;` initializes the declared local `amountpaid`.
 - SQL relation names, column names, aliases, callable names, and qualified member
-  names are classified by their syntactic role. Bare names in SQL column
-  contexts must not become variable references just because a local shares the
-  name. Output-target contexts such as `SELECT ... INTO` and procedure
-  `RETURNING_VALUES` resolve to locals, including colon-prefixed targets.
-- For `where invoice=:invoice`, the left `invoice` is a column and the right
-  `invoice` is a local symbol. For `SELECT EMPLYID FROM ... INTO :EMPLYID`, only
-  the output target is a local use.
+  names are classified by their syntactic role. Explicit column positions, such
+  as an `UPDATE ... SET` target, stay columns even when a local shares the name.
+  In SQL value expressions that permit an unprefixed variable, use InterBase's
+  name-resolution rules and the available relation context; absence of `:` alone
+  proves neither a column nor a local. Where column/local precedence cannot be
+  established, report ambiguity rather than guessing. Output-target contexts
+  such as `SELECT ... INTO` and procedure `RETURNING_VALUES` resolve to locals,
+  with or without the optional prefix.
+- In the example's `UPDATE CUSTOMERINVOICE ... WHERE invoice=:invoice`, the
+  first `invoice` resolves to the table column and the second to the local.
+  This is a contextual result for that statement, not a general rule for every
+  occurrence spelled `invoice`. For `SELECT EMPLYID FROM ... INTO :EMPLYID`, the
+  selected column and local output target are distinct symbols.
 - Comments, string literals, and identifier substrings are never occurrences.
 - Model resolution as distinct outcomes: resolved local, resolved SQL role,
   unresolved/ambiguous procedure context, and outside a supported procedure.
   An unresolved local must not fall through into a same-spelled catalog object.
+
+For example, assuming a declared local `amountpaid` and a table column with the
+same name:
+
+```sql
+amountpaid = 0;                              -- local assignment target
+amountpaid = amountpaid + 1;                 -- two local occurrences
+amountpaid = :amountpaid + 1;                -- same two local occurrences
+UPDATE customerinvoice
+   SET amountpaid = :amountpaid;             -- column target, local value
+```
+
+Renaming the local changes every local occurrence above, preserves each use's
+existing colon or lack of one, and leaves the `SET` column target intact. It must
+not introduce a colon on a procedural assignment target.
 
 ## LSP behavior
 
@@ -219,6 +249,13 @@ current server still selects its variant through the active connection.
   case variations; identifier-prefix collisions.
 - Same-named columns versus locals, SQL aliases, function names, nested SQL
   scopes, and output targets.
+- A local named `amountpaid` alongside a same-named table column: bare assignment
+  target, bare and colon-prefixed reads, and an `UPDATE ... SET` column target.
+  Verify all local forms share definition/reference/rename identity and rename
+  preserves the original prefix syntax.
+- Bare-variable reads from the user's file: the `ordertotal` assignment at line
+  534 and `payDate = F_StripTime(payDate)` at line 864, alongside colon-prefixed
+  reads of those variables elsewhere.
 - Comments and single-/double-quoted strings under both InterBase variants;
   delimited identifiers under Dialect 3.
 - Multiple procedures, nested blocks, `CASE`, `SET TERM`, and incomplete source.
