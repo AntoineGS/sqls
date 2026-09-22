@@ -236,9 +236,13 @@ func (s *sourceSnapshotStore) connectionDirLocked(sc snapshotContext) (string, e
 }
 
 // snapshotDirName is <hash>-<pid>. The identity is hashed rather than written
-// because it can contain a host and a filesystem path; the pid is in the name
-// so pruning can never delete a concurrently running sqls process's live
-// directory.
+// because it can contain a host and a filesystem path.
+//
+// The pid is not what keeps a live directory safe from pruning: it only exempts
+// the pruning process's own directory, and pids are reused, so a later process
+// can match a long-dead one's suffix. What protects a directory still in use is
+// that write refreshes its modification time, so it cannot reach the staleness
+// cutoff while anything is writing to it.
 func snapshotDirName(identity string, pid int) string {
 	sum := sha256.Sum256([]byte(identity))
 	return fmt.Sprintf("%s-%d", hex.EncodeToString(sum[:])[:16], pid)
