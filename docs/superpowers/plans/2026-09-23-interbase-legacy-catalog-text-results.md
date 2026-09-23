@@ -2,7 +2,7 @@
 
 ## Scope and safety
 
-- sqls base revision: `a15aba999212968222640d144c693f82c3b602a0` (branch `feat/interbase-legacy-catalog-text`); full-range test revision `b6231878df4678a2f80721f022ad34bfea25edaa`; timeout-diagnostic changes are the subsequent test-only follow-up recorded by this results update.
+- sqls base revision: `a15aba999212968222640d144c693f82c3b602a0` (branch `feat/interbase-legacy-catalog-text`); full-range test revision `b6231878df4678a2f80721f022ad34bfea25edaa`; timeout-diagnostic test-only changes committed as `2b3120f727dd1a7c22643ad206a54b8b9540f7a2`.
 - Local `interbase-go` replacement: `../interbase-go`, revision `8009fefe498428adb36420b5eabd8938eae3d3f3`.
 - Real validation was performed with the owner-confirmed `WIN1252` setting. `É` alone was not treated as code-page evidence; the owner confirmed the intended code page.
 - The opt-in test loads the existing config and complete SQL document from the environment, copies the connection and nested InterBase config, and changes only the in-memory copy. It issues catalog reads only. No SQL from the document was executed, no business-database writes were performed, and no personal config/editor files were changed.
