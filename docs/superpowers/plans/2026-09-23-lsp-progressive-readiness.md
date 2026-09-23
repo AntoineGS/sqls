@@ -94,7 +94,7 @@ if !errors.Is(err, context.Canceled) { t.Fatalf("error = %v", err) }
 
 ### Task 2: Move connection bootstrap to a single coordinator
 
-**Files:** Create `internal/handler/connection_lifecycle.go`, `connection_lifecycle_test.go`; modify `handler.go`, `execute_command.go`, `diagnostics.go`, every handler file referencing `worker.Cache()`, `handler_test.go`, `concurrency_test.go`, `concurrency_race_test.go`, and handler fixtures referencing worker/ReCache. Task 3 refines these reads into a coherent operation snapshot.
+**Files:** Create `internal/handler/connection_lifecycle.go`, `connection_lifecycle_test.go`; modify `handler.go`, `execute_command.go`, `diagnostics.go`, `snapshot_store.go` (shutdown write fence), every handler file referencing `worker.Cache()`, `handler_test.go`, `concurrency_test.go`, `concurrency_race_test.go`, and handler fixtures referencing worker/ReCache. Task 3 refines these reads into a coherent operation snapshot.
 
 **Interfaces:** Create these package-private definitions:
 
@@ -130,7 +130,10 @@ their own internal state. Construct background consumers once in NewServer.
 
 The coordinator has one goroutine, a capacity-one wake signal, and one pending
 intent slot. Replacing a pending intent returns context.Canceled to its waiter.
-Request deep-copies Config, including Params, InterBase, and TLS. Bootstrap and
+Request deep-copies effective Config after precedence resolution, including
+Params, SSHCfg, InterBase, and TLS. Identical/overridden notifications neither
+supersede an active attach nor retry an unchanged failed configuration; only a
+changed effective config or explicit reselect retries. Bootstrap and
 workspace configuration pass the server lifecycle context, not a notification's
 short-lived handler context. Explicit switches pass their cancellable request
 context. A cancelled queued intent is skipped; an active attempt has a context
@@ -142,9 +145,13 @@ coordinator mutex while acquiring server locks, doing I/O, or sending a reply.
 **Intent id is not connection generation.** A queued switch does not modify the
 active config or generation while an executing query owns connMu.RLock. The
 coordinator obtains connMu.Lock off the read loop, rechecks intent freshness,
-then begins the transition: increment connGeneration, set connecting, detach the
+then begins the transition under connMu → diagnosticsPublishMu → stateMu:
+increment connGeneration, set connecting, detach the
 old visible connection, clear DDL memo, reset MetadataLoader with that generation,
-and trigger diagnostic/status signals. Release state locks before closing/opening.
+and trigger diagnostic/status signals. Reset/Start callbacks only enqueue
+nonblocking signals, never take server locks synchronously. Release state locks
+before opening; old attachment closes run on a bounded lifecycle-owned cleanup
+worker, not the critical path to attaching the new connection.
 Keep connMu across this transition to preserve query/switch serialization.
 
 Open the candidate locally. Check intent/lifecycle cancellation before installing
@@ -152,7 +159,9 @@ it under the generation fence. A stale candidate is closed and cannot start
 metadata. A current candidate is installed with resolved dialect, config/index,
 and ready state; call metadata.Start with the lifecycle-derived generation
 context, not the switch request's response context. Explicit switches finish
-after attach/metadata scheduling; metadata errors are reported separately.
+after attach/metadata scheduling; metadata errors are reported separately. If
+metadata.Start rejects a plan, keep the attachment ready but publish a terminal
+degraded metadata-status error instead of leaving an unstarted snapshot.
 
 - [ ] **Step 1: Add a gated opener test proving handshake independence.**
 
@@ -197,6 +206,8 @@ call potentially blocking native Close inline on the JSON-RPC read loop. Existin
 Stop() error returns scheduling errors only; asynchronous cleanup errors are
 logged. Tests can await cleanup through a private done channel after releasing
 native gates; the protocol response does not await that channel.
+Fence snapshot-store writes once shutdown cleanup starts so a concurrent DDL
+snapshot cannot recreate files after RemoveAll.
 
 For commands needing a ready attachment, add
 `acquireReadyConnection() (database.DBRepository, func(), error)`: use
