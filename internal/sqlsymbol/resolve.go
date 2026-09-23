@@ -182,6 +182,11 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 		a.addResolution(resolution, prefix)
 		if role == Local && symbol != nil {
 			symbol.Uses = append(symbol.Uses, item.Span)
+			if isWriteOccurrence(items, i, a.contexts[i]) {
+				symbol.Writes = append(symbol.Writes, item.Span)
+			} else {
+				symbol.Reads = append(symbol.Reads, item.Span)
+			}
 		}
 	}
 	sort.SliceStable(a.resolutions, func(i, j int) bool {
@@ -193,6 +198,20 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 	for _, symbol := range a.Symbols {
 		sort.Slice(symbol.Uses, func(i, j int) bool { return symbol.Uses[i].Start < symbol.Uses[j].Start })
 	}
+}
+
+func isWriteOccurrence(items []lexeme, index int, context tokenContext) bool {
+	if context.outputTarget {
+		return true
+	}
+	if context.kind != contextProcedure || index+1 >= len(items) || items[index+1].Token.Kind != token.Eq || index == 0 {
+		return false
+	}
+	previous := items[index-1]
+	if previous.Token.Kind == token.Semicolon {
+		return true
+	}
+	return isWord(previous, "BEGIN") || isWord(previous, "THEN") || isWord(previous, "ELSE") || isWord(previous, "DO")
 }
 
 func declarationRole(symbol *Symbol) Role {

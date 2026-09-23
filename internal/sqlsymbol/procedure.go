@@ -17,14 +17,19 @@ const (
 	OutputParameter
 )
 
-// Symbol is a declaration found in a procedure. Uses are intentionally left
-// empty here; occurrence binding is added by a later analysis increment.
+// Symbol is a declaration found in a procedure. Uses retain every bound
+// occurrence for navigation; Reads and Writes separately describe its value
+// usage for diagnostics.
 type Symbol struct {
 	Name          Name
 	Kind          SymbolKind
 	Declaration   Span
+	Type          string
+	TypeSpan      Span
 	Scope         Span
 	Uses          []Span
+	Reads         []Span
+	Writes        []Span
 	RenameBlocked string
 }
 
@@ -117,6 +122,8 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 					Name:        name,
 					Kind:        Variable,
 					Declaration: items[i+2].Span,
+					Type:        text[items[i+3].Span.Start:items[declarationEnd-1].Span.End],
+					TypeSpan:    Span{Start: items[i+3].Span.Start, End: items[declarationEnd-1].Span.End},
 				})
 				i += 2
 				continue
@@ -238,8 +245,12 @@ func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind
 	sawName := false
 	sawType := false
 	var declarations []declaration
+	var current *Symbol
 	for i := open; i < len(items); i++ {
 		item := items[i]
+		if current != nil && sawType && !(item.Token.Kind == token.Comma && depth == 1) && !(item.Token.Kind == token.RParen && depth == 1) {
+			current.TypeSpan.End = item.Span.End
+		}
 		switch item.Token.Kind {
 		case token.LParen:
 			if depth == 1 && !expectName {
@@ -258,6 +269,9 @@ func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind
 				if !expectName && !sawType {
 					return open, nil, fmt.Errorf("procedure parameter is missing a type")
 				}
+				if current != nil {
+					current.Type = text[current.TypeSpan.Start:current.TypeSpan.End]
+				}
 			}
 			depth--
 			if depth == 0 {
@@ -271,24 +285,30 @@ func parseDeclarationList(text string, items []lexeme, open int, kind SymbolKind
 				if !sawType {
 					return open, nil, fmt.Errorf("procedure parameter is missing a type")
 				}
+				if current != nil {
+					current.Type = text[current.TypeSpan.Start:current.TypeSpan.End]
+				}
 				expectName = true
 				sawType = false
+				current = nil
 			}
 		default:
 			if depth == 1 && expectName {
 				if name, ok := nameFromLexeme(text, item); ok {
-					declarations = append(declarations, declaration{symbol: &Symbol{
+					current = &Symbol{
 						Name:        name,
 						Kind:        kind,
 						Declaration: item.Span,
-					}})
+					}
+					declarations = append(declarations, declaration{symbol: current})
 					expectName = false
 					sawName = true
 				} else {
 					return open, nil, fmt.Errorf("procedure parameter has an invalid name")
 				}
-			} else if depth == 1 && !sawType && declarationTypeStart(item) {
+			} else if !expectName && !sawType && declarationTypeStart(item) {
 				sawType = true
+				current.TypeSpan = Span{Start: item.Span.Start, End: item.Span.End}
 			}
 		}
 	}
