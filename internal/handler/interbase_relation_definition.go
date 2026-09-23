@@ -97,6 +97,20 @@ func resolveRelationTarget(ref sqlsymbol.SQLReference, role sqlsymbol.Role, cach
 }
 
 func relationTarget(name sqlsymbol.Name, cache *database.DBCache) (snapshotTarget, bool) {
+	// A positive view descriptor is usable immediately, even while unrelated
+	// catalog categories are loading. It must take precedence over SchemaTables,
+	// where views are also represented.
+	for _, viewName := range cache.SortedViews() {
+		if name.MatchesCatalogName(viewName) {
+			view, _ := cache.View(viewName)
+			return snapshotTarget{kind: database.ObjectKindView, name: view.Name, source: view.ViewSource}, true
+		}
+	}
+	// A relation name alone cannot distinguish a table from a view until the
+	// view category has completed successfully.
+	if !cache.MetadataReady(database.MetadataViews) {
+		return snapshotTarget{}, false
+	}
 	for _, table := range cache.SortedTables() {
 		if name.MatchesCatalogName(table) {
 			return snapshotTarget{kind: database.ObjectKindTable, name: table}, true
@@ -109,12 +123,6 @@ func relationTarget(name sqlsymbol.Name, cache *database.DBCache) (snapshotTarge
 			if name.MatchesCatalogName(table) {
 				return snapshotTarget{kind: database.ObjectKindTable, name: table}, true
 			}
-		}
-	}
-	for _, viewName := range cache.SortedViews() {
-		if name.MatchesCatalogName(viewName) {
-			view, _ := cache.View(viewName)
-			return snapshotTarget{kind: database.ObjectKindView, name: view.Name, source: view.ViewSource}, true
 		}
 	}
 	return snapshotTarget{}, false

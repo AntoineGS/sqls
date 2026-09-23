@@ -62,6 +62,10 @@ func testProcedures() []*database.ProcedureDesc {
 }
 
 func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureDesc) (string, *stubBackend) {
+	return runProcedureCommandWithProcedureState(t, text, procs, nil)
+}
+
+func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*database.ProcedureDesc, procedureState *database.MetadataState) (string, *stubBackend) {
 	t.Helper()
 	tx := newTestContext()
 	tx.setup(t)
@@ -86,8 +90,12 @@ func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureD
 	// there rather than duplicating it here.
 	if procs != nil {
 		waitForCatalog(t, tx.server.worker)
-		if !tx.server.worker.Cache().HasCatalog() {
+		cache := tx.server.worker.Cache()
+		if !cache.HasCatalog() {
 			t.Fatal("the catalog never arrived; every routing assertion below would be vacuous")
+		}
+		if procedureState != nil {
+			cache.Metadata[database.MetadataProcedures] = *procedureState
 		}
 	}
 
@@ -101,6 +109,31 @@ func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureD
 		t.Fatal("conn.Call workspace/executeCommand:", err)
 	}
 	return got, backend
+}
+
+func TestExecuteProcedureWithFailedProcedureMetadataRemainsUnknown(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", []*database.ProcedureDesc{{Name: "OTHER"}}, &failed)
+	if queries := backend.queries(); len(queries) != 0 {
+		t.Fatalf("Query served %d statements without a known procedure signature", len(queries))
+	}
+	if !strings.Contains(got, "MYPROC is not in the catalog cache") || !strings.Contains(got, "switch to this connection again") {
+		t.Errorf("result = %q, want existing unknown-metadata explanation", got)
+	}
+	if strings.Contains(got, "no output") || strings.Contains(got, "has no output") {
+		t.Errorf("result = %q, failed metadata must not be described as a procedure without outputs", got)
+	}
+}
+
+func TestExecuteProcedureUsesKnownDescriptorWhileCategoryFailed(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed)
+	if queries := backend.queries(); len(queries) != 1 {
+		t.Fatalf("Query served %d statements for a present descriptor, want 1", len(queries))
+	}
+	if strings.Contains(got, "not in the catalog cache") {
+		t.Errorf("known descriptor was discarded because category state is failed: %q", got)
+	}
 }
 
 func TestExecuteProcedureWithOutputUsesQueryPath(t *testing.T) {

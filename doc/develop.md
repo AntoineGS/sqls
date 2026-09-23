@@ -188,9 +188,13 @@ The three rules:
 1. **Capability, not driver name.** Handlers type-assert
    `database.DDLRepository` and `database.ExplainRepository`, and read catalog
    data through `DBCache.HasCatalog()` rather than by asserting
-   `database.CatalogRepository`. `HasCatalog()` is false on every other driver
-   and in the window before the worker's catalog pass lands, and every feature
-   degrades to its pre-InterBase behaviour in that case.
+   `database.CatalogRepository`. `HasCatalog()` means catalog data is present;
+   it does not mean every catalog category finished loading. Use
+   `MetadataReady(kinds...)` or `ColumnsReady()` before treating an absent
+   descriptor/key as conclusive. A descriptor that is present is usable even
+   while unrelated categories remain pending; negative conclusions require
+   readiness for the categories that could disprove them. `HasCatalog()` is
+   false on every other driver and before any catalog data arrives.
 2. **Driver identity only for parser- and lexer-shaped behaviour**, matching the
    existing `c.Driver == dialect.DatabaseDriverInterBase` checks in
    `internal/completer/candidates.go`. Completion candidate *generators* use it

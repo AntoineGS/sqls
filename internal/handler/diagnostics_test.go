@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net"
 	"strings"
@@ -193,6 +194,42 @@ func diagnosticCode(diagnostic lsp.Diagnostic) string {
 		return ""
 	}
 	return *diagnostic.Code
+}
+
+func TestDiagnosticUniqueKeysRequiresCompleteCatalogInputs(t *testing.T) {
+	cache := &database.DBCache{
+		Catalog: &database.CatalogCache{
+			Views: map[string]*database.ViewDesc{},
+			Indexes: map[string]*database.IndexDesc{
+				"UQ_T": {Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}},
+			},
+			IndexesByTable: map[string][]*database.IndexDesc{"T": {{Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}}}},
+		},
+		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataColumnsCurrent: database.MetadataReady,
+			database.MetadataViews:          database.MetadataLoading,
+			database.MetadataIndexes:        database.MetadataReady,
+		},
+	}
+	columns := []sqlsymbol.ColumnType{{Name: "ID", Type: "INTEGER"}}
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("incomplete view classification cannot prove table keys")
+	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	cache.Metadata[database.MetadataIndexes] = database.MetadataLoading
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("loading indexes cannot prove a complete unique-key set")
+	}
+	cache.Metadata[database.MetadataIndexes] = database.MetadataReady
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("failed columns cannot prove a complete unique-key set")
+	}
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
+	keys, known := diagnosticUniqueKeys(cache, "T", columns)
+	if !known || len(keys) != 1 || len(keys[0]) != 1 || keys[0][0] != "ID" {
+		t.Fatalf("complete catalog keys = %v, known=%v; want [[ID]], true", keys, known)
+	}
 }
 
 func diagnosticSource(diagnostic lsp.Diagnostic) string {

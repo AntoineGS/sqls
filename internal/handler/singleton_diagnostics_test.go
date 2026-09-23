@@ -28,6 +28,11 @@ func singletonDiagnosticCache() *database.DBCache {
 			Indexes:        map[string]*database.IndexDesc{"PK_ORDERS": index},
 			IndexesByTable: map[string][]*database.IndexDesc{"ORDERS": {index}},
 		},
+		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataColumnsCurrent: database.MetadataReady,
+			database.MetadataViews:          database.MetadataReady,
+			database.MetadataIndexes:        database.MetadataReady,
+		},
 	}
 }
 

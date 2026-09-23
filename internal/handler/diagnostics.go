@@ -103,7 +103,7 @@ func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 // standalone unique indexes in the extended catalog. Wait for that complete
 // catalog: column primary-key flags alone cannot rule out other unique keys.
 func diagnosticUniqueKeys(cache *database.DBCache, table string, columns []sqlsymbol.ColumnType) ([][]string, bool) {
-	if !cache.HasCatalog() {
+	if !cache.HasCatalog() || !cache.ColumnsReady() || !cache.MetadataReady(database.MetadataViews, database.MetadataIndexes) {
 		return nil, false
 	}
 	for _, view := range cache.Catalog.Views {

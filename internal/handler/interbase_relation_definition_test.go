@@ -24,6 +24,7 @@ func relationCatalog() *database.DBCache {
 			{ColumnBase: database.ColumnBase{Table: "CUSTOMERINVOICE", Name: "BALANCE"}},
 			{ColumnBase: database.ColumnBase{Table: "CUSTOMERINVOICE", Name: "INVOICE"}},
 		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataReady},
 	}
 }
 
@@ -57,6 +58,31 @@ func TestResolveRelationTargetOwnershipAndShadowing(t *testing.T) {
 				t.Errorf("target name %q, want %q", got.name, tt.want)
 			}
 		})
+	}
+}
+
+func TestResolveRelationTargetWaitsForViewsBeforeTableFallback(t *testing.T) {
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {"V"}},
+		ColumnsWithParent: map[string][]*database.ColumnDesc{"\tV": {
+			{ColumnBase: database.ColumnBase{Table: "V", Name: "ID"}},
+		}},
+		Catalog:  &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading},
+	}
+	text := "SELECT * FROM V"
+	a, err := sqlsymbol.Analyze(text, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := a.Resolve(strings.Index(text, "V"))
+	if _, ok := resolveRelationTarget(*r.SQL, r.Role, cache); ok {
+		t.Fatal("relation with unresolved view category was classified as a table")
+	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	got, ok := resolveRelationTarget(*r.SQL, r.Role, cache)
+	if !ok || got.kind != database.ObjectKindTable || got.name != "V" {
+		t.Fatalf("ready-empty views table fallback = %+v, %v", got, ok)
 	}
 }
 
@@ -216,6 +242,7 @@ func TestResolveRelationTargetMatchesQuotedMixedCaseCatalogMetadata(t *testing.T
 		ColumnsWithParent: map[string][]*database.ColumnDesc{"\tMIXEDCASE": {
 			{ColumnBase: database.ColumnBase{Table: "MixedCase", Name: "CamelCol"}},
 		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataReady},
 	}
 	for _, tt := range []struct {
 		name   string
@@ -490,6 +517,7 @@ func TestInterBaseRelationDefinitionAcceptsUnicodeQuotedDialect3Names(t *testing
 		ColumnsWithParent: map[string][]*database.ColumnDesc{"\t" + table: {
 			{ColumnBase: database.ColumnBase{Table: table, Name: column}},
 		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataReady},
 	}
 	repo := newStubTableDescriptionRepository(
 		func(context.Context, database.ObjectKind, string) (string, error) {
@@ -778,6 +806,7 @@ func tableDescriptionCatalog(table, column string) *database.DBCache {
 		ColumnsWithParent: map[string][]*database.ColumnDesc{"\t" + table: {
 			{ColumnBase: database.ColumnBase{Table: table, Name: column}},
 		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataReady},
 	}
 }
 

@@ -98,6 +98,9 @@ func resolveInterBaseHoverTarget(text string, params lsp.HoverParams, dbCache *d
 		return hoverTarget{kind: database.ObjectKindFunction, name: desc.Name}, identRange, true
 	}
 	if cols, ok := dbCache.ColumnDescs(name); ok {
+		if !dbCache.MetadataReady(database.MetadataViews) {
+			return hoverTarget{}, lsp.Range{}, false
+		}
 		canonical := name
 		if len(cols) > 0 {
 			canonical = cols[0].Table

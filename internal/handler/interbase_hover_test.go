@@ -84,6 +84,7 @@ func interBaseHoverCache(t *testing.T) *database.DBCache {
 			},
 		},
 	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
 	return cache
 }
 
@@ -166,6 +167,28 @@ func TestResolveInterBaseHoverTarget(t *testing.T) {
 				t.Errorf("name = %q, want %q", got.name, tt.wantName)
 			}
 		})
+	}
+}
+
+func TestResolveInterBaseHoverTargetRequiresReadyViewsForTableFallback(t *testing.T) {
+	cache := &database.DBCache{
+		ColumnsWithParent: map[string][]*database.ColumnDesc{"\tV": {
+			{ColumnBase: database.ColumnBase{Table: "V", Name: "ID"}},
+		}},
+		Catalog:  &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading},
+	}
+	text := "SELECT * FROM V"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "V")},
+	}}
+	if _, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase); ok {
+		t.Fatal("relation with unresolved view category was classified as a table DDL target")
+	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	got, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase)
+	if !ok || got.kind != database.ObjectKindTable || got.name != "V" {
+		t.Fatalf("ready-empty views table fallback = %+v, %v", got, ok)
 	}
 }
 
