@@ -63,7 +63,7 @@ func interBaseMetadataIdentifierWidth(ctx context.Context, q schema.Queryer) (in
 func interBaseMetadataIdentifier(ref string, width int) string
 ```
 
-runMetadataRead begins one `sql.TxOptions{ReadOnly:true}` transaction, discovers
+runMetadataRead begins one `sql.TxOptions{ReadOnly:true, Isolation:sql.LevelSnapshot}` transaction, discovers
 identifier width within it, calls read with that transaction, and rolls back
 before returning its result. Defer rollback immediately to cover panic unwinding;
 the scheduler catches the panic after rollback. No read may use db.Conn while

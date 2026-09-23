@@ -143,7 +143,9 @@ logical completion from resource drainage. No unbounded replacement workers.
 
 ## 6. InterBase query strategy
 
-Use one read-only transaction per job, never share a sql.Tx across parallel jobs.
+Use one read-only snapshot-isolation transaction per InterBase job, never share a
+sql.Tx across parallel jobs. The driver maps default isolation to read committed;
+explicit snapshot isolation is required for multi-query category consistency.
 No job opens another connection while holding its transaction. Rollback closes
 read-only jobs; propagate unexpected cleanup errors before publication. A
 generation is a publication fence, not a database-wide point-in-time snapshot.
