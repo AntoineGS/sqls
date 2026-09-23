@@ -45,12 +45,20 @@ const (
 // concurrency-safe state: every statement it served, every plan it was asked
 // to prepare, and optional gates a test uses to hold one call open.
 type parameterBackend struct {
-	mu           sync.Mutex
-	recorded     []parameterCall
-	explained    []string
-	gates        map[string]*stubGate
-	procedures   []*database.ProcedureDesc
-	capabilities repositoryCapabilities
+	mu                sync.Mutex
+	recorded          []parameterCall
+	explained         []string
+	described         []string
+	gates             map[string]*stubGate
+	procedures        []*database.ProcedureDesc
+	capabilities      repositoryCapabilities
+	inputDescriber    bool
+	inputDescriptions map[string]inputDescriptionResult
+}
+
+type inputDescriptionResult struct {
+	descriptors []database.InputDescriptor
+	err         error
 }
 
 // repositoryCapabilities selects which optional capabilities the next
@@ -91,6 +99,51 @@ func (b *parameterBackend) explains() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]string(nil), b.explained...)
+}
+
+func (b *parameterBackend) withInputDescriber() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.inputDescriber = true
+	if b.inputDescriptions == nil {
+		b.inputDescriptions = make(map[string]inputDescriptionResult)
+	}
+}
+
+func (b *parameterBackend) setInputDescription(query string, descriptors []database.InputDescriptor, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.inputDescriber = true
+	if b.inputDescriptions == nil {
+		b.inputDescriptions = make(map[string]inputDescriptionResult)
+	}
+	b.inputDescriptions[query] = inputDescriptionResult{
+		descriptors: append([]database.InputDescriptor(nil), descriptors...),
+		err:         err,
+	}
+}
+
+func (b *parameterBackend) describeInputs(ctx context.Context, query string) ([]database.InputDescriptor, error) {
+	b.mu.Lock()
+	b.described = append(b.described, query)
+	result := b.inputDescriptions[query]
+	b.mu.Unlock()
+	if err := b.enterGate(ctx, query); err != nil {
+		return nil, err
+	}
+	return append([]database.InputDescriptor(nil), result.descriptors...), result.err
+}
+
+func (b *parameterBackend) describedInputs() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.described...)
+}
+
+func (b *parameterBackend) hasInputDescriber() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.inputDescriber
 }
 
 // gate parks the next repository call whose statement text contains query,
@@ -338,6 +391,29 @@ func (r *parameterFixtureRepository) ExecParams(ctx context.Context, query strin
 	return r.execute(ctx, query)
 }
 
+// inputDescribingParameterRepository opts in to metadata discovery without
+// changing the repository shape used by fixtures that assert discovery does
+// not acquire or call a repository.
+type inputDescribingParameterRepository struct {
+	*parameterFixtureRepository
+}
+
+var _ database.InputDescriber = (*inputDescribingParameterRepository)(nil)
+
+func (r *inputDescribingParameterRepository) DescribeInputs(ctx context.Context, query string) ([]database.InputDescriptor, error) {
+	return r.backend.describeInputs(ctx, query)
+}
+
+type inputDescribingCatalogParameterRepository struct {
+	*catalogParameterRepository
+}
+
+var _ database.InputDescriber = (*inputDescribingCatalogParameterRepository)(nil)
+
+func (r *inputDescribingCatalogParameterRepository) DescribeInputs(ctx context.Context, query string) ([]database.InputDescriptor, error) {
+	return r.backend.describeInputs(ctx, query)
+}
+
 // argsOrEmpty keeps a bound call's Args non-nil even when the handler passed
 // no arguments, so a recorded call always says which family served it.
 func argsOrEmpty(args []any) []any {
@@ -414,7 +490,14 @@ func init() {
 		}
 		repository := &parameterFixtureRepository{readOnlyParameterFixture: readOnly}
 		if len(b.describedProcedures()) > 0 {
-			return &catalogParameterRepository{parameterFixtureRepository: repository}
+			catalog := &catalogParameterRepository{parameterFixtureRepository: repository}
+			if b.hasInputDescriber() {
+				return &inputDescribingCatalogParameterRepository{catalogParameterRepository: catalog}
+			}
+			return catalog
+		}
+		if b.hasInputDescriber() {
+			return &inputDescribingParameterRepository{parameterFixtureRepository: repository}
 		}
 		return repository
 	})

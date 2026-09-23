@@ -13,8 +13,10 @@ import (
 
 // Parameter describes one unique named placeholder in a Batch.
 type Parameter struct {
-	Name string `json:"name"` // first spelling, without colon
-	Key  string `json:"key"`  // ASCII uppercase
+	Name         string `json:"name"` // first spelling, without colon
+	Key          string `json:"key"`  // ASCII uppercase
+	InferredType string `json:"inferredType,omitempty"`
+	DatabaseType string `json:"databaseType,omitempty"`
 }
 
 // Statement is one SQL statement from a Batch, with named placeholders

@@ -2,6 +2,8 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -25,6 +27,54 @@ func TestParameterDiscoveryDoesNotNeedCatalogOrDatabaseIO(t *testing.T) {
 	got := result.(lsp.QueryParameterDiscovery)
 	if !got.Supported || len(got.Parameters) != 1 || got.ConnectionGeneration != 7 {
 		t.Fatalf("%+v", got)
+	}
+	if got.Parameters[0].InferredType != "" || got.Parameters[0].DatabaseType != "" {
+		t.Errorf("unavailable connection suggested a parameter type: %+v", got.Parameters[0])
+	}
+}
+
+func TestParameterDiscoveryUsesInputDescriptors(t *testing.T) {
+	f := newParameterFixture(t, "SELECT :ID FROM T", func(backend *parameterBackend) {
+		backend.setInputDescription("SELECT ? FROM T", []database.InputDescriptor{{Kind: "INTEGER"}}, nil)
+	})
+	d := f.discover(t, nil)
+	if len(d.Parameters) != 1 || d.Parameters[0].Key != "ID" || d.Parameters[0].InferredType != "integer" || d.Parameters[0].DatabaseType != "INTEGER" {
+		t.Fatalf("discovery parameters = %+v, want ID inferred as INTEGER", d.Parameters)
+	}
+	if described := f.backend.describedInputs(); len(described) != 1 || described[0] != "SELECT ? FROM T" {
+		t.Fatalf("described statements = %#v, want rewritten SELECT with one positional marker", described)
+	}
+}
+
+func TestParameterDiscoveryPreparationFailureFallsBackToPicker(t *testing.T) {
+	prepareErr := errors.New("prepare failed")
+	f := newParameterFixture(t, "SELECT :ID FROM T", func(backend *parameterBackend) {
+		backend.setInputDescription("SELECT ? FROM T", nil, prepareErr)
+	})
+	d := f.discover(t, nil)
+	if len(d.Parameters) != 1 || d.Parameters[0].Key != "ID" {
+		t.Fatalf("preparation failure lost discovered names: %+v", d.Parameters)
+	}
+	if d.Parameters[0].InferredType != "" || d.Parameters[0].DatabaseType != "" {
+		t.Errorf("preparation failure suggested a parameter type: %+v", d.Parameters[0])
+	}
+}
+
+func TestParameterDiscoveryPropagatesAlreadyCanceledContext(t *testing.T) {
+	f := newParameterFixture(t, "SELECT :ID FROM T", func(backend *parameterBackend) {
+		backend.setInputDescription("SELECT ? FROM T", []database.InputDescriptor{{Kind: "INTEGER"}}, nil)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := f.tx.server.getQueryParameters(ctx, lsp.ExecuteCommandParams{
+		Command:   CommandGetQueryParameters,
+		Arguments: []interface{}{testFileURI},
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("getQueryParameters() error = %v, want context.Canceled", err)
+	}
+	if described := f.backend.describedInputs(); len(described) != 0 {
+		t.Errorf("already-canceled request described statements %#v", described)
 	}
 }
 
@@ -357,6 +407,20 @@ func TestParameterDiscoveryOverJSONRPCTouchesNoRepository(t *testing.T) {
 	}
 	if len(got.Parameters) != 1 || got.Parameters[0].Key != "ID" {
 		t.Fatalf("Parameters = %+v, want one parameter keyed ID", got.Parameters)
+	}
+	encodedParameter, err := json.Marshal(got.Parameters[0])
+	if err != nil {
+		t.Fatal("json.Marshal discovery parameter:", err)
+	}
+	var parameterFields map[string]json.RawMessage
+	if err := json.Unmarshal(encodedParameter, &parameterFields); err != nil {
+		t.Fatal("json.Unmarshal discovery parameter:", err)
+	}
+	if _, exists := parameterFields["inferredType"]; exists {
+		t.Errorf("legacy discovery JSON unexpectedly contains inferredType: %s", encodedParameter)
+	}
+	if _, exists := parameterFields["databaseType"]; exists {
+		t.Errorf("legacy discovery JSON unexpectedly contains databaseType: %s", encodedParameter)
 	}
 	if got.Version != 1 {
 		t.Errorf("Version = %d, want 1", got.Version)
