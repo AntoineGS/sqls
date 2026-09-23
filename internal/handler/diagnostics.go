@@ -39,6 +39,7 @@ type documentDiagnosticsSnapshot struct {
 
 type diagnosticCatalog struct {
 	columns map[string][]sqlsymbol.ColumnType
+	keys    map[string][][]string
 }
 
 func (c *diagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnType, bool) {
@@ -52,6 +53,18 @@ func (c *diagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnTyp
 	return append([]sqlsymbol.ColumnType(nil), columns...), true
 }
 
+func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) {
+	if c == nil {
+		return nil, false
+	}
+	keys, ok := c.keys[table.Key()]
+	result := make([][]string, len(keys))
+	for i, key := range keys {
+		result[i] = append([]string(nil), key...)
+	}
+	return result, ok
+}
+
 // snapshotDiagnosticCatalog copies the cache metadata used by analysis. The
 // DBCache is copy-on-write, but copying names, types, and their available order
 // keeps this analysis independent of subsequent worker refreshes.
@@ -59,7 +72,10 @@ func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 	if cache == nil {
 		return nil
 	}
-	catalog := &diagnosticCatalog{columns: make(map[string][]sqlsymbol.ColumnType)}
+	catalog := &diagnosticCatalog{
+		columns: make(map[string][]sqlsymbol.ColumnType),
+		keys:    make(map[string][][]string),
+	}
 	for _, table := range cache.SortedTables() {
 		descriptions, ok := cache.ColumnDescs(table)
 		if !ok {
@@ -76,8 +92,60 @@ func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 		// names therefore match exactly; unquoted InterBase names naturally
 		// match the upper-case names returned by its catalog.
 		catalog.columns[table] = columns
+		if keys, known := diagnosticUniqueKeys(cache, table, columns); known {
+			catalog.keys[table] = keys
+		}
 	}
 	return catalog
+}
+
+// Primary-key and UNIQUE-constraint enforcing indexes are present alongside
+// standalone unique indexes in the extended catalog. Wait for that complete
+// catalog: column primary-key flags alone cannot rule out other unique keys.
+func diagnosticUniqueKeys(cache *database.DBCache, table string, columns []sqlsymbol.ColumnType) ([][]string, bool) {
+	if !cache.HasCatalog() {
+		return nil, false
+	}
+	for _, view := range cache.Catalog.Views {
+		if view != nil && view.Name == table {
+			return nil, false
+		}
+	}
+	var keys [][]string
+	for _, index := range cache.IndexesForTable(table) {
+		// The cache lookup folds case, but quoted relation identities do not.
+		if index == nil || index.RelationName != table {
+			continue
+		}
+		if !index.Unique.Valid {
+			return nil, false
+		}
+		if !index.Unique.Bool {
+			continue
+		}
+		if !index.Active.Valid {
+			return nil, false
+		}
+		if !index.Active.Bool {
+			continue
+		}
+		if index.Expression.Valid || len(index.Columns) == 0 {
+			return nil, false
+		}
+		for _, segment := range index.Columns {
+			matches := 0
+			for _, column := range columns {
+				if column.Name == segment {
+					matches++
+				}
+			}
+			if matches != 1 {
+				return nil, false
+			}
+		}
+		keys = append(keys, append([]string(nil), index.Columns...))
+	}
+	return keys, true
 }
 
 func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, bool) {

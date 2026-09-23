@@ -11,6 +11,15 @@ type Catalog interface {
 	Columns(table Name) ([]ColumnType, bool)
 }
 
+// UniqueKeyCatalog optionally supplies complete, enforced column keys. Each
+// inner slice is one whole primary key or active unique index, using catalog
+// spelling. A known table with no keys returns an empty slice and true;
+// unavailable metadata (including unsupported relations) returns false.
+type UniqueKeyCatalog interface {
+	Catalog
+	UniqueKeys(table Name) ([][]string, bool)
+}
+
 // Finding is a source-level diagnostic produced by the symbol analysis.
 type Finding struct {
 	Span     Span
@@ -19,9 +28,9 @@ type Finding struct {
 	Severity int
 }
 
-// Diagnostics reports statically proven InterBase findings. Catalog supplies
-// read-only table widths for assignment diagnostics; unused-symbol analysis
-// does not require it.
+// Diagnostics reports InterBase findings, including advisory warnings about
+// possible truncation and singleton selections lacking a uniqueness guarantee.
+// Catalog supplies read-only metadata; unused-symbol analysis does not need it.
 func (a *Analysis) Diagnostics(c Catalog) []Finding {
 	findings := make([]Finding, 0)
 	for _, symbol := range a.Symbols {
@@ -35,5 +44,6 @@ func (a *Analysis) Diagnostics(c Catalog) []Finding {
 			Severity: 4,
 		})
 	}
-	return append(findings, a.widthDiagnostics(c)...)
+	findings = append(findings, a.widthDiagnostics(c)...)
+	return append(findings, a.singletonDiagnostics(c)...)
 }

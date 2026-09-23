@@ -183,6 +183,42 @@ expressions or types, incomplete statements, unresolved columns, or missing
 catalog metadata. Unused hints remain available without a catalog. Diagnostics
 use the cached catalog only; editing does not execute or prepare SQL.
 
+Procedural `SELECT ... INTO` also receives a `Possible multiple rows in
+singleton SELECT` warning (`interbase-singleton-select`) when a supported
+query is not guaranteed to return at most one row. This is advisory: current
+data may happen to return one row even though the schema permits more.
+For example, if `ORDERS.ID` is the primary key but `CUSTOMER_ID` is not unique:
+
+```sql
+-- Can return several orders for the same customer: warns on SELECT.
+SELECT ID FROM ORDERS WHERE CUSTOMER_ID = :CUSTOMER_ID INTO :ORDER_ID;
+
+-- The full primary key is constrained: no singleton warning.
+SELECT ID FROM ORDERS WHERE ID = :REQUESTED_ID INTO :ORDER_ID;
+```
+
+The rule uses complete primary keys and active unique column indexes from the
+cached catalog, including standalone unique indexes. Every segment of a
+composite key must be constrained by equality to a literal, resolved procedure
+variable, or another bound column. Aliases and self joins are kept distinct.
+Inner joins can propagate key bindings in either direction; left joins must
+also preserve the at-most-one-row bound of their left side. Selecting one
+order and joining its nonunique order lines still warns. An `ON` predicate
+in a left join does not filter the preserved side.
+
+Both `INTO` positions and multiple target variables are supported. `FOR SELECT`
+loops are excluded; `ROWS 1` and recognized aggregates (`COUNT`, `MIN`, `MAX`,
+`SUM`, `AVG`) without `GROUP BY` are safe. `DISTINCT` alone is not a singleton
+guarantee, and `IS NULL` does not constrain a nullable unique key to one row.
+
+This first version analyzes simple projections and conjunctions of comparisons
+and null tests on base tables. Views, derived tables, selectable procedures,
+unions, `OR`, expression indexes, right/full joins, inner joins following a
+left join, and other unsupported expressions or clauses are skipped. Incomplete
+SQL, unresolved identifiers, or unavailable index metadata also suppress this
+warning. It does not inspect data, diagnose scalar subqueries, or automatically
+add a row limit.
+
 **Signature help.** Typing an argument list for a known procedure shows its
 input parameters and highlights the one under the cursor, both for
 `EXECUTE PROCEDURE MYPROC(…)` and for `SELECT * FROM MYPROC(…)`. Output
