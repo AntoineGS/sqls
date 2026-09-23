@@ -162,11 +162,16 @@ func TestMetadataMergeRejectsInvalidPatches(t *testing.T) {
 
 func TestMetadataMergeRebuildsGroupedCatalogMaps(t *testing.T) {
 	index := &IndexDesc{Name: "IX_T", RelationName: "t"}
+	indexA := &IndexDesc{Name: "A_IX_T", RelationName: "T"}
+	indexZ := &IndexDesc{Name: "Z_IX_T", RelationName: "T"}
+	blankIndex := &IndexDesc{Name: "IX_BLANK", RelationName: "   "}
 	trigger := &TriggerDesc{Name: "TR_T", RelationName: sql.NullString{String: "T", Valid: true}}
+	triggerA := &TriggerDesc{Name: "A_TR_T", RelationName: sql.NullString{String: "T", Valid: true}}
+	triggerZ := &TriggerDesc{Name: "Z_TR_T", RelationName: sql.NullString{String: "T", Valid: true}}
 	fragment := &DBCache{Catalog: &CatalogCache{
-		Indexes:         map[string]*IndexDesc{"IX_T": index},
+		Indexes:         map[string]*IndexDesc{"IX_T": index, "A_IX_T": indexA, "Z_IX_T": indexZ, "IX_BLANK": blankIndex},
 		IndexesByTable:  map[string][]*IndexDesc{"WRONG": {index}},
-		Triggers:        map[string]*TriggerDesc{"TR_T": trigger},
+		Triggers:        map[string]*TriggerDesc{"TR_T": trigger, "A_TR_T": triggerA, "Z_TR_T": triggerZ},
 		TriggersByTable: map[string][]*TriggerDesc{"WRONG": {trigger}},
 	}}
 	withIndexes, err := mergeMetadata(newMetadataCache(), MetadataIndexes, MetadataPatch{Cache: fragment})
@@ -177,17 +182,35 @@ func TestMetadataMergeRebuildsGroupedCatalogMaps(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := withTriggers.IndexesForTable("T"); len(got) != 1 || got[0] != index {
+	if got := withTriggers.IndexesForTable("T"); len(got) != 3 || got[0] != indexA || got[1] != index || got[2] != indexZ {
 		t.Fatalf("rebuilt index group = %#v", got)
 	}
-	if got := withTriggers.TriggersForTable("T"); len(got) != 1 || got[0] != trigger {
+	if got := withTriggers.TriggersForTable("T"); len(got) != 3 || got[0] != triggerA || got[1] != trigger || got[2] != triggerZ {
 		t.Fatalf("rebuilt trigger group = %#v", got)
 	}
-	if len(withTriggers.IndexesForTable("WRONG")) != 0 || len(withTriggers.TriggersForTable("WRONG")) != 0 {
+	if len(withTriggers.IndexesForTable("WRONG")) != 0 || len(withTriggers.TriggersForTable("WRONG")) != 0 || len(withTriggers.IndexesForTable("")) != 0 {
 		t.Fatal("accepted inconsistent source grouping")
 	}
 	if len(fragment.Catalog.IndexesByTable["WRONG"]) != 1 {
 		t.Fatal("mutated source grouping")
+	}
+}
+
+func TestMetadataMergeClonesPublishedCatalogMap(t *testing.T) {
+	fragmentProcedures := map[string]*ProcedureDesc{"P": {Name: "P"}}
+	merged, err := mergeMetadata(newMetadataCache(), MetadataProcedures, MetadataPatch{Cache: &DBCache{
+		Catalog: &CatalogCache{Procedures: fragmentProcedures},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragmentProcedures["P"] = &ProcedureDesc{Name: "MUTATED"}
+	fragmentProcedures["LATE"] = &ProcedureDesc{Name: "LATE"}
+	if procedure, ok := merged.Procedure("P"); !ok || procedure.Name != "P" {
+		t.Fatalf("published procedure changed through fragment map: %#v, %v", procedure, ok)
+	}
+	if _, ok := merged.Procedure("LATE"); ok {
+		t.Fatal("published map observed key added to fragment map")
 	}
 }
 

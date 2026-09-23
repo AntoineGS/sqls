@@ -3,6 +3,7 @@ package database
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -71,20 +72,20 @@ func mergeMetadata(base *DBCache, kind MetadataKind, patch MetadataPatch) (*DBCa
 		fragmentCatalog := fragment.Catalog
 		switch kind {
 		case MetadataViews:
-			catalog.Views = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*ViewDesc { return c.Views })
+			catalog.Views = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*ViewDesc { return c.Views }))
 		case MetadataProcedures:
-			catalog.Procedures = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*ProcedureDesc { return c.Procedures })
+			catalog.Procedures = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*ProcedureDesc { return c.Procedures }))
 		case MetadataGenerators:
-			catalog.Generators = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*GeneratorDesc { return c.Generators })
+			catalog.Generators = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*GeneratorDesc { return c.Generators }))
 		case MetadataDomains:
-			catalog.Domains = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*DomainDesc { return c.Domains })
+			catalog.Domains = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*DomainDesc { return c.Domains }))
 		case MetadataFunctions:
-			catalog.Functions = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*FunctionDesc { return c.Functions })
+			catalog.Functions = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*FunctionDesc { return c.Functions }))
 		case MetadataIndexes:
-			catalog.Indexes = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*IndexDesc { return c.Indexes })
+			catalog.Indexes = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*IndexDesc { return c.Indexes }))
 			catalog.IndexesByTable = indexGroups(catalog.Indexes)
 		case MetadataTriggers:
-			catalog.Triggers = mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*TriggerDesc { return c.Triggers })
+			catalog.Triggers = cloneMap(mapOrEmpty(fragmentCatalog, func(c *CatalogCache) map[string]*TriggerDesc { return c.Triggers }))
 			catalog.TriggersByTable = triggerGroups(catalog.Triggers)
 		}
 		next.Catalog = catalog
@@ -189,11 +190,14 @@ func columnsWithPrimaryKeys(columns map[string][]*ColumnDesc, primaryKeys map[st
 func indexGroups(indexes map[string]*IndexDesc) map[string][]*IndexDesc {
 	groups := make(map[string][]*IndexDesc)
 	for _, index := range indexes {
-		if index == nil || index.RelationName == "" {
+		if index == nil || strings.TrimSpace(index.RelationName) == "" {
 			continue
 		}
 		key := catalogCacheKey(index.RelationName)
 		groups[key] = append(groups[key], index)
+	}
+	for _, group := range groups {
+		sort.Slice(group, func(i, j int) bool { return group[i].Name < group[j].Name })
 	}
 	return groups
 }
@@ -206,6 +210,9 @@ func triggerGroups(triggers map[string]*TriggerDesc) map[string][]*TriggerDesc {
 		}
 		key := catalogCacheKey(trigger.RelationName.String)
 		groups[key] = append(groups[key], trigger)
+	}
+	for _, group := range groups {
+		sort.Slice(group, func(i, j int) bool { return group[i].Name < group[j].Name })
 	}
 	return groups
 }
