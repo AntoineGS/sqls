@@ -161,7 +161,11 @@ and ready state; call metadata.Start with the lifecycle-derived generation
 context, not the switch request's response context. Explicit switches finish
 after attach/metadata scheduling; metadata errors are reported separately. If
 metadata.Start rejects a plan, keep the attachment ready but publish a terminal
-degraded metadata-status error instead of leaving an unstarted snapshot.
+degraded metadata-status error instead of leaving an unstarted snapshot. A
+generation-level `MetadataSnapshot.StartFailed` marker, set via
+`MetadataLoader.MarkStartFailed(generation)`, records that no jobs were started;
+it preserves the cache pointer and category statuses. This is not an attachment
+failure and does not expose the raw internal error.
 
 - [ ] **Step 1: Add a gated opener test proving handshake independence.**
 
@@ -326,6 +330,7 @@ type MetadataStatusResult struct {
     Revision uint64 `json:"revision"`
     ConnectionState string `json:"connectionState"`
     ConnectionErrorCode string `json:"connectionErrorCode,omitempty"`
+    MetadataErrorCode string `json:"metadataErrorCode,omitempty"`
     Settled bool `json:"settled"`
     Degraded bool `json:"degraded"`
     Categories []MetadataCategoryStatus `json:"categories"`
@@ -342,6 +347,9 @@ attachment has Settled=true and Degraded=true even though no metadata jobs were
 started; ConnectionErrorCode is connection_failed.
 After attachment, derive these flags from MetadataSnapshot. Stopped/cancelled
 generations end progress as cancelled rather than degraded success.
+For a ready attachment whose metadata scheduling failed before any job started,
+report Settled/Degraded true and MetadataErrorCode `metadata_load_failed`; do
+not claim any individual category failed or serialize the raw error.
 
 - [ ] **Step 1: Add capability/failure tests over JSON-RPC.** Capture notifications
 with existing test clients. Cases: advertised progress, no capability, create
