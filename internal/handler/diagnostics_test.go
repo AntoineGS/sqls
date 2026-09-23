@@ -288,6 +288,73 @@ func TestPublishInterBaseDiagnosticsAndLifecycle(t *testing.T) {
 	}
 }
 
+func TestInterBaseDiagnosticsAcceptance(t *testing.T) {
+	const uri = "file:///diagnostics-acceptance.sql"
+	initialText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
+	fixedText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN LOCAL_VALUE = LOCAL_VALUE; INSERT INTO DST (VALUE) SELECT CAST(SRC.VALUE AS VARCHAR(20)) FROM SRC; END"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
+		t.Fatal("seed diagnostic cache:", err)
+	}
+	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	tx.open(t, uri, initialText, 1)
+
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1
+	})
+	assertVersion(t, initial, 1)
+	if len(initial.Diagnostics) != 2 {
+		t.Fatalf("initial diagnostics = %+v, want unused hint and truncation warning", initial.Diagnostics)
+	}
+	byCode := make(map[string]lsp.Diagnostic, len(initial.Diagnostics))
+	for _, diagnostic := range initial.Diagnostics {
+		byCode[diagnosticCode(diagnostic)] = diagnostic
+		if diagnosticSource(diagnostic) != "sqls" {
+			t.Errorf("diagnostic source = %q, want sqls", diagnosticSource(diagnostic))
+		}
+	}
+	if unused, ok := byCode["interbase-unused"]; !ok {
+		t.Errorf("initial diagnostics = %+v, missing interbase-unused", initial.Diagnostics)
+	} else if unused.Severity != 4 {
+		t.Errorf("unused severity = %d, want 4", unused.Severity)
+	}
+	if truncation, ok := byCode["interbase-string-truncation"]; !ok {
+		t.Errorf("initial diagnostics = %+v, missing interbase-string-truncation", initial.Diagnostics)
+	} else if truncation.Severity != 2 {
+		t.Errorf("truncation severity = %d, want 2", truncation.Severity)
+	}
+
+	tx.change(t, uri, fixedText, 2)
+	cleared := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 2
+	})
+	assertVersion(t, cleared, 2)
+	if len(cleared.Diagnostics) != 0 {
+		t.Fatalf("fixed diagnostics = %+v, want an empty list", cleared.Diagnostics)
+	}
+	if cleared.Diagnostics == nil {
+		t.Fatal("fixed diagnostics is null, want an empty list")
+	}
+}
+
+func TestInterBaseDiagnosticsAcceptanceWithoutCatalog(t *testing.T) {
+	const uri = "file:///diagnostics-acceptance-no-catalog.sql"
+	text := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+
+	notification := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1
+	})
+	assertVersion(t, notification, 1)
+	if len(notification.Diagnostics) != 1 || diagnosticCode(notification.Diagnostics[0]) != "interbase-unused" {
+		t.Fatalf("missing-catalog diagnostics = %+v, want only interbase-unused", notification.Diagnostics)
+	}
+	if notification.Diagnostics[0].Severity != 4 {
+		t.Errorf("unused severity = %d, want 4", notification.Diagnostics[0].Severity)
+	}
+}
+
 func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 	const uri = "file:///diagnostics-cache.sql"
 	text := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"

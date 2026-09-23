@@ -145,6 +145,44 @@ reproducible DDL. They use the existing source-snapshot storage and cleanup.
 The client needs a rebuilt native `sqls` binary and a restart to advertise the
 new references capability.
 
+##### Static diagnostics
+
+For the active InterBase dialect, sqls publishes diagnostics as you edit
+procedures. An input parameter or `DECLARE VARIABLE` with no proven read
+receives an `Unused` hint; assigning to a local is not itself a read. Output
+parameters are exempt. When an ambiguous occurrence could read a declaration,
+sqls suppresses the hint rather than guessing. For example, `LOCAL_VALUE`
+remains unused here:
+
+```sql
+CREATE PROCEDURE P AS
+  DECLARE VARIABLE LOCAL_VALUE VARCHAR(10);
+BEGIN
+  LOCAL_VALUE = 'x';
+END
+```
+
+sqls also warns when a proven source maximum character width exceeds a known
+destination width. For example, if the catalog says `SRC.VALUE` is
+`VARCHAR(40)` and `DST.VALUE` is `VARCHAR(20)`, this projection gets a
+`Possible string truncation` warning:
+
+```sql
+INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC;
+```
+
+The supported write forms are procedure assignments and positional
+`SELECT ... INTO`, `UPDATE ... SET`, and `INSERT` with an explicit destination
+column list followed by `VALUES` or `SELECT`. Widths are inferred for quoted
+string literals, resolved variables and columns, `CAST` to `CHAR(n)` or
+`VARCHAR(n)`, concatenation, bounded `SUBSTRING`, and `TRIM`. Thus an explicit
+`CAST(SRC.VALUE AS VARCHAR(20))` fits the `VARCHAR(20)` destination above.
+
+Unknown or ambiguous widths are silent: sqls does not guess for unsupported
+expressions or types, incomplete statements, unresolved columns, or missing
+catalog metadata. Unused hints remain available without a catalog. Diagnostics
+use the cached catalog only; editing does not execute or prepare SQL.
+
 **Signature help.** Typing an argument list for a known procedure shows its
 input parameters and highlights the one under the cursor, both for
 `EXECUTE PROCEDURE MYPROC(…)` and for `SELECT * FROM MYPROC(…)`. Output
