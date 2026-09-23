@@ -512,6 +512,92 @@ func TestInterBaseRelationDefinitionAcceptsUnicodeQuotedDialect3Names(t *testing
 	}
 }
 
+func TestInterBaseRelationDefinitionAcceptsSupportedRelationShapes(t *testing.T) {
+	const table, column = "TEMP_DATA", "PAYLOAD"
+	quotedTable, quotedColumn := `"`+table+`"`, `"`+column+`"`
+	shapes := []struct {
+		name   string
+		prefix string
+		suffix string
+	}{
+		{name: "global temporary delete rows", prefix: "CREATE GLOBAL TEMPORARY TABLE "},
+		{name: "global temporary preserve rows", prefix: "CREATE GLOBAL TEMPORARY TABLE ", suffix: " ON COMMIT PRESERVE ROWS"},
+		{name: "external table", prefix: "CREATE TABLE ", suffix: " EXTERNAL FILE 'temp.dat'"},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			body := "-- Informational catalog description; not executable DDL.\n" + shape.prefix + quotedTable + shape.suffix + " (\n  " + quotedColumn + " /* type unknown: catalog type unavailable */\n)"
+			tableStart, columnStart := strings.Index(body, quotedTable), strings.Index(body, quotedColumn)
+			description := database.TableDescription{
+				Body:  body,
+				Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
+				Columns: []database.DescriptionColumn{{Name: column,
+					Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(quotedColumn)}}},
+			}
+			query := "SELECT PAYLOAD FROM TEMP_DATA"
+			for _, selectColumn := range []bool{false, true} {
+				targetName := "table"
+				pos := strings.Index(query, table) + 1
+				if selectColumn {
+					targetName = "column"
+					pos = strings.Index(query, column) + 1
+				}
+				t.Run(targetName, func(t *testing.T) {
+					repo := newStubTableDescriptionRepository(
+						func(context.Context, database.ObjectKind, string) (string, error) {
+							return "", database.ErrUnsupportedDDL
+						},
+						func(context.Context, string) (database.TableDescription, error) { return description, nil },
+					)
+					got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo,
+						tableDescriptionCatalog(table, column), query, lsp.Position{Character: pos},
+						dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+					if err != nil || len(got) != 1 {
+						t.Fatalf("definition = %v, %v; expected %s shape to navigate", got, err, shape.name)
+					}
+					if !strings.Contains(readDefinitionSnapshot(t, got), "type unknown: catalog type unavailable") {
+						t.Fatalf("%s reconstruction lost the local unknown-type note", shape.name)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestInterBaseRelationDefinitionRejectsBlockCommentedDeclarations(t *testing.T) {
+	const table, column = "IMPORT_ORDER_PAYMENT", "AMOUNT"
+	quotedTable, quotedColumn := `"`+table+`"`, `"`+column+`"`
+	body := "-- Informational catalog description; not executable DDL.\n/*\nCREATE TABLE " + quotedTable + " (\n  " + quotedColumn + " INTEGER\n)\n*/"
+	tableStart, columnStart := strings.Index(body, quotedTable), strings.Index(body, quotedColumn)
+	description := database.TableDescription{
+		Body:  body,
+		Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
+		Columns: []database.DescriptionColumn{{Name: column,
+			Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(quotedColumn)}}},
+	}
+	query := "SELECT p.AMOUNT FROM IMPORT_ORDER_PAYMENT p"
+	for _, selectColumn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "table", true: "column"}[selectColumn], func(t *testing.T) {
+			pos := strings.Index(query, table) + 1
+			if selectColumn {
+				pos = strings.Index(query, column) + 1
+			}
+			repo := newStubTableDescriptionRepository(
+				func(context.Context, database.ObjectKind, string) (string, error) {
+					return "", database.ErrUnsupportedDDL
+				},
+				func(context.Context, string) (database.TableDescription, error) { return description, nil },
+			)
+			got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo,
+				tableDescriptionCatalog(table, column), query, lsp.Position{Character: pos},
+				dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+			if err != nil || len(got) != 0 {
+				t.Fatalf("definition = %v, %v; block-commented declaration must be rejected", got, err)
+			}
+		})
+	}
+}
+
 func TestInterBaseRelationDefinitionDoesNotUseCatalogDescriptionForUnsafeFallbacks(t *testing.T) {
 	table := "IMPORT_ORDER_PAYMENT"
 	column := "AMOUNT"

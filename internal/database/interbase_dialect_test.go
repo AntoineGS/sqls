@@ -19,6 +19,7 @@ func TestResolveInterBaseDialect(t *testing.T) {
 		wantReattach bool
 		wantWarnings int
 		wantMentions []string
+		wantAbsent   []string
 	}{
 		{
 			name:         "auto-detect on a dialect 3 database attaches once",
@@ -65,7 +66,8 @@ func TestResolveInterBaseDialect(t *testing.T) {
 			wantResolved: 1,
 			wantReattach: false,
 			wantWarnings: 1,
-			wantMentions: []string{"centrale", "dialect 1", "dialect 3", "dialect: 0"},
+			wantMentions: []string{"centrale", "dialect 1", "dialect 3", "parsing", "query attachment", "catalog DDL reconstruction", "source database dialect 3", "dialect: 0"},
+			wantAbsent:   []string{"lex and render types as dialect 1"},
 		},
 		{
 			name:         "a pinned dialect 3 that disagrees connects and warns",
@@ -75,7 +77,8 @@ func TestResolveInterBaseDialect(t *testing.T) {
 			wantResolved: 3,
 			wantReattach: false,
 			wantWarnings: 1,
-			wantMentions: []string{"legacy", "dialect 3", "dialect 1"},
+			wantMentions: []string{"legacy", "dialect 3", "dialect 1", "parsing", "query attachment", "catalog DDL reconstruction", "source database dialect 1"},
+			wantAbsent:   []string{"lex and render types as dialect 3"},
 		},
 		{
 			name:         "a diagnostics failure with auto-detect falls back to 3 and warns",
@@ -115,6 +118,11 @@ func TestResolveInterBaseDialect(t *testing.T) {
 			for _, mention := range tt.wantMentions {
 				if !strings.Contains(got.Warnings[0], mention) {
 					t.Errorf("warning %q does not mention %q", got.Warnings[0], mention)
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(got.Warnings[0], absent) {
+					t.Errorf("warning %q must not claim %q", got.Warnings[0], absent)
 				}
 			}
 			for _, warning := range got.Warnings {

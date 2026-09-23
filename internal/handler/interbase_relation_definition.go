@@ -247,7 +247,7 @@ func unsupportedTableDescription(ctx context.Context, repo database.DBRepository
 		return "", "", nil, false
 	}
 	tableSpan, ok := catalogDescriptionSpan(description.Body, description.Table, target.name)
-	if !ok || !tableDeclarationSpan(description.Body, tableSpan) {
+	if !ok || !tableDeclarationSpan(description.Body, tableSpan, target.name) {
 		return "", "", nil, false
 	}
 	selected := tableSpan
@@ -259,7 +259,7 @@ func unsupportedTableDescription(ctx context.Context, repo database.DBRepository
 			}
 			matches++
 			selected, ok = catalogDescriptionSpan(description.Body, column.Span, column.Name)
-			if !ok || !columnDeclarationSpan(description.Body, selected) {
+			if !ok || !columnDeclarationSpan(description.Body, selected, target.name, column.Name) {
 				return "", "", nil, false
 			}
 		}
@@ -305,23 +305,16 @@ func isIdentifierByte(value byte) bool {
 	return value == '_' || value == '$' || value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
 }
 
-func tableDeclarationSpan(body string, span sqlsymbol.Span) bool {
-	lineStart := strings.LastIndex(body[:span.Start], "\n") + 1
-	linePrefix := strings.TrimSpace(body[lineStart:span.Start])
-	return linePrefix == "CREATE TABLE"
+func tableDeclarationSpan(body string, span sqlsymbol.Span, table string) bool {
+	declaration, ok := sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: table, Quoted: true})
+	return ok && declaration == span
 }
 
-func columnDeclarationSpan(body string, span sqlsymbol.Span) bool {
-	create := strings.LastIndex(body[:span.Start], "CREATE TABLE ")
-	if create < 0 || !strings.Contains(body[create:span.Start], "(") {
-		return false
-	}
-	lineStart := strings.LastIndex(body[:span.Start], "\n") + 1
-	linePrefix := strings.TrimSpace(body[lineStart:span.Start])
-	if strings.HasPrefix(linePrefix, "--") || strings.HasPrefix(linePrefix, "/*") {
-		return false
-	}
-	return linePrefix == "" || strings.HasSuffix(linePrefix, ",")
+func columnDeclarationSpan(body string, span sqlsymbol.Span, table, column string) bool {
+	declaration, ok := sqlsymbol.ColumnDeclaration(body,
+		sqlsymbol.Name{Text: table, Quoted: true},
+		sqlsymbol.Name{Text: column, Quoted: true})
+	return ok && declaration == span
 }
 
 // interBaseContextualDefinition preserves the existing view snapshot behavior
