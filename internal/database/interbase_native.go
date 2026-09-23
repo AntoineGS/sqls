@@ -127,6 +127,7 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 }
 
 var _ ExplainRepository = (*InterBaseDBRepository)(nil)
+var _ InputDescriber = (*InterBaseDBRepository)(nil)
 
 // ExplainPlan returns the server's query plan without executing the
 // statement's result set. It acquires its own *sql.Conn because the plan is
@@ -150,4 +151,38 @@ func (db *InterBaseDBRepository) ExplainPlan(ctx context.Context, query string) 
 		return "", fmt.Errorf("interbase: explain plan: %w", err)
 	}
 	return plan, nil
+}
+
+// DescribeInputs returns the server's metadata for a prepared statement's
+// positional input parameters using one pooled connection.
+func (db *InterBaseDBRepository) DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error) {
+	if db == nil || db.Conn == nil {
+		return nil, errors.New("interbase: database connection is nil")
+	}
+	conn, err := db.Conn.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	driverInputs, err := interbase.DescribeInputs(ctx, conn, query)
+	if err != nil {
+		return nil, err
+	}
+
+	inputs := make([]InputDescriptor, len(driverInputs))
+	for i, input := range driverInputs {
+		inputs[i] = inputDescriptorFromDriver(input)
+	}
+	return inputs, nil
+}
+
+func inputDescriptorFromDriver(input interbase.InputDescriptor) InputDescriptor {
+	return InputDescriptor{
+		Kind:      input.Kind,
+		Subtype:   input.Subtype,
+		Scale:     input.Scale,
+		Precision: input.Precision,
+		Nullable:  input.Nullable,
+	}
 }

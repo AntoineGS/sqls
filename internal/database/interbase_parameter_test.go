@@ -193,6 +193,9 @@ func TestMockDBRepositoryHasNoParameterizedCapabilities(t *testing.T) {
 	if _, ok := repository.(ParameterizedReadOnlyQuerier); ok {
 		t.Error("MockDBRepository implements ParameterizedReadOnlyQuerier, want the plain mock left untouched")
 	}
+	if _, ok := repository.(InputDescriber); ok {
+		t.Error("MockDBRepository implements InputDescriber, want the plain mock left untouched")
+	}
 }
 
 // namedValuesToDriverValues strips positional ordinals so tests can compare

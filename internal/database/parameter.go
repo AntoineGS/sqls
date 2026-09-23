@@ -21,3 +21,17 @@ type ParameterizedRepository interface {
 type ParameterizedReadOnlyQuerier interface {
 	QueryReadOnlyParams(ctx context.Context, query string, args []any) (*QueryResult, error)
 }
+
+// InputDescriptor describes one positional input parameter accepted by a
+// prepared statement.
+type InputDescriptor struct {
+	Kind                      string
+	Subtype, Scale, Precision int
+	Nullable                  bool
+}
+
+// InputDescriber is an optional repository capability for describing the
+// positional input parameters accepted by a query.
+type InputDescriber interface {
+	DescribeInputs(ctx context.Context, query string) ([]InputDescriptor, error)
+}
