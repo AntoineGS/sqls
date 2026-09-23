@@ -275,23 +275,7 @@ func interBaseBulkQuery(ctx context.Context, queryer schema.Queryer, what, query
 }
 
 func interBaseBulkRelations(ctx context.Context, queryer schema.Queryer) ([]interBaseBulkRelation, error) {
-	relations := make([]interBaseBulkRelation, 0)
-	err := interBaseBulkQuery(ctx, queryer, "relations", interBaseBulkRelationsQuery, func(rows *sql.Rows) error {
-		var name sql.NullString
-		if err := rows.Scan(&name); err != nil {
-			return err
-		}
-		relationName, err := interBaseRequiredName(name, "relation name")
-		if err != nil {
-			return err
-		}
-		relations = append(relations, interBaseBulkRelation{name: relationName})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return relations, nil
+	return interBaseBulkRelationsForQuery(ctx, queryer, interBaseBulkRelationsQuery)
 }
 
 // interBaseBulkLoadColumns fills in each relation's columns from one read of
@@ -303,16 +287,7 @@ func interBaseBulkLoadColumns(ctx context.Context, queryer schema.Queryer, relat
 	for index, relation := range relations {
 		positions[relation.name] = index
 	}
-
-	return interBaseBulkQuery(ctx, queryer, "columns", interBaseBulkColumnsQuery, func(rows *sql.Rows) error {
-		var raw interBaseBulkColumnRow
-		if err := rows.Scan(raw.destinations()...); err != nil {
-			return err
-		}
-		relationName, column, err := raw.column()
-		if err != nil {
-			return err
-		}
+	return interBaseBulkScanColumns(ctx, queryer, interBaseBulkIdentifierCastWidth, func(relationName string, column schema.Column) error {
 		index, ok := positions[relationName]
 		if !ok {
 			// The relation list was read first. A column naming a relation it
@@ -325,11 +300,40 @@ func interBaseBulkLoadColumns(ctx context.Context, queryer schema.Queryer, relat
 	})
 }
 
+// interBaseBulkScanColumns reads the common column projection and delegates
+// each fully validated row to consume. Independent metadata jobs and the
+// legacy whole-catalog snapshot share this scan so descriptor inputs cannot
+// drift.
+func interBaseBulkScanColumns(ctx context.Context, queryer schema.Queryer, width int, consume func(string, schema.Column) error) error {
+	return interBaseBulkQuery(ctx, queryer, "columns", interBaseBulkColumnsQueryForWidth(width), func(rows *sql.Rows) error {
+		var raw interBaseBulkColumnRow
+		if err := rows.Scan(raw.destinations()...); err != nil {
+			return err
+		}
+		relationName, column, err := raw.column()
+		if err != nil {
+			return err
+		}
+		return consume(relationName, column)
+	})
+}
+
 // interBaseBulkPrimaryKeys indexes every primary-key field of every user
 // relation. The map is the one columnDescription consults for the key flag.
 func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[string]struct{}, error) {
 	primaryKeys := make(map[string]struct{})
-	err := interBaseBulkQuery(ctx, queryer, "primary key fields", interBaseBulkPrimaryKeyFieldsQuery, func(rows *sql.Rows) error {
+	err := interBaseBulkScanPrimaryKeyFields(ctx, queryer, interBaseBulkIdentifierCastWidth, func(relation, field string) error {
+		primaryKeys[interBaseRelationColumnKey(relation, field)] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return primaryKeys, nil
+}
+
+func interBaseBulkScanPrimaryKeyFields(ctx context.Context, queryer schema.Queryer, width int, consume func(string, string) error) error {
+	return interBaseBulkQuery(ctx, queryer, "primary key fields", interBaseBulkPrimaryKeyFieldsQueryForWidth(width), func(rows *sql.Rows) error {
 		var relationName, fieldName sql.NullString
 		if err := rows.Scan(&relationName, &fieldName); err != nil {
 			return err
@@ -342,13 +346,8 @@ func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[
 		if err != nil {
 			return err
 		}
-		primaryKeys[interBaseRelationColumnKey(relation, field)] = struct{}{}
-		return nil
+		return consume(relation, field)
 	})
-	if err != nil {
-		return nil, err
-	}
-	return primaryKeys, nil
 }
 
 // interBaseBulkForeignKeys groups foreign-key field rows into one mapping per
@@ -360,6 +359,10 @@ func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[
 // is dropped whole: half a foreign key would complete a join with a column
 // that does not participate in it.
 func interBaseBulkForeignKeys(ctx context.Context, queryer schema.Queryer) ([]interBaseForeignKeyMapping, error) {
+	return interBaseBulkForeignKeysWithQuery(ctx, queryer, interBaseBulkForeignKeyFieldsQuery)
+}
+
+func interBaseBulkForeignKeysWithQuery(ctx context.Context, queryer schema.Queryer, query string) ([]interBaseForeignKeyMapping, error) {
 	type constraintIdentity struct {
 		relationName   string
 		constraintName string
@@ -369,7 +372,7 @@ func interBaseBulkForeignKeys(ctx context.Context, queryer schema.Queryer) ([]in
 	mappings := make(map[constraintIdentity]*interBaseForeignKeyMapping)
 	incomplete := make(map[constraintIdentity]struct{})
 
-	err := interBaseBulkQuery(ctx, queryer, "foreign key fields", interBaseBulkForeignKeyFieldsQuery, func(rows *sql.Rows) error {
+	err := interBaseBulkQuery(ctx, queryer, "foreign key fields", query, func(rows *sql.Rows) error {
 		var constraintName, relationName, fieldName, referencedRelation, referencedField sql.NullString
 		if err := rows.Scan(&constraintName, &relationName, &fieldName, &referencedRelation, &referencedField); err != nil {
 			return err
