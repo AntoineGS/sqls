@@ -481,6 +481,10 @@ func (db *InterBaseDBRepository) DescribeProcedures(ctx context.Context) ([]*Pro
 	if err != nil {
 		return nil, err
 	}
+	return db.procedureDescriptions(procedures), nil
+}
+
+func (db *InterBaseDBRepository) procedureDescriptions(procedures []schema.Procedure) []*ProcedureDesc {
 	result := make([]*ProcedureDesc, 0, len(procedures))
 	for _, procedure := range procedures {
 		result = append(result, &ProcedureDesc{
@@ -493,7 +497,7 @@ func (db *InterBaseDBRepository) DescribeProcedures(ctx context.Context) ([]*Pro
 			OutputParameters: db.parameterDescriptions(procedure.OutputParameters, ParameterOutput),
 		})
 	}
-	return result, nil
+	return result
 }
 
 // parameterDescriptions maps one direction's parameters, already ordered by
