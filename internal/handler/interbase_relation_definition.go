@@ -2,6 +2,9 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
@@ -195,12 +198,26 @@ func (s *Server) interBaseRelationDefinitionWithAnalysis(ctx context.Context, re
 	ddlCtx, cancel := context.WithTimeout(ctx, definitionDDLTimeout)
 	defer cancel()
 	ddl, ddlErr := ddlRepo.ObjectDDL(ddlCtx, target.kind, target.name)
-	body, note, ok := snapshotBodyFor(ddl, ddlErr, target)
-	if !ok {
-		return nil, nil
+	var body, note string
+	var descriptionSpan *sqlsymbol.Span
+	if target.kind == database.ObjectKindTable && errors.Is(ddlErr, database.ErrUnsupportedDDL) {
+		var ok bool
+		body, note, descriptionSpan, ok = unsupportedTableDescription(ddlCtx, repo, target, ddlErr)
+		if !ok {
+			return nil, nil
+		}
+	} else {
+		var ok bool
+		body, note, ok = snapshotBodyFor(ddl, ddlErr, target)
+		if !ok {
+			return nil, nil
+		}
 	}
 	var span sqlsymbol.Span
-	if target.column != nil {
+	if descriptionSpan != nil {
+		span = *descriptionSpan
+		ok = true
+	} else if target.column != nil {
 		span, ok = sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: target.name, Quoted: true}, *target.column)
 	} else {
 		span, ok = sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: target.name, Quoted: true})
@@ -219,6 +236,66 @@ func (s *Server) interBaseRelationDefinitionWithAnalysis(ctx context.Context, re
 		return nil, nil
 	}
 	return []lsp.Location{{URI: snapshotURI(path), Range: rangeValue}}, nil
+}
+
+func unsupportedTableDescription(ctx context.Context, repo database.DBRepository, target snapshotTarget, ddlErr error) (body, note string, span *sqlsymbol.Span, ok bool) {
+	source, ok := repo.(database.TableDescriptionRepository)
+	if !ok {
+		return "", "", nil, false
+	}
+	description, err := source.TableDescription(ctx, target.name)
+	if err != nil || description.Body == "" || len(description.Columns) == 0 || !commentOnlyDescription(description.Body) {
+		return "", "", nil, false
+	}
+	tableSpan, ok := catalogDescriptionSpan(description.Body, description.Table, target.name)
+	if !ok {
+		return "", "", nil, false
+	}
+	selected := tableSpan
+	if target.column != nil {
+		matches := 0
+		for _, column := range description.Columns {
+			if !target.column.MatchesCatalogName(column.Name) {
+				continue
+			}
+			matches++
+			selected, ok = catalogDescriptionSpan(description.Body, column.Span, column.Name)
+			if !ok {
+				return "", "", nil, false
+			}
+		}
+		if matches != 1 {
+			return "", "", nil, false
+		}
+	}
+	return description.Body, snapshotUnsupportedTableDDLNote(ddlErr, target.name), &selected, true
+}
+
+func catalogDescriptionSpan(body string, span database.DescriptionSpan, name string) (sqlsymbol.Span, bool) {
+	if span.Start < 0 || span.End < span.Start || span.End > len(body) {
+		return sqlsymbol.Span{}, false
+	}
+	want := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	if body[span.Start:span.End] != want {
+		return sqlsymbol.Span{}, false
+	}
+	return sqlsymbol.Span{Start: span.Start, End: span.End}, true
+}
+
+func commentOnlyDescription(body string) bool {
+	for _, line := range strings.Split(body, "\n") {
+		if !strings.HasPrefix(line, "--") {
+			return false
+		}
+	}
+	return body != ""
+}
+
+func snapshotUnsupportedTableDDLNote(err error, table string) string {
+	if object, name, feature, ok := database.UnsupportedDDLDetail(err); ok && object != "" && name != "" && feature != "" {
+		return fmt.Sprintf("Strict executable DDL could not be reproduced: %s %q: %s.\nThe following comment-only catalog description is informational and not executable SQL.", object, name, feature)
+	}
+	return fmt.Sprintf("Strict executable DDL could not be reproduced for table %q.\nThe following comment-only catalog description is informational and not executable SQL.", table)
 }
 
 // interBaseContextualDefinition preserves the existing view snapshot behavior

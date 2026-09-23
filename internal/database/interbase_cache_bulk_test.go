@@ -43,6 +43,7 @@ func openInterBaseScalableFixture(t *testing.T, relationCount int) *sql.DB {
 			t.Fatalf("insert catalog fixture row: %v: %s", err, statement)
 		}
 	}
+	addInterBaseCatalogIdentifierMetadata(t, db)
 
 	insert(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_TYPE","RDB$FIELD_LENGTH","RDB$FIELD_SCALE","RDB$FIELD_SUB_TYPE") VALUES (?,?,?,?,?)`,
 		"D_KEY", 8, 4, 0, 0)

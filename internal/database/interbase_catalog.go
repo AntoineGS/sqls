@@ -67,6 +67,11 @@ func interBaseColumnType(domain *schema.Domain) string {
 		return ""
 	}
 	fieldType := domain.FieldType.Int64
+	if fieldType == 27 && domain.FieldScale.Valid && domain.FieldScale.Int64 < 0 {
+		if label, normalized := domain.CatalogTypeLabel(); normalized {
+			return label
+		}
+	}
 	switch fieldType {
 	case 7:
 		return interBaseNumericType("SMALLINT", 4, domain)

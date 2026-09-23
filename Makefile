@@ -16,6 +16,10 @@ all: clean build
 build:
 	go build -ldflags=$(BUILD_LDFLAGS) -o $(BIN) .
 
+.PHONY: build-interbase
+build-interbase:
+	GOOS=linux GOARCH=amd64 CGO_ENABLED=1 go build -tags interbase -ldflags=$(BUILD_LDFLAGS) -o $(BIN) .
+
 .PHONY: release
 release: $(GOBIN)/gobump
 	go build -ldflags=$(BUILD_LDFLAGS) -o $(BIN) .
