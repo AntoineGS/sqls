@@ -73,7 +73,7 @@ func (f *catalogSnapshotPrivacyForwarder) CatalogSnapshot(ctx context.Context) (
 	}
 	f.observations[f.phase] = observation
 	if f.logf != nil {
-		f.logf("snapshot phase=%s outcome=%s elapsed=%s err_type=%s is_deadline_exceeded=%t is_canceled=%t ctx_err=%s",
+		f.logf("phase=%s snapshot=%s elapsed=%s err_type=%s is_deadline_exceeded=%t is_canceled=%t ctx_err=%s",
 			f.phase, observation.outcome, observation.elapsed, observation.errType,
 			observation.deadlineExceeded, observation.canceled, observation.contextErr)
 	}
@@ -347,7 +347,7 @@ func TestCatalogSnapshotPrivacyForwarderPreservesSnapshotAndCatalogCapabilities(
 	if got := forwarder.record("full-catalog"); got.outcome != "used" || got.errType != "<nil>" {
 		t.Fatalf("snapshot observation = %+v, want used/nil", got)
 	}
-	if !strings.Contains(logged.String(), "outcome=used") {
+	if !strings.Contains(logged.String(), "snapshot=used") {
 		t.Fatalf("safe snapshot status missing from log: %q", logged.String())
 	}
 }
