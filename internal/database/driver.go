@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 
@@ -57,22 +58,23 @@ func (db *DBConnection) Close() error {
 	if db == nil {
 		return nil
 	}
+	var closeErrors []error
 	if db.Conn != nil {
 		if err := db.Conn.Close(); err != nil {
-			return err
+			closeErrors = append(closeErrors, err)
 		}
 	}
 	if db.SSHConn != nil {
 		if err := db.SSHConn.Close(); err != nil {
-			return err
+			closeErrors = append(closeErrors, err)
 		}
 	}
 	if db.Tunnel != nil {
 		if err := db.Tunnel.Close(); err != nil {
-			return err
+			closeErrors = append(closeErrors, err)
 		}
 	}
-	return nil
+	return errors.Join(closeErrors...)
 }
 
 func RegisterOpen(name dialect.DatabaseDriver, opener Opener) {
