@@ -80,7 +80,7 @@ func (l *MetadataLoader) Reset(generation uint64) {
 				status[kind] = value
 			}
 		}
-		l.snapshot = &MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Cache: l.snapshot.Cache, Status: status}
+		l.snapshot = &MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: status}
 		l.closeDoneLocked()
 	}
 	l.generation, l.started = generation, false
@@ -139,7 +139,7 @@ func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRe
 	for _, job := range plan.Jobs {
 		status[job.Kind] = MetadataStatus{State: MetadataPending, QueuedAt: now}
 	}
-	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Cache: l.snapshot.Cache, Status: status})
+	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: true, Cache: l.snapshot.Cache, Status: status})
 	done := l.done
 	callback := l.callback
 	if l.active == 0 {
@@ -267,13 +267,13 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 				continue
 			}
 			if ctx.Err() != nil {
-				<-l.semaphore
+				l.releaseMetadataSlot()
 				l.settleCancelled(generation)
 				return
 			}
 			cache, admitted := l.admitJob(generation, ctx, job.Kind)
 			if !admitted {
-				<-l.semaphore
+				l.releaseMetadataSlot()
 				l.settleCancelled(generation)
 				return
 			}
@@ -282,9 +282,8 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 			launched = true
 			go func(job MetadataJob, cache *DBCache) {
 				defer func() {
-					<-l.semaphore
+					l.releaseMetadataSlot()
 					l.runnerFinished()
-					l.signalSlotAvailable()
 				}()
 				if ctx.Err() != nil {
 					return
@@ -367,7 +366,7 @@ func (l *MetadataLoader) admitJob(generation uint64, ctx context.Context, kind M
 	}
 	status.State, status.StartedAt = MetadataLoading, time.Now()
 	statuses[kind] = status
-	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Cache: current.Cache, Status: statuses})
+	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
 	if l.active == 0 {
 		l.drained = make(chan struct{})
 	}
@@ -391,6 +390,13 @@ func (l *MetadataLoader) signalSlotAvailable() {
 	l.slotWake = make(chan struct{})
 	close(previous)
 	l.mu.Unlock()
+}
+
+// releaseMetadataSlot releases one loader-wide runner permit and wakes every
+// generation that may be waiting to acquire it.
+func (l *MetadataLoader) releaseMetadataSlot() {
+	<-l.semaphore
+	l.signalSlotAvailable()
 }
 
 func dependenciesReady(job MetadataJob, states map[MetadataKind]MetadataState) bool {
@@ -433,7 +439,7 @@ func (l *MetadataLoader) setStatus(generation uint64, kind MetadataKind, status 
 	if cache == nil {
 		cache = current.Cache
 	}
-	next := &MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Cache: cache, Status: statuses}
+	next := &MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: cache, Status: statuses}
 	statuses[kind] = status
 	l.publishLocked(next)
 	callback := l.callback
@@ -461,7 +467,7 @@ func (l *MetadataLoader) settleCancelled(generation uint64) {
 		}
 	}
 	if changed {
-		l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Cache: l.snapshot.Cache, Status: statuses})
+		l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
 	}
 	l.closeDoneLocked()
 	callback := l.callback
@@ -534,7 +540,7 @@ func (l *MetadataLoader) Stop() {
 			}
 		}
 		if changed {
-			l.publishLocked(&MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Cache: l.snapshot.Cache, Status: statuses})
+			l.publishLocked(&MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
 		}
 	}
 	l.closeDoneLocked()

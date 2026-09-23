@@ -37,6 +37,20 @@ func mergeMetadata(base *DBCache, kind MetadataKind, patch MetadataPatch) (*DBCa
 	if !knownMetadataKind(kind) {
 		return nil, fmt.Errorf("unknown metadata kind %q", kind)
 	}
+	if err := validateMetadataPayload(kind, patch.Cache); err != nil {
+		return nil, err
+	}
+	if kind == MetadataForeignKeys {
+		for table, references := range patch.Cache.ForeignKeys {
+			for referencedTable, keys := range references {
+				for index, key := range keys {
+					if err := validateForeignKey(key); err != nil {
+						return nil, fmt.Errorf("metadata foreign key %s -> %s at index %d: %w", table, referencedTable, index, err)
+					}
+				}
+			}
+		}
+	}
 
 	next := *base
 	next.Metadata = cloneMap(base.Metadata)
@@ -91,6 +105,40 @@ func mergeMetadata(base *DBCache, kind MetadataKind, patch MetadataPatch) (*DBCa
 		next.Catalog = catalog
 	}
 	return &next, nil
+}
+
+func validateMetadataPayload(kind MetadataKind, fragment *DBCache) error {
+	var present bool
+	switch kind {
+	case MetadataSchemas:
+		present = fragment.Schemas != nil
+	case MetadataRelations:
+		present = fragment.SchemaTables != nil
+	case MetadataColumnsCurrent, MetadataColumnsAll:
+		present = fragment.ColumnsWithParent != nil
+	case MetadataPrimaryKeys:
+		present = fragment.PrimaryKeyColumns != nil
+	case MetadataForeignKeys:
+		present = fragment.ForeignKeys != nil
+	case MetadataViews:
+		present = fragment.Catalog != nil && fragment.Catalog.Views != nil
+	case MetadataProcedures:
+		present = fragment.Catalog != nil && fragment.Catalog.Procedures != nil
+	case MetadataGenerators:
+		present = fragment.Catalog != nil && fragment.Catalog.Generators != nil
+	case MetadataDomains:
+		present = fragment.Catalog != nil && fragment.Catalog.Domains != nil
+	case MetadataFunctions:
+		present = fragment.Catalog != nil && fragment.Catalog.Functions != nil
+	case MetadataIndexes:
+		present = fragment.Catalog != nil && fragment.Catalog.Indexes != nil
+	case MetadataTriggers:
+		present = fragment.Catalog != nil && fragment.Catalog.Triggers != nil
+	}
+	if !present {
+		return fmt.Errorf("metadata %s payload is missing its category data", kind)
+	}
+	return nil
 }
 
 func mapOrEmpty[V any](catalog *CatalogCache, get func(*CatalogCache) map[string]V) map[string]V {

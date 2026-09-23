@@ -160,6 +160,74 @@ func TestMetadataMergeRejectsInvalidPatches(t *testing.T) {
 	}
 }
 
+func TestMetadataMergeRejectsMissingCategoryPayload(t *testing.T) {
+	tests := []struct {
+		kind  MetadataKind
+		cache *DBCache
+	}{
+		{MetadataSchemas, &DBCache{}},
+		{MetadataRelations, &DBCache{}},
+		{MetadataColumnsCurrent, &DBCache{}},
+		{MetadataColumnsAll, &DBCache{}},
+		{MetadataPrimaryKeys, &DBCache{}},
+		{MetadataForeignKeys, &DBCache{}},
+		{MetadataViews, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataProcedures, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataGenerators, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataDomains, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataFunctions, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataIndexes, &DBCache{Catalog: &CatalogCache{}}},
+		{MetadataTriggers, &DBCache{Catalog: &CatalogCache{}}},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			merged, err := mergeMetadata(newMetadataCache(), tc.kind, MetadataPatch{Cache: tc.cache})
+			if err == nil {
+				t.Fatalf("mergeMetadata() = (%#v, nil), want missing payload error", merged)
+			}
+		})
+	}
+}
+
+func TestMetadataMergeAcceptsAllocatedEmptyCategoryPayload(t *testing.T) {
+	patches := map[MetadataKind]*DBCache{
+		MetadataSchemas:        {Schemas: map[string]string{}},
+		MetadataRelations:      {SchemaTables: map[string][]string{}},
+		MetadataColumnsCurrent: {ColumnsWithParent: map[string][]*ColumnDesc{}},
+		MetadataColumnsAll:     {ColumnsWithParent: map[string][]*ColumnDesc{}},
+		MetadataPrimaryKeys:    {PrimaryKeyColumns: map[string]map[string]struct{}{}},
+		MetadataForeignKeys:    {ForeignKeys: map[string]map[string][]*ForeignKey{}},
+		MetadataViews:          {Catalog: &CatalogCache{Views: map[string]*ViewDesc{}}},
+		MetadataProcedures:     {Catalog: &CatalogCache{Procedures: map[string]*ProcedureDesc{}}},
+		MetadataGenerators:     {Catalog: &CatalogCache{Generators: map[string]*GeneratorDesc{}}},
+		MetadataDomains:        {Catalog: &CatalogCache{Domains: map[string]*DomainDesc{}}},
+		MetadataFunctions:      {Catalog: &CatalogCache{Functions: map[string]*FunctionDesc{}}},
+		MetadataIndexes:        {Catalog: &CatalogCache{Indexes: map[string]*IndexDesc{}}},
+		MetadataTriggers:       {Catalog: &CatalogCache{Triggers: map[string]*TriggerDesc{}}},
+	}
+	for kind, cache := range patches {
+		t.Run(string(kind), func(t *testing.T) {
+			merged, err := mergeMetadata(newMetadataCache(), kind, MetadataPatch{Cache: cache})
+			if err != nil {
+				t.Fatalf("mergeMetadata() error = %v", err)
+			}
+			if !merged.MetadataReady(kind) {
+				t.Fatal("allocated empty payload should be ready")
+			}
+		})
+	}
+}
+
+func TestMetadataMergeRejectsMalformedForeignKeyLaterPair(t *testing.T) {
+	key := &ForeignKey{{&ColumnBase{Table: "child"}, &ColumnBase{Table: "parent"}}, {&ColumnBase{Table: "child"}, nil}}
+	_, err := mergeMetadata(newMetadataCache(), MetadataForeignKeys, MetadataPatch{Cache: &DBCache{
+		ForeignKeys: map[string]map[string][]*ForeignKey{"child": {"parent": {key}}},
+	}})
+	if err == nil {
+		t.Fatal("mergeMetadata() accepted malformed later foreign-key pair")
+	}
+}
+
 func TestMetadataMergeRebuildsGroupedCatalogMaps(t *testing.T) {
 	index := &IndexDesc{Name: "IX_T", RelationName: "t"}
 	indexA := &IndexDesc{Name: "A_IX_T", RelationName: "T"}

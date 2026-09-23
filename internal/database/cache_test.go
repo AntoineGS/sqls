@@ -136,6 +136,19 @@ func TestCacheBuildWithoutSnapshotCapabilityUsesTheRepositoryDirectly(t *testing
 	}
 }
 
+func TestCacheBuildPrimaryMarksSuccessfulCategoriesReady(t *testing.T) {
+	repository := NewMockDBRepository(nil)
+	cache, err := NewDBCacheUpdater(repository).GenerateDBCachePrimary(context.Background())
+	if err != nil {
+		t.Fatalf("GenerateDBCachePrimary() error = %v", err)
+	}
+	for _, kind := range []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataForeignKeys} {
+		if !cache.MetadataReady(kind) {
+			t.Errorf("successful primary generation did not mark %s ready", kind)
+		}
+	}
+}
+
 func catalogTestRepository() *MockCapabilityRepository {
 	repository := NewMockCapabilityRepository()
 	repository.MockDescribeViews = func(context.Context) ([]*ViewDesc, error) {

@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"errors"
 	"testing"
 )
@@ -53,7 +54,7 @@ func TestMetadataReadinessAndSnapshotSettlement(t *testing.T) {
 		{MetadataCancelled, true, false},
 		{MetadataUnsupported, true, false},
 	} {
-		snapshot := &MetadataSnapshot{Status: map[MetadataKind]MetadataStatus{MetadataViews: {State: tc.state}}}
+		snapshot := &MetadataSnapshot{Started: true, Status: map[MetadataKind]MetadataStatus{MetadataViews: {State: tc.state}}}
 		if got := snapshot.Settled(); got != tc.settled {
 			t.Errorf("Settled() for %q = %v, want %v", tc.state, got, tc.settled)
 		}
@@ -61,11 +62,34 @@ func TestMetadataReadinessAndSnapshotSettlement(t *testing.T) {
 			t.Errorf("Degraded() for %q = %v, want %v", tc.state, got, tc.degraded)
 		}
 	}
-	failed := &MetadataSnapshot{Status: map[MetadataKind]MetadataStatus{
+	failed := &MetadataSnapshot{Started: true, Status: map[MetadataKind]MetadataStatus{
 		MetadataViews:   {State: MetadataFailed, Err: errors.New("internal")},
 		MetadataIndexes: {State: MetadataCancelled},
 	}}
 	if !failed.Degraded() || !failed.Settled() {
 		t.Fatal("failed/terminal mixture should be settled and degraded")
+	}
+}
+
+func TestMetadataLoaderResetIsNotSettledBeforeStart(t *testing.T) {
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+
+	before := loader.Snapshot()
+	if before.Settled() {
+		t.Fatal("reset generation settled before Start")
+	}
+	cache := before.Cache
+	load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 1}))
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if loader.Snapshot().Cache != cache {
+		t.Fatal("starting a zero-job plan replaced the published cache pointer")
+	}
+	waitLoad(t, load)
+	if !loader.Snapshot().Settled() {
+		t.Fatal("valid zero-job plan should settle")
 	}
 }

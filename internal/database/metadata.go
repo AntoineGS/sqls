@@ -53,6 +53,7 @@ type MetadataStatus struct {
 type MetadataSnapshot struct {
 	Generation uint64
 	Revision   uint64
+	Started    bool
 	Cache      *DBCache
 	Status     map[MetadataKind]MetadataStatus
 }
@@ -83,9 +84,9 @@ type MetadataPlanRepository interface {
 	MetadataPlan() MetadataPlan
 }
 
-// Settled reports whether every category in a non-empty snapshot is terminal.
+// Settled reports whether a started snapshot has terminal status for every category.
 func (s *MetadataSnapshot) Settled() bool {
-	if s == nil || len(s.Status) == 0 {
+	if s == nil || !s.Started || len(s.Status) == 0 {
 		return false
 	}
 	for _, status := range s.Status {

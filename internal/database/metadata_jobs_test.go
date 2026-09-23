@@ -228,3 +228,27 @@ func TestMetadataGenericForeignKeyGroupingRejectsMalformedPairs(t *testing.T) {
 		})
 	}
 }
+
+func TestMetadataGenericForeignKeyGroupingValidatesEveryPair(t *testing.T) {
+	left := &ColumnBase{Table: "child"}
+	right := &ColumnBase{Table: "parent"}
+	malformedLaterPair := &ForeignKey{{left, right}, {left, nil}}
+	if _, err := groupForeignKeys([]*ForeignKey{malformedLaterPair}); err == nil {
+		t.Fatal("groupForeignKeys() error = nil for nil endpoint in a later pair")
+	}
+
+	repository := catalogTestRepository()
+	repository.MockDescribeForeignKeysBySchema = func(context.Context, string) ([]*ForeignKey, error) {
+		return []*ForeignKey{malformedLaterPair}, nil
+	}
+	var foreignKeys MetadataJob
+	for _, job := range metadataPlanFor(repository).Jobs {
+		if job.Kind == MetadataForeignKeys {
+			foreignKeys = job
+			break
+		}
+	}
+	if _, err := foreignKeys.Run(context.Background(), &DBCache{}); err == nil {
+		t.Fatal("foreign-key job accepted malformed later pair")
+	}
+}

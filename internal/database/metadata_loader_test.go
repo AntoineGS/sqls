@@ -462,3 +462,38 @@ func TestMetadataLoaderAdmissionRejectsResetGeneration(t *testing.T) {
 	}
 	loader.Stop()
 }
+
+func TestMetadataLoaderRejectedOldGenerationSlotWakesWaitingGeneration(t *testing.T) {
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	for i := 0; i < cap(loader.semaphore); i++ {
+		loader.semaphore <- struct{}{}
+	}
+	loader.Reset(2)
+
+	// Model the new generation parked on the loader's current wake epoch while
+	// all three permits remain held by superseded-generation runners.
+	wake := loader.slotWakeChannel()
+	waiting := make(chan struct{})
+	go func() {
+		close(waiting)
+		<-wake
+	}()
+	<-waiting
+
+	// A stale admission releases a permit after Reset. That release must wake
+	// the parked generation as well as make the permit available.
+	loader.releaseMetadataSlot()
+	select {
+	case <-wake:
+	case <-time.After(2 * time.Second):
+		t.Fatal("releasing rejected old-generation slot did not wake waiting generation")
+	}
+	select {
+	case loader.semaphore <- struct{}{}:
+		<-loader.semaphore
+	default:
+		t.Fatal("rejected admission did not release its global slot")
+	}
+}

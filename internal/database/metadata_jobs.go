@@ -260,8 +260,8 @@ func cloneIndexDesc(index *IndexDesc) *IndexDesc {
 func groupForeignKeys(keys []*ForeignKey) (map[string]map[string][]*ForeignKey, error) {
 	grouped := make(map[string]map[string][]*ForeignKey)
 	for i, key := range keys {
-		if key == nil || len(*key) == 0 || (*key)[0][0] == nil || (*key)[0][1] == nil {
-			return nil, fmt.Errorf("malformed foreign key at index %d: missing table pair", i)
+		if err := validateForeignKey(key); err != nil {
+			return nil, fmt.Errorf("malformed foreign key at index %d: %w", i, err)
 		}
 		pair := (*key)[0]
 		left, right := pair[0].Table, pair[1].Table
@@ -275,4 +275,16 @@ func groupForeignKeys(keys []*ForeignKey) (map[string]map[string][]*ForeignKey, 
 		grouped[right][left] = append(grouped[right][left], key)
 	}
 	return grouped, nil
+}
+
+func validateForeignKey(key *ForeignKey) error {
+	if key == nil || len(*key) == 0 {
+		return fmt.Errorf("missing table pair")
+	}
+	for pairIndex, pair := range *key {
+		if len(pair) != 2 || pair[0] == nil || pair[1] == nil {
+			return fmt.Errorf("pair %d is missing a table endpoint", pairIndex)
+		}
+	}
+	return nil
 }
