@@ -43,10 +43,13 @@ Both following runs used the post-range command below, owner-confirmed WIN1252, 
 |---|---:|---:|---:|---:|---:|---|
 | Pre-wrapper post-range run 1 | 16.5 ms | 4.941 s | 5.339 s | 4m40.614 s | 4m50.935 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 3m9.065s remaining |
 | Pre-wrapper post-range run 2 | 17.2 ms | 5.530 s | 5.947 s | 4m56.392 s | 5m7.915 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 2m52.085s remaining |
+| Primary independent pre-wrapper run | 17.8 ms | 5.706 s | 5.644 s | 4m53.353 s | 5m4.760 s | All assertions passed; no context error; 2m55.240s remaining |
 
-Both runs passed all catalog, source UTF-8/`CRÉATION`, real key, full-document warning, complete UTF-16 range, and corrected-predicate/unrelated-diagnostic assertions. 1,775 procedures were observed in each run. Each run remained well within its eight-minute app context. These passes predate the snapshot forwarder below and do not validate its behavior or prove that snapshots were used. The dominant measured duration is the full catalog phase. A post-wrapper live rerun is pending orchestrator authorization; do not claim the current wrapper has live-verified fallback/snapshot behavior.
+All three pre-wrapper runs passed the catalog, source UTF-8/`CRÉATION`, real key, full-document warning, complete UTF-16 range, and corrected-predicate/unrelated-diagnostic assertions. 1,775 procedures were observed in each. These passes predate the snapshot forwarder below and do not validate its behavior or prove that snapshots were used. The dominant measured duration is the full catalog phase.
 
-Post-range command (executed twice sequentially; environment values intentionally omitted):
+The primary's independent **post-wrapper** read-only run also passed, using the command below against revision `a8c4a1362709f607264905980829aec87feb83c8`. The primary, secondary, and full-catalog snapshots each reported `snapshot=used`, with no fallback or context error. Open took 18.2 ms, primary 5.022 s (snapshot 4.990 s), secondary 4.972 s (snapshot 4.952 s), full catalog 5m0.759s (snapshot 4.963 s), and total 5m10.802s, leaving 2m49.198s on the application deadline. All 1,775 procedures, source UTF-8/`CRÉATION`, real unique key, full-document diagnostic at line 273 with complete UTF-16 range, and corrected-predicate assertions passed. This proves the optimized snapshot path was used in this run; the fake tests separately exercise fallback sanitization, but real fallback was not induced.
+
+Post-range command (two sequential worker runs and independent primary runs, all non-concurrent; environment values intentionally omitted):
 
 ```sh
 SQLS_LEGACY_CATALOG_CONFIG="$CONFIG_PATH" \
@@ -74,7 +77,7 @@ go test ./internal/handler -count=1
 CGO_ENABLED=1 go test -tags interbase ./internal/handler -count=1
 ```
 
-**PASS**: success preserves catalog/snapshot capability, exact snapshot repository and closer; error fallback returns a fixed non-wrapping sentinel without the fake secret marker while recording safe type/deadline metadata and preserving the closer; nil-repository/nil-error fallback is recorded as fallback. Tagged and untagged handler suites pass. No real run was launched after adding this wrapper, by instruction.
+**PASS**: success preserves catalog/snapshot capability, exact snapshot repository and closer; error fallback returns a fixed non-wrapping sentinel without the fake secret marker while recording safe type/deadline metadata and preserving the closer; nil-repository/nil-error fallback is recorded as fallback. Tagged and untagged handler suites pass. The post-wrapper real run above passed with snapshots used in all phases.
 
 ## Test suites and native build
 
@@ -83,11 +86,11 @@ CGO_ENABLED=1 go test -tags interbase ./internal/handler -count=1
 | `go test ./... -count=1` | PASS |
 | `CGO_ENABLED=1 go test -tags interbase ./... -count=1` | PASS |
 | `make build-interbase` | PASS |
-| `go version -m ./sqls` | Go `go1.27.1`; includes `-tags=interbase`, `CGO_ENABLED=1`, linux/amd64, and `vcs.revision=a15aba999212968222640d144c693f82c3b602a0` |
+| `go version -m ./sqls` | Go `go1.27.1`; includes `-tags=interbase`, `CGO_ENABLED=1`, linux/amd64, and `vcs.revision=a8c4a1362709f607264905980829aec87feb83c8` at the final code revision before this results-note update |
 | `ldd ./sqls` | PASS; links `/opt/interbase/lib/libgds.so` |
 | `git diff --check` | PASS |
 
-The executable was removed after checking build metadata and linkage; it is not an acceptance artifact or commit candidate.
+The executable is an ignored worktree build artifact, not a deployment artifact or commit candidate; no executable was copied into the editor path.
 
 ## Editor publication
 
