@@ -31,6 +31,27 @@ func TestInterBaseMetadataProceduresMatchLegacyAndUseConstantQueries(t *testing.
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("procedure descriptors differ\n got: %#v\nwant: %#v", got, want)
 			}
+			wantType := "TIMESTAMP"
+			if dialect == 1 {
+				wantType = "DATE"
+			}
+			var dateParameter *ProcedureParameterDesc
+			for _, procedure := range got {
+				if procedure.Name != "EDGE_PROC" {
+					continue
+				}
+				for _, parameter := range procedure.InputParameters {
+					if parameter.Name == "DATE_VALUE" {
+						dateParameter = parameter
+					}
+				}
+			}
+			if dateParameter == nil {
+				t.Fatal("EDGE_PROC DATE_VALUE parameter is missing")
+			}
+			if dateParameter.Type != wantType {
+				t.Fatalf("DATE_VALUE type = %q for Dialect %d, want %q", dateParameter.Type, dialect, wantType)
+			}
 			if patch.Count != len(want) {
 				t.Fatalf("Count = %d, want %d", patch.Count, len(want))
 			}
@@ -125,6 +146,9 @@ func insertProcedureParityFixtures(t *testing.T, db *sql.DB) {
 	if _, err := db.Exec(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_LENGTH","RDB$FIELD_SCALE","RDB$FIELD_TYPE","RDB$FIELD_SUB_TYPE","RDB$SYSTEM_FLAG","RDB$NULL_FLAG") VALUES (?,?,?,?,?,?,?)`, "EXPLICIT_NULLABLE", 4, 0, 8, 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := db.Exec(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_TYPE","RDB$SYSTEM_FLAG") VALUES (?,?,?)`, "PROC_DATE", 35, 0); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"NO_PARAMS", "EDGE_PROC"} {
 		if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURES" VALUES (?,?,?,?,?,?,?,?,?)`, name, 60000, 3, 1, "  description verbatim  ", "BEGIN\n  SELECT 'source';\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
 			t.Fatal(err)
@@ -142,4 +166,5 @@ func insertProcedureParityFixtures(t *testing.T, db *sql.DB) {
 	insert("INLINE", 2, 0, "RDB$1")
 	insert("NULLABLE", 1, 0, "EXPLICIT_NULLABLE")
 	insert("USER_DOMAIN", 0, 0, "EMAIL_ADDRESS")
+	insert("DATE_VALUE", 4, 0, "PROC_DATE")
 }
