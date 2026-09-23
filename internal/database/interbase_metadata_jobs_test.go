@@ -316,6 +316,193 @@ func TestInterBaseMetadataJobsLeaveInteractiveConnectionCapacity(t *testing.T) {
 	}
 }
 
+func TestInterBaseMetadataActualPlanLeavesInteractiveSelectCapacity(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 3)
+	fault := &interBaseFixtureFault{
+		match: "SELECT MAX(f.RDB$FIELD_LENGTH)", stage: "gate", gate: release, entered: entered,
+	}
+	db := openInterBaseScalableFixtureWithFault(t, 1, fault)
+	db.SetMaxOpenConns(5)
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			close(release)
+			t.Fatalf("actual metadata plan did not gate three query jobs: %v", ctx.Err())
+		}
+	}
+	var value int
+	if err := db.QueryRowContext(ctx, "SELECT 1").Scan(&value); err != nil || value != 1 {
+		close(release)
+		t.Fatalf("interactive SELECT 1 with three actual jobs gated: value=%d err=%v", value, err)
+	}
+	close(release)
+	select {
+	case <-load.Done:
+	case <-ctx.Done():
+		t.Fatalf("actual plan did not drain after releasing gates: %v; statuses=%+v", ctx.Err(), loader.Snapshot().Status)
+	}
+}
+
+func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
+	// Schemas is deliberately a local synthetic constant in MetadataPlan and
+	// has no query to fault-inject. Every DB-backed planned category is matched
+	// against its reader's real SQL in the fixture driver's Prepare/Query path.
+	cases := []struct {
+		kind  MetadataKind
+		match string
+	}{
+		{MetadataRelations, "FROM RDB$RELATIONS r\nWHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\nORDER BY"},
+		{MetadataColumnsCurrent, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\nORDER BY rf.RDB$RELATION_NAME"},
+		{MetadataPrimaryKeys, "pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'"},
+		{MetadataForeignKeys, "fk.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'"},
+		{MetadataViews, "r.RDB$VIEW_BLR IS NOT NULL"},
+		{MetadataIndexes, "FROM RDB$INDICES i\nLEFT JOIN RDB$RELATION_CONSTRAINTS"},
+		{MetadataProcedures, "FROM RDB$PROCEDURES p"},
+		{MetadataFunctions, "FROM RDB$FUNCTIONS f"},
+		{MetadataGenerators, "RDB$GENERATORS"},
+		{MetadataDomains, "FROM RDB$FIELDS f\n"},
+		{MetadataTriggers, "RDB$TRIGGERS"},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.kind), func(t *testing.T) {
+			failure := errors.New("injected actual-plan reader query failure")
+			db := openInterBaseScalableFixtureWithFault(t, 1, &interBaseFixtureFault{match: tc.match, stage: "query", err: failure})
+			loader := NewMetadataLoader()
+			t.Cleanup(loader.Stop)
+			loader.Reset(1)
+			load, err := loader.Start(context.Background(), 1, &InterBaseDBRepository{Conn: db})
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitLoad(t, load)
+			snapshot := loader.Snapshot()
+			if got := snapshot.Status[tc.kind].State; got != MetadataFailed {
+				t.Fatalf("%s state = %s; match %q failed to reach real reader SQL", tc.kind, got, tc.match)
+			}
+			if snapshot.Cache.MetadataReady(tc.kind) {
+				t.Fatalf("failed %s category was published ready", tc.kind)
+			}
+			if count := interBaseMetadataFragmentCount(snapshot.Cache, tc.kind); count != 0 {
+				t.Fatalf("failed %s category published %d fragment entries", tc.kind, count)
+			}
+			for _, job := range (&InterBaseDBRepository{}).MetadataPlan().Jobs {
+				if job.Kind != tc.kind && snapshot.Status[job.Kind].State != MetadataReady {
+					t.Errorf("independent sibling %s state = %s, want ready", job.Kind, snapshot.Status[job.Kind].State)
+				}
+			}
+		})
+	}
+}
+
+func interBaseMetadataFragmentCount(cache *DBCache, kind MetadataKind) int {
+	if cache == nil {
+		return 0
+	}
+	switch kind {
+	case MetadataSchemas:
+		return len(cache.Schemas)
+	case MetadataRelations:
+		count := 0
+		for _, tables := range cache.SchemaTables {
+			count += len(tables)
+		}
+		return count
+	case MetadataColumnsCurrent:
+		count := 0
+		for _, columns := range cache.ColumnsWithParent {
+			count += len(columns)
+		}
+		return count
+	case MetadataPrimaryKeys:
+		return len(cache.PrimaryKeyColumns)
+	case MetadataForeignKeys:
+		count := 0
+		for _, byReferencedTable := range cache.ForeignKeys {
+			for _, keys := range byReferencedTable {
+				count += len(keys)
+			}
+		}
+		return count
+	case MetadataViews:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Views)
+		}
+	case MetadataIndexes:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Indexes)
+		}
+	case MetadataProcedures:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Procedures)
+		}
+	case MetadataFunctions:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Functions)
+		}
+	case MetadataGenerators:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Generators)
+		}
+	case MetadataDomains:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Domains)
+		}
+	case MetadataTriggers:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.Triggers)
+		}
+	}
+	return 0
+}
+
+func TestInterBaseMetadataActualPlanDataRowsFaultStagesDiscardCategory(t *testing.T) {
+	for _, tc := range []struct {
+		kind  MetadataKind
+		match string
+		view  bool
+	}{
+		{MetadataRelations, "FROM RDB$RELATIONS r\nWHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\nORDER BY", false},
+		{MetadataViews, "r.RDB$VIEW_BLR IS NOT NULL", true},
+	} {
+		for _, stage := range []string{"scan", "iterate", "close"} {
+			t.Run(string(tc.kind)+"/"+stage, func(t *testing.T) {
+				failure := errors.New("injected actual reader rows " + stage + " failure")
+				fault := &interBaseFixtureFault{match: tc.match, stage: stage, err: failure}
+				db := openInterBaseScalableFixtureWithFault(t, 1, fault)
+				if tc.view {
+					insertMetadataViewFixtures(t, db, 1)
+				}
+				loader := NewMetadataLoader()
+				t.Cleanup(loader.Stop)
+				loader.Reset(1)
+				load, err := loader.Start(context.Background(), 1, &InterBaseDBRepository{Conn: db})
+				if err != nil {
+					t.Fatal(err)
+				}
+				waitLoad(t, load)
+				snapshot := loader.Snapshot()
+				if got := snapshot.Status[tc.kind].State; got != MetadataFailed {
+					t.Fatalf("actual %s reader %s injection status = %s, want failed", tc.kind, stage, got)
+				}
+				if snapshot.Status[MetadataProcedures].State != MetadataReady {
+					t.Fatal("data-row error suppressed independent procedure reader")
+				}
+			})
+		}
+	}
+}
+
 func TestInterBaseMetadataJobPanicDoesNotSuppressIndependentSibling(t *testing.T) {
 	loader := NewMetadataLoader()
 	t.Cleanup(loader.Stop)

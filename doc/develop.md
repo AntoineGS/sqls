@@ -265,16 +265,17 @@ InterBase's `MetadataPlan` executes independent category jobs with a plan
 parallelism of three; each catalog job owns one read-only snapshot transaction
 and therefore at most one connection. Identifier-width discovery is part of
 that job's budget, not hidden setup. The fixture-backed set-based readers have
-these measured statement budgets (including discovery): views, indexes,
+these measured fixture-reader statement budgets (including discovery): views, indexes,
 procedures, and functions each use **3 statements** (two data reads plus one
 identifier-width read), independent of whether the fixture has 1 or 100 parent
-objects. The relation/core-reader suite separately asserts width discovery plus
-one bulk data read for its corresponding reader. Legacy accessors used by
-generators, domains, and triggers perform their own catalog projection
-discovery; their native server round-trip counts are not currently measured.
-These are statements prepared/executed by the catalog path, not a claim about
-wire-level packets. `TestInterBaseMetadataLive` is opt-in and read-only; a skip
-for absent credentials is explicitly not native equivalence verification.
+objects. No Plan-level statement-count budgets are published for simple
+categories or repository-accessor jobs: end-to-end category query accounting
+waits for Plan 4 instrumentation. The fixture's reader tests can assert local
+statement behavior, but do not establish a complete live per-category budget.
+These counts are statements prepared/executed by the fixture catalog path, not
+a claim about wire-level packets. `TestInterBaseMetadataLive` is opt-in and
+read-only; missing per-dialect configuration is explicitly not native
+equivalence verification.
 
 **The hover DDL round trip is the one place this plan puts inline I/O on the
 request-handling loop.** `interbase_hover.go` calls `ObjectDDL` synchronously

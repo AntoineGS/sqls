@@ -4,23 +4,33 @@ package database
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
 	"time"
+
+	sqldialect "github.com/sqls-server/sqls/dialect"
 )
 
 // This is intentionally opt-in and read-only. Run once against maintenance-
 // stable Dialect 1 and Dialect 3 databases; concurrent DDL can invalidate parity.
 func TestInterBaseMetadataLive(t *testing.T) {
+	databases := map[int]string{}
 	for _, dialect := range []int{1, 3} {
 		t.Run("dialect-"+string(rune('0'+dialect)), func(t *testing.T) {
-			connection, err := Open(interBaseLiveConfig(t, dialect))
+			config := interBaseMetadataDialectConfig(t, dialect)
+			databases[dialect] = config.DataSourceName
+			connection, err := Open(config)
 			if err != nil {
 				t.Fatalf("open InterBase: %v", err)
 			}
 			t.Cleanup(func() { _ = connection.Close() })
 			repo := NewInterBaseDBRepositoryFromConnection(connection).(*InterBaseDBRepository)
+			if repo.SQLDialect != dialect || repo.SourceSQLDialect != dialect {
+				t.Fatalf("resolved/server dialects = %d/%d; requested separate dialect-%d database", repo.SQLDialect, repo.SourceSQLDialect, dialect)
+			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
 			before := connection.Conn.Stats()
@@ -39,6 +49,17 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			snapshot := loader.Snapshot()
 			if snapshot.Degraded() {
 				t.Fatalf("metadata plan degraded: %+v", snapshot.Status)
+			}
+			for kind, status := range snapshot.Status {
+				if kind == MetadataColumnsAll { // InterBase intentionally does not offer this category.
+					continue
+				}
+				if status.State != MetadataReady {
+					t.Fatalf("category %s state=%s, wanted complete ready snapshot", kind, status.State)
+				}
+				if count := interBaseMetadataFragmentCount(snapshot.Cache, kind); count != status.Count {
+					t.Errorf("category %s map entries=%d, status count=%d", kind, count, status.Count)
+				}
 			}
 
 			// Compare complete descriptors, not only names or category totals.
@@ -94,6 +115,97 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			if !reflect.DeepEqual(gotFunctions, wantFunctions) {
 				t.Errorf("function descriptors differ: got %d, legacy %d", len(gotFunctions), len(wantFunctions))
 			}
+			wantGenerators, err := repo.DescribeGenerators(ctx)
+			if err != nil {
+				t.Fatalf("legacy generators: %v", err)
+			}
+			gotGenerators := make([]*GeneratorDesc, 0, len(snapshot.Cache.Catalog.Generators))
+			for _, item := range snapshot.Cache.Catalog.Generators {
+				gotGenerators = append(gotGenerators, item)
+			}
+			sort.Slice(wantGenerators, func(i, j int) bool { return wantGenerators[i].Name < wantGenerators[j].Name })
+			sort.Slice(gotGenerators, func(i, j int) bool { return gotGenerators[i].Name < gotGenerators[j].Name })
+			if !reflect.DeepEqual(gotGenerators, wantGenerators) {
+				t.Errorf("generator descriptors differ: got %d, legacy %d", len(gotGenerators), len(wantGenerators))
+			}
+			wantDomains, err := repo.DescribeDomains(ctx)
+			if err != nil {
+				t.Fatalf("legacy domains: %v", err)
+			}
+			gotDomains := make([]*DomainDesc, 0, len(snapshot.Cache.Catalog.Domains))
+			for _, item := range snapshot.Cache.Catalog.Domains {
+				gotDomains = append(gotDomains, item)
+			}
+			sort.Slice(wantDomains, func(i, j int) bool { return wantDomains[i].Name < wantDomains[j].Name })
+			sort.Slice(gotDomains, func(i, j int) bool { return gotDomains[i].Name < gotDomains[j].Name })
+			if !reflect.DeepEqual(gotDomains, wantDomains) {
+				t.Errorf("domain descriptors differ: got %d, legacy %d", len(gotDomains), len(wantDomains))
+			}
+			wantTriggers, err := repo.DescribeTriggers(ctx)
+			if err != nil {
+				t.Fatalf("legacy triggers: %v", err)
+			}
+			gotTriggers := make([]*TriggerDesc, 0, len(snapshot.Cache.Catalog.Triggers))
+			for _, item := range snapshot.Cache.Catalog.Triggers {
+				gotTriggers = append(gotTriggers, item)
+			}
+			sort.Slice(wantTriggers, func(i, j int) bool { return wantTriggers[i].Name < wantTriggers[j].Name })
+			sort.Slice(gotTriggers, func(i, j int) bool { return gotTriggers[i].Name < gotTriggers[j].Name })
+			if !reflect.DeepEqual(gotTriggers, wantTriggers) {
+				t.Errorf("trigger descriptors differ: got %d, legacy %d", len(gotTriggers), len(wantTriggers))
+			}
+
+			wantRelations, err := repo.SchemaTables(ctx)
+			if err != nil {
+				t.Fatalf("legacy relations: %v", err)
+			}
+			if !reflect.DeepEqual(snapshot.Cache.SchemaTables, wantRelations) {
+				t.Errorf("relation maps differ: loader=%d legacy=%d", len(snapshot.Cache.SchemaTables[""]), len(wantRelations[""]))
+			}
+			wantColumns, err := repo.DescribeDatabaseTable(ctx)
+			if err != nil {
+				t.Fatalf("legacy columns: %v", err)
+			}
+			gotColumns := make([]*ColumnDesc, 0)
+			for _, columns := range snapshot.Cache.ColumnsWithParent {
+				gotColumns = append(gotColumns, columns...)
+			}
+			sort.Slice(wantColumns, func(i, j int) bool {
+				if wantColumns[i].Table != wantColumns[j].Table {
+					return wantColumns[i].Table < wantColumns[j].Table
+				}
+				return wantColumns[i].Name < wantColumns[j].Name
+			})
+			sort.Slice(gotColumns, func(i, j int) bool {
+				if gotColumns[i].Table != gotColumns[j].Table {
+					return gotColumns[i].Table < gotColumns[j].Table
+				}
+				return gotColumns[i].Name < gotColumns[j].Name
+			})
+			if !reflect.DeepEqual(gotColumns, wantColumns) {
+				t.Errorf("column descriptors differ: got %d, legacy %d", len(gotColumns), len(wantColumns))
+			}
+			wantForeignKeys, err := repo.DescribeForeignKeysBySchema(ctx, "")
+			if err != nil {
+				t.Fatalf("legacy foreign keys: %v", err)
+			}
+			gotForeignKeys := make([]*ForeignKey, 0)
+			for _, byReferencedTable := range snapshot.Cache.ForeignKeys {
+				for _, keys := range byReferencedTable {
+					gotForeignKeys = append(gotForeignKeys, keys...)
+				}
+			}
+			foreignKeyName := func(fk *ForeignKey) string {
+				if fk == nil || len(*fk) == 0 || (*fk)[0][0] == nil {
+					return ""
+				}
+				return (*fk)[0][0].Table + "." + (*fk)[0][0].Name
+			}
+			sort.Slice(gotForeignKeys, func(i, j int) bool { return foreignKeyName(gotForeignKeys[i]) < foreignKeyName(gotForeignKeys[j]) })
+			sort.Slice(wantForeignKeys, func(i, j int) bool { return foreignKeyName(wantForeignKeys[i]) < foreignKeyName(wantForeignKeys[j]) })
+			if !reflect.DeepEqual(gotForeignKeys, wantForeignKeys) {
+				t.Errorf("foreign-key descriptors differ: got %d, legacy %d", len(gotForeignKeys), len(wantForeignKeys))
+			}
 
 			after := connection.Conn.Stats()
 			t.Logf("dialect=%d categories=%d db.Stats WaitCount delta=%d WaitDuration delta=%s; per-job query counts are not instrumented by database/sql", dialect, len(snapshot.Status), after.WaitCount-before.WaitCount, after.WaitDuration-before.WaitDuration)
@@ -102,4 +214,19 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			}
 		})
 	}
+	if databases[1] != "" && databases[3] != "" && databases[1] == databases[3] {
+		t.Fatal("Dialect 1 and Dialect 3 must use separately identified database configurations")
+	}
+}
+
+func interBaseMetadataDialectConfig(t *testing.T, dialect int) *DBConfig {
+	t.Helper()
+	prefix := fmt.Sprintf("INTERBASE_DIALECT%d_", dialect)
+	database, databaseSet := os.LookupEnv(prefix + "DATABASE")
+	user, userSet := os.LookupEnv(prefix + "USER")
+	password, passwordSet := os.LookupEnv(prefix + "PASSWORD")
+	if !databaseSet || database == "" || !userSet || user == "" || !passwordSet {
+		t.Skipf("set %sDATABASE, %sUSER, and %sPASSWORD for a separate read-only Dialect %d database", prefix, prefix, prefix, dialect)
+	}
+	return &DBConfig{Alias: fmt.Sprintf("live-dialect-%d", dialect), Driver: sqldialect.DatabaseDriverInterBase, DataSourceName: database, User: user, Passwd: password, Dialect: dialect}
 }
