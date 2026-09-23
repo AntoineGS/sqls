@@ -67,6 +67,18 @@ const (
 // Analyze discovers InterBase procedure declarations and binds source
 // occurrences to those declarations.
 func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
+	return analyze(text, dv, false)
+}
+
+// AnalyzeDiagnostics uses the same binder as navigation but tolerates a
+// malformed procedure declaration when a later safe procedure boundary lets
+// independent findings remain useful. Navigation continues to use Analyze's
+// strict parse-error behavior.
+func AnalyzeDiagnostics(text string, dv dialect.DriverVariant) (*Analysis, error) {
+	return analyze(text, dv, true)
+}
+
+func analyze(text string, dv dialect.DriverVariant, tolerant bool) (*Analysis, error) {
 	analysis := &Analysis{Text: text, Variant: dv}
 	if dv.Driver != dialect.DatabaseDriverInterBase {
 		return analysis, nil
@@ -83,7 +95,17 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 	bodyStarted := false
 	for i := 0; i < len(items); i++ {
 		if header, ok, err := procedureHeaderAt(text, items, i); err != nil {
-			return nil, err
+			if !tolerant {
+				return nil, err
+			}
+			if current >= 0 {
+				suppressProcedureDiagnostics(analysis, current)
+				closeProcedure(analysis, current, items[i].Span.Start)
+				current = -1
+			}
+			frames = nil
+			bodyStarted = false
+			continue
 		} else if ok {
 			if current >= 0 {
 				closeProcedure(analysis, current, items[i].Span.Start)
@@ -103,20 +125,39 @@ func Analyze(text string, dv dialect.DriverVariant) (*Analysis, error) {
 			if isWord(item, "DECLARE") && i+2 < len(items) && isWord(items[i+1], "VARIABLE") {
 				name, ok := nameFromLexeme(text, items[i+2])
 				if !ok {
-					return nil, fmt.Errorf("local variable declaration has an invalid name")
+					if !tolerant {
+						return nil, fmt.Errorf("local variable declaration has an invalid name")
+					}
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					continue
 				}
 				if i+3 >= len(items) || !declarationTypeStart(items[i+3]) {
-					return nil, fmt.Errorf("local variable %s is missing a type", name.Key())
+					if !tolerant {
+						return nil, fmt.Errorf("local variable %s is missing a type", name.Key())
+					}
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					continue
 				}
 				declarationEnd := i + 3
 				for declarationEnd < len(items) && items[declarationEnd].Token.Kind != token.Semicolon {
 					if isWord(items[declarationEnd], "BEGIN") {
-						return nil, fmt.Errorf("local variable %s declaration is missing a terminator", name.Key())
+						if !tolerant {
+							return nil, fmt.Errorf("local variable %s declaration is missing a terminator", name.Key())
+						}
+						declarationEnd = len(items)
+						break
 					}
 					declarationEnd++
 				}
-				if declarationEnd == len(items) {
-					return nil, fmt.Errorf("local variable %s declaration is incomplete", name.Key())
+				if declarationEnd == len(items) || isWord(items[declarationEnd], "BEGIN") {
+					if !tolerant {
+						if declarationEnd == len(items) {
+							return nil, fmt.Errorf("local variable %s declaration is incomplete", name.Key())
+						}
+						return nil, fmt.Errorf("local variable %s declaration is missing a terminator", name.Key())
+					}
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					continue
 				}
 				addSymbol(analysis, current, &Symbol{
 					Name:        name,
@@ -164,6 +205,56 @@ func declarationTypeStart(item lexeme) bool {
 		!isWord(item, "AS") && !isWord(item, "DECLARE") &&
 		!isWord(item, "VARIABLE") && !isWord(item, "CREATE") &&
 		!isWord(item, "ALTER")
+}
+
+// recoverLocalDeclaration skips a malformed declaration to the next safe
+// declaration terminator or procedure body. If only another procedure or EOF
+// remains, the current procedure's diagnostics are suppressed because its
+// reads cannot be bound reliably.
+func recoverLocalDeclaration(analysis *Analysis, current *int, frames *[]bodyFrame, bodyStarted *bool, items []lexeme, start int) int {
+	for i := start + 1; i < len(items); i++ {
+		switch {
+		case items[i].Token.Kind == token.Semicolon:
+			return i
+		case isWord(items[i], "BEGIN"):
+			return i - 1
+		case isProcedureHeaderStart(items, i):
+			suppressProcedureDiagnostics(analysis, *current)
+			closeProcedure(analysis, *current, items[i].Span.Start)
+			*current = -1
+			*frames = nil
+			*bodyStarted = false
+			return i - 1
+		}
+	}
+	suppressProcedureDiagnostics(analysis, *current)
+	closeProcedure(analysis, *current, len(analysis.Text))
+	*current = -1
+	*frames = nil
+	*bodyStarted = false
+	return len(items) - 1
+}
+
+func isProcedureHeaderStart(items []lexeme, start int) bool {
+	if start < 0 || start >= len(items) || (!isWord(items[start], "CREATE") && !isWord(items[start], "ALTER")) {
+		return false
+	}
+	next := start + 1
+	if isWord(items[start], "CREATE") && next+1 < len(items) && isWord(items[next], "OR") && isWord(items[next+1], "ALTER") {
+		next += 2
+	}
+	return next < len(items) && isWord(items[next], "PROCEDURE")
+}
+
+func suppressProcedureDiagnostics(analysis *Analysis, index int) {
+	if analysis == nil || index < 0 || index >= len(analysis.procedures) {
+		return
+	}
+	for _, symbols := range analysis.procedures[index].Symbols {
+		for _, symbol := range symbols {
+			symbol.RenameBlocked = firstReason(symbol.RenameBlocked, "malformed procedure declaration")
+		}
+	}
 }
 
 func significantLexemes(items []lexeme) []lexeme {

@@ -70,6 +70,73 @@ func TestWorkerReCacheIsRaceFreeUnderConcurrentUpdates(t *testing.T) {
 	}
 }
 
+func TestWorkerDiscardsSecondaryColumnsFromPreviousRepository(t *testing.T) {
+	oldSecondaryStarted := make(chan struct{}, 1)
+	newSecondaryStarted := make(chan struct{}, 1)
+	oldSecondaryRelease := make(chan struct{}, 1)
+	newSecondaryRelease := make(chan struct{}, 1)
+	oldColumns := []*ColumnDesc{{ColumnBase: ColumnBase{Table: "T", Name: "OLD"}, Type: "VARCHAR(40)"}}
+	newColumns := []*ColumnDesc{{ColumnBase: ColumnBase{Table: "T", Name: "NEW"}, Type: "VARCHAR(20)"}}
+
+	oldRepo := newWorkerTestRepo(func(context.Context) ([]*ColumnDesc, error) {
+		oldSecondaryStarted <- struct{}{}
+		<-oldSecondaryRelease
+		return oldColumns, nil
+	})
+	oldRepo.MockDescribeDatabaseTableBySchema = func(context.Context, string) ([]*ColumnDesc, error) {
+		return oldColumns, nil
+	}
+	newRepo := newWorkerTestRepo(func(context.Context) ([]*ColumnDesc, error) {
+		newSecondaryStarted <- struct{}{}
+		<-newSecondaryRelease
+		return newColumns, nil
+	})
+	newRepo.MockDescribeDatabaseTableBySchema = func(context.Context, string) ([]*ColumnDesc, error) {
+		return newColumns, nil
+	}
+
+	w := NewWorker()
+	w.Start()
+	t.Cleanup(func() {
+		select {
+		case oldSecondaryRelease <- struct{}{}:
+		default:
+		}
+		select {
+		case newSecondaryRelease <- struct{}{}:
+		default:
+		}
+		w.Stop()
+	})
+
+	if err := w.ReCache(context.Background(), oldRepo); err != nil {
+		t.Fatal("first ReCache:", err)
+	}
+	select {
+	case <-oldSecondaryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old repository secondary pass did not start")
+	}
+
+	if err := w.ReCache(context.Background(), newRepo); err != nil {
+		t.Fatal("second ReCache:", err)
+	}
+	oldSecondaryRelease <- struct{}{}
+	select {
+	case <-newSecondaryStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("new repository secondary pass did not start")
+	}
+
+	cache := w.Cache()
+	if _, ok := cache.Column("T", "NEW"); !ok {
+		t.Fatal("new primary columns were replaced by the previous repository's secondary result")
+	}
+	if _, ok := cache.Column("T", "OLD"); ok {
+		t.Fatal("previous repository column leaked into the new connection cache")
+	}
+}
+
 func TestWorkerStopIsIdempotent(t *testing.T) {
 	w := NewWorker()
 	w.Start()

@@ -268,7 +268,7 @@ func (a *Analysis) insertSelectFindings(items []lexeme, selectIndex, end int, co
 	if from+1 >= end || (!isNameToken(items[from+1]) && items[from+1].Token.Kind != token.LParen) {
 		return nil, false
 	}
-	if !completeSelectTail(a.Text, items[from+1:end]) {
+	if !completeSelectTail(a.Text, items[from+1:end]) || !completeFromRelations(items[from+1:end]) {
 		return nil, false
 	}
 	projections, ok := splitTopLevel(items[selectIndex+1:from], token.Comma)
@@ -316,7 +316,7 @@ func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catal
 	if from+1 >= end || (!isNameToken(items[from+1]) && items[from+1].Token.Kind != token.LParen) {
 		return nil, false
 	}
-	if !completeSelectTail(a.Text, items[from+1:end]) {
+	if !completeSelectTail(a.Text, items[from+1:end]) || !completeFromRelations(items[from+1:end]) {
 		return nil, false
 	}
 	projections, ok := splitTopLevel(items[selectIndex+1:into], token.Comma)
@@ -540,6 +540,59 @@ func completeSelectTail(text string, items []lexeme) bool {
 		}
 	}
 	return true
+}
+
+func completeFromRelations(items []lexeme) bool {
+	relationEnd := len(items)
+	for _, clause := range []string{"WHERE", "GROUP", "HAVING", "ORDER", "ROWS", "PLAN", "UNION", "RETURNING", "RETURNING_VALUES"} {
+		if index := topLevelWordIndex(items, clause); index >= 0 && index < relationEnd {
+			relationEnd = index
+		}
+	}
+	items = items[:relationEnd]
+	if len(items) == 0 || (!isNameToken(items[0]) && items[0].Token.Kind != token.LParen) {
+		return false
+	}
+
+	depth := 0
+	hasJoinPredicate := false
+	for i, item := range items {
+		switch item.Token.Kind {
+		case token.LParen:
+			depth++
+		case token.RParen:
+			depth--
+		}
+		if depth != 0 {
+			continue
+		}
+		if item.Token.Kind == token.Comma {
+			if i == 0 || i+1 >= len(items) || !relationEndToken(items[i-1]) || !relationStartToken(items[i+1]) {
+				return false
+			}
+		}
+		if isWord(item, "JOIN") && (i == 0 || i+1 >= len(items) || !relationStartToken(items[i+1])) {
+			return false
+		}
+		if isWord(item, "ON") {
+			hasJoinPredicate = true
+		}
+	}
+	last := items[len(items)-1]
+	if last.Token.Kind == token.Comma || last.Token.Kind == token.Period ||
+		isWord(last, "JOIN") || isWord(last, "ON") || isWord(last, "AS") ||
+		(!hasJoinPredicate && !relationEndToken(last)) {
+		return false
+	}
+	return depth == 0
+}
+
+func relationStartToken(item lexeme) bool {
+	return isNameToken(item) || item.Token.Kind == token.LParen
+}
+
+func relationEndToken(item lexeme) bool {
+	return isNameToken(item) || item.Token.Kind == token.RParen
 }
 
 func completeClauseExpression(text string, items []lexeme, clause, requiredWord string, boundaries []string) bool {

@@ -103,7 +103,9 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 
 	if snapshot.cacheReady {
 		snapshot.cache = s.worker.Cache()
-		snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
+		if snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
+			snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
+		}
 	}
 	return snapshot, true
 }
@@ -143,7 +145,7 @@ func diagnosticsForSnapshot(snapshot documentDiagnosticsSnapshot) []lsp.Diagnost
 	if snapshot.variant.Driver != dialect.DatabaseDriverInterBase {
 		return diagnostics
 	}
-	analysis, err := sqlsymbol.Analyze(snapshot.text, snapshot.variant)
+	analysis, err := sqlsymbol.AnalyzeDiagnostics(snapshot.text, snapshot.variant)
 	if err != nil {
 		// In-progress malformed SQL must not fail didOpen/didChange. The
 		// analyzer's conservative failure means no finding is currently proven.

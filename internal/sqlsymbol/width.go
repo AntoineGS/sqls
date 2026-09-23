@@ -62,8 +62,8 @@ func stringTypeWidth(typeName string) (int, bool) {
 		if !strings.EqualFold(modifier, "SET") {
 			return 0, false
 		}
-		charset, remaining := takeTypeWord(remaining)
-		if charset == "" || strings.TrimSpace(remaining) != "" {
+		charset, remaining, ok := takeTypeIdentifier(remaining)
+		if !ok || charset == "" || strings.TrimSpace(remaining) != "" {
 			return 0, false
 		}
 	}
@@ -81,6 +81,28 @@ func takeTypeWord(s string) (string, string) {
 		end++
 	}
 	return s[:end], s[end:]
+}
+
+func takeTypeIdentifier(s string) (string, string, bool) {
+	trimmed := strings.TrimLeft(s, " \t\r\n")
+	if !strings.HasPrefix(trimmed, `"`) {
+		word, remaining := takeTypeWord(trimmed)
+		return word, remaining, word != ""
+	}
+	for i := 1; i < len(trimmed); i++ {
+		if trimmed[i] != '"' {
+			continue
+		}
+		if i+1 < len(trimmed) && trimmed[i+1] == '"' {
+			i++
+			continue
+		}
+		if i == 1 {
+			return "", "", false
+		}
+		return trimmed[:i+1], trimmed[i+1:], true
+	}
+	return "", "", false
 }
 
 func isTypeWordByte(b byte) bool {

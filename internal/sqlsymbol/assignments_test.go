@@ -37,6 +37,13 @@ END`,
 			wantText:    []string{"LARGE", "SMALL", "40", "20"},
 		},
 		{
+			name: "quoted character set assignment",
+			text: `CREATE PROCEDURE P (LARGE CHAR(40) CHARACTER SET "UTF8") RETURNS (SMALL CHAR(20)) AS BEGIN SMALL = LARGE; END`,
+			markers:     []string{"SMALL"},
+			occurrences: []int{1},
+			wantText:    []string{"LARGE", "SMALL", "40", "20"},
+		},
+		{
 			name:     "update target resolves only from updated relation",
 			text:     `CREATE PROCEDURE P (LARGE VARCHAR(40)) AS BEGIN UPDATE DST SET VALUE = :LARGE; END`,
 			catalog:  testCatalog{columns: map[string][]ColumnType{"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}}}},
@@ -159,6 +166,14 @@ func TestWidthAssignmentsStaySilentWhenUnproven(t *testing.T) {
 		{
 			name: "incomplete insert select predicate",
 			text: `CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC WHERE; END`,
+			catalog: testCatalog{columns: map[string][]ColumnType{
+				"SRC": {{Name: "VALUE", Type: "VARCHAR(40)"}},
+				"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}},
+			}},
+		},
+		{
+			name: "incomplete insert select relation list",
+			text: `CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC,; END`,
 			catalog: testCatalog{columns: map[string][]ColumnType{
 				"SRC": {{Name: "VALUE", Type: "VARCHAR(40)"}},
 				"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}},

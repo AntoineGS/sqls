@@ -15,6 +15,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
 type diagnosticsNotification struct {
@@ -425,6 +426,35 @@ func TestPublishMalformedEditClearsFindingsWithoutFailingChange(t *testing.T) {
 	assertVersion(t, malformed, 2)
 	if malformed.Diagnostics == nil {
 		t.Fatal("malformed edit diagnostics is null, want an empty list")
+	}
+}
+
+func TestDiagnosticsPreserveValidProcedureAfterMalformedDeclaration(t *testing.T) {
+	text := `CREATE PROCEDURE BROKEN AS
+DECLARE VARIABLE INVALID BEGIN
+END;
+CREATE PROCEDURE VALID AS
+DECLARE VARIABLE UNUSED VARCHAR(10);
+BEGIN UNUSED = 'x'; END`
+	variant := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}
+	if _, err := sqlsymbol.Analyze(text, variant); err == nil {
+		t.Fatal("navigation analysis must retain its strict parse-error behavior")
+	}
+
+	got := diagnosticsForSnapshot(documentDiagnosticsSnapshot{
+		uri:     "file:///malformed-and-valid.sql",
+		text:    text,
+		variant: variant,
+	})
+	if len(got) != 1 {
+		t.Fatalf("diagnostics = %+v, want the valid procedure's unused hint", got)
+	}
+	if diagnosticCode(got[0]) != "interbase-unused" {
+		t.Fatalf("diagnostic code = %q, want interbase-unused", diagnosticCode(got[0]))
+	}
+	want := lsp.Range{Start: lsp.Position{Line: 4, Character: 17}, End: lsp.Position{Line: 4, Character: 23}}
+	if got[0].Range != want {
+		t.Fatalf("valid procedure diagnostic range = %+v, want %+v", got[0].Range, want)
 	}
 }
 
