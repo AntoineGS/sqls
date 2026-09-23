@@ -21,6 +21,13 @@ func metadataRepo(plan MetadataPlan) metadataPlanTestRepo {
 	return metadataPlanTestRepo{MockDBRepository: &MockDBRepository{}, plan: plan}
 }
 
+type metadataPlanFuncRepo struct {
+	*MockDBRepository
+	plan func() MetadataPlan
+}
+
+func (r metadataPlanFuncRepo) MetadataPlan() MetadataPlan { return r.plan() }
+
 func waitLoad(t *testing.T, load *MetadataLoad) {
 	t.Helper()
 	select {
@@ -313,4 +320,128 @@ func TestMetadataLoaderAbsentPlan(t *testing.T) {
 	if _, err := loader.Start(context.Background(), 1, NewMockDBRepository(nil)); !errors.Is(err, ErrInvalidMetadataPlan) {
 		t.Fatalf("Start error = %v", err)
 	}
+}
+
+func TestMetadataLoaderPlannerDoesNotBlockReset(t *testing.T) {
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	entered, release := make(chan struct{}), make(chan struct{})
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := loader.Start(context.Background(), 1, metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
+			close(entered)
+			<-release
+			return MetadataPlan{Parallelism: 1}
+		}})
+		startDone <- err
+	}()
+	<-entered
+	resetDone := make(chan struct{})
+	go func() { loader.Reset(2); close(resetDone) }()
+	select {
+	case <-resetDone:
+	case <-time.After(2 * time.Second):
+		close(release)
+		<-startDone
+		t.Fatal("Reset blocked behind repository MetadataPlan")
+	}
+	close(release)
+	if err := <-startDone; !errors.Is(err, ErrMetadataStaleGeneration) {
+		t.Fatalf("Start error after concurrent Reset = %v", err)
+	}
+	loader.Stop()
+}
+
+func TestMetadataLoaderPlannerCanReenterSnapshot(t *testing.T) {
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	startDone := make(chan error, 1)
+	go func() {
+		_, err := loader.Start(context.Background(), 1, metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
+			if got := loader.Snapshot().Generation; got != 1 {
+				t.Errorf("planner snapshot generation = %d", got)
+			}
+			return MetadataPlan{Parallelism: 1}
+		}})
+		startDone <- err
+	}()
+	select {
+	case err := <-startDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reentrant Snapshot deadlocked in MetadataPlan")
+	}
+	loader.Stop()
+}
+
+func TestMetadataLoaderConcurrentStartsAcceptAtMostOne(t *testing.T) {
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	const contenders = 8
+	ready, release := make(chan struct{}, contenders), make(chan struct{})
+	results := make(chan error, contenders)
+	repo := metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
+		ready <- struct{}{}
+		<-release
+		return MetadataPlan{Parallelism: 1}
+	}}
+	for i := 0; i < contenders; i++ {
+		go func() { _, err := loader.Start(context.Background(), 1, repo); results <- err }()
+	}
+	for i := 0; i < contenders; i++ {
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			close(release)
+			t.Fatal("Starts did not all reach planner")
+		}
+	}
+	close(release)
+	accepted, alreadyStarted := 0, 0
+	for i := 0; i < contenders; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			accepted++
+		case errors.Is(err, ErrMetadataAlreadyStarted):
+			alreadyStarted++
+		default:
+			t.Fatalf("unexpected Start error: %v", err)
+		}
+	}
+	if accepted != 1 || alreadyStarted != contenders-1 {
+		t.Fatalf("accepted=%d already-started=%d", accepted, alreadyStarted)
+	}
+	loader.Stop()
+}
+
+func TestMetadataLoaderAdmissionRejectsResetGeneration(t *testing.T) {
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	oldCache := loader.Cache()
+	loader.mu.Lock()
+	loader.started = true
+	loader.ctx = context.Background()
+	status := cloneMap(loader.snapshot.Status)
+	status[MetadataViews] = MetadataStatus{State: MetadataPending}
+	loader.snapshot = &MetadataSnapshot{Generation: 1, Revision: loader.snapshot.Revision + 1, Cache: loader.snapshot.Cache, Status: status}
+	loader.mu.Unlock()
+	loader.semaphore <- struct{}{}
+	captured, admitted := loader.admitJob(1, context.Background(), MetadataViews)
+	if !admitted || captured != oldCache {
+		t.Fatalf("current generation admission = (%p, %t), want (%p, true)", captured, admitted, oldCache)
+	}
+	loader.runnerFinished()
+	loader.Reset(2)
+	cache, admitted := loader.admitJob(1, context.Background(), MetadataProcedures)
+	<-loader.semaphore
+	if admitted {
+		t.Fatal("obsolete generation admitted a runner")
+	}
+	if cache != nil || loader.Cache() == oldCache {
+		t.Fatal("obsolete admission captured or published the new generation cache")
+	}
+	loader.Stop()
 }

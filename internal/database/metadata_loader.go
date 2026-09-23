@@ -106,15 +106,31 @@ func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRe
 		l.mu.Unlock()
 		return nil, ErrMetadataAlreadyStarted
 	}
+	l.mu.Unlock()
+
 	planner, ok := repo.(MetadataPlanRepository)
 	if !ok {
-		l.mu.Unlock()
 		return nil, fmt.Errorf("%w: repository does not provide MetadataPlan", ErrInvalidMetadataPlan)
 	}
 	plan := planner.MetadataPlan()
 	if err := validateMetadataPlan(plan); err != nil {
-		l.mu.Unlock()
 		return nil, fmt.Errorf("%w: %v", ErrInvalidMetadataPlan, err)
+	}
+
+	// Planning and validation are repository-controlled work. Recheck the
+	// lifecycle state after that work before committing this generation's start.
+	l.mu.Lock()
+	if l.stopped {
+		l.mu.Unlock()
+		return nil, ErrMetadataStopped
+	}
+	if generation != l.generation || l.snapshot == nil {
+		l.mu.Unlock()
+		return nil, ErrMetadataStaleGeneration
+	}
+	if l.started {
+		l.mu.Unlock()
+		return nil, ErrMetadataAlreadyStarted
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -259,11 +275,14 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 				l.settleCancelled(generation)
 				return
 			}
+			cache, admitted := l.admitJob(generation, ctx, job.Kind)
+			if !admitted {
+				<-l.semaphore
+				l.settleCancelled(generation)
+				return
+			}
 			states[job.Kind] = MetadataLoading
-			cache := l.Cache()
-			l.setStatus(generation, job.Kind, MetadataStatus{State: MetadataLoading, QueuedAt: l.statusTime(generation, job.Kind), StartedAt: time.Now()}, nil)
 			running++
-			l.runnerStarted()
 			launched = true
 			go func(job MetadataJob, cache *DBCache) {
 				defer func() {
@@ -271,6 +290,9 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 					l.runnerFinished()
 					l.signalSlotAvailable()
 				}()
+				if ctx.Err() != nil {
+					return
+				}
 				result := metadataResult{kind: job.Kind}
 				func() {
 					defer func() {
@@ -331,6 +353,35 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 	l.finish(generation)
 }
 
+// admitJob is the launch linearization point. The generation, cancellation
+// state, status transition, and cache input are checked/captured together so a
+// reset cannot make an old scheduler hand a new generation's cache to a job.
+func (l *MetadataLoader) admitJob(generation uint64, ctx context.Context, kind MetadataKind) (*DBCache, bool) {
+	l.mu.Lock()
+	if l.stopped || !l.started || l.generation != generation || l.snapshot == nil || l.ctx == nil || l.ctx.Err() != nil || ctx == nil || ctx.Err() != nil {
+		l.mu.Unlock()
+		return nil, false
+	}
+	current := l.snapshot
+	statuses := cloneMap(current.Status)
+	status := statuses[kind]
+	if status.State != MetadataPending {
+		l.mu.Unlock()
+		return nil, false
+	}
+	status.State, status.StartedAt = MetadataLoading, time.Now()
+	statuses[kind] = status
+	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Cache: current.Cache, Status: statuses})
+	if l.active == 0 {
+		l.drained = make(chan struct{})
+	}
+	l.active++
+	cache, callback := current.Cache, l.callback
+	l.mu.Unlock()
+	callMetadataCallback(callback)
+	return cache, true
+}
+
 func (l *MetadataLoader) slotWakeChannel() <-chan struct{} {
 	l.mu.Lock()
 	wake := l.slotWake
@@ -355,14 +406,6 @@ func dependenciesReady(job MetadataJob, states map[MetadataKind]MetadataState) b
 	return true
 }
 
-func (l *MetadataLoader) runnerStarted() {
-	l.mu.Lock()
-	if l.active == 0 {
-		l.drained = make(chan struct{})
-	}
-	l.active++
-	l.mu.Unlock()
-}
 func (l *MetadataLoader) runnerFinished() {
 	l.mu.Lock()
 	l.active--
@@ -370,14 +413,6 @@ func (l *MetadataLoader) runnerFinished() {
 		close(l.drained)
 	}
 	l.mu.Unlock()
-}
-
-func (l *MetadataLoader) statusTime(generation uint64, kind MetadataKind) time.Time {
-	s := l.Snapshot()
-	if s.Generation == generation {
-		return s.Status[kind].QueuedAt
-	}
-	return time.Time{}
 }
 
 func (l *MetadataLoader) setStatus(generation uint64, kind MetadataKind, status MetadataStatus, cache *DBCache) {
