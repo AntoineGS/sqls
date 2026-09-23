@@ -58,21 +58,21 @@ func metadataPlanFor(repo DBRepository) MetadataPlan {
 			if err != nil {
 				return MetadataPatch{}, err
 			}
-			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(columns)}, Count: len(columns)}, nil
+			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(cloneColumnDescs(columns))}, Count: len(columns)}, nil
 		}},
 		MetadataJob{Kind: MetadataColumnsAll, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			columns, err := repo.DescribeDatabaseTable(ctx)
 			if err != nil {
 				return MetadataPatch{}, err
 			}
-			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(columns)}, Count: len(columns)}, nil
+			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(cloneColumnDescs(columns))}, Count: len(columns)}, nil
 		}},
 		MetadataJob{Kind: MetadataForeignKeys, DependsOn: []MetadataKind{MetadataSchemas}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
 			keys, err := repo.DescribeForeignKeysBySchema(ctx, cache.defaultSchema)
 			if err != nil {
 				return MetadataPatch{}, err
 			}
-			grouped, err := groupForeignKeys(keys)
+			grouped, err := groupForeignKeys(cloneForeignKeys(keys))
 			if err != nil {
 				return MetadataPatch{}, err
 			}
@@ -95,7 +95,7 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Views: make(map[string]*ViewDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Views[catalogCacheKey(value.Name)] = value
+					cache.Views[catalogCacheKey(value.Name)] = cloneViewDesc(value)
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -108,7 +108,7 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Procedures: make(map[string]*ProcedureDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Procedures[catalogCacheKey(value.Name)] = value
+					cache.Procedures[catalogCacheKey(value.Name)] = cloneProcedureDesc(value)
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -121,7 +121,8 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Generators: make(map[string]*GeneratorDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Generators[catalogCacheKey(value.Name)] = value
+					copy := *value
+					cache.Generators[catalogCacheKey(value.Name)] = &copy
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -134,7 +135,8 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Domains: make(map[string]*DomainDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Domains[catalogCacheKey(value.Name)] = value
+					copy := *value
+					cache.Domains[catalogCacheKey(value.Name)] = &copy
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -147,7 +149,7 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Functions: make(map[string]*FunctionDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Functions[catalogCacheKey(value.Name)] = value
+					cache.Functions[catalogCacheKey(value.Name)] = cloneFunctionDesc(value)
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -160,7 +162,7 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Indexes: make(map[string]*IndexDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Indexes[catalogCacheKey(value.Name)] = value
+					cache.Indexes[catalogCacheKey(value.Name)] = cloneIndexDesc(value)
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
@@ -173,12 +175,86 @@ func catalogMetadataJobs(repo CatalogRepository) []MetadataJob {
 			cache := &CatalogCache{Triggers: make(map[string]*TriggerDesc, len(values))}
 			for _, value := range values {
 				if value != nil {
-					cache.Triggers[catalogCacheKey(value.Name)] = value
+					copy := *value
+					cache.Triggers[catalogCacheKey(value.Name)] = &copy
 				}
 			}
 			return MetadataPatch{Cache: &DBCache{Catalog: cache}, Count: len(values)}, nil
 		}},
 	}
+}
+
+func cloneColumnDescs(columns []*ColumnDesc) []*ColumnDesc {
+	cloned := make([]*ColumnDesc, len(columns))
+	for i, column := range columns {
+		if column != nil {
+			copy := *column
+			cloned[i] = &copy
+		}
+	}
+	return cloned
+}
+
+func cloneForeignKeys(keys []*ForeignKey) []*ForeignKey {
+	cloned := make([]*ForeignKey, len(keys))
+	for i, key := range keys {
+		if key == nil {
+			continue
+		}
+		copy := make(ForeignKey, len(*key))
+		for pairIndex, pair := range *key {
+			for columnIndex, column := range pair {
+				if column != nil {
+					columnCopy := *column
+					copy[pairIndex][columnIndex] = &columnCopy
+				}
+			}
+		}
+		cloned[i] = &copy
+	}
+	return cloned
+}
+
+func cloneViewDesc(view *ViewDesc) *ViewDesc {
+	copy := *view
+	copy.Columns = cloneColumnDescs(view.Columns)
+	return &copy
+}
+
+func cloneProcedureDesc(procedure *ProcedureDesc) *ProcedureDesc {
+	copy := *procedure
+	copy.InputParameters = cloneProcedureParameters(procedure.InputParameters)
+	copy.OutputParameters = cloneProcedureParameters(procedure.OutputParameters)
+	return &copy
+}
+
+func cloneProcedureParameters(parameters []*ProcedureParameterDesc) []*ProcedureParameterDesc {
+	cloned := make([]*ProcedureParameterDesc, len(parameters))
+	for i, parameter := range parameters {
+		if parameter != nil {
+			copy := *parameter
+			cloned[i] = &copy
+		}
+	}
+	return cloned
+}
+
+func cloneFunctionDesc(function *FunctionDesc) *FunctionDesc {
+	copy := *function
+	copy.Arguments = make([]*FunctionArgumentDesc, len(function.Arguments))
+	for i, argument := range function.Arguments {
+		if argument != nil {
+			argumentCopy := *argument
+			copy.Arguments[i] = &argumentCopy
+		}
+	}
+	return &copy
+}
+
+func cloneIndexDesc(index *IndexDesc) *IndexDesc {
+	copy := *index
+	copy.Columns = append([]string(nil), index.Columns...)
+	return &copy
 }
 
 func groupForeignKeys(keys []*ForeignKey) (map[string]map[string][]*ForeignKey, error) {

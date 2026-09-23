@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"testing"
 	"time"
@@ -85,6 +86,113 @@ func TestMetadataGenericCurrentSchemaFailureIsIsolated(t *testing.T) {
 	}
 	if _, ok := snapshot.Cache.Procedure("drop_customer"); !ok {
 		t.Error("procedure sibling did not publish")
+	}
+	for _, kind := range []MetadataKind{MetadataGenerators, MetadataDomains, MetadataFunctions, MetadataIndexes, MetadataTriggers} {
+		if !snapshot.Cache.MetadataReady(kind) {
+			t.Errorf("independent %s payload was not marked ready", kind)
+		}
+	}
+	if _, ok := snapshot.Cache.Generator("gen_customer_id"); !ok {
+		t.Error("generator sibling did not publish")
+	}
+	if _, ok := snapshot.Cache.Domain("email_address"); !ok {
+		t.Error("domain sibling did not publish")
+	}
+	if names := snapshot.Cache.SortedFunctions(); len(names) != 2 {
+		t.Errorf("function sibling names = %v, want 2 functions", names)
+	}
+	if _, ok := snapshot.Cache.Index("idx_customer_pk"); !ok || len(snapshot.Cache.IndexesForTable("customer")) != 2 {
+		t.Error("index sibling or table grouping did not publish")
+	}
+	if _, ok := snapshot.Cache.Trigger("customer_bi"); !ok || len(snapshot.Cache.TriggersForTable("customer")) != 1 {
+		t.Error("trigger sibling or table grouping did not publish")
+	}
+}
+
+func TestMetadataGenericFragmentsOwnRepositoryDescriptors(t *testing.T) {
+	repository := catalogTestRepository()
+	column := &ColumnDesc{ColumnBase: ColumnBase{Schema: "world", Table: "customer", Name: "original"}, Type: "INTEGER"}
+	repository.MockDescribeDatabaseTable = func(context.Context) ([]*ColumnDesc, error) { return []*ColumnDesc{column}, nil }
+	repository.MockDescribeDatabaseTableBySchema = func(context.Context, string) ([]*ColumnDesc, error) { return []*ColumnDesc{column}, nil }
+
+	left := &ColumnBase{Schema: "world", Table: "child", Name: "child_id"}
+	right := &ColumnBase{Schema: "world", Table: "parent", Name: "id"}
+	fk := &ForeignKey{{left, right}}
+	repository.MockDescribeForeignKeysBySchema = func(context.Context, string) ([]*ForeignKey, error) { return []*ForeignKey{fk}, nil }
+
+	viewColumn := &ColumnDesc{ColumnBase: ColumnBase{Name: "view_column"}, Type: "VARCHAR"}
+	view := &ViewDesc{Name: "owned_view", Columns: []*ColumnDesc{viewColumn}}
+	parameter := &ProcedureParameterDesc{Name: "input_value", Position: 1}
+	procedure := &ProcedureDesc{Name: "owned_procedure", InputParameters: []*ProcedureParameterDesc{parameter}}
+	generator := &GeneratorDesc{Name: "owned_generator"}
+	domain := &DomainDesc{Name: "owned_domain", Type: "INTEGER"}
+	argument := &FunctionArgumentDesc{Name: "argument", Position: sql.NullInt64{Int64: 1, Valid: true}, Type: "INTEGER"}
+	function := &FunctionDesc{Name: "owned_function", ReturnType: "INTEGER", Arguments: []*FunctionArgumentDesc{argument}}
+	index := &IndexDesc{Name: "owned_index", RelationName: "customer", Columns: []string{"original_column"}}
+	trigger := &TriggerDesc{Name: "owned_trigger", RelationName: sql.NullString{String: "customer", Valid: true}, Event: "BEFORE INSERT"}
+	repository.MockDescribeViews = func(context.Context) ([]*ViewDesc, error) { return []*ViewDesc{view}, nil }
+	repository.MockDescribeProcedures = func(context.Context) ([]*ProcedureDesc, error) { return []*ProcedureDesc{procedure}, nil }
+	repository.MockDescribeGenerators = func(context.Context) ([]*GeneratorDesc, error) { return []*GeneratorDesc{generator}, nil }
+	repository.MockDescribeDomains = func(context.Context) ([]*DomainDesc, error) { return []*DomainDesc{domain}, nil }
+	repository.MockDescribeFunctions = func(context.Context) ([]*FunctionDesc, error) { return []*FunctionDesc{function}, nil }
+	repository.MockDescribeIndexes = func(context.Context) ([]*IndexDesc, error) { return []*IndexDesc{index}, nil }
+	repository.MockDescribeTriggers = func(context.Context) ([]*TriggerDesc, error) { return []*TriggerDesc{trigger}, nil }
+
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	load, err := loader.Start(context.Background(), 1, repository)
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	select {
+	case <-load.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("metadata load did not settle")
+	}
+	snapshot := loader.Snapshot()
+
+	// Mutate source-owned objects after publication. Neither descriptors nor
+	// mutable nested slices/pointers may be shared with the retained snapshot.
+	column.Name = "mutated"
+	left.Table, right.Name = "mutated_table", "mutated_id"
+	(*fk)[0][0] = &ColumnBase{Table: "replacement"}
+	viewColumn.Name = "mutated_view_column"
+	parameter.Name = "mutated_parameter"
+	procedure.InputParameters[0] = &ProcedureParameterDesc{Name: "replacement_parameter"}
+	generator.Name = "mutated_generator"
+	domain.Type = "mutated_type"
+	argument.Name = "mutated_argument"
+	function.Arguments[0] = &FunctionArgumentDesc{Name: "replacement_argument"}
+	index.Columns[0] = "mutated_column"
+	trigger.Event = "mutated_event"
+
+	if got := snapshot.Cache.ColumnsWithParent[columnDatabaseKey("world", "customer")][0].Name; got != "original" {
+		t.Errorf("published column name = %q, want original", got)
+	}
+	publishedFK := snapshot.Cache.ForeignKeys["child"]["parent"][0]
+	if got := (*publishedFK)[0][0].Table; got != "child" {
+		t.Errorf("published foreign key table = %q, want child", got)
+	}
+	if got := snapshot.Cache.Catalog.Views["OWNED_VIEW"].Columns[0].Name; got != "view_column" {
+		t.Errorf("published view column = %q, want view_column", got)
+	}
+	if got := snapshot.Cache.Catalog.Procedures["OWNED_PROCEDURE"].InputParameters[0].Name; got != "input_value" {
+		t.Errorf("published procedure parameter = %q, want input_value", got)
+	}
+	if got := snapshot.Cache.Catalog.Generators["OWNED_GENERATOR"].Name; got != "owned_generator" {
+		t.Errorf("published generator name = %q, want owned_generator", got)
+	}
+	if got := snapshot.Cache.Catalog.Domains["OWNED_DOMAIN"].Type; got != "INTEGER" {
+		t.Errorf("published domain type = %q, want INTEGER", got)
+	}
+	if got := snapshot.Cache.Catalog.Functions["OWNED_FUNCTION"].Arguments[0].Name; got != "argument" {
+		t.Errorf("published function argument = %q, want argument", got)
+	}
+	if got := snapshot.Cache.Catalog.Indexes["OWNED_INDEX"].Columns[0]; got != "original_column" {
+		t.Errorf("published index column = %q, want original_column", got)
+	}
+	if got := snapshot.Cache.Catalog.Triggers["OWNED_TRIGGER"].Event; got != "BEFORE INSERT" {
+		t.Errorf("published trigger event = %q, want BEFORE INSERT", got)
 	}
 }
 
