@@ -359,6 +359,42 @@ func TestWorkerSwapsCatalogCache(t *testing.T) {
 	}
 }
 
+func TestWorkerLegacySettersPublishReadinessWithoutMutatingOldCache(t *testing.T) {
+	worker := NewWorker()
+	worker.setRepo(NewMockDBRepository(nil))
+	generation := worker.repoGeneration
+	priorMetadata := map[MetadataKind]MetadataState{MetadataSchemas: MetadataReady}
+	worker.dbCache = &DBCache{Metadata: priorMetadata}
+	worker.cacheGeneration = generation
+	before := worker.Cache()
+
+	worker.setColumnCache(generation, map[string][]*ColumnDesc{})
+	columns := worker.Cache()
+	if columns == before {
+		t.Fatal("column publication did not copy the cache")
+	}
+	if columns.Metadata[MetadataColumnsAll] != MetadataReady {
+		t.Error("legacy all-columns publication did not mark all-columns ready")
+	}
+	if _, mutated := priorMetadata[MetadataColumnsAll]; mutated {
+		t.Error("column publication mutated a retained Metadata map")
+	}
+	if _, mutated := before.Metadata[MetadataColumnsAll]; mutated {
+		t.Error("column publication changed readiness in the retained cache")
+	}
+
+	worker.setCatalogCache(generation, &CatalogCache{Views: map[string]*ViewDesc{}})
+	catalog := worker.Cache()
+	for _, kind := range []MetadataKind{MetadataViews, MetadataProcedures, MetadataGenerators, MetadataDomains, MetadataFunctions, MetadataIndexes, MetadataTriggers} {
+		if catalog.Metadata[kind] != MetadataReady {
+			t.Errorf("legacy catalog publication did not mark %q ready", kind)
+		}
+	}
+	if columns.Metadata[MetadataViews] == MetadataReady {
+		t.Error("catalog publication mutated the retained columns cache")
+	}
+}
+
 func TestWorkerCatalogPassRunsDespiteColumnPassError(t *testing.T) {
 	// worker.go's loop body continues on a GenerateDBCacheSecondary error, so
 	// appending the catalog build after it would silently skip the catalog

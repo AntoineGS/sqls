@@ -85,6 +85,7 @@ func (w *Worker) setColumnCache(generation uint64, col map[string][]*ColumnDesc)
 		// *DBCache keep seeing a consistent snapshot.
 		newCache := *w.dbCache
 		newCache.ColumnsWithParent = col
+		newCache.Metadata = copyMetadataWithReady(w.dbCache.Metadata, MetadataColumnsAll)
 		w.dbCache = &newCache
 		changed = true
 	}
@@ -103,6 +104,9 @@ func (w *Worker) setCatalogCache(generation uint64, c *CatalogCache) {
 		// *DBCache keep seeing a consistent snapshot.
 		newCache := *w.dbCache
 		newCache.Catalog = c
+		newCache.Metadata = copyMetadataWithReady(w.dbCache.Metadata,
+			MetadataViews, MetadataProcedures, MetadataGenerators, MetadataDomains,
+			MetadataFunctions, MetadataIndexes, MetadataTriggers)
 		w.dbCache = &newCache
 		changed = true
 	}
@@ -111,6 +115,17 @@ func (w *Worker) setCatalogCache(generation uint64, c *CatalogCache) {
 	if changed && callback != nil {
 		callback()
 	}
+}
+
+func copyMetadataWithReady(metadata map[MetadataKind]MetadataState, kinds ...MetadataKind) map[MetadataKind]MetadataState {
+	copy := make(map[MetadataKind]MetadataState, len(metadata)+len(kinds))
+	for kind, state := range metadata {
+		copy[kind] = state
+	}
+	for _, kind := range kinds {
+		copy[kind] = MetadataReady
+	}
+	return copy
 }
 
 func (w *Worker) Start() {
