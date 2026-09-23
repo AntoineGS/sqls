@@ -59,20 +59,15 @@ import (
 // SQL_TEXT decode and remain subject to the same truncation.
 const interBaseBulkIdentifierCastWidth = 67
 
-// interBaseBulkIdentifierCast renders CAST(ref AS VARCHAR(n)) for one
-// identifier column reference, so interBaseBulkIdentifierCastWidth has a
-// single point of truth: the width used to validate the fix live against
-// NRF01 and the width every query below actually selects with cannot drift
-// apart.
-func interBaseBulkIdentifierCast(ref string) string {
-	return fmt.Sprintf("CAST(%s AS VARCHAR(%d))", ref, interBaseBulkIdentifierCastWidth)
-}
-
-var interBaseBulkRelationsQuery = fmt.Sprintf(`
+func interBaseBulkRelationsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s
 FROM RDB$RELATIONS r
 WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-ORDER BY r.RDB$RELATION_NAME`, interBaseBulkIdentifierCast("r.RDB$RELATION_NAME"))
+ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME", width))
+}
+
+var interBaseBulkRelationsQuery = interBaseBulkRelationsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkColumnsQuery is the driver's per-relation column projection
 // restricted to the fields ColumnDesc renders, and widened to every user
@@ -82,7 +77,8 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseBulkIdentifierCast("r.RDB$RELATION_NAME"
 // The driver also reads the column's own collation (its rco join); ColumnDesc
 // renders the domain's type alone, so that join is left out rather than paid
 // for on every column of every relation.
-var interBaseBulkColumnsQuery = fmt.Sprintf(`
+func interBaseBulkColumnsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s, %s, %s,
        rf.RDB$NULL_FLAG, rf.RDB$DEFAULT_SOURCE,
        %s, f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE,
@@ -99,12 +95,15 @@ LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                            AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
 WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
 ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
-	interBaseBulkIdentifierCast("rf.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("rf.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("rf.RDB$FIELD_SOURCE"),
-	interBaseBulkIdentifierCast("f.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("cs.RDB$CHARACTER_SET_NAME"),
-	interBaseBulkIdentifierCast("co.RDB$COLLATION_NAME"))
+		interBaseMetadataIdentifier("rf.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("rf.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("rf.RDB$FIELD_SOURCE", width),
+		interBaseMetadataIdentifier("f.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("cs.RDB$CHARACTER_SET_NAME", width),
+		interBaseMetadataIdentifier("co.RDB$COLLATION_NAME", width))
+}
+
+var interBaseBulkColumnsQuery = interBaseBulkColumnsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkPrimaryKeyFieldsQuery returns one row per primary-key field.
 // The key flag is a membership test, so the fields need no ordering; the
@@ -117,7 +116,8 @@ ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
 // (review.md residual concern 1). Unreachable through normal DDL — InterBase
 // itself never flags a user relation's own index system — but cheap to close
 // and closes the one documented divergence from the loader it replaces.
-var interBaseBulkPrimaryKeyFieldsQuery = fmt.Sprintf(`
+func interBaseBulkPrimaryKeyFieldsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s, %s
 FROM RDB$RELATION_CONSTRAINTS pk
 JOIN RDB$RELATIONS r ON r.RDB$RELATION_NAME = pk.RDB$RELATION_NAME
@@ -126,8 +126,11 @@ JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
   AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
   AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0`,
-	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("s.RDB$FIELD_NAME"))
+		interBaseMetadataIdentifier("pk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("s.RDB$FIELD_NAME", width))
+}
+
+var interBaseBulkPrimaryKeyFieldsQuery = interBaseBulkPrimaryKeyFieldsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkForeignKeyFieldsQuery returns one row per foreign-key field,
 // paired with the referenced field at the same index segment position. That
@@ -145,7 +148,8 @@ WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
 // names a real unique/primary-key constraint with a real index, so a missing
 // pi row means a corrupt catalog, the same "drop the whole key" stance the
 // query already takes for a missing enforcing index.
-var interBaseBulkForeignKeyFieldsQuery = fmt.Sprintf(`
+func interBaseBulkForeignKeyFieldsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s, %s, %s,
        %s, %s
 FROM RDB$RELATION_CONSTRAINTS fk
@@ -162,11 +166,14 @@ WHERE fk.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'
   AND COALESCE(fi.RDB$SYSTEM_FLAG, 0) = 0
   AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0
 ORDER BY fk.RDB$CONSTRAINT_NAME, fs.RDB$FIELD_POSITION`,
-	interBaseBulkIdentifierCast("fk.RDB$CONSTRAINT_NAME"),
-	interBaseBulkIdentifierCast("fk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("fs.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("ps.RDB$FIELD_NAME"))
+		interBaseMetadataIdentifier("fk.RDB$CONSTRAINT_NAME", width),
+		interBaseMetadataIdentifier("fk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("fs.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("pk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("ps.RDB$FIELD_NAME", width))
+}
+
+var interBaseBulkForeignKeyFieldsQuery = interBaseBulkForeignKeyFieldsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkRelation is one relation with its ordered columns, in the shape
 // columnDescription already consumes. A relation with no columns keeps its
