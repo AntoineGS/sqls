@@ -310,10 +310,7 @@ func (s *Server) handleTextDocumentDidOpen(ctx context.Context, conn *jsonrpc2.C
 		return nil, err
 	}
 
-	if err := s.openFileAtVersion(params.TextDocument.URI, params.TextDocument.LanguageID, params.TextDocument.Version); err != nil {
-		return nil, err
-	}
-	if err := s.updateFile(params.TextDocument.URI, params.TextDocument.Text); err != nil {
+	if err := s.openFileAtVersion(params.TextDocument.URI, params.TextDocument.LanguageID, params.TextDocument.Text, params.TextDocument.Version); err != nil {
 		return nil, err
 	}
 	s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
@@ -357,8 +354,13 @@ func (s *Server) handleTextDocumentDidSave(ctx context.Context, conn *jsonrpc2.C
 	}
 
 	if params.Text != nil {
-		err = s.updateFile(params.TextDocument.URI, *params.Text)
-		if err == nil {
+		revision, revisionErr := s.documentRevision(params.TextDocument.URI)
+		if revisionErr != nil {
+			return nil, revisionErr
+		}
+		var applied bool
+		applied, err = s.updateFileAtRevision(params.TextDocument.URI, *params.Text, revision)
+		if err == nil && applied {
 			s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
 		}
 	} else {
@@ -387,16 +389,12 @@ func (s *Server) handleTextDocumentDidClose(ctx context.Context, conn *jsonrpc2.
 	return nil, nil
 }
 
-func (s *Server) openFile(uri string, languageID string) error {
-	return s.openFileAtVersion(uri, languageID, 0)
-}
-
-func (s *Server) openFileAtVersion(uri string, languageID string, version int) error {
+func (s *Server) openFileAtVersion(uri string, languageID string, text string, version int) error {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	s.fileRevision++
 	f := &File{
-		Text:       "",
+		Text:       text,
 		LanguageID: languageID,
 		Version:    version,
 		Revision:   s.fileRevision,
@@ -412,9 +410,33 @@ func (s *Server) closeFile(uri string) error {
 	return nil
 }
 
-func (s *Server) updateFile(uri string, text string) error {
-	_, err := s.updateFileVersion(uri, text, nil)
-	return err
+func (s *Server) documentRevision(uri string) (uint64, error) {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	f, ok := s.files[uri]
+	if !ok {
+		return 0, fmt.Errorf("document not found: %v", uri)
+	}
+	return f.Revision, nil
+}
+
+// updateFileAtRevision applies text only while the document is still at the
+// revision observed when the save notification began. didSave has no LSP
+// version, so this prevents an in-flight save from replacing a newer change.
+func (s *Server) updateFileAtRevision(uri string, text string, expectedRevision uint64) (bool, error) {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	f, ok := s.files[uri]
+	if !ok {
+		return false, fmt.Errorf("document not found: %v", uri)
+	}
+	if f.Revision != expectedRevision {
+		return false, nil
+	}
+	f.Text = text
+	s.fileRevision++
+	f.Revision = s.fileRevision
+	return true, nil
 }
 
 func (s *Server) updateFileVersion(uri string, text string, version *int) (bool, error) {
@@ -441,8 +463,8 @@ func (s *Server) saveFile(uri string) error {
 }
 
 // fileText returns a copy of the document text for uri. Callers must never
-// retain the *File: updateFile mutates Text through the stored pointer, so a
-// reader that keeps the pointer races with a concurrent didChange.
+// retain the *File: document update methods mutate it under stateMu, so a reader
+// that keeps the pointer races with a concurrent didChange.
 func (s *Server) fileText(uri string) (string, bool) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()

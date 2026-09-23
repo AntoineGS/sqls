@@ -454,3 +454,76 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 		}
 	}
 }
+
+func TestDidOpenAndChangeDoNotRestoreInitialSnapshot(t *testing.T) {
+	const uri = "file:///open-change-order.sql"
+	server := &Server{files: make(map[string]*File)}
+	initialText := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('old'); END"
+	if err := server.openFileAtVersion(uri, "sql", initialText, 1); err != nil {
+		t.Fatal("install didOpen snapshot:", err)
+	}
+	got, ok := server.fileText(uri)
+	if !ok || got != initialText {
+		t.Fatalf("didOpen text = (%q, %v), want initial text installed atomically", got, ok)
+	}
+	server.stateMu.RLock()
+	openVersion := server.files[uri].Version
+	server.stateMu.RUnlock()
+	if openVersion != 1 {
+		t.Fatalf("didOpen version = %d, want 1", openVersion)
+	}
+	newerText := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('new'); END"
+	newerVersion := 2
+	changed, err := server.updateFileVersion(uri, newerText, &newerVersion)
+	if err != nil || !changed {
+		t.Fatalf("apply newer didChange = (%v, %v), want (true, nil)", changed, err)
+	}
+
+	got, ok = server.fileText(uri)
+	if !ok || got != newerText {
+		t.Fatalf("document after ordered open/change = (%q, %v), want newer text", got, ok)
+	}
+	server.stateMu.RLock()
+	version := server.files[uri].Version
+	server.stateMu.RUnlock()
+	if version != newerVersion {
+		t.Fatalf("document version = %d, want %d", version, newerVersion)
+	}
+}
+
+func TestDidSaveCannotOverwriteChangeAppliedAfterSaveSnapshot(t *testing.T) {
+	const uri = "file:///save-change-order.sql"
+	server := &Server{files: make(map[string]*File)}
+	initialText := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('initial'); END"
+	if err := server.openFileAtVersion(uri, "sql", initialText, 1); err != nil {
+		t.Fatal("install didOpen snapshot:", err)
+	}
+	server.stateMu.RLock()
+	saveRevision := server.files[uri].Revision
+	server.stateMu.RUnlock()
+
+	newerText := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('edited'); END"
+	newerVersion := 2
+	changed, err := server.updateFileVersion(uri, newerText, &newerVersion)
+	if err != nil || !changed {
+		t.Fatalf("apply newer didChange = (%v, %v), want (true, nil)", changed, err)
+	}
+	staleSavedText := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('saved earlier'); END"
+	applied, err := server.updateFileAtRevision(uri, staleSavedText, saveRevision)
+	if err != nil {
+		t.Fatal("apply delayed didSave text:", err)
+	}
+	if applied {
+		t.Fatal("delayed didSave text replaced a document changed after the save snapshot")
+	}
+	got, ok := server.fileText(uri)
+	if !ok || got != newerText {
+		t.Fatalf("document after overlapping save/change = (%q, %v), want newer edit", got, ok)
+	}
+	server.stateMu.RLock()
+	version := server.files[uri].Version
+	server.stateMu.RUnlock()
+	if version != newerVersion {
+		t.Fatalf("document version = %d, want %d", version, newerVersion)
+	}
+}
