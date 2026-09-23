@@ -19,9 +19,9 @@ type Finding struct {
 	Severity int
 }
 
-// Diagnostics reports statically proven InterBase findings. Catalog is
-// reserved for catalog-backed width diagnostics; unused-symbol analysis does
-// not require it.
+// Diagnostics reports statically proven InterBase findings. Catalog supplies
+// read-only table widths for assignment diagnostics; unused-symbol analysis
+// does not require it.
 func (a *Analysis) Diagnostics(c Catalog) []Finding {
 	findings := make([]Finding, 0)
 	for _, symbol := range a.Symbols {
@@ -35,5 +35,5 @@ func (a *Analysis) Diagnostics(c Catalog) []Finding {
 			Severity: 4,
 		})
 	}
-	return findings
+	return append(findings, a.widthDiagnostics(c)...)
 }
