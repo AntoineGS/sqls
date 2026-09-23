@@ -17,6 +17,7 @@ func TestParameterDiscoveryDoesNotNeedCatalogOrDatabaseIO(t *testing.T) {
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "nrf01", Host: "test", Path: "db.ib"}
 	s.connGeneration = 7
+	s.connectionState = connectionReady
 	s.files["file:///query.sql"] = &File{Text: "SELECT :ID, :id FROM T"}
 	result, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{
 		Command: CommandGetQueryParameters, Arguments: []interface{}{"file:///query.sql"},
@@ -87,6 +88,7 @@ func discoverParams(t *testing.T, cfg *database.DBConfig, dbConn *database.DBCon
 	s.dbConn = dbConn
 	s.curDBCfg = cfg
 	s.connGeneration = generation
+	s.connectionState = connectionReady
 	const uri = "file:///query.sql"
 	s.files[uri] = &File{Text: text}
 	result, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{
@@ -213,6 +215,7 @@ func TestParameterIdentitySameSelectionSharesQueryKeyAcrossDocuments(t *testing.
 	defer s.Stop()
 	s.dbConn = dbConn
 	s.curDBCfg = cfg
+	s.connectionState = connectionReady
 	s.files["file:///a.sql"] = &File{Text: selection}
 	s.files["file:///b.sql"] = &File{Text: "-- unrelated preface\n" + selection}
 
@@ -250,6 +253,7 @@ func TestParameterDiscoveryNonInterBaseReturnsUnsupported(t *testing.T) {
 	defer s.Stop()
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverPostgreSQL}
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverPostgreSQL, Host: "test"}
+	s.connectionState = connectionReady
 	s.files["file:///query.sql"] = &File{Text: "SELECT :ID FROM T"}
 
 	result, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{
@@ -291,6 +295,7 @@ func TestParameterDiscoveryUnknownURIFails(t *testing.T) {
 	defer s.Stop()
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Host: "test", Path: "db.ib", User: "alice"}
+	s.connectionState = connectionReady
 
 	_, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{
 		Command:   CommandGetQueryParameters,
@@ -319,6 +324,7 @@ func TestParameterDiscoveryInvalidRangeFails(t *testing.T) {
 			defer s.Stop()
 			s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 			s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Host: "test", Path: "db.ib", User: "alice"}
+			s.connectionState = connectionReady
 			s.files["file:///query.sql"] = &File{Text: text}
 
 			rng := tt.rng
@@ -347,6 +353,7 @@ func TestParameterSelectionAcceptsUnicodeRangeBoundary(t *testing.T) {
 	defer s.Stop()
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Host: "test", Path: "db.ib", User: "alice"}
+	s.connectionState = connectionReady
 	s.files["file:///query.sql"] = &File{Text: text}
 
 	end := utf16Len(prefix)
@@ -373,6 +380,7 @@ func TestParameterIdentityNilConfigReturnsError(t *testing.T) {
 	defer s.Stop()
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	s.curDBCfg = nil
+	s.connectionState = connectionReady
 	s.files["file:///query.sql"] = &File{Text: "SELECT 1"}
 
 	_, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{

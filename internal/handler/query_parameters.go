@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -157,17 +158,27 @@ func validateSelectionRange(text string, r lsp.Range) error {
 }
 
 // getQueryParameters discovers the named parameters in the requested
-// document/range. An unsupported connection (including no connection at all)
-// simply reports supported=false so the client can fall back to the legacy
-// execution flow. An available InterBase input describer may enrich named
-// parameters with safe value-type suggestions; preparation failures preserve
-// the discovered names and leave affected suggestions empty.
+// document/range. With no configured connection, it reports supported=false so
+// the client can fall back to the legacy execution flow. During an attachment
+// transition it instead returns the transient readiness error. An available
+// InterBase input describer may enrich named parameters with safe value-type
+// suggestions; preparation failures preserve the discovered names and leave
+// affected suggestions empty.
 func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteCommandParams) (interface{}, error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	repo, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		if errors.Is(err, errConnectionChanging) {
+			return nil, err
+		}
+		if errors.Is(err, errNoReadyConnection) {
+			return lsp.QueryParameterDiscovery{QueryParameterContext: lsp.QueryParameterContext{Version: parameterProtocolVersion}}, nil
+		}
+		return nil, err
+	}
+	defer unlock()
 
 	sel, err := s.parameterSelection(params)
 	if err != nil {
@@ -194,23 +205,20 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		repo, repoErr := s.newDBRepository(ctx)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if repoErr == nil {
-			if describer, ok := repo.(database.InputDescriber); ok {
-				inferred, inferErr := inferParameterTypes(
-					ctx,
-					batch,
-					describer.DescribeInputs,
-					sel.Variant.Variant.InterBaseSQLDialect(),
-				)
-				if inferErr != nil {
-					return nil, inferErr
-				}
-				discovery.Parameters = inferred
+		if describer, ok := repo.(database.InputDescriber); ok {
+			inferred, inferErr := inferParameterTypes(
+				ctx,
+				batch,
+				describer.DescribeInputs,
+				sel.Variant.Variant.InterBaseSQLDialect(),
+			)
+			if inferErr != nil {
+				return nil, inferErr
 			}
+			discovery.Parameters = inferred
 		}
 	}
 	return discovery, nil

@@ -310,6 +310,9 @@ func (r *parameterFixtureBase) Exec(ctx context.Context, query string) (sql.Resu
 
 func (r *parameterFixtureBase) ExplainPlan(ctx context.Context, query string) (string, error) {
 	r.backend.recordExplain(query)
+	if err := r.backend.enterGate(ctx, query); err != nil {
+		return "", err
+	}
 	return "PLAN (T NATURAL)", nil
 }
 

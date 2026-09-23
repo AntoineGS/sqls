@@ -356,11 +356,13 @@ func configureInterBaseTestServer(t *testing.T, tx *TestContext, variant dialect
 			return nil, nil
 		},
 	}
+	tx.server.stateMu.Lock()
 	tx.server.dbConn = &database.DBConnection{
 		Driver:  dialect.DatabaseDriverInterBase,
 		Variant: variant,
 	}
 	tx.server.connectionState = connectionReady
+	tx.server.stateMu.Unlock()
 	loadMetadataForTest(t, tx.server, repo)
 }
 

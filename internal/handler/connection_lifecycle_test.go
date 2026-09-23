@@ -4,14 +4,18 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"net"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
@@ -464,6 +468,208 @@ func TestCancelledActiveIntentClosesCandidateAndLeavesTerminalIdleState(t *testi
 	case <-s.cleanupDone:
 	case <-time.After(time.Second):
 		t.Fatal("cleanup did not finish")
+	}
+}
+
+func TestDatabaseCommandsDuringConnectionTransitionReturnPromptly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		call func(*Server) error
+	}{
+		{name: "explain", call: func(s *Server) error {
+			_, err := s.explainQuery(context.Background(), lsp.ExecuteCommandParams{})
+			return err
+		}},
+		{name: "query parameters", call: func(s *Server) error {
+			_, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{})
+			return err
+		}},
+		{name: "switch database validation", call: func(s *Server) error {
+			_, err := s.switchDatabase(context.Background(), lsp.ExecuteCommandParams{Arguments: []interface{}{"next"}})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewServer()
+			s.stateMu.Lock()
+			s.connectionState = connectionConnecting
+			s.stateMu.Unlock()
+			s.connMu.Lock() // models an attach holding the transition write lock.
+			result := make(chan error, 1)
+			go func() { result <- tc.call(s) }()
+			select {
+			case err := <-result:
+				s.connMu.Unlock()
+				if err == nil || !strings.Contains(err.Error(), "database connection") {
+					t.Fatalf("command error = %v, want a clear transient connection error", err)
+				}
+			case <-time.After(time.Second):
+				s.connMu.Unlock()
+				t.Fatal("command blocked behind an attachment instead of returning transient readiness error")
+			}
+			if err := s.Stop(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestShowConnectionsDoesNotWaitForConnectionTransition(t *testing.T) {
+	s := NewServer()
+	s.connMu.Lock()
+	result := make(chan error, 1)
+	go func() { _, err := s.showConnections(context.Background(), lsp.ExecuteCommandParams{}); result <- err }()
+	select {
+	case err := <-result:
+		s.connMu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		s.connMu.Unlock()
+		t.Fatal("showConnections blocked on connMu")
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestQueryParametersTreatsLockContentionAsTransitionWithoutConnection(t *testing.T) {
+	s := NewServer()
+	s.connMu.Lock()
+	result := make(chan error, 1)
+	go func() {
+		_, err := s.getQueryParameters(context.Background(), lsp.ExecuteCommandParams{})
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		s.connMu.Unlock()
+		if err == nil || !strings.Contains(err.Error(), "database connection is changing") {
+			t.Fatalf("getQueryParameters error = %v, want transient lock-contention error", err)
+		}
+	case <-time.After(time.Second):
+		s.connMu.Unlock()
+		t.Fatal("getQueryParameters waited on connMu")
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLateWorkspaceConfigurationBootstrapsAfterInitializedOnce(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	entered, release := make(chan struct{}), make(chan struct{})
+	var opens atomic.Int32
+	s.openConnection = func(ctx context.Context, cfg *database.DBConfig) (*database.DBConnection, error) {
+		if opens.Add(1) != 1 {
+			return nil, errors.New("duplicate late-config attachment")
+		}
+		close(entered)
+		select {
+		case <-release:
+			return nil, errors.New("test opener failure")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	s.handleInitialized() // no config yet: bootstrap settles without opening.
+
+	cfg := &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: ":memory:"}}}
+	raw, err := json.Marshal(map[string]interface{}{"settings": map[string]interface{}{"sqls": cfg}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := json.RawMessage(raw)
+	_, err = s.handleWorkspaceDidChangeConfiguration(context.Background(), nil, &jsonrpc2.Request{Params: &params})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("late workspace configuration did not start attachment")
+	}
+	s.handleInitialized()
+	s.handleInitialized()
+	close(release)
+	deadline := time.After(time.Second)
+	for {
+		s.stateMu.RLock()
+		state := s.connectionState
+		s.stateMu.RUnlock()
+		if state == connectionFailed {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("late configuration never reached terminal failure state; got %q", state)
+		default:
+			runtime.Gosched()
+		}
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("openConnection called %d times, want 1 after repeated initialized", got)
+	}
+}
+
+func TestChangedConfigurationSupersedesActiveAttachAndClosesStaleCandidate(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	enteredA, releaseA, staleClosed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	enteredB, installed := make(chan struct{}), &database.DBConnection{Driver: dialect.DatabaseDriverSQLite3}
+	var opens atomic.Int32
+	s.openConnection = func(ctx context.Context, cfg *database.DBConfig) (*database.DBConnection, error) {
+		if opens.Add(1) == 1 {
+			close(enteredA)
+			<-releaseA // deliberately ignore cancellation and return a late candidate.
+			return &database.DBConnection{Conn: closedSignalDB(t, staleClosed)}, nil
+		}
+		close(enteredB)
+		return installed, nil
+	}
+	cfgA := &database.DBConfig{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: "A"}
+	cfgB := &database.DBConfig{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: "B"}
+	first := s.coordinator.Request(s.lifecycleCtx, cfgA, 0, "")
+	select {
+	case <-enteredA:
+	case <-time.After(time.Second):
+		t.Fatal("A attach did not start")
+	}
+	second := s.coordinator.Request(s.lifecycleCtx, cfgB, 0, "")
+	close(releaseA)
+	select {
+	case err := <-first:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("superseded A result = %v, want canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("superseded A did not settle")
+	}
+	select {
+	case <-staleClosed:
+	case <-time.After(time.Second):
+		t.Fatal("stale A candidate was not closed locally")
+	}
+	select {
+	case <-enteredB:
+	case <-time.After(time.Second):
+		t.Fatal("new B configuration was not attached")
+	}
+	select {
+	case err := <-second:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("B attach did not settle")
+	}
+	s.stateMu.RLock()
+	got, state := s.dbConn, s.connectionState
+	s.stateMu.RUnlock()
+	if got != installed || state != connectionReady {
+		t.Fatalf("installed connection=%p state=%q, want B=%p ready", got, state, installed)
 	}
 }
 

@@ -47,8 +47,11 @@ var explainMutatingTypes = map[string]bool{
 const explainArrayColumnMarker = "array results are unsupported"
 
 func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
+	repo, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	if len(params.Arguments) == 0 {
 		return nil, fmt.Errorf("required arguments were not provided: <File URI>")
@@ -77,10 +80,6 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 		return nil, err
 	}
 
-	repo, err := s.newDBRepository(ctx)
-	if err != nil {
-		return nil, err
-	}
 	explainer, err := explainRepositoryFor(repo)
 	if err != nil {
 		return nil, err

@@ -18,7 +18,10 @@ import (
 )
 
 var (
-	ErrNoConnection = errors.New("no database connection")
+	ErrNoConnection       = errors.New("no database connection")
+	errConnectionChanging = errors.New("database connection is changing; retry shortly")
+	errNoReadyConnection  = errors.New("database connection is not ready; retry shortly")
+	errConnectionNotReady = errors.New("database connection is not ready; retry shortly")
 )
 
 type Server struct {
@@ -741,14 +744,17 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 
 func (s *Server) acquireReadyConnection() (database.DBRepository, func(), error) {
 	if !s.connMu.TryRLock() {
-		return nil, nil, errors.New("database connection is changing; retry shortly")
+		return nil, nil, errConnectionChanging
 	}
 	s.stateMu.RLock()
-	ready := s.connectionState == connectionReady && s.dbConn != nil
+	state, hasConnection := s.connectionState, s.dbConn != nil
 	s.stateMu.RUnlock()
-	if !ready {
+	if state != connectionReady || !hasConnection {
 		s.connMu.RUnlock()
-		return nil, nil, errors.New("database connection is not ready; retry shortly")
+		if !hasConnection && (state == connectionIdle || state == connectionFailed) {
+			return nil, nil, errNoReadyConnection
+		}
+		return nil, nil, errConnectionNotReady
 	}
 	repo, err := s.newDBRepository(s.lifecycleCtx)
 	if err != nil {
@@ -797,6 +803,27 @@ func (s *Server) getConfig() *config.Config {
 		cfg = config.NewConfig()
 	}
 	return cfg
+}
+
+func (s *Server) connectionConfigsSnapshot() []*database.DBConfig {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	var cfg *config.Config
+	switch {
+	case validConfig(s.SpecificFileCfg):
+		cfg = s.SpecificFileCfg
+	case validConfig(s.WSCfg):
+		cfg = s.WSCfg
+	case validConfig(s.DefaultFileCfg):
+		cfg = s.DefaultFileCfg
+	default:
+		cfg = config.NewConfig()
+	}
+	connections := make([]*database.DBConfig, len(cfg.Connections))
+	for i, connection := range cfg.Connections {
+		connections[i] = cloneConnectionConfig(connection)
+	}
+	return connections
 }
 
 // parserDriver returns the active connection's driver. It is retained with its

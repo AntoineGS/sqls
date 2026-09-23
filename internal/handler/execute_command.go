@@ -765,7 +765,9 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	// user selects the database to connect to, so there is nothing to validate.
 	// newDBRepository takes stateMu internally, so this is safe to call while
 	// holding only connMu.
-	s.connMu.RLock()
+	if !s.connMu.TryRLock() {
+		return nil, errConnectionChanging
+	}
 	repo, err := s.newDBRepository(ctx)
 	switch {
 	case errors.Is(err, ErrNoConnection):
@@ -798,10 +800,8 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 }
 
 func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
 	results := []string{}
-	conns := s.getConfig().Connections
+	conns := s.connectionConfigsSnapshot()
 	for i, conn := range conns {
 		var desc string
 		if conn.DataSourceName != "" {
