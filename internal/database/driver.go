@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -10,10 +11,12 @@ import (
 )
 
 var driverOpeners = make(map[dialect.DatabaseDriver]Opener)
+var driverContextOpeners = make(map[dialect.DatabaseDriver]ContextOpener)
 var driverFactories = make(map[dialect.DatabaseDriver]Factory)
 var driverConnFactories = make(map[dialect.DatabaseDriver]ConnFactory)
 
 type Opener func(*DBConfig) (*DBConnection, error)
+type ContextOpener func(context.Context, *DBConfig) (*DBConnection, error)
 type Factory func(*sql.DB) DBRepository
 
 // ConnFactory builds a repository from the whole connection rather than from
@@ -79,6 +82,16 @@ func RegisterOpen(name dialect.DatabaseDriver, opener Opener) {
 	driverOpeners[name] = opener
 }
 
+// RegisterOpenContext registers an optional context-aware opener. It is a
+// separate capability so existing DBRepository implementations and legacy
+// drivers do not need to change.
+func RegisterOpenContext(name dialect.DatabaseDriver, opener ContextOpener) {
+	if _, ok := driverContextOpeners[name]; ok {
+		panic(fmt.Sprintf("driver context open %s method is already registered", name))
+	}
+	driverContextOpeners[name] = opener
+}
+
 func RegisterFactory(name dialect.DatabaseDriver, factory Factory) {
 	if _, ok := driverFactories[name]; ok {
 		panic(fmt.Sprintf("driver factory %s already registered", name))
@@ -101,6 +114,36 @@ func Open(cfg *DBConfig) (*DBConnection, error) {
 		return nil, fmt.Errorf("driver not found, %s", cfg.Driver)
 	}
 	return OpenFn(cfg)
+}
+
+// OpenContext opens a connection, preferring a context-aware driver opener.
+// Legacy openers are called synchronously: an uncancellable open must never be
+// left running in a detached goroutine. If cancellation wins while an opener
+// is returning a connection, that candidate is closed instead of being handed
+// to the caller.
+func OpenContext(ctx context.Context, cfg *DBConfig) (*DBConnection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("connection config is nil")
+	}
+
+	if opener, ok := driverContextOpeners[cfg.Driver]; ok {
+		conn, err := opener(ctx, cfg)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = conn.Close()
+			return nil, ctxErr
+		}
+		return conn, err
+	}
+
+	conn, err := Open(cfg)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = conn.Close()
+		return nil, ctxErr
+	}
+	return conn, err
 }
 
 func CreateRepository(driver dialect.DatabaseDriver, db *sql.DB) (DBRepository, error) {

@@ -18,6 +18,13 @@ const interBasePingTimeout = 10 * time.Second
 // interBaseAttach opens and pings a pooled connection at one SQL dialect.
 // A zero sqlDialect uses the driver default, which normalizeDialect maps to 3.
 func interBaseAttach(connCfg interBaseConnConfig, sqlDialect int) (*sql.DB, error) {
+	return interBaseAttachContext(context.Background(), connCfg, sqlDialect)
+}
+
+// interBaseAttachContext opens and pings one pooled connection while honoring
+// the caller's lifetime. The timeout bounds the ping without extending the
+// caller's deadline.
+func interBaseAttachContext(parent context.Context, connCfg interBaseConnConfig, sqlDialect int) (*sql.DB, error) {
 	connector, err := interbase.NewConnector(interBaseDriverConfig(connCfg, sqlDialect))
 	if err != nil {
 		return nil, fmt.Errorf("interbase: create connector: %w", err)
@@ -27,10 +34,13 @@ func interBaseAttach(connCfg interBaseConnConfig, sqlDialect int) (*sql.DB, erro
 	conn.SetMaxIdleConns(DefaultMaxIdleConns)
 	conn.SetMaxOpenConns(DefaultMaxOpenConns)
 
-	ctx, cancel := context.WithTimeout(context.Background(), interBasePingTimeout)
+	ctx, cancel := context.WithTimeout(parent, interBasePingTimeout)
 	defer cancel()
 	if err := conn.PingContext(ctx); err != nil {
 		_ = conn.Close()
+		if parentErr := parent.Err(); parentErr != nil {
+			return nil, parentErr
+		}
 		return nil, fmt.Errorf("interbase: ping failed: %w", err)
 	}
 	return conn, nil
@@ -64,7 +74,11 @@ func interBaseDriverConfig(cfg interBaseConnConfig, sqlDialect int) interbase.Co
 // connection. Its error is never fatal: metadata introspection must not block
 // editing, so the caller degrades to a default dialect and warns.
 func interBaseDiagnostics(conn *sql.DB) (interbase.DatabaseDiagnostics, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), interBasePingTimeout)
+	return interBaseDiagnosticsContext(context.Background(), conn)
+}
+
+func interBaseDiagnosticsContext(parent context.Context, conn *sql.DB) (interbase.DatabaseDiagnostics, error) {
+	ctx, cancel := context.WithTimeout(parent, interBasePingTimeout)
 	defer cancel()
 
 	pooled, err := conn.Conn(ctx)
@@ -77,6 +91,22 @@ func interBaseDiagnostics(conn *sql.DB) (interbase.DatabaseDiagnostics, error) {
 }
 
 func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
+	return interBaseOpenContext(context.Background(), cfg)
+}
+
+func interBaseOpenContext(ctx context.Context, cfg *DBConfig) (*DBConnection, error) {
+	return interBaseOpenContextWith(ctx, cfg, interBaseAttachContext, interBaseDiagnosticsContext)
+}
+
+func interBaseOpenContextWith(
+	ctx context.Context,
+	cfg *DBConfig,
+	attach func(context.Context, interBaseConnConfig, int) (*sql.DB, error),
+	diagnosticsFn func(context.Context, *sql.DB) (interbase.DatabaseDiagnostics, error),
+) (*DBConnection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if cfg == nil {
 		return nil, errors.New("interbase: connection config is nil")
 	}
@@ -100,12 +130,16 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 
 	// The first attach uses the requested dialect; a requested zero means the
 	// driver default, which is 3.
-	conn, err := interBaseAttach(connCfg, cfg.Dialect)
+	conn, err := attach(ctx, connCfg, cfg.Dialect)
 	if err != nil {
 		return nil, err
 	}
 
-	diagnostics, diagErr := interBaseDiagnostics(conn)
+	diagnostics, diagErr := diagnosticsFn(ctx, conn)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		_ = conn.Close()
+		return nil, ctxErr
+	}
 	decision := resolveInterBaseDialect(alias, cfg.Dialect, diagnostics.SQLDialect, diagErr)
 	sourceDialect := decision.Resolved
 	if diagErr == nil && (diagnostics.SQLDialect == 1 || diagnostics.SQLDialect == 3) {
@@ -115,7 +149,10 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 	if decision.Reattach {
 		// The single extra attach, paid only by a Dialect 1 database.
 		_ = conn.Close()
-		conn, err = interBaseAttach(connCfg, decision.Resolved)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err = attach(ctx, connCfg, decision.Resolved)
 		if err != nil {
 			return nil, err
 		}

@@ -16,6 +16,7 @@ const interBaseDefaultPort = 3050
 
 func init() {
 	RegisterOpen(dialect.DatabaseDriverInterBase, interBaseOpen)
+	RegisterOpenContext(dialect.DatabaseDriverInterBase, interBaseOpenContext)
 	RegisterFactory(dialect.DatabaseDriverInterBase, NewInterBaseDBRepository)
 	RegisterConnFactory(dialect.DatabaseDriverInterBase, NewInterBaseDBRepositoryFromConnection)
 }
