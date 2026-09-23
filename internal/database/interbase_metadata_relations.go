@@ -3,9 +3,70 @@ package database
 import (
 	"context"
 	"database/sql"
+	"fmt"
+	"strings"
 
 	"interbase-go/schema"
 )
+
+func (db *InterBaseDBRepository) readMetadataViews(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+	views := make([]schema.Relation, 0)
+	byName := make(map[string]int)
+	headerQuery := fmt.Sprintf(`
+SELECT %s, %s, r.RDB$VIEW_SOURCE, r.RDB$DESCRIPTION
+FROM RDB$RELATIONS r
+WHERE r.RDB$VIEW_BLR IS NOT NULL
+  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME", width), interBaseMetadataIdentifier("r.RDB$OWNER_NAME", width))
+	err := interBaseBulkQuery(ctx, q, "view headers", headerQuery, func(rows *sql.Rows) error {
+		var rawName, owner sql.NullString
+		var view schema.Relation
+		if err := rows.Scan(&rawName, &owner, &view.ViewSource, &view.Description); err != nil {
+			return err
+		}
+		name, err := interBaseRequiredName(rawName, "view name")
+		if err != nil {
+			return err
+		}
+		view.Name, view.Kind = name, schema.RelationView
+		view.OwnerName = trimInterBaseCatalogName(owner)
+		if _, exists := byName[name]; exists {
+			return fmt.Errorf("duplicate view header %q", name)
+		}
+		byName[name] = len(views)
+		views = append(views, view)
+		return nil
+	})
+	if err != nil {
+		return MetadataPatch{}, err
+	}
+	query := interBaseBulkColumnsQueryForWidth(width)
+	query = strings.Replace(query, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0", "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0 AND r.RDB$VIEW_BLR IS NOT NULL", 1)
+	err = interBaseBulkScanColumnsWithQuery(ctx, q, query, func(relation string, column schema.Column) error {
+		index, ok := byName[relation]
+		if !ok {
+			return fmt.Errorf("view column has no matching view header: %q", relation)
+		}
+		views[index].Columns = append(views[index].Columns, column)
+		return nil
+	})
+	if err != nil {
+		return MetadataPatch{}, err
+	}
+	descriptions := db.viewDescriptions(views)
+	byDescription := make(map[string]*ViewDesc, len(descriptions))
+	for _, description := range descriptions {
+		byDescription[description.Name] = description
+	}
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: byDescription}}, Count: len(descriptions)}, nil
+}
+
+func trimInterBaseCatalogName(value sql.NullString) sql.NullString {
+	if value.Valid {
+		value.String = strings.TrimRight(value.String, " ")
+	}
+	return value
+}
 
 func (db *InterBaseDBRepository) readMetadataRelations(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 	query := interBaseBulkRelationsQueryForWidth(width)

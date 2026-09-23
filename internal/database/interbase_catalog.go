@@ -375,8 +375,10 @@ func (db *InterBaseDBRepository) DescribeViews(ctx context.Context) ([]*ViewDesc
 		return nil, err
 	}
 
-	// A view has no primary key, so no constraint read is needed: passing an
-	// empty index keeps the column rendering identical to a table's.
+	return db.viewDescriptions(views), nil
+}
+
+func (db *InterBaseDBRepository) viewDescriptions(views []schema.Relation) []*ViewDesc {
 	noPrimaryKeys := map[string]struct{}{}
 	result := make([]*ViewDesc, 0, len(views))
 	for _, view := range views {
@@ -384,16 +386,9 @@ func (db *InterBaseDBRepository) DescribeViews(ctx context.Context) ([]*ViewDesc
 		for _, column := range view.Columns {
 			columns = append(columns, db.columnDescription(view.Name, column, noPrimaryKeys))
 		}
-		result = append(result, &ViewDesc{
-			Schema:      "",
-			Name:        view.Name,
-			OwnerName:   view.OwnerName,
-			ViewSource:  view.ViewSource,
-			Description: view.Description,
-			Columns:     columns,
-		})
+		result = append(result, &ViewDesc{Schema: "", Name: view.Name, OwnerName: view.OwnerName, ViewSource: view.ViewSource, Description: view.Description, Columns: columns})
 	}
-	return result, nil
+	return result
 }
 
 func (db *InterBaseDBRepository) DescribeGenerators(ctx context.Context) ([]*GeneratorDesc, error) {
@@ -450,6 +445,10 @@ func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexD
 	if err != nil {
 		return nil, err
 	}
+	return db.indexDescriptions(indexes), nil
+}
+
+func (db *InterBaseDBRepository) indexDescriptions(indexes []schema.Index) []*IndexDesc {
 	result := make([]*IndexDesc, 0, len(indexes))
 	for _, index := range indexes {
 		columns := make([]string, 0, len(index.Segments))
@@ -468,7 +467,7 @@ func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexD
 			Description:    index.Description,
 		})
 	}
-	return result, nil
+	return result
 }
 
 var _ CatalogRepository = (*InterBaseDBRepository)(nil)

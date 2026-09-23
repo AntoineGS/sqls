@@ -305,7 +305,11 @@ func interBaseBulkLoadColumns(ctx context.Context, queryer schema.Queryer, relat
 // legacy whole-catalog snapshot share this scan so descriptor inputs cannot
 // drift.
 func interBaseBulkScanColumns(ctx context.Context, queryer schema.Queryer, width int, consume func(string, schema.Column) error) error {
-	return interBaseBulkQuery(ctx, queryer, "columns", interBaseBulkColumnsQueryForWidth(width), func(rows *sql.Rows) error {
+	return interBaseBulkScanColumnsWithQuery(ctx, queryer, interBaseBulkColumnsQueryForWidth(width), consume)
+}
+
+func interBaseBulkScanColumnsWithQuery(ctx context.Context, queryer schema.Queryer, query string, consume func(string, schema.Column) error) error {
+	return interBaseBulkQuery(ctx, queryer, "columns", query, func(rows *sql.Rows) error {
 		var raw interBaseBulkColumnRow
 		if err := rows.Scan(raw.destinations()...); err != nil {
 			return err
