@@ -374,6 +374,52 @@ func TestInterBaseCatalogTextCharsetAllowlistMatchesDriver(t *testing.T) {
 	}
 }
 
+func TestInterBaseCatalogTextCharsetMappingParity(t *testing.T) {
+	tests := []struct {
+		name    string
+		charset string
+		want    string
+	}{
+		{name: "WIN1250", charset: "WIN1250", want: "WIN1250"},
+		{name: "owner confirmed WIN1252", charset: "WIN1252", want: "WIN1252"},
+		{name: "ISO8859_1", charset: "ISO8859_1", want: "ISO8859_1"},
+		{name: "ASCII", charset: "ASCII", want: "ASCII"},
+		{name: "normalizes case and whitespace", charset: " wIn1252 ", want: "WIN1252"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := &DBConfig{
+				Driver: dialect.DatabaseDriverInterBase,
+				Path:   "/tmp/sqls-catalog-charset.ib",
+				User:   "sqls",
+				Params: map[string]string{"charset": " utf8 "},
+				InterBase: &InterBaseConfig{
+					CatalogTextCharset: test.charset,
+				},
+			}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("DBConfig.Validate() error = %v", err)
+			}
+
+			connCfg, err := interBaseConnectionConfig(cfg)
+			if err != nil {
+				t.Fatalf("interBaseConnectionConfig() error = %v", err)
+			}
+			if connCfg.Charset != "UTF8" || connCfg.CatalogTextCharset != test.want {
+				t.Fatalf("projected charsets = (%q, %q), want attachment UTF8 and catalog %q", connCfg.Charset, connCfg.CatalogTextCharset, test.want)
+			}
+
+			driverCfg := interBaseDriverConfig(connCfg, 3)
+			if driverCfg.Charset != "UTF8" || driverCfg.CatalogTextCharset != test.want {
+				t.Fatalf("driver charsets = (%q, %q), want attachment UTF8 and catalog %q", driverCfg.Charset, driverCfg.CatalogTextCharset, test.want)
+			}
+			if _, err := interbase.NewConnector(driverCfg); err != nil {
+				t.Fatalf("NewConnector() rejected mapped configuration: %v", err)
+			}
+		})
+	}
+}
+
 func TestInterBaseDriverConfigIsAcceptedByConnector(t *testing.T) {
 	// NewConnector validates the whole configuration, including the composed
 	// attachment string, without dialing (interbase.go:114-139). This is the
