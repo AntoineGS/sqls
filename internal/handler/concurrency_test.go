@@ -153,6 +153,7 @@ type stubBackend struct {
 	mu             sync.Mutex
 	gates          map[string]*stubGate
 	served         []stubQuery
+	execServed     []string
 	openedDB       []*sql.DB
 	readOnly       bool
 	readOnlyServed []string
@@ -199,6 +200,18 @@ func (b *stubBackend) queries() []stubQuery {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return append([]stubQuery(nil), b.served...)
+}
+
+func (b *stubBackend) recordExec(query string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.execServed = append(b.execServed, query)
+}
+
+func (b *stubBackend) execs() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.execServed...)
 }
 
 // enableReadOnlyQuerier makes the next repository the factory builds implement
@@ -284,6 +297,7 @@ func (r *stubRepository) Query(ctx context.Context, query string) (*sql.Rows, er
 var errStubExecRejected = errors.New("interbase: statement requires execution as a query")
 
 func (r *stubRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
+	r.backend.recordExec(query)
 	if name := interBaseProcedureName(query); name != "" {
 		procs := r.backend.describedProcedures()
 		if len(procs) > 0 && !procedureNamed(procs, name) {

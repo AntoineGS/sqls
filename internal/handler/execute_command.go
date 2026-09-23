@@ -307,6 +307,9 @@ func (s *Server) runRoutedStatement(ctx context.Context, query string, vertical 
 	if err != nil && routing.unknown && cancellationNotice(ctx, err) == "" {
 		return fmt.Sprintf("Exec failed: %v\n\n"+unknownProcedureHint+"\n", err, routing.name), nil
 	}
+	if err == nil && routing.unknown && routing.metadataIncomplete {
+		return res + fmt.Sprintf("\n"+unknownProcedureHint+"\n", routing.name), nil
+	}
 	return res, err
 }
 
@@ -334,6 +337,9 @@ type procedureRouting struct {
 	// unknown is true when the statement is an EXECUTE PROCEDURE call whose
 	// procedure the cache could not resolve.
 	unknown bool
+	// metadataIncomplete distinguishes an absent signature from a conclusive
+	// miss in a successfully loaded procedure category.
+	metadataIncomplete bool
 }
 
 // interBaseProcedureRouting decides how to run an EXECUTE PROCEDURE statement,
@@ -352,13 +358,13 @@ func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
 
 	cache := s.worker.Cache()
 	if cache == nil || !cache.HasCatalog() {
-		return procedureRouting{name: name, unknown: true}
+		return procedureRouting{name: name, unknown: true, metadataIncomplete: true}
 	}
 	// The accessor normalises the name it is given, so the identifier goes in
 	// exactly as the user typed it.
 	desc, ok := cache.Procedure(name)
 	if !ok {
-		return procedureRouting{name: name, unknown: true}
+		return procedureRouting{name: name, unknown: true, metadataIncomplete: !cache.MetadataReady(database.MetadataProcedures)}
 	}
 	return procedureRouting{name: name, returnsRows: len(desc.OutputParameters) > 0}
 }

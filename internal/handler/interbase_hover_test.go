@@ -192,6 +192,24 @@ func TestResolveInterBaseHoverTargetRequiresReadyViewsForTableFallback(t *testin
 	}
 }
 
+func TestResolveInterBaseHoverTargetUsesKnownViewWhileViewsLoading(t *testing.T) {
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {"V"}},
+		Catalog: &database.CatalogCache{Views: map[string]*database.ViewDesc{
+			"V": {Name: "V"},
+		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading},
+	}
+	text := "SELECT * FROM V"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "V")},
+	}}
+	got, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase)
+	if !ok || got.kind != database.ObjectKindView || got.name != "V" {
+		t.Fatalf("known view match while category loads = %+v, %v", got, ok)
+	}
+}
+
 func TestResolveInterBaseHoverTargetIsCaseInsensitiveWithoutUpperCasingAtTheCallSite(t *testing.T) {
 	params := lsp.HoverParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{

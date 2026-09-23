@@ -230,6 +230,17 @@ func TestDiagnosticUniqueKeysRequiresCompleteCatalogInputs(t *testing.T) {
 	if !known || len(keys) != 1 || len(keys[0]) != 1 || keys[0][0] != "ID" {
 		t.Fatalf("complete catalog keys = %v, known=%v; want [[ID]], true", keys, known)
 	}
+	cache.Catalog.Indexes = map[string]*database.IndexDesc{}
+	cache.Catalog.IndexesByTable = map[string][]*database.IndexDesc{}
+	keys, known = diagnosticUniqueKeys(cache, "T", columns)
+	if !known || len(keys) != 0 {
+		t.Fatalf("ready-empty indexes keys = %v, known=%v; want empty, true", keys, known)
+	}
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
+	cache.Metadata[database.MetadataColumnsAll] = database.MetadataReady
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); !known {
+		t.Fatal("all-columns readiness should satisfy the columns requirement")
+	}
 }
 
 func diagnosticSource(diagnostic lsp.Diagnostic) string {

@@ -62,10 +62,10 @@ func testProcedures() []*database.ProcedureDesc {
 }
 
 func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureDesc) (string, *stubBackend) {
-	return runProcedureCommandWithProcedureState(t, text, procs, nil)
+	return runProcedureCommandWithProcedureState(t, text, procs, nil, "")
 }
 
-func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*database.ProcedureDesc, procedureState *database.MetadataState) (string, *stubBackend) {
+func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*database.ProcedureDesc, procedureState *database.MetadataState, omitCachedProcedure string) (string, *stubBackend) {
 	t.Helper()
 	tx := newTestContext()
 	tx.setup(t)
@@ -97,6 +97,9 @@ func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*d
 		if procedureState != nil {
 			cache.Metadata[database.MetadataProcedures] = *procedureState
 		}
+		if omitCachedProcedure != "" {
+			delete(cache.Catalog.Procedures, omitCachedProcedure)
+		}
 	}
 
 	tx.textDocumentDidOpen(t, testFileURI, text)
@@ -113,7 +116,7 @@ func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*d
 
 func TestExecuteProcedureWithFailedProcedureMetadataRemainsUnknown(t *testing.T) {
 	failed := database.MetadataFailed
-	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", []*database.ProcedureDesc{{Name: "OTHER"}}, &failed)
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", []*database.ProcedureDesc{{Name: "OTHER"}}, &failed, "")
 	if queries := backend.queries(); len(queries) != 0 {
 		t.Fatalf("Query served %d statements without a known procedure signature", len(queries))
 	}
@@ -127,12 +130,26 @@ func TestExecuteProcedureWithFailedProcedureMetadataRemainsUnknown(t *testing.T)
 
 func TestExecuteProcedureUsesKnownDescriptorWhileCategoryFailed(t *testing.T) {
 	failed := database.MetadataFailed
-	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed)
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed, "")
 	if queries := backend.queries(); len(queries) != 1 {
 		t.Fatalf("Query served %d statements for a present descriptor, want 1", len(queries))
 	}
 	if strings.Contains(got, "not in the catalog cache") {
 		t.Errorf("known descriptor was discarded because category state is failed: %q", got)
+	}
+}
+
+func TestExecuteProcedureUnknownWhileMetadataFailedHintsEvenWhenExecSucceeds(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed, "MYPROC")
+	if execs := backend.execs(); len(execs) != 1 {
+		t.Fatalf("Exec served %d statements, want exactly one", len(execs))
+	}
+	if queries := backend.queries(); len(queries) != 0 {
+		t.Fatalf("Query served %d statements; unresolved procedure must not be retried as Query", len(queries))
+	}
+	if !strings.Contains(got, "MYPROC is not in the catalog cache") || !strings.Contains(got, "switch to this connection again") {
+		t.Errorf("successful Exec result = %q, want visible unknown-metadata hint", got)
 	}
 }
 
