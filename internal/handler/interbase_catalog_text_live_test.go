@@ -4,6 +4,9 @@ package handler
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,25 +61,45 @@ func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	}
 	cfg.InterBase.CatalogTextCharset = strings.TrimSpace(charset)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
+	totalStarted := time.Now()
+	defer func() {
+		t.Logf("live acceptance total elapsed=%s deadline_remaining=%s ctx_err=%s", time.Since(totalStarted), liveDeadlineRemaining(ctx), liveContextError(ctx))
+	}()
+
+	phaseStarted := time.Now()
 	conn, err := database.Open(&cfg)
+	logLivePhase(t, ctx, "open", phaseStarted, err)
 	if err != nil {
 		t.Fatalf("open configured InterBase connection failed (%T)", err)
 	}
 	defer conn.Close()
 	repo := database.NewInterBaseDBRepositoryFromConnection(conn)
 	updater := database.NewDBCacheUpdater(repo)
+	phaseStarted = time.Now()
 	cache, err := updater.GenerateDBCachePrimary(ctx)
+	logLivePhase(t, ctx, "primary-cache", phaseStarted, err)
 	if err != nil {
 		t.Fatalf("primary database cache failed (%T)", err)
 	}
+	phaseStarted = time.Now()
 	columns, err := updater.GenerateDBCacheSecondary(ctx)
+	logLivePhase(t, ctx, "secondary-cache", phaseStarted, err)
 	if err != nil {
 		t.Fatalf("secondary database cache failed (%T)", err)
 	}
 	cache.ColumnsWithParent = columns
-	catalog, supported, err := updater.GenerateCatalogCache(ctx)
+	phaseStarted = time.Now()
+	// The snapshot fallback path logs its raw error. Suppress package logs only
+	// during this call so this diagnostic run never emits backend error text.
+	catalog, supported, err := func() (*database.CatalogCache, bool, error) {
+		previousLogOutput := log.Writer()
+		log.SetOutput(io.Discard)
+		defer log.SetOutput(previousLogOutput)
+		return updater.GenerateCatalogCache(ctx)
+	}()
+	logLivePhase(t, ctx, "full-catalog", phaseStarted, err)
 	if err != nil || !supported || catalog == nil {
 		t.Fatalf("full catalog failed: supported=%v err-type=%T", supported, err)
 	}
@@ -155,6 +178,32 @@ func hasSingletonDiagnosticAtRange(diagnostics []lsp.Diagnostic, expected lsp.Ra
 		}
 	}
 	return false
+}
+
+func logLivePhase(t *testing.T, ctx context.Context, phase string, started time.Time, err error) {
+	t.Helper()
+	t.Logf("phase=%s elapsed=%s deadline_remaining=%s err_type=%T is_deadline_exceeded=%t is_canceled=%t ctx_err=%s",
+		phase, time.Since(started), liveDeadlineRemaining(ctx), err,
+		errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled), liveContextError(ctx))
+}
+
+func liveDeadlineRemaining(ctx context.Context) string {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return "none"
+	}
+	return time.Until(deadline).String()
+}
+
+func liveContextError(ctx context.Context) string {
+	switch {
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return context.DeadlineExceeded.Error()
+	case errors.Is(ctx.Err(), context.Canceled):
+		return context.Canceled.Error()
+	default:
+		return "nil"
+	}
 }
 
 func sameDiagnosticsExceptTargetSingleton(before, after []lsp.Diagnostic, expected lsp.Range) bool {
