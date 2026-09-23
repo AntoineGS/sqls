@@ -31,4 +31,4 @@ Existing planning/spec files were left untouched and excluded from the commit.
 
 ## Commit
 
-Commit: `1cc7633` (`feat(metadata): define category readiness and load contracts`).
+Implementation commit: `a33d1a5` (`feat(metadata): define category readiness and load contracts`).
