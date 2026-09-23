@@ -259,6 +259,23 @@ one place instead of at each call site:
   the user cannot act on. What the catalog cannot reproduce as DDL is otherwise
   displayed as its own fields and its verbatim source text.
 
+### InterBase metadata jobs
+
+InterBase's `MetadataPlan` executes independent category jobs with a plan
+parallelism of three; each catalog job owns one read-only snapshot transaction
+and therefore at most one connection. Identifier-width discovery is part of
+that job's budget, not hidden setup. The fixture-backed set-based readers have
+these measured statement budgets (including discovery): views, indexes,
+procedures, and functions each use **3 statements** (two data reads plus one
+identifier-width read), independent of whether the fixture has 1 or 100 parent
+objects. The relation/core-reader suite separately asserts width discovery plus
+one bulk data read for its corresponding reader. Legacy accessors used by
+generators, domains, and triggers perform their own catalog projection
+discovery; their native server round-trip counts are not currently measured.
+These are statements prepared/executed by the catalog path, not a claim about
+wire-level packets. `TestInterBaseMetadataLive` is opt-in and read-only; a skip
+for absent credentials is explicitly not native equivalence verification.
+
 **The hover DDL round trip is the one place this plan puts inline I/O on the
 request-handling loop.** `interbase_hover.go` calls `ObjectDDL` synchronously
 from the hover handler, which is not among the async-dispatched methods (see
