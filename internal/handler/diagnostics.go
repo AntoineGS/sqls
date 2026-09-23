@@ -25,16 +25,14 @@ func isServerNotification(method string) bool {
 }
 
 type documentDiagnosticsSnapshot struct {
-	uri             string
-	text            string
-	version         int
-	revision        uint64
-	variant         dialect.DriverVariant
-	generation      int
-	cacheGeneration int
-	cacheReady      bool
-	cache           *database.DBCache
-	cacheSnapshot   sqlsymbol.Catalog
+	uri           string
+	text          string
+	version       int
+	revision      uint64
+	variant       dialect.DriverVariant
+	generation    int
+	cache         *database.DBCache
+	cacheSnapshot sqlsymbol.Catalog
 }
 
 type diagnosticCatalog struct {
@@ -156,22 +154,21 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		return documentDiagnosticsSnapshot{}, false
 	}
 	snapshot := documentDiagnosticsSnapshot{
-		uri:             uri,
-		text:            file.Text,
-		version:         file.Version,
-		revision:        file.Revision,
-		generation:      s.connGeneration,
-		cacheGeneration: s.diagnosticsCacheGeneration,
-		cacheReady:      s.diagnosticsCacheGeneration == s.connGeneration,
+		uri:        uri,
+		text:       file.Text,
+		version:    file.Version,
+		revision:   file.Revision,
+		generation: s.connGeneration,
 	}
 	if s.dbConn != nil {
 		snapshot.variant = s.dbConn.DriverVariant()
 	}
 	s.stateMu.RUnlock()
 
-	if snapshot.cacheReady {
-		snapshot.cache = s.worker.Cache()
-		if snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
+	meta := s.metadata.Snapshot()
+	if meta != nil && meta.Generation == uint64(snapshot.generation) {
+		snapshot.cache = meta.Cache
+		if snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
 			snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
 		}
 	}
@@ -182,8 +179,7 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	s.stateMu.RLock()
 	file, open := s.files[snapshot.uri]
 	current := open && file.Version == snapshot.version && file.Revision == snapshot.revision &&
-		s.connGeneration == snapshot.generation &&
-		s.diagnosticsCacheGeneration == snapshot.cacheGeneration
+		s.connGeneration == snapshot.generation
 	if s.dbConn == nil {
 		current = current && snapshot.variant == (dialect.DriverVariant{})
 	} else {
@@ -193,10 +189,8 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	if !current {
 		return false
 	}
-	if snapshot.cacheReady {
-		return s.worker.Cache() == snapshot.cache
-	}
-	return true
+	meta := s.metadata.Snapshot()
+	return meta != nil && meta.Generation == uint64(snapshot.generation) && meta.Cache == snapshot.cache
 }
 
 func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.Conn, uri string) {

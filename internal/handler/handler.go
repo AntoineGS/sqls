@@ -58,14 +58,24 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration int
-	// diagnosticsCacheGeneration identifies the connection generation for
-	// which worker.Cache() was last rebuilt. A reconnect temporarily makes the
-	// previous cache unavailable to static diagnostics until the new primary
-	// cache has completed.
-	diagnosticsCacheGeneration int
-	fileRevision               uint64
-	notificationConn           *jsonrpc2.Conn
+	connGeneration  int
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	coordinator     *connectionCoordinator
+	metadata        *database.MetadataLoader
+	// worker is retained only as a nil compatibility slot for older package
+	// tests; production no longer constructs or reads the eager worker.
+	worker           *database.Worker
+	initialized      bool
+	connectionState  connectionState
+	openConnection   database.ContextOpener
+	activeConfigKey  string
+	cleanupOnce      sync.Once
+	cleanupDone      chan struct{}
+	cleanupQueue     chan *database.DBConnection
+	stopOnce         sync.Once
+	fileRevision     uint64
+	notificationConn *jsonrpc2.Conn
 
 	// ddlMemo caches the rendered DDL appendix per connection generation.
 	// Hover fires on every cursor rest over the same token; without this,
@@ -78,7 +88,6 @@ type Server struct {
 	// go-to-definition for database objects and nothing else.
 	snapshots *sourceSnapshotStore
 
-	worker  *database.Worker
 	files   map[string]*File
 	cancels *cancelRegistry
 }
@@ -91,18 +100,29 @@ type File struct {
 }
 
 func NewServer() *Server {
-	worker := database.NewWorker()
-	worker.Start()
+	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 
 	server := &Server{
-		files:   make(map[string]*File),
-		ddlMemo: make(map[ddlKey]string),
-		worker:  worker,
-		cancels: newCancelRegistry(),
+		files:           make(map[string]*File),
+		ddlMemo:         make(map[ddlKey]string),
+		cancels:         newCancelRegistry(),
+		lifecycleCtx:    lifecycleCtx,
+		lifecycleCancel: lifecycleCancel,
+		metadata:        database.NewMetadataLoader(),
+		connectionState: connectionIdle,
+		openConnection:  database.OpenContext,
+		cleanupDone:     make(chan struct{}),
+		cleanupQueue:    make(chan *database.DBConnection, 1),
 	}
-	worker.SetCacheChangedCallback(func() {
-		go server.republishOpenDiagnostics(context.Background())
+	server.metadata.SetChangedCallback(func() {
+		select {
+		case <-server.lifecycleCtx.Done():
+		default:
+			go server.republishOpenDiagnostics(server.lifecycleCtx)
+		}
 	})
+	server.coordinator = newConnectionCoordinator(server)
+	go server.cleanupConnections()
 	// Deliberately no filesystem access here: NewServer runs in every test in
 	// this package, and touching the real cache directory from a unit test is
 	// the hazard the injected root exists to remove. The root is only resolved,
@@ -138,12 +158,23 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 // the process open — but it does take stateMu for the pointer read, because a
 // concurrent switch may be reassigning it.
 func (s *Server) Stop() error {
-	defer s.snapshots.RemoveAll()
-	defer s.worker.Stop()
-	s.stateMu.RLock()
-	dbConn := s.dbConn
-	s.stateMu.RUnlock()
-	return dbConn.Close()
+	s.stopOnce.Do(func() {
+		s.lifecycleCancel()
+		s.coordinator.Stop()
+		s.metadata.Stop()
+		s.snapshots.BeginShutdown()
+		s.stateMu.Lock()
+		s.connectionState = connectionStopped
+		dbConn := s.dbConn
+		s.dbConn = nil
+		s.stateMu.Unlock()
+		select {
+		case s.cleanupQueue <- dbConn:
+		default:
+		}
+		go func() { <-s.coordinator.done; close(s.cleanupQueue) }()
+	})
+	return nil
 }
 
 func (s *Server) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
@@ -169,6 +200,7 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 	case "initialize":
 		return s.handleInitialize(ctx, conn, req)
 	case "initialized":
+		s.handleInitialized()
 		return
 	case "shutdown":
 		return s.handleShutdown(ctx, conn, req)
@@ -256,46 +288,16 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 	s.initOptionDBConfig = params.InitializationOptions.ConnectionConfig
 	s.stateMu.Unlock()
 
-	// Initialize database database connection
-	// NOTE: If no connection is found at this point, it is possible that the connection settings are sent to workspace config, so don't make an error
-	messenger := lsp.NewMessenger(conn)
-	s.connMu.Lock()
-	err = s.reconnectionDB(ctx)
-	s.connMu.Unlock()
-	if err != nil {
-		if errors.Is(err, ErrNoConnection) {
-			if err := messenger.ShowInfo(ctx, err.Error()); err != nil {
-				log.Println("send info", err.Error())
-				return nil, err
-			}
-		} else {
-			log.Println("send err", err.Error())
-			if err := messenger.ShowError(ctx, err.Error()); err != nil {
-				return nil, err
-			}
-		}
-	}
-	s.showConnectionWarnings(ctx, messenger)
+	// No attachment, metadata, or client messaging is permitted on initialize's
+	// read-loop path. Bootstrap is triggered by the initialized notification.
 	return result, nil
 }
 
 func (s *Server) handleShutdown(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
-	s.stateMu.RLock()
-	dbConn := s.dbConn
-	s.stateMu.RUnlock()
-	if dbConn != nil {
-		dbConn.Close()
-	}
-	return nil, nil
+	return nil, s.Stop()
 }
 
 func (s *Server) handleExit(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
-	s.stateMu.RLock()
-	dbConn := s.dbConn
-	s.stateMu.RUnlock()
-	if dbConn != nil {
-		dbConn.Close()
-	}
 	err = s.Stop()
 	return nil, err
 }
@@ -483,36 +485,13 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	}
 	s.stateMu.Lock()
 	s.WSCfg = params.Settings.SQLS
-	s.stateMu.Unlock()
-
-	// Skip database connection
-	s.stateMu.RLock()
+	initialized := s.initialized
 	connected := s.dbConn != nil
-	s.stateMu.RUnlock()
-	if connected {
-		return nil, nil
+	s.stateMu.Unlock()
+	if initialized && !connected {
+		cfg, index, dbName := s.desiredConnection()
+		s.coordinator.Request(s.lifecycleCtx, cfg, index, dbName)
 	}
-
-	// Initialize database database connection
-	messenger := lsp.NewMessenger(conn)
-	s.connMu.Lock()
-	err = s.reconnectionDB(ctx)
-	s.connMu.Unlock()
-	if err != nil {
-		if errors.Is(err, ErrNoConnection) {
-			if err := messenger.ShowInfo(ctx, err.Error()); err != nil {
-				log.Println("send info", err.Error())
-				return nil, err
-			}
-		} else {
-			log.Println("send err", err.Error())
-			if err := messenger.ShowError(ctx, err.Error()); err != nil {
-				return nil, err
-			}
-		}
-	}
-	s.showConnectionWarnings(ctx, messenger)
-
 	return nil, nil
 }
 
@@ -529,48 +508,136 @@ func (s *Server) handleCancelRequest(ctx context.Context, conn *jsonrpc2.Conn, r
 }
 
 func (s *Server) reconnectionDB(ctx context.Context) error {
-	s.stateMu.RLock()
-	oldConn := s.dbConn
-	s.stateMu.RUnlock()
-	if err := oldConn.Close(); err != nil {
-		return err
-	}
+	cfg, index, dbName := s.desiredConnection()
+	return <-s.coordinator.Request(ctx, cfg, index, dbName)
+}
 
-	dbConn, err := s.newDBConnection(ctx)
-	if err != nil {
+func (s *Server) handleInitialized() {
+	s.stateMu.Lock()
+	if s.initialized || s.connectionState == connectionStopped {
+		s.stateMu.Unlock()
+		return
+	}
+	s.initialized = true
+	connected := s.dbConn != nil
+	s.stateMu.Unlock()
+	if !connected {
+		cfg, index, name := s.desiredConnection()
+		s.coordinator.Request(s.lifecycleCtx, cfg, index, name)
+	}
+}
+
+func (s *Server) desiredConnection() (*database.DBConfig, int, string) {
+	cfg := s.topConnection()
+	s.stateMu.RLock()
+	index, name := s.curConnectionIndex, s.curDBName
+	s.stateMu.RUnlock()
+	if index != 0 {
+		cfg = s.getConnection(index)
+	}
+	if cfg != nil {
+		cfg = cloneConnectionConfig(cfg)
+		if name != "" {
+			cfg.DBName = name
+		}
+	}
+	return cfg, index, name
+}
+
+func (s *Server) activeIntentConfig() *database.DBConfig {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return cloneConnectionConfig(s.curDBCfg)
+}
+
+func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) error {
+	if intent.Config == nil {
+		s.stateMu.Lock()
+		s.connectionState = connectionIdle
+		s.stateMu.Unlock()
+		return ErrNoConnection
+	}
+	// A queued intent cannot alter the active generation until it owns the
+	// write lock, which also serializes it with queries using the old identity.
+	s.connMu.Lock()
+	defer s.connMu.Unlock()
+	if err := intent.Context.Err(); err != nil {
 		return err
 	}
 	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
-	s.dbConn = dbConn
+	if s.connectionState == connectionStopped {
+		s.stateMu.Unlock()
+		s.diagnosticsPublishMu.Unlock()
+		return context.Canceled
+	}
 	s.connGeneration++
-	s.diagnosticsCacheGeneration = -1
 	generation := s.connGeneration
-	// The new connection may be a different database entirely, so nothing
-	// cached against the old one is still true.
+	s.connectionState = connectionConnecting
+	old := s.dbConn
+	s.dbConn = nil
+	s.curDBCfg = cloneConnectionConfig(intent.Config)
+	s.curConnectionIndex = intent.ConnectionIndex
+	s.curDBName = intent.DatabaseName
 	s.ddlMemo = make(map[ddlKey]string)
+	s.metadata.Reset(uint64(generation))
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
-
-	for _, warning := range dbConn.Warnings {
-		log.Println(warning)
+	if old != nil {
+		select {
+		case s.cleanupQueue <- old:
+		default:
+			log.Printf("sqls: attachment cleanup queue full; closing detached connection asynchronously is deferred")
+		}
 	}
-
-	dbRepo, err := s.newDBRepository(ctx)
+	s.republishOpenDiagnostics(s.lifecycleCtx)
+	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))
 	if err != nil {
-		s.republishOpenDiagnostics(ctx)
-		return err
-	}
-	cacheErr := s.worker.ReCache(ctx, dbRepo)
-	if cacheErr == nil {
 		s.stateMu.Lock()
-		if s.connGeneration == generation {
-			s.diagnosticsCacheGeneration = generation
+		if s.connGeneration == generation && s.connectionState != connectionStopped {
+			s.connectionState = connectionFailed
 		}
 		s.stateMu.Unlock()
+		return err
 	}
-	s.republishOpenDiagnostics(ctx)
-	return cacheErr
+	if ctx.Err() != nil || s.lifecycleCtx.Err() != nil {
+		_ = candidate.Close()
+		return context.Canceled
+	}
+	s.diagnosticsPublishMu.Lock()
+	s.stateMu.Lock()
+	if s.connGeneration != generation || s.connectionState == connectionStopped || ctx.Err() != nil {
+		s.stateMu.Unlock()
+		s.diagnosticsPublishMu.Unlock()
+		_ = candidate.Close()
+		return context.Canceled
+	}
+	s.dbConn = candidate
+	s.connectionState = connectionReady
+	s.activeConfigKey = intentKey(intent)
+	s.stateMu.Unlock()
+	s.diagnosticsPublishMu.Unlock()
+	repo, err := database.CreateRepositoryFromConnection(intent.Config.Driver, candidate)
+	if err == nil {
+		_, err = s.metadata.Start(s.lifecycleCtx, uint64(generation), repo)
+	}
+	if err != nil {
+		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
+	}
+	s.republishOpenDiagnostics(s.lifecycleCtx)
+	return nil
+}
+
+func (s *Server) cleanupConnections() {
+	for conn := range s.cleanupQueue {
+		if err := conn.Close(); err != nil {
+			log.Printf("sqls: closing database attachment: %v", err)
+		}
+	}
+	if s.snapshots != nil {
+		s.snapshots.RemoveAll()
+	}
+	close(s.cleanupDone)
 }
 
 // showConnectionWarnings sends any non-fatal connect-time diagnostics to the
@@ -639,6 +706,25 @@ func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, er
 		return nil, err
 	}
 	return repo, nil
+}
+
+func (s *Server) acquireReadyConnection() (database.DBRepository, func(), error) {
+	if !s.connMu.TryRLock() {
+		return nil, nil, errors.New("database connection is changing; retry shortly")
+	}
+	s.stateMu.RLock()
+	ready := s.connectionState == connectionReady && s.dbConn != nil
+	s.stateMu.RUnlock()
+	if !ready {
+		s.connMu.RUnlock()
+		return nil, nil, errors.New("database connection is not ready; retry shortly")
+	}
+	repo, err := s.newDBRepository(s.lifecycleCtx)
+	if err != nil {
+		s.connMu.RUnlock()
+		return nil, nil, err
+	}
+	return repo, s.connMu.RUnlock, nil
 }
 
 func (s *Server) topConnection() *database.DBConfig {

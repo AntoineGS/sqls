@@ -178,15 +178,11 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 }
 
 func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	// parse execute command arguments
-	s.stateMu.RLock()
-	connected := s.dbConn != nil
-	s.stateMu.RUnlock()
-	if !connected {
-		return nil, errors.New("database connection is not open")
+	_, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		return nil, err
 	}
+	defer unlock()
 
 	showVertical := showVerticalRequested(params)
 
@@ -356,7 +352,7 @@ func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
 		return procedureRouting{}
 	}
 
-	cache := s.worker.Cache()
+	cache := s.metadata.Cache()
 	if cache == nil || !cache.HasCatalog() {
 		return procedureRouting{name: name, unknown: true, metadataIncomplete: true}
 	}
@@ -700,12 +696,11 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...
 }
 
 func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	databases, err := repo.Databases(ctx)
 	if err != nil {
 		return nil, err
@@ -714,12 +709,11 @@ func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandPar
 }
 
 func (s *Server) showSchemas(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	schemas, err := repo.Schemas(ctx)
 	if err != nil {
 		return nil, err
@@ -759,8 +753,6 @@ func isNoOpDatabaseSwitch(ctx context.Context, repo database.DBRepository, dbNam
 }
 
 func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <DB Name>")
 	}
@@ -773,6 +765,7 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	// user selects the database to connect to, so there is nothing to validate.
 	// newDBRepository takes stateMu internally, so this is safe to call while
 	// holding only connMu.
+	s.connMu.RLock()
 	repo, err := s.newDBRepository(ctx)
 	switch {
 	case errors.Is(err, ErrNoConnection):
@@ -781,22 +774,22 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 		return nil, err
 	default:
 		if err := validateDatabaseSwitch(ctx, repo, dbName); err != nil {
+			s.connMu.RUnlock()
 			return nil, err
 		}
 		if isNoOpDatabaseSwitch(ctx, repo, dbName) {
 			// Already open: see isNoOpDatabaseSwitch for why reconnecting
 			// would break rather than refresh it.
+			s.connMu.RUnlock()
 			return nil, nil
 		}
 	}
-
-	// Change current database
-	s.stateMu.Lock()
-	s.curDBName = dbName
-	s.stateMu.Unlock()
-
-	// close and reconnection to database
-	if err := s.reconnectionDB(ctx); err != nil {
+	s.connMu.RUnlock()
+	cfg, index, _ := s.desiredConnection()
+	if cfg != nil {
+		cfg.DBName = dbName
+	}
+	if err := <-s.coordinator.RequestExplicit(ctx, cfg, index, dbName); err != nil {
 		return nil, err
 	}
 
@@ -831,8 +824,6 @@ func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandP
 }
 
 func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <Connection Index>")
 	}
@@ -864,13 +855,11 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 	}
 	index = index - 1
 
-	// Reconnect database
-	s.stateMu.Lock()
-	s.curConnectionIndex = index
-	s.stateMu.Unlock()
-
-	// close and reconnection to database
-	if err := s.reconnectionDB(ctx); err != nil {
+	connectionCfg := s.getConnection(index)
+	s.stateMu.RLock()
+	dbName := s.curDBName
+	s.stateMu.RUnlock()
+	if err := <-s.coordinator.RequestExplicit(ctx, connectionCfg, index, dbName); err != nil {
 		return nil, err
 	}
 
@@ -878,12 +867,11 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 }
 
 func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	m, err := repo.SchemaTables(ctx)
 	if err != nil {
 		return nil, err

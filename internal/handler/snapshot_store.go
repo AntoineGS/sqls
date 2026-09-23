@@ -67,7 +67,8 @@ type sourceSnapshotStore struct {
 	dir        string
 	// created is every directory this store made, so shutdown can remove
 	// exactly those and nothing a concurrent sqls process owns.
-	created map[string]struct{}
+	created      map[string]struct{}
+	shuttingDown bool
 }
 
 func newSourceSnapshotStore(root string) *sourceSnapshotStore {
@@ -106,6 +107,9 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.shuttingDown {
+		return "", errors.New("snapshot store is shutting down")
+	}
 
 	s.pruneLocked()
 
@@ -219,6 +223,16 @@ func (s *sourceSnapshotStore) RemoveAll() {
 			log.Printf("sqls: remove snapshot directory %q: %v", dir, err)
 		}
 	}
+}
+
+// BeginShutdown fences all future writes before cleanup removes owned files.
+func (s *sourceSnapshotStore) BeginShutdown() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.shuttingDown = true
+	s.mu.Unlock()
 }
 
 func (s *sourceSnapshotStore) connectionDirLocked(sc snapshotContext) (string, error) {

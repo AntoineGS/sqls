@@ -34,7 +34,7 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	dbCache := s.worker.Cache()
+	dbCache := s.metadata.Cache()
 	res, err := hoverWithDriverVariant(text, params, dbCache, s.parserDriverVariant())
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		return nil, err

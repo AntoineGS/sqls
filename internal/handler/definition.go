@@ -69,7 +69,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 	if contextual {
-		dbCache := s.worker.Cache()
+		dbCache := s.metadata.Cache()
 		repo, err := s.newDBRepository(ctx)
 		if err != nil {
 			return nil, nil
@@ -77,7 +77,7 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return s.interBaseContextualDefinitionWithAnalysis(ctx, repo, dbCache, text, params.Position, dv, analysis)
 	}
 
-	dbCache := s.worker.Cache()
+	dbCache := s.metadata.Cache()
 	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, dv)
 	if err != nil {
 		return nil, err

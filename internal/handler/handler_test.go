@@ -7,10 +7,12 @@ import (
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
 
 	"github.com/sqls-server/sqls/internal/config"
+	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -24,8 +26,28 @@ type TestContext struct {
 	ctx        context.Context
 }
 
+// loadMetadataForTest installs a loader generation just like an attachment
+// transition, then waits for deterministic settlement rather than sleeping.
+func loadMetadataForTest(t *testing.T, s *Server, repo database.DBRepository) {
+	t.Helper()
+	s.diagnosticsPublishMu.Lock()
+	s.stateMu.Lock()
+	s.connGeneration++
+	generation:=s.connGeneration
+	s.metadata.Reset(uint64(generation))
+	s.stateMu.Unlock()
+	s.diagnosticsPublishMu.Unlock()
+	load,err:=s.metadata.Start(context.Background(),uint64(generation),repo)
+	if err!=nil { t.Fatalf("start metadata: %v",err) }
+	select { case <-load.Done: case <-time.After(10*time.Second): t.Fatal("metadata loader watchdog expired") }
+}
+
 func newTestContext() *TestContext {
 	server := NewServer()
+	// Transitional test fixture only; NewServer does not construct the legacy
+	// eager worker in production.
+	server.worker = database.NewWorker()
+	server.worker.Start()
 	handler := NewDispatcher(jsonrpc2.HandlerWithError(server.Handle))
 	ctx := context.Background()
 	return &TestContext{
@@ -70,6 +92,9 @@ func (tx *TestContext) initServer(t *testing.T) {
 	}
 	if err := tx.conn.Call(tx.ctx, "initialize", params, nil); err != nil {
 		t.Fatal("conn.Call initialize:", err)
+	}
+	if err := tx.conn.Notify(tx.ctx, "initialized", struct{}{}); err != nil {
+		t.Fatal("conn.Notify initialized:", err)
 	}
 }
 

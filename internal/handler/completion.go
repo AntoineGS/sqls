@@ -25,7 +25,7 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	c := completer.NewCompleter(s.worker.Cache())
+	c := completer.NewCompleter(s.metadata.Cache())
 	dv := s.parserDriverVariant()
 	c.Driver, c.Variant = dv.Driver, dv.Variant
 	completionItems, err := c.Complete(text, params, s.getConfig().LowercaseKeywords)

@@ -29,7 +29,7 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
 	}
 
-	res, err := SignatureHelpWithDriverVariant(text, params, s.worker.Cache(), s.parserDriverVariant())
+	res, err := SignatureHelpWithDriverVariant(text, params, s.metadata.Cache(), s.parserDriverVariant())
 	if err != nil {
 		return nil, err
 	}

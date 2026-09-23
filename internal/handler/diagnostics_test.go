@@ -93,10 +93,15 @@ func newDiagnosticsTestContext(t *testing.T, driver dialect.DatabaseDriver) *dia
 	t.Helper()
 	ctx := context.Background()
 	server := NewServer()
+	server.worker = database.NewWorker()
+	server.worker.Start()
 	t.Cleanup(func() { server.worker.Stop() })
 	server.stateMu.Lock()
 	server.dbConn = &database.DBConnection{Driver: driver}
+	server.connectionState = connectionReady
+	server.connGeneration = 1
 	server.stateMu.Unlock()
+	server.metadata.Reset(1)
 	clientEnd, serverEnd := net.Pipe()
 	client := newDiagnosticsClient()
 	clientConn := jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(clientEnd, jsonrpc2.VSCodeObjectCodec{}), client)
@@ -258,10 +263,7 @@ func TestPublishInterBaseDiagnosticsAndLifecycle(t *testing.T) {
 	const uri = "file:///diagnostics-lifecycle.sql"
 	text := "/*😀*/ CREATE PROCEDURE P AS DECLARE VARIABLE UNUSED VARCHAR(10); BEGIN UNUSED = 'x'; INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, text, 1)
 
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
@@ -342,10 +344,7 @@ func TestInterBaseDiagnosticsAcceptance(t *testing.T) {
 	initialText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	fixedText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN LOCAL_VALUE = LOCAL_VALUE; INSERT INTO DST (VALUE) SELECT CAST(SRC.VALUE AS VARCHAR(20)) FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, initialText, 1)
 
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
@@ -408,10 +407,7 @@ func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 	const uri = "file:///diagnostics-cache.sql"
 	text := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed initial diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, text, 1)
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1
@@ -420,15 +416,12 @@ func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 		t.Fatalf("initial diagnostics = %+v, want truncation warning", initial.Diagnostics)
 	}
 
-	oldCache := tx.server.worker.Cache()
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(50)"))); err != nil {
-		t.Fatal("refresh diagnostic cache:", err)
-	}
-	primaryCache := tx.server.worker.Cache()
+	oldCache := tx.server.metadata.Cache()
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(50)")))
+	primaryCache := tx.server.metadata.Cache()
 	if primaryCache == oldCache {
-		t.Fatal("worker cache pointer did not refresh")
+		t.Fatal("metadata cache pointer did not refresh")
 	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, primaryCache)
 	refreshed := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 0
 	})
@@ -573,7 +566,6 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 	tx.server.stateMu.Lock()
 	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverMySQL}
 	tx.server.connGeneration++
-	tx.server.diagnosticsCacheGeneration = -1
 	tx.server.stateMu.Unlock()
 	tx.server.diagnosticsPublishMu.Unlock()
 	tx.server.republishOpenDiagnostics(tx.ctx)
