@@ -274,6 +274,14 @@ type Diagnostic struct {
 	RelatedInformation []DiagnosticRelatedInformation `json:"relatedInformation,omitempty"`
 }
 
+// PublishDiagnosticsParams replaces the diagnostics for a document. Version
+// is omitted for clears that are emitted after the document has been closed.
+type PublishDiagnosticsParams struct {
+	URI         string       `json:"uri"`
+	Version     *int         `json:"version,omitempty"`
+	Diagnostics []Diagnostic `json:"diagnostics"`
+}
+
 type WorkDoneProgressParams struct {
 	WorkDoneToken interface{} `json:"workDoneToken"`
 }

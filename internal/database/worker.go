@@ -7,8 +7,9 @@ import (
 )
 
 type Worker struct {
-	dbRepo  DBRepository
-	dbCache *DBCache
+	dbRepo         DBRepository
+	dbCache        *DBCache
+	onCacheChanged func()
 
 	done     chan struct{}
 	update   chan struct{}
@@ -31,8 +32,24 @@ func (w *Worker) Cache() *DBCache {
 
 func (w *Worker) setCache(c *DBCache) {
 	w.lock.Lock()
-	defer w.lock.Unlock()
 	w.dbCache = c
+	callback := w.onCacheChanged
+	w.lock.Unlock()
+	if callback != nil {
+		callback()
+	}
+}
+
+// SetCacheChangedCallback registers a callback invoked after any cache
+// replacement. The callback runs without the worker lock held.
+func (w *Worker) SetCacheChangedCallback(callback func()) {
+	w.lock.Lock()
+	w.onCacheChanged = callback
+	hasCache := w.dbCache != nil
+	w.lock.Unlock()
+	if callback != nil && hasCache {
+		callback()
+	}
 }
 
 // repo returns the repository the worker goroutine should use. ReCache runs on
@@ -52,25 +69,37 @@ func (w *Worker) setRepo(repo DBRepository) {
 
 func (w *Worker) setColumnCache(col map[string][]*ColumnDesc) {
 	w.lock.Lock()
-	defer w.lock.Unlock()
+	changed := false
 	if w.dbCache != nil {
 		// Swap in a copy so that readers holding the previous
 		// *DBCache keep seeing a consistent snapshot.
 		newCache := *w.dbCache
 		newCache.ColumnsWithParent = col
 		w.dbCache = &newCache
+		changed = true
+	}
+	callback := w.onCacheChanged
+	w.lock.Unlock()
+	if changed && callback != nil {
+		callback()
 	}
 }
 
 func (w *Worker) setCatalogCache(c *CatalogCache) {
 	w.lock.Lock()
-	defer w.lock.Unlock()
+	changed := false
 	if w.dbCache != nil {
 		// Swap in a copy so that readers holding the previous
 		// *DBCache keep seeing a consistent snapshot.
 		newCache := *w.dbCache
 		newCache.Catalog = c
 		w.dbCache = &newCache
+		changed = true
+	}
+	callback := w.onCacheChanged
+	w.lock.Unlock()
+	if changed && callback != nil {
+		callback()
 	}
 }
 

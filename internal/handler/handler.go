@@ -36,6 +36,12 @@ type Server struct {
 	// across database I/O.
 	stateMu sync.RWMutex
 
+	// diagnosticsPublishMu serializes version/generation validation with LSP
+	// diagnostic sends. Connection generation changes use the same fence so a
+	// publication from the previous attachment cannot follow the switch's
+	// clearing/recompute notification.
+	diagnosticsPublishMu sync.Mutex
+
 	dbConn *database.DBConnection
 
 	curDBCfg           *database.DBConfig
@@ -53,6 +59,13 @@ type Server struct {
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
 	connGeneration int
+	// diagnosticsCacheGeneration identifies the connection generation for
+	// which worker.Cache() was last rebuilt. A reconnect temporarily makes the
+	// previous cache unavailable to static diagnostics until the new primary
+	// cache has completed.
+	diagnosticsCacheGeneration int
+	fileRevision               uint64
+	notificationConn           *jsonrpc2.Conn
 
 	// ddlMemo caches the rendered DDL appendix per connection generation.
 	// Hover fires on every cursor rest over the same token; without this,
@@ -73,6 +86,8 @@ type Server struct {
 type File struct {
 	LanguageID string
 	Text       string
+	Version    int
+	Revision   uint64
 }
 
 func NewServer() *Server {
@@ -85,6 +100,9 @@ func NewServer() *Server {
 		worker:  worker,
 		cancels: newCancelRegistry(),
 	}
+	worker.SetCacheChangedCallback(func() {
+		go server.republishOpenDiagnostics(context.Background())
+	})
 	// Deliberately no filesystem access here: NewServer runs in every test in
 	// this package, and touching the real cache directory from a unit test is
 	// the hazard the injected root exists to remove. The root is only resolved,
@@ -129,6 +147,11 @@ func (s *Server) Stop() error {
 }
 
 func (s *Server) Handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
+	if conn != nil && !isServerNotification(req.Method) {
+		s.stateMu.Lock()
+		s.notificationConn = conn
+		s.stateMu.Unlock()
+	}
 	// Prevent any uncaught panics from taking the entire server down.
 	defer func() {
 		if perr := panicf(recover(), "%v", req.Method); perr != nil {
@@ -287,12 +310,13 @@ func (s *Server) handleTextDocumentDidOpen(ctx context.Context, conn *jsonrpc2.C
 		return nil, err
 	}
 
-	if err := s.openFile(params.TextDocument.URI, params.TextDocument.LanguageID); err != nil {
+	if err := s.openFileAtVersion(params.TextDocument.URI, params.TextDocument.LanguageID, params.TextDocument.Version); err != nil {
 		return nil, err
 	}
 	if err := s.updateFile(params.TextDocument.URI, params.TextDocument.Text); err != nil {
 		return nil, err
 	}
+	s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
 	return nil, nil
 }
 
@@ -309,8 +333,12 @@ func (s *Server) handleTextDocumentDidChange(ctx context.Context, conn *jsonrpc2
 	if len(params.ContentChanges) == 0 {
 		return nil, nil
 	}
-	if err := s.updateFile(params.TextDocument.URI, params.ContentChanges[0].Text); err != nil {
+	changed, err := s.updateFileVersion(params.TextDocument.URI, params.ContentChanges[0].Text, &params.TextDocument.Version)
+	if err != nil {
 		return nil, err
+	}
+	if changed {
+		s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
 	}
 	return nil, nil
 }
@@ -320,13 +348,19 @@ func (s *Server) handleTextDocumentDidSave(ctx context.Context, conn *jsonrpc2.C
 		return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams}
 	}
 
-	var params lsp.DidSaveTextDocumentParams
+	var params struct {
+		Text         *string                    `json:"text"`
+		TextDocument lsp.TextDocumentIdentifier `json:"textDocument"`
+	}
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
 
-	if params.Text != "" {
-		err = s.updateFile(params.TextDocument.URI, params.Text)
+	if params.Text != nil {
+		err = s.updateFile(params.TextDocument.URI, *params.Text)
+		if err == nil {
+			s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
+		}
 	} else {
 		err = s.saveFile(params.TextDocument.URI)
 	}
@@ -349,16 +383,24 @@ func (s *Server) handleTextDocumentDidClose(ctx context.Context, conn *jsonrpc2.
 	if err := s.closeFile(params.TextDocument.URI); err != nil {
 		return nil, err
 	}
+	s.clearClosedDiagnostics(ctx, conn, params.TextDocument.URI)
 	return nil, nil
 }
 
 func (s *Server) openFile(uri string, languageID string) error {
+	return s.openFileAtVersion(uri, languageID, 0)
+}
+
+func (s *Server) openFileAtVersion(uri string, languageID string, version int) error {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	s.fileRevision++
 	f := &File{
 		Text:       "",
 		LanguageID: languageID,
+		Version:    version,
+		Revision:   s.fileRevision,
 	}
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
 	s.files[uri] = f
 	return nil
 }
@@ -371,14 +413,27 @@ func (s *Server) closeFile(uri string) error {
 }
 
 func (s *Server) updateFile(uri string, text string) error {
+	_, err := s.updateFileVersion(uri, text, nil)
+	return err
+}
+
+func (s *Server) updateFileVersion(uri string, text string, version *int) (bool, error) {
 	s.stateMu.Lock()
 	defer s.stateMu.Unlock()
 	f, ok := s.files[uri]
 	if !ok {
-		return fmt.Errorf("document not found: %v", uri)
+		return false, fmt.Errorf("document not found: %v", uri)
+	}
+	if version != nil && *version < f.Version {
+		return false, nil
 	}
 	f.Text = text
-	return nil
+	if version != nil {
+		f.Version = *version
+	}
+	s.fileRevision++
+	f.Revision = s.fileRevision
+	return true, nil
 }
 
 func (s *Server) saveFile(uri string) error {
@@ -463,13 +518,17 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
 	s.dbConn = dbConn
 	s.connGeneration++
+	s.diagnosticsCacheGeneration = -1
+	generation := s.connGeneration
 	// The new connection may be a different database entirely, so nothing
 	// cached against the old one is still true.
 	s.ddlMemo = make(map[ddlKey]string)
 	s.stateMu.Unlock()
+	s.diagnosticsPublishMu.Unlock()
 
 	for _, warning := range dbConn.Warnings {
 		log.Println(warning)
@@ -477,12 +536,19 @@ func (s *Server) reconnectionDB(ctx context.Context) error {
 
 	dbRepo, err := s.newDBRepository(ctx)
 	if err != nil {
+		s.republishOpenDiagnostics(ctx)
 		return err
 	}
-	if err := s.worker.ReCache(ctx, dbRepo); err != nil {
-		return err
+	cacheErr := s.worker.ReCache(ctx, dbRepo)
+	if cacheErr == nil {
+		s.stateMu.Lock()
+		if s.connGeneration == generation {
+			s.diagnosticsCacheGeneration = generation
+		}
+		s.stateMu.Unlock()
 	}
-	return nil
+	s.republishOpenDiagnostics(ctx)
+	return cacheErr
 }
 
 // showConnectionWarnings sends any non-fatal connect-time diagnostics to the

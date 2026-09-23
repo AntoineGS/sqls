@@ -193,6 +193,7 @@ func (dc *DBCache) SortedSchemas() []string {
 
 func (dc *DBCache) SortedTablesByDBName(dbName string) (tbls []string, ok bool) {
 	tbls, ok = dc.SchemaTables[strings.ToUpper(dbName)]
+	tbls = append([]string(nil), tbls...)
 	sort.Strings(tbls)
 	return
 }
