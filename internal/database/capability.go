@@ -45,8 +45,9 @@ type CatalogSnapshotRepository interface {
 	CatalogSnapshot(ctx context.Context) (repo DBRepository, close func() error, err error)
 }
 
-// TableDescription is a comment-only view of recorded table metadata. Its
-// spans are byte offsets into Body and Columns remain in catalog order.
+// TableDescription is a SQL-shaped informational reconstruction of recorded
+// table metadata. It is not guaranteed executable SQL. Its spans are byte
+// offsets into Body and Columns remain in catalog order.
 type TableDescription struct {
 	Body    string
 	Table   DescriptionSpan

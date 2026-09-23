@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -202,7 +201,7 @@ func (s *Server) interBaseRelationDefinitionWithAnalysis(ctx context.Context, re
 	var descriptionSpan *sqlsymbol.Span
 	if target.kind == database.ObjectKindTable && errors.Is(ddlErr, database.ErrUnsupportedDDL) {
 		var ok bool
-		body, note, descriptionSpan, ok = unsupportedTableDescription(ddlCtx, repo, target, ddlErr)
+		body, note, descriptionSpan, ok = unsupportedTableDescription(ddlCtx, repo, target)
 		if !ok {
 			return nil, nil
 		}
@@ -238,17 +237,17 @@ func (s *Server) interBaseRelationDefinitionWithAnalysis(ctx context.Context, re
 	return []lsp.Location{{URI: snapshotURI(path), Range: rangeValue}}, nil
 }
 
-func unsupportedTableDescription(ctx context.Context, repo database.DBRepository, target snapshotTarget, ddlErr error) (body, note string, span *sqlsymbol.Span, ok bool) {
+func unsupportedTableDescription(ctx context.Context, repo database.DBRepository, target snapshotTarget) (body, note string, span *sqlsymbol.Span, ok bool) {
 	source, ok := repo.(database.TableDescriptionRepository)
 	if !ok {
 		return "", "", nil, false
 	}
 	description, err := source.TableDescription(ctx, target.name)
-	if err != nil || description.Body == "" || len(description.Columns) == 0 || !commentOnlyDescription(description.Body) {
+	if err != nil || description.Body == "" || len(description.Columns) == 0 {
 		return "", "", nil, false
 	}
 	tableSpan, ok := catalogDescriptionSpan(description.Body, description.Table, target.name)
-	if !ok {
+	if !ok || !tableDeclarationSpan(description.Body, tableSpan) {
 		return "", "", nil, false
 	}
 	selected := tableSpan
@@ -260,7 +259,7 @@ func unsupportedTableDescription(ctx context.Context, repo database.DBRepository
 			}
 			matches++
 			selected, ok = catalogDescriptionSpan(description.Body, column.Span, column.Name)
-			if !ok {
+			if !ok || !columnDeclarationSpan(description.Body, selected) {
 				return "", "", nil, false
 			}
 		}
@@ -268,34 +267,61 @@ func unsupportedTableDescription(ctx context.Context, repo database.DBRepository
 			return "", "", nil, false
 		}
 	}
-	return description.Body, snapshotUnsupportedTableDDLNote(ddlErr, target.name), &selected, true
+	return description.Body, "Catalog reconstruction; unsupported table facets may be incomplete.", &selected, true
 }
 
 func catalogDescriptionSpan(body string, span database.DescriptionSpan, name string) (sqlsymbol.Span, bool) {
 	if span.Start < 0 || span.End < span.Start || span.End > len(body) {
 		return sqlsymbol.Span{}, false
 	}
-	want := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
-	if body[span.Start:span.End] != want {
+	actual := body[span.Start:span.End]
+	wantQuoted := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
+	if actual != wantQuoted && actual != name {
+		return sqlsymbol.Span{}, false
+	}
+	if actual == name && !validDialect1Identifier(name) {
+		return sqlsymbol.Span{}, false
+	}
+	if span.Start > 0 && isIdentifierByte(body[span.Start-1]) || span.End < len(body) && isIdentifierByte(body[span.End]) {
 		return sqlsymbol.Span{}, false
 	}
 	return sqlsymbol.Span{Start: span.Start, End: span.End}, true
 }
 
-func commentOnlyDescription(body string) bool {
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "--") {
+func validDialect1Identifier(name string) bool {
+	if len(name) == 0 || len(name) > 67 || name[0] < 'A' || name[0] > 'Z' {
+		return false
+	}
+	for index := 1; index < len(name); index++ {
+		char := name[index]
+		if (char < 'A' || char > 'Z') && (char < '0' || char > '9') && char != '_' && char != '$' {
 			return false
 		}
 	}
-	return body != ""
+	return true
 }
 
-func snapshotUnsupportedTableDDLNote(err error, table string) string {
-	if object, name, feature, ok := database.UnsupportedDDLDetail(err); ok && object != "" && name != "" && feature != "" {
-		return fmt.Sprintf("Strict executable DDL could not be reproduced: %s %q: %s.\nThe following comment-only catalog description is informational and not executable SQL.", object, name, feature)
+func isIdentifierByte(value byte) bool {
+	return value == '_' || value == '$' || value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z'
+}
+
+func tableDeclarationSpan(body string, span sqlsymbol.Span) bool {
+	lineStart := strings.LastIndex(body[:span.Start], "\n") + 1
+	linePrefix := strings.TrimSpace(body[lineStart:span.Start])
+	return linePrefix == "CREATE TABLE"
+}
+
+func columnDeclarationSpan(body string, span sqlsymbol.Span) bool {
+	create := strings.LastIndex(body[:span.Start], "CREATE TABLE ")
+	if create < 0 || !strings.Contains(body[create:span.Start], "(") {
+		return false
 	}
-	return fmt.Sprintf("Strict executable DDL could not be reproduced for table %q.\nThe following comment-only catalog description is informational and not executable SQL.", table)
+	lineStart := strings.LastIndex(body[:span.Start], "\n") + 1
+	linePrefix := strings.TrimSpace(body[lineStart:span.Start])
+	if strings.HasPrefix(linePrefix, "--") || strings.HasPrefix(linePrefix, "/*") {
+		return false
+	}
+	return linePrefix == "" || strings.HasSuffix(linePrefix, ",")
 }
 
 // interBaseContextualDefinition preserves the existing view snapshot behavior

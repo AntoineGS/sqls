@@ -31,6 +31,10 @@ type DBConnection struct {
 	// Variant is the server-side SQL variant resolved at connect. It is empty
 	// for drivers that have no variants.
 	Variant dialect.SQLVariant
+	// SourceSQLDialect is the dialect reported by the attached InterBase
+	// database. It is independent of Variant, which is the client attachment
+	// dialect selected for lexing and queries.
+	SourceSQLDialect int
 	// DatabaseName identifies the attached database for drivers with a single
 	// attachment per connection. Empty when the driver enumerates databases.
 	DatabaseName string

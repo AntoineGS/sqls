@@ -276,6 +276,9 @@ type InterBaseDBRepository struct {
 	Conn *sql.DB
 	// SQLDialect is 1 or 3; zero is treated as 3, matching the driver default.
 	SQLDialect int
+	// SourceSQLDialect is the database's own reported dialect when known.
+	// Zero falls back to SQLDialect (and ultimately the driver default 3).
+	SourceSQLDialect int
 	// DatabaseName is the attachment string; empty when unknown.
 	DatabaseName string
 
@@ -304,9 +307,10 @@ func NewInterBaseDBRepositoryFromConnection(conn *DBConnection) DBRepository {
 		return &InterBaseDBRepository{}
 	}
 	return &InterBaseDBRepository{
-		Conn:         conn.Conn,
-		SQLDialect:   conn.Variant.InterBaseSQLDialect(),
-		DatabaseName: conn.DatabaseName,
+		Conn:             conn.Conn,
+		SQLDialect:       conn.Variant.InterBaseSQLDialect(),
+		SourceSQLDialect: conn.SourceSQLDialect,
+		DatabaseName:     conn.DatabaseName,
 	}
 }
 

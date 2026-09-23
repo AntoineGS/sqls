@@ -10,7 +10,11 @@ import (
 
 var _ DDLRepository = (*InterBaseDBRepository)(nil)
 
-// ObjectDDL reproduces an object's definition from the catalog.
+// ObjectDDL reconstructs an object's definition from the catalog using the
+// source database dialect reported at connect time (falling back to the
+// effective attachment dialect when diagnostics were unavailable). Callers
+// must not treat this as cross-dialect conversion: source SQL and defaults
+// remain verbatim and are rendered only for the compatible source dialect.
 //
 // The object is always looked up first, so "no such object" and "the object
 // exists but has no renderable DDL" stay distinguishable: the first is
@@ -113,11 +117,34 @@ func (db *InterBaseDBRepository) ObjectDDL(ctx context.Context, kind ObjectKind,
 		return "", fmt.Errorf("interbase: unsupported object kind %q", kind)
 	}
 
-	ddl, err := generator.GenerateDDL()
+	options, ok := generator.(interface {
+		GenerateDDLWithOptions(schema.DDLOptions) (string, error)
+	})
+	if !ok {
+		// External functions are intentionally unsupported and expose no
+		// options-aware DDL method. Keep their structured refusal intact.
+		ddl, err := generator.GenerateDDL()
+		if err != nil {
+			return "", interBaseWrapDDLError(err)
+		}
+		return ddl, nil
+	}
+	ddl, err := options.GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseSourceDialect(db)})
 	if err != nil {
 		return "", interBaseWrapDDLError(err)
 	}
 	return ddl, nil
+}
+
+func interBaseSourceDialect(db *InterBaseDBRepository) schema.DDLDialect {
+	dialect := db.SourceSQLDialect
+	if dialect == 0 {
+		dialect = db.SQLDialect
+	}
+	if dialect != 1 && dialect != 3 {
+		dialect = 3
+	}
+	return schema.DDLDialect(dialect)
 }
 
 // interBaseUnsupportedDDL adapts the driver's structured refusal to the
