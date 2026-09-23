@@ -65,11 +65,13 @@ type Server struct {
 	metadata         *database.MetadataLoader
 	initialized      bool
 	connectionState  connectionState
+	metadataStartErr error
 	openConnection   database.ContextOpener
 	activeConfigKey  string
 	cleanupOnce      sync.Once
 	cleanupDone      chan struct{}
 	cleanupQueue     chan *database.DBConnection
+	cleanupFinal     chan *database.DBConnection
 	stopOnce         sync.Once
 	fileRevision     uint64
 	notificationConn *jsonrpc2.Conn
@@ -109,7 +111,8 @@ func NewServer() *Server {
 		connectionState: connectionIdle,
 		openConnection:  database.OpenContext,
 		cleanupDone:     make(chan struct{}),
-		cleanupQueue:    make(chan *database.DBConnection, 1),
+		cleanupQueue:    make(chan *database.DBConnection, 2),
+		cleanupFinal:    make(chan *database.DBConnection, 1),
 	}
 	server.metadata.SetChangedCallback(func() {
 		select {
@@ -165,10 +168,7 @@ func (s *Server) Stop() error {
 		dbConn := s.dbConn
 		s.dbConn = nil
 		s.stateMu.Unlock()
-		select {
-		case s.cleanupQueue <- dbConn:
-		default:
-		}
+		s.cleanupFinal <- dbConn
 		go func() { <-s.coordinator.done; close(s.cleanupQueue) }()
 	})
 	return nil
@@ -548,6 +548,9 @@ func (s *Server) activeIntentConfig() *database.DBConfig {
 }
 
 func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if intent.Config == nil {
 		s.stateMu.Lock()
 		s.connectionState = connectionIdle
@@ -558,6 +561,9 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	// write lock, which also serializes it with queries using the old identity.
 	s.connMu.Lock()
 	defer s.connMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := intent.Context.Err(); err != nil {
 		return err
 	}
@@ -571,6 +577,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.connGeneration++
 	generation := s.connGeneration
 	s.connectionState = connectionConnecting
+	s.metadataStartErr = nil
 	old := s.dbConn
 	s.dbConn = nil
 	s.curDBCfg = cloneConnectionConfig(intent.Config)
@@ -580,30 +587,36 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.metadata.Reset(uint64(generation))
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
-	if old != nil {
-		select {
-		case s.cleanupQueue <- old:
-		default:
-			log.Printf("sqls: attachment cleanup queue full; closing detached connection asynchronously is deferred")
-		}
-	}
+	_ = s.enqueueDetachedConnection(old)
 	s.republishOpenDiagnostics(s.lifecycleCtx)
 	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))
 	if err != nil {
 		s.stateMu.Lock()
 		if s.connGeneration == generation && s.connectionState != connectionStopped {
-			s.connectionState = connectionFailed
+			if ctx.Err() != nil || intent.Context.Err() != nil || errors.Is(err, context.Canceled) {
+				s.connectionState = connectionIdle
+			} else {
+				s.connectionState = connectionFailed
+			}
 		}
 		s.stateMu.Unlock()
 		return err
 	}
-	if ctx.Err() != nil || s.lifecycleCtx.Err() != nil {
+	if ctx.Err() != nil || intent.Context.Err() != nil || s.lifecycleCtx.Err() != nil {
 		_ = candidate.Close()
+		s.stateMu.Lock()
+		if s.connGeneration == generation && s.connectionState != connectionStopped {
+			s.connectionState = connectionIdle
+		}
+		s.stateMu.Unlock()
 		return context.Canceled
 	}
 	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
-	if s.connGeneration != generation || s.connectionState == connectionStopped || ctx.Err() != nil {
+	if s.connGeneration != generation || s.connectionState == connectionStopped || ctx.Err() != nil || intent.Context.Err() != nil {
+		if s.connGeneration == generation && s.connectionState != connectionStopped {
+			s.connectionState = connectionIdle
+		}
 		s.stateMu.Unlock()
 		s.diagnosticsPublishMu.Unlock()
 		_ = candidate.Close()
@@ -619,6 +632,11 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 		_, err = s.metadata.Start(s.lifecycleCtx, uint64(generation), repo)
 	}
 	if err != nil {
+		s.stateMu.Lock()
+		if s.connGeneration == generation && s.connectionState == connectionReady {
+			s.metadataStartErr = err
+		}
+		s.stateMu.Unlock()
 		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
 	}
 	s.republishOpenDiagnostics(s.lifecycleCtx)
@@ -627,14 +645,30 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 
 func (s *Server) cleanupConnections() {
 	for conn := range s.cleanupQueue {
-		if err := conn.Close(); err != nil {
-			log.Printf("sqls: closing database attachment: %v", err)
-		}
+		s.closeDetachedConnection(conn)
 	}
+	s.closeDetachedConnection(<-s.cleanupFinal)
 	if s.snapshots != nil {
 		s.snapshots.RemoveAll()
 	}
 	close(s.cleanupDone)
+}
+
+func (s *Server) closeDetachedConnection(conn *database.DBConnection) {
+	if err := conn.Close(); err != nil {
+		log.Printf("sqls: closing database attachment: %v", err)
+	}
+}
+
+// enqueueDetachedConnection transfers ownership to the cleanup worker. The
+// bounded queue normally absorbs close latency; if full, the coordinator is
+// backpressured rather than dropping a native attachment handle.
+func (s *Server) enqueueDetachedConnection(conn *database.DBConnection) error {
+	if conn == nil {
+		return nil
+	}
+	s.cleanupQueue <- conn
+	return nil
 }
 
 // showConnectionWarnings sends any non-fatal connect-time diagnostics to the

@@ -771,6 +771,7 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	case errors.Is(err, ErrNoConnection):
 		// fall through: nothing to validate yet.
 	case err != nil:
+		s.connMu.RUnlock()
 		return nil, err
 	default:
 		if err := validateDatabaseSwitch(ctx, repo, dbName); err != nil {
@@ -789,7 +790,7 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	if cfg != nil {
 		cfg.DBName = dbName
 	}
-	if err := <-s.coordinator.RequestExplicit(ctx, cfg, index, dbName); err != nil {
+	if err := awaitConnectionIntent(ctx, s.coordinator.RequestExplicit(ctx, cfg, index, dbName)); err != nil {
 		return nil, err
 	}
 
@@ -859,7 +860,7 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 	s.stateMu.RLock()
 	dbName := s.curDBName
 	s.stateMu.RUnlock()
-	if err := <-s.coordinator.RequestExplicit(ctx, connectionCfg, index, dbName); err != nil {
+	if err := awaitConnectionIntent(ctx, s.coordinator.RequestExplicit(ctx, connectionCfg, index, dbName)); err != nil {
 		return nil, err
 	}
 

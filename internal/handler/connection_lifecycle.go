@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"maps"
-	"reflect"
 	"sync"
 
 	"github.com/sqls-server/sqls/internal/database"
@@ -37,6 +36,7 @@ type connectionCoordinator struct {
 	mu           sync.Mutex
 	pending      *connectionIntent
 	activeCancel context.CancelFunc
+	activeKey    string
 	stopped      bool
 	nextID       uint64
 	lastKey      string
@@ -90,31 +90,35 @@ func (c *connectionCoordinator) request(ctx context.Context, cfg *database.DBCon
 		reply <- context.Canceled
 		return reply
 	}
-	keyBytes, _ := json.Marshal(struct {
-		C *database.DBConfig
-		I int
-		D string
-	}{copyCfg, index, dbName})
-	key := string(keyBytes)
-	if c.pending != nil && (!reflect.DeepEqual(c.pending.Config, copyCfg) || explicit) {
-		c.pending.Reply <- context.Canceled
+	intent := &connectionIntent{Config: copyCfg, ConnectionIndex: index, DatabaseName: dbName, Reply: reply, explicit: explicit}
+	key := intentKey(intent)
+	var replaced chan error
+	if !explicit {
+		if c.pending != nil && intentKey(c.pending) == key {
+			c.mu.Unlock()
+			reply <- nil
+			return reply
+		}
+		if c.pending == nil && (c.activeKey == key || c.lastKey == key) {
+			c.mu.Unlock()
+			reply <- nil
+			return reply
+		}
 	}
-	if c.pending != nil && (!reflect.DeepEqual(c.pending.Config, copyCfg) || explicit) {
+	if c.pending != nil {
+		replaced = c.pending.Reply
 		c.pending = nil
 	}
-	if c.activeCancel != nil && !reflect.DeepEqual(c.server.activeIntentConfig(), copyCfg) {
+	if c.activeCancel != nil && c.activeKey != key {
 		c.activeCancel()
 	}
-	// Avoid retrying an unchanged failed/active notification. Explicit requests
-	// are refreshes and intentionally bypass this identity check.
-	if !explicit && key == c.lastKey && c.pending == nil {
-		c.mu.Unlock()
-		reply <- nil
-		return reply
-	}
 	c.nextID++
-	c.pending = &connectionIntent{ID: c.nextID, Context: ctx, Config: copyCfg, ConnectionIndex: index, DatabaseName: dbName, Reply: reply, explicit: explicit}
+	intent.ID, intent.Context = c.nextID, ctx
+	c.pending = intent
 	c.mu.Unlock()
+	if replaced != nil {
+		replaced <- context.Canceled
+	}
 	select {
 	case c.wake <- struct{}{}:
 	default:
@@ -129,17 +133,38 @@ func (c *connectionCoordinator) Stop() {
 		return
 	}
 	c.stopped = true
+	var pending chan error
 	if c.pending != nil {
-		c.pending.Reply <- context.Canceled
+		pending = c.pending.Reply
 		c.pending = nil
 	}
 	if c.activeCancel != nil {
 		c.activeCancel()
 	}
 	c.mu.Unlock()
+	if pending != nil {
+		pending <- context.Canceled
+	}
 	select {
 	case c.wake <- struct{}{}:
 	default:
+	}
+}
+
+func awaitConnectionIntent(ctx context.Context, reply <-chan error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+	select {
+	case err := <-reply:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -159,11 +184,19 @@ func (c *connectionCoordinator) run() {
 		}
 		intent := c.pending
 		c.pending = nil
+		if intent != nil {
+			c.activeKey = intentKey(intent)
+		}
 		c.mu.Unlock()
 		if intent == nil {
 			continue
 		}
 		if err := intent.Context.Err(); err != nil {
+			c.mu.Lock()
+			if c.activeKey == intentKey(intent) {
+				c.activeKey = ""
+			}
+			c.mu.Unlock()
 			intent.Reply <- err
 			continue
 		}
@@ -184,7 +217,10 @@ func (c *connectionCoordinator) run() {
 		cancel()
 		c.mu.Lock()
 		c.activeCancel = nil
-		c.lastKey = intentKey(intent)
+		c.activeKey = ""
+		if !errors.Is(err, context.Canceled) {
+			c.lastKey = intentKey(intent)
+		}
 		c.mu.Unlock()
 		intent.Reply <- err
 	}
