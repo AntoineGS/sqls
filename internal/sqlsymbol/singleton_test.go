@@ -144,3 +144,57 @@ func TestSingletonSelectWithoutKeyMetadata(t *testing.T) {
 		}
 	}
 }
+
+// A scalar UDF changes a value, not the number of rows produced by FROM.
+// CONFIG_NAME alone does not cover BRANCH_CONFIG's composite primary key.
+func TestSingletonSelectScalarFunctionProjectionDoesNotHideMissingKey(t *testing.T) {
+	catalog := singletonTestCatalog{
+		widthTestCatalog: widthTestCatalog{
+			"BRANCH_CONFIG": {
+				{Name: "BRANCHID", Type: "VARCHAR(2)"},
+				{Name: "CONFIG_NAME", Type: "VARCHAR(80)"},
+				{Name: "CONFIG_VALUE", Type: "VARCHAR(80)"},
+			},
+		},
+		keys: map[string][][]string{"BRANCH_CONFIG": {{"BRANCHID", "CONFIG_NAME"}}},
+	}
+	tests := []struct {
+		name, statement string
+		warn            bool
+	}{
+		{
+			name:      "missing branch id",
+			statement: "SELECT F_LEFT(config_value, 1) FROM branch_config WHERE config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' into :AllowNoPayments;",
+			warn:      true,
+		},
+		{
+			name:      "full composite key",
+			statement: "SELECT F_LEFT(config_value, 1) FROM branch_config WHERE config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' AND branchid = '00' into :AllowNoPayments;",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			text := "ALTER PROCEDURE IMPORTEXTERNALORDER AS DECLARE VARIABLE AllowNoPayments CHAR(1); BEGIN " + tt.statement + " END"
+			analysis, err := AnalyzeDiagnostics(text, interBaseVariant())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var found []Finding
+			for _, finding := range analysis.Diagnostics(catalog) {
+				if finding.Code == "interbase-singleton-select" {
+					found = append(found, finding)
+				}
+			}
+			want := 0
+			if tt.warn {
+				want = 1
+			}
+			if len(found) != want {
+				t.Fatalf("singleton warnings = %+v, want %d", found, want)
+			}
+			if tt.warn && text[found[0].Span.Start:found[0].Span.End] != "SELECT" {
+				t.Fatalf("warning span = %q, want SELECT", text[found[0].Span.Start:found[0].Span.End])
+			}
+		})
+	}
+}

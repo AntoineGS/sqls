@@ -218,6 +218,8 @@ left join, and other unsupported expressions or clauses are skipped. Incomplete
 SQL, unresolved identifiers, or unavailable index metadata also suppress this
 warning. It does not inspect data, diagnose scalar subqueries, or automatically
 add a row limit.
+Simple scalar function projections such as `F_LEFT(CONFIG_VALUE, 1)` are
+supported: changing the selected value does not make a multi-row query unique.
 
 **Signature help.** Typing an argument list for a known procedure shows its
 input parameters and highlights the one under the cursor, both for

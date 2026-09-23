@@ -412,6 +412,28 @@ func (q *singletonQuery) projection(items []lexeme) (aggregate, column, ok bool)
 			}
 			_, valid = q.value(args)
 			return true, false, valid
+		case "LIST":
+			// LIST also collapses rows, but its optional separator and
+			// DISTINCT syntax are outside the recognized aggregate subset.
+			return false, false, false
+		default:
+			// A scalar function runs once per input row: its result cannot
+			// change the cardinality of FROM. Keep the argument shape small
+			// so an aggregate or subquery hidden inside a call remains unknown.
+			args, end, valid := enclosedList(items, 1, len(items))
+			if !valid || end != len(items) {
+				return false, false, false
+			}
+			parts, valid := splitTopLevel(args, token.Comma)
+			if !valid {
+				return false, false, false
+			}
+			for _, part := range parts {
+				if _, valid := q.value(part); !valid {
+					return false, false, false
+				}
+			}
+			return false, true, true
 		}
 	}
 	value, ok := q.value(items)
