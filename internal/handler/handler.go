@@ -58,14 +58,11 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration  int
-	lifecycleCtx    context.Context
-	lifecycleCancel context.CancelFunc
-	coordinator     *connectionCoordinator
-	metadata        *database.MetadataLoader
-	// worker is retained only as a nil compatibility slot for older package
-	// tests; production no longer constructs or reads the eager worker.
-	worker           *database.Worker
+	connGeneration   int
+	lifecycleCtx     context.Context
+	lifecycleCancel  context.CancelFunc
+	coordinator      *connectionCoordinator
+	metadata         *database.MetadataLoader
 	initialized      bool
 	connectionState  connectionState
 	openConnection   database.ContextOpener

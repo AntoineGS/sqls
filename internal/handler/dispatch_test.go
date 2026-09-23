@@ -17,7 +17,7 @@ type failingCloser struct{ err error }
 
 func (c failingCloser) Close() error { return c.err }
 
-func TestStopStopsWorkerEvenWhenConnectionCloseFails(t *testing.T) {
+func TestStopSchedulesCleanupWhenConnectionCloseFails(t *testing.T) {
 	closeErr := errors.New("attachment is half dead")
 	server := NewServer()
 	server.dbConn = &database.DBConnection{
@@ -25,18 +25,16 @@ func TestStopStopsWorkerEvenWhenConnectionCloseFails(t *testing.T) {
 		Tunnel: failingCloser{err: closeErr},
 	}
 
-	if err := server.Stop(); !errors.Is(err, closeErr) {
-		t.Fatalf("Stop() = %v, want %v", err, closeErr)
+	if err := server.Stop(); err != nil {
+		t.Fatalf("Stop() scheduling error = %v", err)
 	}
-
-	// A stopped worker must not accept another update. Stop is idempotent, so
-	// calling it again is the cheap way to assert it already ran: a worker that
-	// was never stopped would still be running here and the select below would
-	// not see a closed channel.
 	select {
-	case <-server.worker.Done():
-	default:
-		t.Fatal("Stop returned without stopping the worker")
+	case <-server.cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup worker did not finish")
+	}
+	if server.connectionState != connectionStopped {
+		t.Fatal("server did not enter terminal stopped state")
 	}
 }
 
@@ -44,7 +42,7 @@ func TestExecuteCommandDispatchesAsynchronously(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -87,7 +85,7 @@ func TestExecuteQueryHonoursCancelRequest(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -127,7 +125,7 @@ func TestCancelRequestForUnknownIDIsIgnored(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	unknown := jsonrpc2.ID{Str: "no-such-request", IsString: true}
 	if err := tx.conn.Notify(tx.ctx, "$/cancelRequest", cancelParams{ID: unknown}); err != nil {
@@ -142,7 +140,7 @@ func TestLateCancellationRendersTheRealResultWithANote(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))

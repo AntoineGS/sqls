@@ -30,7 +30,7 @@ func newParameterFixture(t *testing.T, text string, prepare func(*parameterBacke
 	tx := newTestContext()
 	tx.setup(t)
 	t.Cleanup(tx.tearDown)
-	t.Cleanup(tx.server.worker.Stop)
+	t.Cleanup(func() { _ = tx.server.Stop() })
 
 	backend := installParameterBackend(t)
 	if prepare != nil {
@@ -42,7 +42,7 @@ func newParameterFixture(t *testing.T, text string, prepare func(*parameterBacke
 	// assertion issued straight afterwards would race it and fall to the
 	// unknown-procedure branch.
 	if len(backend.describedProcedures()) > 0 {
-		waitForCatalog(t, tx.server.worker)
+		waitForCatalog(t, tx.server)
 	}
 	tx.textDocumentDidOpen(t, testFileURI, text)
 	return &parameterFixture{tx: tx, backend: backend}
@@ -700,7 +700,7 @@ func TestParameterExplainZeroMarkerStatementKeepsItsExistingPath(t *testing.T) {
 // wrong reason.
 func TestParameterExecutionProcedureCatalogIsResolved(t *testing.T) {
 	f := newParameterFixture(t, "EXECUTE PROCEDURE MYPROC(:CODE)", withProcedures)
-	cache := f.tx.server.worker.Cache()
+	cache := f.tx.server.metadata.Cache()
 	if !cache.HasCatalog() {
 		t.Fatal("the catalog never arrived; the routing assertions would be vacuous")
 	}

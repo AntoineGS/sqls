@@ -14,7 +14,7 @@ func TestInterBaseDialect1LanguageServerCompletion(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	cases := []struct {
@@ -105,7 +105,7 @@ func TestInterBaseLanguageServerFormattingByVariant(t *testing.T) {
 			tx := newTestContext()
 			tx.initServer(t)
 			defer tx.tearDown()
-			defer tx.server.worker.Stop()
+			defer tx.server.Stop()
 			configureInterBaseTestServer(t, tx, tt.variant)
 
 			tx.textDocumentDidOpen(t, testFileURI, tt.input)
@@ -146,7 +146,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			tx := newTestContext()
 			tx.initServer(t)
 			defer tx.tearDown()
-			defer tx.server.worker.Stop()
+			defer tx.server.Stop()
 			configureInterBaseTestServer(t, tx, tt.variant)
 
 			const text = "select rdb$ from rdb$database"
@@ -192,7 +192,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			tx := newTestContext()
 			tx.initServer(t)
 			defer tx.tearDown()
-			defer tx.server.worker.Stop()
+			defer tx.server.Stop()
 			configureInterBaseTestServer(t, tx, tt.variant)
 
 			const text = "TIM"
@@ -258,7 +258,7 @@ func TestInterBaseDialect1LanguageServerHover(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	input := "select rdb$relation_id from rdb$database"
@@ -356,13 +356,12 @@ func configureInterBaseTestServer(t *testing.T, tx *TestContext, variant dialect
 			return nil, nil
 		},
 	}
-	if err := tx.server.worker.ReCache(context.Background(), repo); err != nil {
-		t.Fatal("worker.ReCache:", err)
-	}
 	tx.server.dbConn = &database.DBConnection{
 		Driver:  dialect.DatabaseDriverInterBase,
 		Variant: variant,
 	}
+	tx.server.connectionState = connectionReady
+	loadMetadataForTest(t, tx.server, repo)
 }
 
 type recordingMessenger struct {

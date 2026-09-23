@@ -70,7 +70,7 @@ func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*d
 	tx := newTestContext()
 	tx.setup(t)
 	t.Cleanup(tx.tearDown)
-	t.Cleanup(tx.server.worker.Stop)
+	t.Cleanup(func() { _ = tx.server.Stop() })
 
 	backend := installStubBackend(t)
 	if procs != nil {
@@ -78,19 +78,11 @@ func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*d
 	}
 	tx.addWorkspaceConfig(t, stubInterBaseConnections("interbase"))
 
-	// The catalog lands on the worker's SECONDARY, asynchronous pass:
-	// addWorkspaceConfig reaches ReCache, which only signals the worker
-	// goroutine (worker.go:95-97). Issuing the command straight afterwards
-	// races that goroutine, HasCatalog() is still false, and routing falls to
-	// the unknown-procedure branch — so the two tests that assert the Query
-	// path would fail or, worse, flake. Wait for the catalog first.
-	//
-	// waitForCatalog is the polling helper the catalog-migration plan adds
-	// alongside GenerateCatalogCache. If that plan has not landed, add it
-	// there rather than duplicating it here.
+	// Keep the readiness assertion explicit: this fixture waits for the loader
+	// generation rather than relying on timing after configuration.
 	if procs != nil {
-		waitForCatalog(t, tx.server.worker)
-		cache := tx.server.worker.Cache()
+		waitForCatalog(t, tx.server)
+		cache := tx.server.metadata.Cache()
 		if !cache.HasCatalog() {
 			t.Fatal("the catalog never arrived; every routing assertion below would be vacuous")
 		}
@@ -233,17 +225,17 @@ func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	backend.setProcedures(testProcedures())
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
 
-	waitForCatalog(t, tx.server.worker)
-	if !tx.server.worker.Cache().HasCatalog() {
+	waitForCatalog(t, tx.server)
+	if !tx.server.metadata.Cache().HasCatalog() {
 		t.Fatal("the non-InterBase connection has no catalog; this test would pass for the wrong reason")
 	}
-	if _, ok := tx.server.worker.Cache().Procedure("MYPROC"); !ok {
+	if _, ok := tx.server.metadata.Cache().Procedure("MYPROC"); !ok {
 		t.Fatal("MYPROC is not in the cache; routing would return unknown regardless of the driver")
 	}
 

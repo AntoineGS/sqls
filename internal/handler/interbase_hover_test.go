@@ -95,7 +95,7 @@ func interBaseHoverCache(t *testing.T) *database.DBCache {
 func interBaseHoverServer(t *testing.T) *Server {
 	t.Helper()
 	server := NewServer()
-	t.Cleanup(server.worker.Stop)
+	t.Cleanup(func() { _ = server.Stop() })
 	server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	return server
 }
@@ -492,7 +492,7 @@ func TestInterBaseHoverEndToEndKeepsExistingColumnHover(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	tx.textDocumentDidOpen(t, testFileURI, "select rdb$relation_id from rdb$database")

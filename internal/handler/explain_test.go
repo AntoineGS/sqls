@@ -192,7 +192,7 @@ func TestExplainCodeActionIsAdvertised(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	tx.textDocumentDidOpen(t, testFileURI, "SELECT * FROM CITY")
 

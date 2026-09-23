@@ -14,7 +14,7 @@ func Test_executeQuery(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -44,7 +44,7 @@ func TestQueryRendersPartialResultBeforeReportingError(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -84,7 +84,7 @@ func TestBlobLimitHintOnlyWithBlobColumn(t *testing.T) {
 			tx := newTestContext()
 			tx.setup(t)
 			defer tx.tearDown()
-			defer tx.server.worker.Stop()
+			defer tx.server.Stop()
 
 			installStubBackend(t)
 			tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -116,7 +116,7 @@ func TestQuerySucceedsWithCompleteFooter(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -144,7 +144,7 @@ func TestExecuteQueryUsesReadOnlyTransactionForSelect(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	backend.enableReadOnlyQuerier()
@@ -175,7 +175,7 @@ func TestExecuteQueryFallsBackWhenReadOnlyQuerierAbsent(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))

@@ -93,9 +93,11 @@ func newDiagnosticsTestContext(t *testing.T, driver dialect.DatabaseDriver) *dia
 	t.Helper()
 	ctx := context.Background()
 	server := NewServer()
-	server.worker = database.NewWorker()
-	server.worker.Start()
-	t.Cleanup(func() { server.worker.Stop() })
+	// These tests drive diagnostic publication explicitly; disable the
+	// constructor callback so its asynchronous startup signal cannot race and
+	// duplicate a document-open notification.
+	server.metadata.SetChangedCallback(nil)
+	t.Cleanup(func() { server.Stop() })
 	server.stateMu.Lock()
 	server.dbConn = &database.DBConnection{Driver: driver}
 	server.connectionState = connectionReady
@@ -143,19 +145,6 @@ func diagnosticsRepository(types map[string]string) *database.MockDBRepository {
 			return nil, nil
 		},
 	}
-}
-
-func waitForDiagnosticCacheReplacement(t *testing.T, worker *database.Worker, previous *database.DBCache) *database.DBCache {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cache := worker.Cache(); cache != nil && cache != previous {
-			return cache
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for asynchronous cache replacement")
-	return nil
 }
 
 func diagnosticTypes(destinationType string) map[string]string {
@@ -524,6 +513,9 @@ func TestPublishDiagnosticsDoesNotSendDelayedOlderVersion(t *testing.T) {
 		return n.Version != nil && *n.Version == 4 && len(n.Diagnostics) == 0
 	})
 	assertVersion(t, latest, 4)
+	if tx.server.diagnosticsSnapshotCurrent(oldSnapshot) {
+		t.Fatal("old diagnostics snapshot remained current after version change")
+	}
 
 	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, oldSnapshot, oldDiagnostics)
 	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
@@ -560,12 +552,13 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 	}
 	oldDiagnostics := diagnosticsForSnapshot(oldSnapshot)
 
-	// Model the fenced state transition used by reconnectionDB. The new
+	// Model the fenced state transition used by the coordinator. The new
 	// attachment is non-InterBase, so republishing must clear its old findings.
 	tx.server.diagnosticsPublishMu.Lock()
 	tx.server.stateMu.Lock()
 	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverMySQL}
 	tx.server.connGeneration++
+	tx.server.metadata.Reset(uint64(tx.server.connGeneration))
 	tx.server.stateMu.Unlock()
 	tx.server.diagnosticsPublishMu.Unlock()
 	tx.server.republishOpenDiagnostics(tx.ctx)
@@ -573,6 +566,9 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 0
 	})
 	assertVersion(t, cleared, 1)
+	if tx.server.diagnosticsSnapshotCurrent(oldSnapshot) {
+		t.Fatal("old diagnostics snapshot remained current after connection transition")
+	}
 
 	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, oldSnapshot, oldDiagnostics)
 	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {

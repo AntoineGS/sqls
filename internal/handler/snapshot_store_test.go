@@ -547,6 +547,11 @@ func TestSnapshotsRemovedOnShutdown(t *testing.T) {
 	if err := server.Stop(); err != nil {
 		t.Fatal("Stop:", err)
 	}
+	select {
+	case <-server.cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup worker did not finish")
+	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("snapshot survived a clean shutdown (err=%v)", err)
 	}
@@ -567,25 +572,24 @@ func TestSnapshotsRemovedEvenWhenConnectionCloseFails(t *testing.T) {
 		t.Fatal("write:", err)
 	}
 
-	// Stop must report the close failure *and* still clean up. A half-dead
-	// InterBase attachment is exactly the shutdown that fails, and it must not
-	// be the shutdown that leaves database source on disk.
-	if err := server.Stop(); !errors.Is(err, closeErr) {
-		t.Fatalf("Stop() = %v, want %v", err, closeErr)
+	// Stop schedules cleanup; native Close errors are logged and do not delay
+	// the protocol response. Await the private cleanup fence before inspecting.
+	if err := server.Stop(); err != nil {
+		t.Fatalf("Stop() scheduling error = %v", err)
+	}
+	select {
+	case <-server.cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup worker did not finish")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("snapshot survived a failing shutdown (err=%v)", err)
-	}
-	select {
-	case <-server.worker.Done():
-	default:
-		t.Error("Stop returned without stopping the worker")
 	}
 }
 
 func TestSnapshotContextTracksTheConnectionGeneration(t *testing.T) {
 	server := NewServer()
-	defer server.worker.Stop()
+	defer server.Stop()
 
 	server.curDBCfg = &database.DBConfig{
 		Alias:          "local_ib",
@@ -612,7 +616,7 @@ func TestSnapshotContextTracksTheConnectionGeneration(t *testing.T) {
 
 func TestSnapshotContextWithoutAConnection(t *testing.T) {
 	server := NewServer()
-	defer server.worker.Stop()
+	defer server.Stop()
 
 	sc := server.snapshotContext()
 	if sc.label == "" {

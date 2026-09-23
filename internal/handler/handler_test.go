@@ -33,21 +33,24 @@ func loadMetadataForTest(t *testing.T, s *Server, repo database.DBRepository) {
 	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
 	s.connGeneration++
-	generation:=s.connGeneration
+	generation := s.connGeneration
 	s.metadata.Reset(uint64(generation))
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
-	load,err:=s.metadata.Start(context.Background(),uint64(generation),repo)
-	if err!=nil { t.Fatalf("start metadata: %v",err) }
-	select { case <-load.Done: case <-time.After(10*time.Second): t.Fatal("metadata loader watchdog expired") }
+	load, err := s.metadata.Start(context.Background(), uint64(generation), repo)
+	if err != nil {
+		t.Fatalf("start metadata: %v", err)
+	}
+	select {
+	case <-load.Done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("metadata loader watchdog expired")
+	}
+	s.republishOpenDiagnostics(context.Background())
 }
 
 func newTestContext() *TestContext {
 	server := NewServer()
-	// Transitional test fixture only; NewServer does not construct the legacy
-	// eager worker in production.
-	server.worker = database.NewWorker()
-	server.worker.Start()
 	handler := NewDispatcher(jsonrpc2.HandlerWithError(server.Handle))
 	ctx := context.Background()
 	return &TestContext{
@@ -99,6 +102,32 @@ func (tx *TestContext) initServer(t *testing.T) {
 }
 
 func (tx *TestContext) addWorkspaceConfig(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	tx.changeWorkspaceConfig(t, cfg)
+	// The LSP notification itself must return without waiting for attachment.
+	// Tests which subsequently exercise DB-backed behavior explicitly select
+	// and await a ready attachment here rather than racing the coordinator.
+	connection, index, dbName := tx.server.desiredConnection()
+	if connection == nil {
+		return
+	}
+	select {
+	case err := <-tx.server.coordinator.RequestExplicit(tx.ctx, connection, index, dbName):
+		if err != nil {
+			t.Fatalf("attach workspace test config: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for workspace test attachment")
+	}
+	ctx, cancel := context.WithTimeout(tx.ctx, 5*time.Second)
+	defer cancel()
+	if err := tx.server.metadata.Wait(ctx); err != nil {
+		t.Fatalf("wait for metadata test readiness: %v", err)
+	}
+}
+
+func (tx *TestContext) changeWorkspaceConfig(t *testing.T, cfg *config.Config) {
+	t.Helper()
 	didChangeConfigurationParams := lsp.DidChangeConfigurationParams{
 		Settings: struct {
 			SQLS *config.Config "json:\"sqls\""

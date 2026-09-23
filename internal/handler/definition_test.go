@@ -338,12 +338,12 @@ func TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback(t *testing.T
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	task5DefinitionSentinel.calls = 0
 	backend := installStubBackend(t)
 	backend.setProcedures([]*database.ProcedureDesc{{Name: "MYPROC"}})
 	tx.addWorkspaceConfig(t, stubInterBaseConnections("catalog"))
-	waitForCatalog(t, tx.server.worker)
+	waitForCatalog(t, tx.server)
 	tx.server.snapshots = newTestSnapshotStore(t)
 
 	// Keep the request parser on InterBase while making any mistaken catalog

@@ -739,7 +739,7 @@ func newStubDDLRepository(ddl func(context.Context, database.ObjectKind, string)
 func newDefinitionServer(t *testing.T) *Server {
 	t.Helper()
 	server := NewServer()
-	t.Cleanup(server.worker.Stop)
+	t.Cleanup(func() { _ = server.Stop() })
 	server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	server.curDBCfg = &database.DBConfig{
 		Alias:          "local_ib",
@@ -1050,7 +1050,7 @@ func TestInterBaseDefinitionFallsBackToAliasResolution(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantDefault)
 	tx.server.snapshots = newTestSnapshotStore(t)
 
@@ -1122,7 +1122,7 @@ func TestDefinitionWithoutAConnectionReturnsNoLocations(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	// Deliberately no configureInterBaseTestServer and no connection.
 
 	tx.textDocumentDidOpen(t, testFileURI, "SELECT * FROM MYPROC")
