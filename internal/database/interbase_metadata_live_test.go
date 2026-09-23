@@ -189,20 +189,10 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			if err != nil {
 				t.Fatalf("legacy foreign keys: %v", err)
 			}
-			gotForeignKeys := make([]*ForeignKey, 0)
-			for _, byReferencedTable := range snapshot.Cache.ForeignKeys {
-				for _, keys := range byReferencedTable {
-					gotForeignKeys = append(gotForeignKeys, keys...)
-				}
-			}
-			foreignKeyName := func(fk *ForeignKey) string {
-				if fk == nil || len(*fk) == 0 || (*fk)[0][0] == nil {
-					return ""
-				}
-				return (*fk)[0][0].Table + "." + (*fk)[0][0].Name
-			}
-			sort.Slice(gotForeignKeys, func(i, j int) bool { return foreignKeyName(gotForeignKeys[i]) < foreignKeyName(gotForeignKeys[j]) })
-			sort.Slice(wantForeignKeys, func(i, j int) bool { return foreignKeyName(wantForeignKeys[i]) < foreignKeyName(wantForeignKeys[j]) })
+			gotForeignKeys := uniqueInterBaseForeignKeys(snapshot.Cache.ForeignKeys)
+			sort.Slice(wantForeignKeys, func(i, j int) bool {
+				return interBaseForeignKeyIdentity(wantForeignKeys[i]) < interBaseForeignKeyIdentity(wantForeignKeys[j])
+			})
 			if !reflect.DeepEqual(gotForeignKeys, wantForeignKeys) {
 				t.Errorf("foreign-key descriptors differ: got %d, legacy %d", len(gotForeignKeys), len(wantForeignKeys))
 			}

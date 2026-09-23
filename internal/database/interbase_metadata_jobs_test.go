@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"io"
+	"reflect"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -252,6 +255,93 @@ func TestInterBaseMetadataPlanCompletesWithOneConnection(t *testing.T) {
 	}
 }
 
+func TestInterBaseMetadataForeignKeyParityCountsUniqueOrderedCompositeMappings(t *testing.T) {
+	db := openInterBaseScalableFixture(t, 2)
+	repo := &InterBaseDBRepository{Conn: db}
+	ctx := context.Background()
+	legacy, err := repo.DescribeForeignKeysBySchema(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy) != 1 {
+		t.Fatalf("legacy foreign key count = %d, want one non-self composite FK", len(legacy))
+	}
+
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	load, err := loader.Start(ctx, 1, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitLoad(t, load)
+	snapshot := loader.Snapshot()
+	status := snapshot.Status[MetadataForeignKeys]
+	if status.State != MetadataReady {
+		t.Fatalf("foreign-key state = %s", status.State)
+	}
+	mapOccurrences := 0
+	for _, byReferencedTable := range snapshot.Cache.ForeignKeys {
+		for _, keys := range byReferencedTable {
+			mapOccurrences += len(keys)
+		}
+	}
+	if mapOccurrences != 2 || status.Count != 1 {
+		t.Fatalf("fixture should expose one non-self FK in both directions: map occurrences=%d status count=%d", mapOccurrences, status.Count)
+	}
+	if count := interBaseMetadataFragmentCount(snapshot.Cache, MetadataForeignKeys); count != status.Count {
+		t.Fatalf("unique foreign-key map count=%d, loader count=%d; bidirectional cache entries must not inflate parity count", count, status.Count)
+	}
+	got := uniqueInterBaseForeignKeys(snapshot.Cache.ForeignKeys)
+	if !reflect.DeepEqual(got, legacy) {
+		t.Fatalf("unique full mappings differ\n got: %#v\nwant: %#v", got, legacy)
+	}
+	if len(*got[0]) != 2 {
+		t.Fatalf("composite mapping segment count=%d, want 2", len(*got[0]))
+	}
+	wantSegments := [][2]string{{"REF_A", "KEY_A"}, {"REF_B", "KEY_B"}}
+	for i, pair := range *got[0] {
+		if pair[0].Table != "T002" || pair[1].Table != "T001" || pair[0].Name != wantSegments[i][0] || pair[1].Name != wantSegments[i][1] {
+			t.Errorf("segment %d endpoints = %s.%s -> %s.%s, want T002.%s -> T001.%s", i, pair[0].Table, pair[0].Name, pair[1].Table, pair[1].Name, wantSegments[i][0], wantSegments[i][1])
+		}
+	}
+}
+
+func TestInterBaseMetadataForeignKeyCanonicalizationPreservesSelfReferenceAndRelationIdentity(t *testing.T) {
+	makeForeignKey := func(sourceTable, targetTable string) *ForeignKey {
+		fk := ForeignKey{
+			{&ColumnBase{Table: sourceTable, Name: "A"}, &ColumnBase{Table: targetTable, Name: "X"}},
+			{&ColumnBase{Table: sourceTable, Name: "B"}, &ColumnBase{Table: targetTable, Name: "Y"}},
+		}
+		return &fk
+	}
+	self := makeForeignKey("NODE", "NODE")
+	other := makeForeignKey("OTHER", "PARENT")
+	cacheMap := map[string]map[string][]*ForeignKey{
+		"NODE":   {"NODE": {self, self}}, // same-table symmetric insertion
+		"OTHER":  {"PARENT": {other}},
+		"PARENT": {"OTHER": {other}},
+	}
+	got := uniqueInterBaseForeignKeys(cacheMap)
+	if len(got) != 2 {
+		t.Fatalf("canonical FK count = %d, want self-reference once plus distinct relation mapping", len(got))
+	}
+	identities := map[string]bool{}
+	for _, fk := range got {
+		identities[interBaseForeignKeyIdentity(fk)] = true
+	}
+	if !identities[interBaseForeignKeyIdentity(self)] || !identities[interBaseForeignKeyIdentity(other)] {
+		t.Fatal("canonicalization lost self-referential or distinct relation mapping")
+	}
+	for _, fk := range got {
+		if interBaseForeignKeyIdentity(fk) == interBaseForeignKeyIdentity(self) {
+			if len(*fk) != 2 || (*fk)[0][0].Name != "A" || (*fk)[1][0].Name != "B" || (*fk)[0][1].Name != "X" || (*fk)[1][1].Name != "Y" {
+				t.Fatalf("canonicalization changed self-reference ordered endpoints: %#v", *fk)
+			}
+		}
+	}
+}
+
 type interBaseMetadataPlanWithParallelism struct {
 	*InterBaseDBRepository
 	parallelism int
@@ -427,13 +517,7 @@ func interBaseMetadataFragmentCount(cache *DBCache, kind MetadataKind) int {
 	case MetadataPrimaryKeys:
 		return len(cache.PrimaryKeyColumns)
 	case MetadataForeignKeys:
-		count := 0
-		for _, byReferencedTable := range cache.ForeignKeys {
-			for _, keys := range byReferencedTable {
-				count += len(keys)
-			}
-		}
-		return count
+		return len(uniqueInterBaseForeignKeys(cache.ForeignKeys))
 	case MetadataViews:
 		if cache.Catalog != nil {
 			return len(cache.Catalog.Views)
@@ -464,6 +548,54 @@ func interBaseMetadataFragmentCount(cache *DBCache, kind MetadataKind) int {
 		}
 	}
 	return 0
+}
+
+// uniqueInterBaseForeignKeys collapses the cache's symmetric table lookup
+// entries into logical constraints. The identity is the directed, ordered list
+// of source/target endpoints, not a constraint name: names alone can collide
+// across relations, while segment order and both endpoints distinguish the
+// mapping. Self-referential entries occupy the same lookup bucket twice and
+// are likewise emitted once without reversing their endpoint direction.
+func uniqueInterBaseForeignKeys(byTable map[string]map[string][]*ForeignKey) []*ForeignKey {
+	byIdentity := make(map[string]*ForeignKey)
+	for _, references := range byTable {
+		for _, keys := range references {
+			for _, fk := range keys {
+				if fk != nil {
+					key := interBaseForeignKeyIdentity(fk)
+					if _, exists := byIdentity[key]; !exists {
+						byIdentity[key] = fk
+					}
+				}
+			}
+		}
+	}
+	identities := make([]string, 0, len(byIdentity))
+	for key := range byIdentity {
+		identities = append(identities, key)
+	}
+	sort.Strings(identities)
+	result := make([]*ForeignKey, 0, len(identities))
+	for _, key := range identities {
+		result = append(result, byIdentity[key])
+	}
+	return result
+}
+
+func interBaseForeignKeyIdentity(fk *ForeignKey) string {
+	if fk == nil {
+		return "null"
+	}
+	type segment struct{ SourceSchema, SourceTable, SourceColumn, TargetSchema, TargetTable, TargetColumn string }
+	segments := make([]segment, 0, len(*fk))
+	for _, pair := range *fk {
+		if pair[0] == nil || pair[1] == nil {
+			continue
+		}
+		segments = append(segments, segment{pair[0].Schema, pair[0].Table, pair[0].Name, pair[1].Schema, pair[1].Table, pair[1].Name})
+	}
+	encoded, _ := json.Marshal(segments)
+	return string(encoded)
 }
 
 func TestInterBaseMetadataActualPlanDataRowsFaultStagesDiscardCategory(t *testing.T) {
