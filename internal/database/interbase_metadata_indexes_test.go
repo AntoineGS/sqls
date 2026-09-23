@@ -45,6 +45,19 @@ func TestInterBaseMetadataViewsMatchLegacyAndUseConstantQueries(t *testing.T) {
 	}
 }
 
+func TestInterBaseBulkViewColumnsQueryExplicitlyRestrictsToViews(t *testing.T) {
+	query := interBaseBulkViewColumnsQueryForWidth(127)
+	if !strings.Contains(query, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\n  AND r.RDB$VIEW_BLR IS NOT NULL") {
+		t.Fatalf("view-column query is missing its view-only predicate:\n%s", query)
+	}
+	if strings.Count(query, "r.RDB$VIEW_BLR IS NOT NULL") != 1 {
+		t.Fatalf("view-only predicate occurs %d times, want exactly once", strings.Count(query, "r.RDB$VIEW_BLR IS NOT NULL"))
+	}
+	if strings.Contains(interBaseBulkColumnsQueryForWidth(127), "r.RDB$VIEW_BLR IS NOT NULL") {
+		t.Fatal("general column query unexpectedly excludes non-view relations")
+	}
+}
+
 func TestInterBaseMetadataIndexesMatchLegacyAndUseConstantQueries(t *testing.T) {
 	for _, size := range []int{1, 100} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {

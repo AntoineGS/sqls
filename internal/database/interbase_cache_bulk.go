@@ -78,6 +78,14 @@ var interBaseBulkRelationsQuery = interBaseBulkRelationsQueryForWidth(interBaseB
 // renders the domain's type alone, so that join is left out rather than paid
 // for on every column of every relation.
 func interBaseBulkColumnsQueryForWidth(width int) string {
+	return interBaseBulkColumnsQueryForRelationFilter(width, "")
+}
+
+func interBaseBulkViewColumnsQueryForWidth(width int) string {
+	return interBaseBulkColumnsQueryForRelationFilter(width, "\n  AND r.RDB$VIEW_BLR IS NOT NULL")
+}
+
+func interBaseBulkColumnsQueryForRelationFilter(width int, relationFilter string) string {
 	return fmt.Sprintf(`
 SELECT %s, %s, %s,
        rf.RDB$NULL_FLAG, rf.RDB$DEFAULT_SOURCE,
@@ -93,14 +101,14 @@ LEFT JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
 LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
 LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                            AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
-WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+ WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0%s
 ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
 		interBaseMetadataIdentifier("rf.RDB$RELATION_NAME", width),
 		interBaseMetadataIdentifier("rf.RDB$FIELD_NAME", width),
 		interBaseMetadataIdentifier("rf.RDB$FIELD_SOURCE", width),
 		interBaseMetadataIdentifier("f.RDB$FIELD_NAME", width),
 		interBaseMetadataIdentifier("cs.RDB$CHARACTER_SET_NAME", width),
-		interBaseMetadataIdentifier("co.RDB$COLLATION_NAME", width))
+		interBaseMetadataIdentifier("co.RDB$COLLATION_NAME", width), relationFilter)
 }
 
 var interBaseBulkColumnsQuery = interBaseBulkColumnsQueryForWidth(interBaseBulkIdentifierCastWidth)

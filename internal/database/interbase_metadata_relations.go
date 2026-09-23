@@ -40,8 +40,7 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME"
 	if err != nil {
 		return MetadataPatch{}, err
 	}
-	query := interBaseBulkColumnsQueryForWidth(width)
-	query = strings.Replace(query, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0", "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0 AND r.RDB$VIEW_BLR IS NOT NULL", 1)
+	query := interBaseBulkViewColumnsQueryForWidth(width)
 	err = interBaseBulkScanColumnsWithQuery(ctx, q, query, func(relation string, column schema.Column) error {
 		index, ok := byName[relation]
 		if !ok {

@@ -342,6 +342,32 @@ func TestInterBaseMetadataForeignKeyCanonicalizationPreservesSelfReferenceAndRel
 	}
 }
 
+func TestInterBaseMetadataForeignKeyCanonicalizationPreservesDuplicateEndpointConstraints(t *testing.T) {
+	makeForeignKey := func() *ForeignKey {
+		fk := ForeignKey{{&ColumnBase{Table: "CHILD", Name: "PARENT_ID"}, &ColumnBase{Table: "PARENT", Name: "ID"}}}
+		return &fk
+	}
+	first, second := makeForeignKey(), makeForeignKey()
+	other := &ForeignKey{{&ColumnBase{Table: "OTHER_CHILD", Name: "PARENT_ID"}, &ColumnBase{Table: "PARENT", Name: "ID"}}}
+	cache := map[string]map[string][]*ForeignKey{
+		"CHILD":       {"PARENT": {first, second}},
+		"PARENT":      {"CHILD": {first, second}, "OTHER_CHILD": {other}},
+		"OTHER_CHILD": {"PARENT": {other}},
+	}
+
+	got := uniqueInterBaseForeignKeys(cache)
+	if len(got) != 3 {
+		t.Fatalf("canonical FK count = %d, want 3 (including two distinct identical-endpoint constraints)", len(got))
+	}
+	identities := []string{interBaseForeignKeyIdentity(got[0]), interBaseForeignKeyIdentity(got[1]), interBaseForeignKeyIdentity(got[2])}
+	if !sort.StringsAreSorted(identities) {
+		t.Fatalf("canonical FK descriptors are not deterministically sorted: %q", identities)
+	}
+	if identities[0] != identities[1] || identities[1] == identities[2] {
+		t.Fatalf("canonicalization did not retain duplicate-endpoint constraints: %q", identities)
+	}
+}
+
 type interBaseMetadataPlanWithParallelism struct {
 	*InterBaseDBRepository
 	parallelism int
@@ -550,35 +576,29 @@ func interBaseMetadataFragmentCount(cache *DBCache, kind MetadataKind) int {
 	return 0
 }
 
-// uniqueInterBaseForeignKeys collapses the cache's symmetric table lookup
-// entries into logical constraints. The identity is the directed, ordered list
-// of source/target endpoints, not a constraint name: names alone can collide
-// across relations, while segment order and both endpoints distinguish the
-// mapping. Self-referential entries occupy the same lookup bucket twice and
-// are likewise emitted once without reversing their endpoint direction.
+// uniqueInterBaseForeignKeys removes repeated cache occurrences of the same
+// constraint pointer. Distinct constraints can have identical endpoint
+// descriptors, so endpoint content is not a valid deduplication key. Sorting
+// descriptors makes comparisons independent of cache map iteration order.
 func uniqueInterBaseForeignKeys(byTable map[string]map[string][]*ForeignKey) []*ForeignKey {
-	byIdentity := make(map[string]*ForeignKey)
+	seen := make(map[*ForeignKey]struct{})
+	result := make([]*ForeignKey, 0)
 	for _, references := range byTable {
 		for _, keys := range references {
 			for _, fk := range keys {
-				if fk != nil {
-					key := interBaseForeignKeyIdentity(fk)
-					if _, exists := byIdentity[key]; !exists {
-						byIdentity[key] = fk
-					}
+				if fk == nil {
+					continue
+				}
+				if _, exists := seen[fk]; !exists {
+					seen[fk] = struct{}{}
+					result = append(result, fk)
 				}
 			}
 		}
 	}
-	identities := make([]string, 0, len(byIdentity))
-	for key := range byIdentity {
-		identities = append(identities, key)
-	}
-	sort.Strings(identities)
-	result := make([]*ForeignKey, 0, len(identities))
-	for _, key := range identities {
-		result = append(result, byIdentity[key])
-	}
+	sort.Slice(result, func(i, j int) bool {
+		return interBaseForeignKeyIdentity(result[i]) < interBaseForeignKeyIdentity(result[j])
+	})
 	return result
 }
 
