@@ -25,6 +25,12 @@ type DDLRepository interface {
 	ObjectDDL(ctx context.Context, kind ObjectKind, name string) (string, error)
 }
 
+// TableDescriptionRepository is an optional capability for repositories that
+// can return a non-executable, catalog-derived description of an exact table.
+type TableDescriptionRepository interface {
+	TableDescription(ctx context.Context, name string) (TableDescription, error)
+}
+
 // ExplainRepository is implemented by repositories that can return a server
 // query plan without executing the statement's result set.
 type ExplainRepository interface {
@@ -37,6 +43,27 @@ type ExplainRepository interface {
 // unaffected and remains usable concurrently.
 type CatalogSnapshotRepository interface {
 	CatalogSnapshot(ctx context.Context) (repo DBRepository, close func() error, err error)
+}
+
+// TableDescription is a comment-only view of recorded table metadata. Its
+// spans are byte offsets into Body and Columns remain in catalog order.
+type TableDescription struct {
+	Body    string
+	Table   DescriptionSpan
+	Columns []DescriptionColumn
+}
+
+// DescriptionSpan identifies a byte range in a TableDescription body.
+type DescriptionSpan struct {
+	Start int
+	End   int
+}
+
+// DescriptionColumn identifies a table column and its byte range in a
+// TableDescription body.
+type DescriptionColumn struct {
+	Name string
+	Span DescriptionSpan
 }
 
 var (

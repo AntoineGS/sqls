@@ -256,7 +256,73 @@ func openInterBaseSchemaFixture(t *testing.T) *sql.DB {
 	argument(2, 1, 10, 14, 0)  // CHAR: no character length, renders ""
 	argument(3, 1, 4, 8, nil)  // INTEGER
 
+	addInterBaseCatalogIdentifierMetadata(t, db)
+
 	return db
+}
+
+// addInterBaseCatalogIdentifierMetadata models the catalog columns whose
+// source-domain widths schema uses to build safe VARCHAR projections. Its
+// rows are system-only and do not appear among user table descriptions.
+func addInterBaseCatalogIdentifierMetadata(t *testing.T, db *sql.DB) {
+	t.Helper()
+	identifierFields := []struct {
+		relation string
+		field    string
+		width    int
+	}{
+		{"RDB$RELATIONS", "RDB$RELATION_NAME", 67},
+		{"RDB$RELATIONS", "RDB$SECURITY_CLASS", 31},
+		{"RDB$RELATIONS", "RDB$OWNER_NAME", 31},
+		{"RDB$RELATIONS", "RDB$DEFAULT_CLASS", 31},
+		{"RDB$RELATION_FIELDS", "RDB$RELATION_NAME", 31},
+		{"RDB$RELATION_FIELDS", "RDB$FIELD_NAME", 31},
+		{"RDB$RELATION_FIELDS", "RDB$FIELD_SOURCE", 31},
+		{"RDB$RELATION_FIELDS", "RDB$SECURITY_CLASS", 31},
+		{"RDB$RELATION_FIELDS", "RDB$BASE_FIELD", 31},
+		{"RDB$VIEW_RELATIONS", "RDB$RELATION_NAME", 67},
+		{"RDB$FIELDS", "RDB$FIELD_NAME", 31},
+		{"RDB$CHARACTER_SETS", "RDB$CHARACTER_SET_NAME", 31},
+		{"RDB$COLLATIONS", "RDB$COLLATION_NAME", 31},
+		{"RDB$PROCEDURES", "RDB$PROCEDURE_NAME", 31},
+		{"RDB$PROCEDURES", "RDB$SECURITY_CLASS", 31},
+		{"RDB$PROCEDURES", "RDB$OWNER_NAME", 31},
+		{"RDB$PROCEDURE_PARAMETERS", "RDB$PARAMETER_NAME", 31},
+		{"RDB$PROCEDURE_PARAMETERS", "RDB$PROCEDURE_NAME", 31},
+		{"RDB$PROCEDURE_PARAMETERS", "RDB$FIELD_SOURCE", 31},
+		{"RDB$GENERATORS", "RDB$GENERATOR_NAME", 67},
+		{"RDB$INDICES", "RDB$INDEX_NAME", 67},
+		{"RDB$INDICES", "RDB$RELATION_NAME", 67},
+		{"RDB$INDICES", "RDB$FOREIGN_KEY", 67},
+		{"RDB$INDEX_SEGMENTS", "RDB$INDEX_NAME", 67},
+		{"RDB$INDEX_SEGMENTS", "RDB$FIELD_NAME", 67},
+		{"RDB$RELATION_CONSTRAINTS", "RDB$CONSTRAINT_NAME", 31},
+		{"RDB$RELATION_CONSTRAINTS", "RDB$RELATION_NAME", 67},
+		{"RDB$RELATION_CONSTRAINTS", "RDB$INDEX_NAME", 67},
+		{"RDB$REF_CONSTRAINTS", "RDB$CONST_NAME_UQ", 67},
+		{"RDB$CHECK_CONSTRAINTS", "RDB$TRIGGER_NAME", 67},
+		{"RDB$TRIGGERS", "RDB$TRIGGER_NAME", 67},
+		{"RDB$TRIGGERS", "RDB$RELATION_NAME", 67},
+		{"RDB$ROLES", "RDB$ROLE_NAME", 67},
+		{"RDB$DEPENDENCIES", "RDB$DEPENDENT_NAME", 67},
+		{"RDB$DEPENDENCIES", "RDB$FIELD_NAME", 67},
+		{"RDB$DEPENDENCIES", "RDB$DEPENDED_ON_NAME", 67},
+		{"RDB$FUNCTIONS", "RDB$FUNCTION_NAME", 67},
+		{"RDB$FUNCTION_ARGUMENTS", "RDB$FUNCTION_NAME", 67},
+		{"RDB$USER_PRIVILEGES", "RDB$RELATION_NAME", 67},
+		{"RDB$USER_PRIVILEGES", "RDB$FIELD_NAME", 67},
+	}
+	for index, identifier := range identifierFields {
+		source := fmt.Sprintf("RDB$SQLS_FIXTURE_WIDTH_%02d", index)
+		if _, err := db.Exec(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_LENGTH","RDB$FIELD_SCALE","RDB$FIELD_TYPE","RDB$FIELD_SUB_TYPE","RDB$SYSTEM_FLAG","RDB$CHARACTER_LENGTH") VALUES (?,?,?,?,?,?,?)`,
+			source, identifier.width, 0, 14, 0, 1, identifier.width); err != nil {
+			t.Fatalf("insert identifier-width domain %q: %v", source, err)
+		}
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATION_FIELDS" ("RDB$FIELD_NAME","RDB$RELATION_NAME","RDB$FIELD_SOURCE","RDB$FIELD_POSITION","RDB$SYSTEM_FLAG") VALUES (?,?,?,?,?)`,
+			identifier.field, identifier.relation, source, index, 1); err != nil {
+			t.Fatalf("insert identifier metadata for %s.%s: %v", identifier.relation, identifier.field, err)
+		}
+	}
 }
 
 var interBaseFixtureTables = []string{
@@ -404,6 +470,122 @@ func interBaseNullInt(value int64) sql.NullInt64 {
 
 func interBaseNullString(value string) sql.NullString {
 	return sql.NullString{String: value, Valid: true}
+}
+
+func TestInterBaseTableDescriptionExactLookupAndOrderedSpans(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repository := NewInterBaseDBRepository(db)
+	descriptions, ok := repository.(TableDescriptionRepository)
+	if !ok {
+		t.Fatal("NewInterBaseDBRepository does not implement TableDescriptionRepository")
+	}
+
+	got, err := descriptions.TableDescription(context.Background(), "CUSTOMER")
+	if err != nil {
+		t.Fatalf("TableDescription(CUSTOMER) error = %v", err)
+	}
+	wantColumns := []string{
+		"ID", "CODE", "CREATED", "AMOUNT", "LABEL", "INHERITED",
+		"OVERRIDE", "DEFAULT_NULL", "REQUIRED", "DOUBLE_AMOUNT", "TOTAL",
+	}
+	if len(got.Columns) != len(wantColumns) {
+		t.Fatalf("TableDescription(CUSTOMER) has %d columns, want %d", len(got.Columns), len(wantColumns))
+	}
+	if got.Body == "" {
+		t.Fatal("TableDescription(CUSTOMER) returned an empty body")
+	}
+	if span := got.Table; !validDescriptionSpan(got.Body, span) || got.Body[span.Start:span.End] != `"CUSTOMER"` {
+		t.Fatalf("table span = %+v in %q, want the exact quoted table name", span, got.Body)
+	}
+	for index, want := range wantColumns {
+		column := got.Columns[index]
+		if column.Name != want {
+			t.Errorf("column %d name = %q, want %q", index, column.Name, want)
+		}
+		if !validDescriptionSpan(got.Body, column.Span) {
+			t.Errorf("column %q span %+v is outside the description body", column.Name, column.Span)
+			continue
+		}
+		if spanText := got.Body[column.Span.Start:column.Span.End]; spanText != `"`+want+`"` {
+			t.Errorf("column %q span = %q, want exact quoted column name", column.Name, spanText)
+		}
+	}
+}
+
+func TestInterBaseTableDescriptionDoesNotAliasFirst22Characters(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	tables := []struct {
+		name   string
+		column string
+	}{
+		{name: "IMPORT_ORDER_LINE_ITEMS", column: "ITEMS_ONLY"},
+		{name: "IMPORT_ORDER_LINE_ITEMZ", column: "ITEMZ_ONLY"},
+	}
+	if tables[0].name[:22] != tables[1].name[:22] {
+		t.Fatalf("test table names %q and %q do not share their first 22 characters", tables[0].name, tables[1].name)
+	}
+	for index, table := range tables {
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATIONS" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			table.name, 100+index, nil, nil, nil, "SYSDBA", nil, 8, 1, nil, 0, "PERSISTENT", 0, nil); err != nil {
+			t.Fatalf("insert collision relation %q: %v", table.name, err)
+		}
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATION_FIELDS" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			interBaseFixed(table.column), table.name, table.column, 0, nil, 0, nil, 0, nil, nil, nil, nil, nil, nil); err != nil {
+			t.Fatalf("insert column %q for %q: %v", table.column, table.name, err)
+		}
+	}
+
+	descriptions, ok := NewInterBaseDBRepository(db).(TableDescriptionRepository)
+	if !ok {
+		t.Fatal("NewInterBaseDBRepository does not implement TableDescriptionRepository")
+	}
+	for _, table := range tables {
+		t.Run(table.name, func(t *testing.T) {
+			got, err := descriptions.TableDescription(context.Background(), table.name)
+			if err != nil {
+				t.Fatalf("TableDescription(%q) error = %v", table.name, err)
+			}
+			if got.Body[got.Table.Start:got.Table.End] != `"`+table.name+`"` {
+				t.Errorf("table span = %q, want %q", got.Body[got.Table.Start:got.Table.End], table.name)
+			}
+			if len(got.Columns) != 1 || got.Columns[0].Name != table.column {
+				t.Fatalf("columns = %+v, want only %q", got.Columns, table.column)
+			}
+			if span := got.Columns[0].Span; !validDescriptionSpan(got.Body, span) || got.Body[span.Start:span.End] != `"`+table.column+`"` {
+				t.Errorf("column span = %+v, want exact name %q", span, table.column)
+			}
+		})
+	}
+}
+
+func TestInterBaseTableDescriptionErrors(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	descriptions, ok := NewInterBaseDBRepository(db).(TableDescriptionRepository)
+	if !ok {
+		t.Fatal("NewInterBaseDBRepository does not implement TableDescriptionRepository")
+	}
+
+	missing, err := descriptions.TableDescription(context.Background(), "NO_SUCH_TABLE")
+	if !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("TableDescription(unknown) error = %v, want ErrObjectNotFound", err)
+	}
+	if missing.Body != "" {
+		t.Errorf("TableDescription(unknown) body = %q, want empty", missing.Body)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	canceled, err := descriptions.TableDescription(ctx, "CUSTOMER")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("TableDescription(canceled context) error = %v, want context.Canceled", err)
+	}
+	if canceled.Body != "" {
+		t.Errorf("TableDescription(canceled context) body = %q, want empty", canceled.Body)
+	}
+}
+
+func validDescriptionSpan(body string, span DescriptionSpan) bool {
+	return span.Start >= 0 && span.Start <= span.End && span.End <= len(body)
 }
 
 func TestInterBaseTypeRenderingByDialect(t *testing.T) {
