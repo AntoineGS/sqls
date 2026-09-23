@@ -3,10 +3,10 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io"
-	"log"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +21,67 @@ import (
 )
 
 const interBaseLiveSingletonNeedle = "SELECT F_LEFT(config_value, 1) FROM branch_config WHERE config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' into :AllowNoPayments;"
+
+var errCatalogSnapshotUnavailable = errors.New("catalog snapshot unavailable")
+
+type catalogSnapshotObservation struct {
+	outcome          string
+	elapsed          time.Duration
+	errType          string
+	deadlineExceeded bool
+	canceled         bool
+	contextErr       string
+}
+
+// catalogSnapshotPrivacyForwarder preserves the repository capabilities and
+// delegates successful snapshot reads unchanged. On snapshot error it returns
+// a fixed sentinel so database.cache's fallback log cannot disclose raw driver
+// error text.
+type catalogSnapshotPrivacyForwarder struct {
+	database.DBRepository
+	database.CatalogRepository
+	snapshotSource database.CatalogSnapshotRepository
+	phase          string
+	observations   map[string]catalogSnapshotObservation
+	logf           func(string, ...any)
+}
+
+func newCatalogSnapshotPrivacyForwarder(repo database.DBRepository, catalog database.CatalogRepository, snapshot database.CatalogSnapshotRepository, phase string, logf func(string, ...any)) *catalogSnapshotPrivacyForwarder {
+	return &catalogSnapshotPrivacyForwarder{
+		DBRepository: repo, CatalogRepository: catalog, snapshotSource: snapshot,
+		phase: phase, observations: make(map[string]catalogSnapshotObservation), logf: logf,
+	}
+}
+
+func (f *catalogSnapshotPrivacyForwarder) setPhase(phase string) { f.phase = phase }
+
+func (f *catalogSnapshotPrivacyForwarder) record(phase string) catalogSnapshotObservation {
+	return f.observations[phase]
+}
+
+func (f *catalogSnapshotPrivacyForwarder) CatalogSnapshot(ctx context.Context) (database.DBRepository, func() error, error) {
+	started := time.Now()
+	repo, closeSnapshot, err := f.snapshotSource.CatalogSnapshot(ctx)
+	outcome := "fallback"
+	if err == nil && repo != nil {
+		outcome = "used"
+	}
+	observation := catalogSnapshotObservation{
+		outcome: outcome, elapsed: time.Since(started), errType: fmt.Sprintf("%T", err),
+		deadlineExceeded: errors.Is(err, context.DeadlineExceeded),
+		canceled:         errors.Is(err, context.Canceled), contextErr: liveContextError(ctx),
+	}
+	f.observations[f.phase] = observation
+	if f.logf != nil {
+		f.logf("snapshot phase=%s outcome=%s elapsed=%s err_type=%s is_deadline_exceeded=%t is_canceled=%t ctx_err=%s",
+			f.phase, observation.outcome, observation.elapsed, observation.errType,
+			observation.deadlineExceeded, observation.canceled, observation.contextErr)
+	}
+	if err != nil {
+		return repo, closeSnapshot, errCatalogSnapshotUnavailable
+	}
+	return repo, closeSnapshot, nil
+}
 
 func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	configPath := os.Getenv("SQLS_LEGACY_CATALOG_CONFIG")
@@ -76,14 +137,27 @@ func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	}
 	defer conn.Close()
 	repo := database.NewInterBaseDBRepositoryFromConnection(conn)
-	updater := database.NewDBCacheUpdater(repo)
+	catalogRepo, ok := repo.(database.CatalogRepository)
+	if !ok {
+		t.Fatal("InterBase repository does not provide catalog capability")
+	}
+	snapshotRepo, ok := repo.(database.CatalogSnapshotRepository)
+	if !ok {
+		t.Fatal("InterBase repository does not provide catalog snapshot capability")
+	}
+	forwarder := newCatalogSnapshotPrivacyForwarder(repo, catalogRepo, snapshotRepo, "", func(format string, args ...any) {
+		t.Logf(format, args...)
+	})
+	updater := database.NewDBCacheUpdater(forwarder)
 	phaseStarted = time.Now()
+	forwarder.setPhase("primary-cache")
 	cache, err := updater.GenerateDBCachePrimary(ctx)
 	logLivePhase(t, ctx, "primary-cache", phaseStarted, err)
 	if err != nil {
 		t.Fatalf("primary database cache failed (%T)", err)
 	}
 	phaseStarted = time.Now()
+	forwarder.setPhase("secondary-cache")
 	columns, err := updater.GenerateDBCacheSecondary(ctx)
 	logLivePhase(t, ctx, "secondary-cache", phaseStarted, err)
 	if err != nil {
@@ -91,17 +165,14 @@ func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	}
 	cache.ColumnsWithParent = columns
 	phaseStarted = time.Now()
-	// The snapshot fallback path logs its raw error. Suppress package logs only
-	// during this call so this diagnostic run never emits backend error text.
-	catalog, supported, err := func() (*database.CatalogCache, bool, error) {
-		previousLogOutput := log.Writer()
-		log.SetOutput(io.Discard)
-		defer log.SetOutput(previousLogOutput)
-		return updater.GenerateCatalogCache(ctx)
-	}()
+	forwarder.setPhase("full-catalog")
+	catalog, supported, err := updater.GenerateCatalogCache(ctx)
 	logLivePhase(t, ctx, "full-catalog", phaseStarted, err)
 	if err != nil || !supported || catalog == nil {
 		t.Fatalf("full catalog failed: supported=%v err-type=%T", supported, err)
+	}
+	if snapshot := forwarder.record("full-catalog"); snapshot.outcome != "used" {
+		t.Fatalf("full catalog completed without using snapshot capability: outcome=%s err-type=%s", snapshot.outcome, snapshot.errType)
 	}
 	cache.Catalog = catalog
 
@@ -240,3 +311,143 @@ func equalStrings(left, right []string) bool {
 	}
 	return true
 }
+
+func TestCatalogSnapshotPrivacyForwarderPreservesSnapshotAndCatalogCapabilities(t *testing.T) {
+	wantRepo := &fakeSnapshotDBRepository{}
+	closed := false
+	var viewsCalled bool
+	catalogRepo := &fakeSnapshotCatalogRepository{describeViews: func(context.Context) ([]*database.ViewDesc, error) {
+		viewsCalled = true
+		return []*database.ViewDesc{{Name: "SAFE_VIEW"}}, nil
+	}}
+	source := &fakeSnapshotSource{
+		CatalogRepository: catalogRepo,
+		snapshot: func(context.Context) (database.DBRepository, func() error, error) {
+			return wantRepo, func() error { closed = true; return nil }, nil
+		},
+	}
+	var logged bytes.Buffer
+	forwarder := newCatalogSnapshotPrivacyForwarder(source, source.CatalogRepository, source, "full-catalog", func(format string, args ...any) {
+		fmt.Fprintf(&logged, format, args...)
+	})
+
+	var catalog database.CatalogRepository = forwarder
+	views, err := catalog.DescribeViews(context.Background())
+	if err != nil || !viewsCalled || len(views) != 1 || views[0].Name != "SAFE_VIEW" {
+		t.Fatalf("embedded catalog capability not preserved: views=%v called=%t err-type=%T", views, viewsCalled, err)
+	}
+
+	gotRepo, closeSnapshot, err := forwarder.CatalogSnapshot(context.Background())
+	if err != nil || gotRepo != wantRepo || closeSnapshot == nil {
+		t.Fatalf("successful snapshot was not forwarded unchanged: repo=%T err-type=%T", gotRepo, err)
+	}
+	if err := closeSnapshot(); err != nil || !closed {
+		t.Fatalf("snapshot closer not preserved: closed=%t err-type=%T", closed, err)
+	}
+	if got := forwarder.record("full-catalog"); got.outcome != "used" || got.errType != "<nil>" {
+		t.Fatalf("snapshot observation = %+v, want used/nil", got)
+	}
+	if !strings.Contains(logged.String(), "outcome=used") {
+		t.Fatalf("safe snapshot status missing from log: %q", logged.String())
+	}
+}
+
+func TestCatalogSnapshotPrivacyForwarderSanitizesFallbackAndPreservesCloser(t *testing.T) {
+	const secretMarker = "test-only-sensitive-backend-detail"
+	originalErr := &fakeSnapshotError{message: secretMarker, cause: context.DeadlineExceeded}
+	closed := false
+	source := &fakeSnapshotSource{snapshot: func(context.Context) (database.DBRepository, func() error, error) {
+		return nil, func() error { closed = true; return nil }, originalErr
+	}}
+	var logged bytes.Buffer
+	forwarder := newCatalogSnapshotPrivacyForwarder(source, source.CatalogRepository, source, "primary-cache", func(format string, args ...any) {
+		fmt.Fprintf(&logged, format, args...)
+	})
+
+	gotRepo, closeSnapshot, err := forwarder.CatalogSnapshot(context.Background())
+	if gotRepo != nil || closeSnapshot == nil || err != errCatalogSnapshotUnavailable {
+		t.Fatalf("fallback result = (%T, closer=%t, err-type=%T), want nil/preserved closer/fixed sentinel", gotRepo, closeSnapshot != nil, err)
+	}
+	if errors.Is(err, originalErr) || strings.Contains(err.Error(), secretMarker) {
+		t.Fatalf("fallback error retained original details: %q", err.Error())
+	}
+	if strings.Contains(logged.String(), secretMarker) {
+		t.Fatalf("fallback log leaked original error message: %q", logged.String())
+	}
+	if !errors.Is(originalErr, context.DeadlineExceeded) || !strings.Contains(logged.String(), "is_deadline_exceeded=true") {
+		t.Fatalf("safe fallback log lacks deadline evidence: %q", logged.String())
+	}
+	if got := forwarder.record("primary-cache"); got.outcome != "fallback" || got.errType != "*handler.fakeSnapshotError" || !got.deadlineExceeded || got.contextErr != "nil" {
+		t.Fatalf("fallback observation = %+v", got)
+	}
+	if err := closeSnapshot(); err != nil || !closed {
+		t.Fatalf("fallback closer not preserved: closed=%t err-type=%T", closed, err)
+	}
+}
+
+func TestCatalogSnapshotPrivacyForwarderRecordsSilentNilFallback(t *testing.T) {
+	source := &fakeSnapshotSource{snapshot: func(context.Context) (database.DBRepository, func() error, error) {
+		return nil, nil, nil
+	}}
+	forwarder := newCatalogSnapshotPrivacyForwarder(source, source.CatalogRepository, source, "secondary-cache", nil)
+	repo, closer, err := forwarder.CatalogSnapshot(context.Background())
+	if repo != nil || closer != nil || err != nil {
+		t.Fatalf("nil snapshot fallback = (%T, %t, %T), want nil/nil/nil", repo, closer != nil, err)
+	}
+	if got := forwarder.record("secondary-cache"); got.outcome != "fallback" || got.errType != "<nil>" {
+		t.Fatalf("silent fallback observation = %+v", got)
+	}
+}
+
+type fakeSnapshotDBRepository struct{ database.DBRepository }
+
+type fakeSnapshotSource struct {
+	database.DBRepository
+	database.CatalogRepository
+	snapshot func(context.Context) (database.DBRepository, func() error, error)
+}
+
+func (f *fakeSnapshotSource) CatalogSnapshot(ctx context.Context) (database.DBRepository, func() error, error) {
+	return f.snapshot(ctx)
+}
+
+type fakeSnapshotCatalogRepository struct {
+	describeViews func(context.Context) ([]*database.ViewDesc, error)
+}
+
+func (f *fakeSnapshotCatalogRepository) DescribeViews(ctx context.Context) ([]*database.ViewDesc, error) {
+	return f.describeViews(ctx)
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeProcedures(context.Context) ([]*database.ProcedureDesc, error) {
+	return nil, nil
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeGenerators(context.Context) ([]*database.GeneratorDesc, error) {
+	return nil, nil
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeTriggers(context.Context) ([]*database.TriggerDesc, error) {
+	return nil, nil
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeDomains(context.Context) ([]*database.DomainDesc, error) {
+	return nil, nil
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeIndexes(context.Context) ([]*database.IndexDesc, error) {
+	return nil, nil
+}
+
+func (*fakeSnapshotCatalogRepository) DescribeFunctions(context.Context) ([]*database.FunctionDesc, error) {
+	return nil, nil
+}
+
+type fakeSnapshotError struct {
+	message string
+	cause   error
+}
+
+func (e *fakeSnapshotError) Error() string { return e.message }
+
+func (e *fakeSnapshotError) Unwrap() error { return e.cause }

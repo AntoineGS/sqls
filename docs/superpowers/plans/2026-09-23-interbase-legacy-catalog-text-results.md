@@ -33,7 +33,7 @@ During coordinate debugging, the observed diagnostic range was zero-based `272:4
 
 ### Timeout investigation and post-range-fix diagnostic runs
 
-The test now uses an eight-minute application context and logs only phase, elapsed duration, remaining deadline, error type, `errors.Is` checks for deadline/cancellation, and the context sentinel. Snapshot fallback package logging is suppressed only during `GenerateCatalogCache`, so raw backend errors cannot be emitted. Catalog repository and snapshot code paths are unchanged. No SQL/config/source values are logged.
+The test uses an eight-minute application context and logs phase elapsed/deadline remaining, error type, `errors.Is` deadline/cancellation flags, and the context sentinel. The current implementation uses a test-only forwarder embedding the real DB/catalog repository capabilities and delegating every snapshot call. Successful snapshot repositories and closers are passed through unchanged; failures are recorded as sanitized type/flags and replaced with a fixed non-wrapping sentinel before the existing cache fallback can log them. Nil-repository/nil-error fallback is tracked explicitly. It does not intercept the process-global logger or alter production snapshot/cache code. This is scoped protection for snapshot-fallback errors, not a claim of universal secret-safety for arbitrary driver/process output.
 
 The earlier primary run failed at exactly 300 seconds inside `GenerateCatalogCache` with a wrapped-error type and `supported=false`; it did not record `errors.Is` or context sentinel evidence, so the timeout cause was not proven. The prior worker pass took 290.43s under a five-minute context. The new runs localize most time to full catalog loading; no deeper repository decorator or production cache instrumentation was added.
 
@@ -41,10 +41,10 @@ Both following runs used the post-range command below, owner-confirmed WIN1252, 
 
 | Run | Open | Primary | Secondary | Full catalog | Total | Error/context evidence |
 |---|---:|---:|---:|---:|---:|---|
-| Post-range run 1 | 16.5 ms | 4.941 s | 5.339 s | 4m40.614 s | 4m50.935 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 3m9.065s remaining |
-| Post-range run 2 | 17.2 ms | 5.530 s | 5.947 s | 4m56.392 s | 5m7.915 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 2m52.085s remaining |
+| Pre-wrapper post-range run 1 | 16.5 ms | 4.941 s | 5.339 s | 4m40.614 s | 4m50.935 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 3m9.065s remaining |
+| Pre-wrapper post-range run 2 | 17.2 ms | 5.530 s | 5.947 s | 4m56.392 s | 5m7.915 s | All phases succeeded; error type nil; deadline/canceled false; `ctx.Err()` nil; 2m52.085s remaining |
 
-Both runs passed all catalog, source UTF-8/`CRÉATION`, real key, full-document warning, complete UTF-16 range, and corrected-predicate/unrelated-diagnostic assertions. 1,775 procedures were observed in each run. Each run remained well within its eight-minute app context, but similar ~5-minute durations and a prior exact-five-minute failure mean this is repeated read-only evidence, not a latency guarantee. No category-specific error was returned; snapshot fallback logs were intentionally suppressed and fallback status was not separately instrumented. The dominant measured duration is the full catalog phase.
+Both runs passed all catalog, source UTF-8/`CRÉATION`, real key, full-document warning, complete UTF-16 range, and corrected-predicate/unrelated-diagnostic assertions. 1,775 procedures were observed in each run. Each run remained well within its eight-minute app context. These passes predate the snapshot forwarder below and do not validate its behavior or prove that snapshots were used. The dominant measured duration is the full catalog phase. A post-wrapper live rerun is pending orchestrator authorization; do not claim the current wrapper has live-verified fallback/snapshot behavior.
 
 Post-range command (executed twice sequentially; environment values intentionally omitted):
 
@@ -64,6 +64,17 @@ CGO_ENABLED=1 go test -tags interbase ./internal/handler \
 ```
 
 **PASS / expected SKIP**: test reported that all three `SQLS_LEGACY_CATALOG_*` environment variables are required; no connection was opened.
+
+Snapshot-forwarder focused tests (the test file is native-tagged):
+
+```sh
+CGO_ENABLED=1 go test -tags interbase ./internal/handler \
+  -run '^TestCatalogSnapshotPrivacyForwarder' -count=1 -v
+go test ./internal/handler -count=1
+CGO_ENABLED=1 go test -tags interbase ./internal/handler -count=1
+```
+
+**PASS**: success preserves catalog/snapshot capability, exact snapshot repository and closer; error fallback returns a fixed non-wrapping sentinel without the fake secret marker while recording safe type/deadline metadata and preserving the closer; nil-repository/nil-error fallback is recorded as fallback. Tagged and untagged handler suites pass. No real run was launched after adding this wrapper, by instruction.
 
 ## Test suites and native build
 
