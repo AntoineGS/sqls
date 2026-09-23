@@ -99,8 +99,7 @@ func interBaseBulkRelationsForQuery(ctx context.Context, q schema.Queryer, query
 }
 
 func interBaseBulkForeignKeysForWidth(ctx context.Context, q schema.Queryer, width int) ([]interBaseForeignKeyMapping, error) {
-	// interBaseBulkForeignKeys historically uses the fixed-width compatibility
-	// query. Temporarily route the shared grouping scan through a width-aware
-	// queryer; this avoids maintaining a second grouping implementation.
+	// Pass a width-aware SQL string into the shared grouping scan so the job
+	// uses its snapshot-derived identifier capacity without duplicating logic.
 	return interBaseBulkForeignKeysWithQuery(ctx, q, interBaseBulkForeignKeyFieldsQueryForWidth(width))
 }

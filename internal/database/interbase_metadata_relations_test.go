@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -64,6 +66,101 @@ func TestInterBaseMetadataCoreReaderQueryCountDoesNotGrowWithRelations(t *testin
 			}
 		})
 	}
+}
+
+func TestInterBaseMetadataCoreReadersMatchLegacySnapshot(t *testing.T) {
+	db := openInterBaseScalableFixture(t, 3)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	if _, err := loader.Start(ctx, 1, &interBaseMetadataFailureRepository{InterBaseDBRepository: repo}); err != nil {
+		t.Fatal(err)
+	}
+	if err := loader.Wait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	got := loader.Snapshot()
+	for _, kind := range []MetadataKind{MetadataRelations, MetadataColumnsCurrent, MetadataPrimaryKeys, MetadataForeignKeys} {
+		if got.Status[kind].State != MetadataReady {
+			t.Fatalf("core job %s state = %s, want ready", kind, got.Status[kind].State)
+		}
+	}
+
+	legacy, err := NewDBCacheUpdater(repo).GenerateDBCachePrimary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got.Cache.SchemaTables, legacy.SchemaTables) {
+		t.Errorf("SchemaTables differ\ncore:   %#v\nlegacy: %#v", got.Cache.SchemaTables, legacy.SchemaTables)
+	}
+	if !reflect.DeepEqual(got.Cache.ColumnsWithParent, legacy.ColumnsWithParent) {
+		t.Errorf("ColumnsWithParent differ\ncore:   %#v\nlegacy: %#v", got.Cache.ColumnsWithParent, legacy.ColumnsWithParent)
+	}
+	if want := legacyPrimaryKeyColumns(legacy.ColumnsWithParent); !reflect.DeepEqual(got.Cache.PrimaryKeyColumns, want) {
+		t.Errorf("PrimaryKeyColumns differ\ncore:   %#v\nlegacy: %#v", got.Cache.PrimaryKeyColumns, want)
+	}
+	if core, old := canonicalForeignKeyMappings(got.Cache.ForeignKeys), canonicalForeignKeyMappings(legacy.ForeignKeys); !reflect.DeepEqual(core, old) {
+		t.Errorf("ForeignKeys differ\ncore:   %#v\nlegacy: %#v", core, old)
+	}
+}
+
+func legacyPrimaryKeyColumns(columns map[string][]*ColumnDesc) map[string]map[string]struct{} {
+	keys := make(map[string]map[string]struct{})
+	for _, descriptors := range columns {
+		for _, descriptor := range descriptors {
+			if descriptor == nil || descriptor.Key != "YES" {
+				continue
+			}
+			table := columnDatabaseKey("", descriptor.Table)
+			if keys[table] == nil {
+				keys[table] = make(map[string]struct{})
+			}
+			keys[table][descriptor.Name] = struct{}{}
+		}
+	}
+	return keys
+}
+
+func canonicalForeignKeyMappings(foreignKeys map[string]map[string][]*ForeignKey) map[string]map[string][]string {
+	canonical := make(map[string]map[string][]string)
+	for table, references := range foreignKeys {
+		for referencedTable, keys := range references {
+			for _, foreignKey := range keys {
+				if foreignKey == nil || len(*foreignKey) == 0 {
+					continue
+				}
+				first := (*foreignKey)[0]
+				left, right := columnDatabaseKey("", first[0].Table), columnDatabaseKey("", first[1].Table)
+				cacheTable := table
+				if strings.HasPrefix(cacheTable, "\t") {
+					cacheTable = strings.TrimPrefix(cacheTable, "\t")
+				}
+				cacheReferenced := referencedTable
+				if strings.HasPrefix(cacheReferenced, "\t") {
+					cacheReferenced = strings.TrimPrefix(cacheReferenced, "\t")
+				}
+				if columnDatabaseKey("", cacheTable) != left || columnDatabaseKey("", cacheReferenced) != right {
+					continue // each cache stores the mapping in both directions
+				}
+				mapping := strings.Builder{}
+				for _, pair := range *foreignKey {
+					fmt.Fprintf(&mapping, "%s.%s -> %s.%s;", pair[0].Table, pair[0].Name, pair[1].Table, pair[1].Name)
+				}
+				if canonical[left] == nil {
+					canonical[left] = make(map[string][]string)
+				}
+				canonical[left][right] = append(canonical[left][right], mapping.String())
+			}
+		}
+	}
+	for _, references := range canonical {
+		for table := range references {
+			sort.Strings(references[table])
+		}
+	}
+	return canonical
 }
 
 func TestInterBaseMetadataColumnsDoNotRequireRelationsAndPKCanMergeEitherOrder(t *testing.T) {
