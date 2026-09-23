@@ -83,18 +83,49 @@ SDK and client library are not distributed with sqls.
 Build from this checkout:
 
 ```shell
-CGO_ENABLED=1 go build -tags interbase -o sqls .
+make build-interbase
 ```
 
 Ordinary builds do not link the InterBase client. Selecting an InterBase
 connection in such a build reports that the native build is required. The
-upstream `go install ...@latest` command does not include this local integration.
+plain `make build` does not enable the adapter. The upstream `go install ...@latest`
+command does not include this local integration.
+
+#### Legacy catalog text encoding
+
+For databases whose catalog text BLOB bytes use one known legacy single-byte
+encoding, an InterBase connection may opt in to local decoding:
+
+```yaml
+connections:
+  - driver: interbase
+    params:
+      charset: UTF8
+    interbase:
+      catalogTextCharset: WIN1250
+```
+
+`catalogTextCharset` accepts `WIN1250`, `WIN1252`, `ISO8859_1`, or `ASCII`,
+ignoring case and surrounding whitespace. When absent or blank, sqls honors the
+catalog fields' declared charsets. The override describes the actual encoding
+of the documented, materialized catalog text BLOB bytes; it does not change the
+attachment charset used for ordinary queries. Attachment `params.charset` and
+`interbase.catalogTextCharset` are independent settings.
+
+Use this option only when the covered catalog text uses one uniform encoding.
+It is not encoding detection, and mixed encodings are not supported. Confirm
+the code page from database ownership and representative characters before
+enabling it. Remove the override for correctly encoded Unicode catalogs so
+declared-charset decoding remains in effect. Direct BLOB streams retain their
+declared-charset behavior; this option applies only to the driver's documented
+materialized database/sql catalog fields.
 
 #### InterBase editor features
 
 On an InterBase connection sqls reads the database's own catalog and uses it in
-five catalog-backed editor surfaces. There are no settings; catalog-backed
-behavior falls back to its ordinary behavior when the metadata is unavailable —
+five catalog-backed editor surfaces. No additional editor-feature settings are
+needed; catalog-backed behavior falls back to its ordinary behavior when the
+metadata is unavailable —
 on another driver, on a build without the InterBase tag, and in the short window
 after connecting before the catalog has been read. In-document procedure
 navigation, references and rename are separate document-only features and do not

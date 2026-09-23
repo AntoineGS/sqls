@@ -41,14 +41,15 @@ func interBaseAttach(connCfg interBaseConnConfig, sqlDialect int) (*sql.DB, erro
 // attachment, including any TLS options.
 func interBaseDriverConfig(cfg interBaseConnConfig, sqlDialect int) interbase.Config {
 	return interbase.Config{
-		Database:       cfg.Database,
-		Host:           cfg.Host,
-		User:           cfg.User,
-		Password:       cfg.Password,
-		Role:           cfg.Role,
-		Charset:        cfg.Charset,
-		Dialect:        sqlDialect,
-		ConnectTimeout: cfg.ConnectTimeout,
+		Database:           cfg.Database,
+		Host:               cfg.Host,
+		User:               cfg.User,
+		Password:           cfg.Password,
+		Role:               cfg.Role,
+		Charset:            cfg.Charset,
+		CatalogTextCharset: cfg.CatalogTextCharset,
+		Dialect:            sqlDialect,
+		ConnectTimeout:     cfg.ConnectTimeout,
 		TLS: interbase.TLSConfig{
 			Enabled:              cfg.TLS.Enabled,
 			ServerPublicFile:     cfg.TLS.ServerPublicFile,

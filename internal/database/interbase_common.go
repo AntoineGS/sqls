@@ -102,6 +102,28 @@ func interBaseCharset(cfg *DBConfig) (string, error) {
 	return "", fmt.Errorf("interbase: unsupported charset %q", charset)
 }
 
+// interBaseCatalogTextCharset mirrors interbase-go's optional catalog text
+// charset allowlist. It intentionally remains driver-neutral so validation is
+// available in untagged builds where the native driver package is unavailable.
+func interBaseCatalogTextCharset(cfg *DBConfig) (string, error) {
+	if cfg == nil {
+		return "", errors.New("interbase: connection config is nil")
+	}
+	if cfg.InterBase == nil {
+		return "", nil
+	}
+	normalized := strings.ToUpper(strings.TrimSpace(cfg.InterBase.CatalogTextCharset))
+	if normalized == "" {
+		return "", nil
+	}
+	switch normalized {
+	case "WIN1250", "WIN1252", "ISO8859_1", "ASCII":
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("invalid: connections[].interbase.catalogTextCharset %q must be WIN1250, WIN1252, ISO8859_1, or ASCII", cfg.InterBase.CatalogTextCharset)
+	}
+}
+
 // interBaseMaxRoleBytes mirrors the driver's credential length limit
 // (interbase-go interbase.go:165-169, math.MaxUint8).
 const interBaseMaxRoleBytes = 255
@@ -202,14 +224,15 @@ func interBaseTLS(cfg *DBConfig) (interBaseTLSSettings, error) {
 // cgo and the interbase build tag, while this mapping and its tests must build
 // with plain `go test ./...`; interbase_native.go copies it field-for-field.
 type interBaseConnConfig struct {
-	Database       string
-	Host           string
-	User           string
-	Password       string
-	Role           string
-	Charset        string
-	ConnectTimeout time.Duration
-	TLS            interBaseTLSSettings
+	Database           string
+	Host               string
+	User               string
+	Password           string
+	Role               string
+	Charset            string
+	CatalogTextCharset string
+	ConnectTimeout     time.Duration
+	TLS                interBaseTLSSettings
 }
 
 // interBaseConnectionConfig maps the connection settings onto the driver's
@@ -232,6 +255,10 @@ func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
 	if err != nil {
 		return interBaseConnConfig{}, err
 	}
+	catalogTextCharset, err := interBaseCatalogTextCharset(cfg)
+	if err != nil {
+		return interBaseConnConfig{}, err
+	}
 	role, err := interBaseRole(cfg)
 	if err != nil {
 		return interBaseConnConfig{}, err
@@ -246,12 +273,13 @@ func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
 	}
 
 	conn := interBaseConnConfig{
-		User:           cfg.User,
-		Password:       cfg.Passwd,
-		Role:           role,
-		Charset:        charset,
-		ConnectTimeout: connectTimeout,
-		TLS:            tls,
+		User:               cfg.User,
+		Password:           cfg.Passwd,
+		Role:               role,
+		Charset:            charset,
+		CatalogTextCharset: catalogTextCharset,
+		ConnectTimeout:     connectTimeout,
+		TLS:                tls,
 	}
 	if cfg.DataSourceName != "" {
 		conn.Database = cfg.DataSourceName

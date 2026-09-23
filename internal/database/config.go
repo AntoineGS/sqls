@@ -167,6 +167,9 @@ func (c *DBConfig) Validate() error {
 		if _, err := interBaseCharset(c); err != nil {
 			return err
 		}
+		if _, err := interBaseCatalogTextCharset(c); err != nil {
+			return err
+		}
 		if _, err := interBaseRole(c); err != nil {
 			return err
 		}
@@ -244,6 +247,9 @@ func (s *SSHConfig) ClientConfig() (*ssh.ClientConfig, error) {
 // matching the existing sshConfig precedent.
 type InterBaseConfig struct {
 	Role string `json:"role" yaml:"role"`
+	// CatalogTextCharset optionally decodes materialized catalog text BLOBs
+	// using a uniform legacy single-byte encoding. Empty honors declared charsets.
+	CatalogTextCharset string `json:"catalogTextCharset" yaml:"catalogTextCharset"`
 	// ConnectTimeout bounds the native attachment handshake. It is a Go duration
 	// string, for example "10s"; empty leaves the InterBase client default. It is
 	// a string because YAML has no duration type and a bare integer is ambiguous.

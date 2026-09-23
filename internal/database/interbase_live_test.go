@@ -354,6 +354,26 @@ func TestInterBaseCharsetAllowlistMatchesDriverNormalizer(t *testing.T) {
 	}
 }
 
+func TestInterBaseCatalogTextCharsetAllowlistMatchesDriver(t *testing.T) {
+	for _, charset := range []string{"WIN1250", "WIN1252", "ISO8859_1", "ASCII"} {
+		cfg := interbase.Config{
+			Database:           "/tmp/sqls-allowlist.ib",
+			User:               "sqls",
+			CatalogTextCharset: charset,
+		}
+		if _, err := interbase.NewConnector(cfg); err != nil {
+			t.Errorf("driver rejected catalog text charset %q accepted by sqls: %v", charset, err)
+		}
+	}
+	for _, charset := range []string{"NONE", "OCTETS", "UTF8", "UNICODE_FSS", "LATIN1", "WIN1250\x00"} {
+		if _, err := interbase.NewConnector(interbase.Config{
+			Database: "/tmp/sqls-allowlist.ib", User: "sqls", CatalogTextCharset: charset,
+		}); err == nil {
+			t.Errorf("driver accepted invalid catalog text charset %q", charset)
+		}
+	}
+}
+
 func TestInterBaseDriverConfigIsAcceptedByConnector(t *testing.T) {
 	// NewConnector validates the whole configuration, including the composed
 	// attachment string, without dialing (interbase.go:114-139). This is the
@@ -402,13 +422,14 @@ func TestInterBaseDriverConfigIsAcceptedByConnector(t *testing.T) {
 // driver's configuration.
 func TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct(t *testing.T) {
 	connCfg := interBaseConnConfig{
-		Database:       "/srv/interbase/example.ib",
-		Host:           "db.example.test/3050",
-		User:           "alice",
-		Password:       "secret",
-		Role:           "SQLS_READONLY",
-		Charset:        "UTF8",
-		ConnectTimeout: 10 * time.Second,
+		Database:           "/srv/interbase/example.ib",
+		Host:               "db.example.test/3050",
+		User:               "alice",
+		Password:           "secret",
+		Role:               "SQLS_READONLY",
+		Charset:            "UTF8",
+		CatalogTextCharset: "WIN1250",
+		ConnectTimeout:     10 * time.Second,
 		TLS: interBaseTLSSettings{
 			Enabled:              true,
 			ServerPublicFile:     "/etc/interbase/server.pem",
@@ -421,14 +442,15 @@ func TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct(t *testing.T) {
 
 	got := interBaseDriverConfig(connCfg, 3)
 	want := interbase.Config{
-		Database:       "/srv/interbase/example.ib",
-		Host:           "db.example.test/3050",
-		User:           "alice",
-		Password:       "secret",
-		Role:           "SQLS_READONLY",
-		Charset:        "UTF8",
-		Dialect:        3,
-		ConnectTimeout: 10 * time.Second,
+		Database:           "/srv/interbase/example.ib",
+		Host:               "db.example.test/3050",
+		User:               "alice",
+		Password:           "secret",
+		Role:               "SQLS_READONLY",
+		Charset:            "UTF8",
+		CatalogTextCharset: "WIN1250",
+		Dialect:            3,
+		ConnectTimeout:     10 * time.Second,
 		TLS: interbase.TLSConfig{
 			Enabled:              true,
 			ServerPublicFile:     "/etc/interbase/server.pem",
@@ -459,8 +481,8 @@ func TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct(t *testing.T) {
 func TestInterBaseDriverConfigFieldsAreAllKnown(t *testing.T) {
 	wantConfigFields := []string{
 		"Database", "Host", "User", "Password", "Role",
-		"EncryptedPassword", "SystemEncryptionPassword", "Charset", "Dialect",
-		"ConnectTimeout", "TLS", "TransactionOptions",
+		"EncryptedPassword", "SystemEncryptionPassword", "Charset", "CatalogTextCharset",
+		"Dialect", "ConnectTimeout", "TLS", "TransactionOptions",
 	}
 	if got := interBaseStructFieldNames(reflect.TypeOf(interbase.Config{})); !reflect.DeepEqual(got, wantConfigFields) {
 		t.Fatalf("interbase.Config fields = %v, want %v (update interBaseDriverConfig and this list together)", got, wantConfigFields)

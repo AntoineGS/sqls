@@ -81,6 +81,86 @@ func TestInterBaseConfigValidatesCharset(t *testing.T) {
 	}
 }
 
+func TestInterBaseCatalogTextCharsetConfig(t *testing.T) {
+	if got, err := interBaseCatalogTextCharset(&DBConfig{}); err != nil || got != "" {
+		t.Fatalf("interBaseCatalogTextCharset(absent block) = (%q, %v), want empty and nil", got, err)
+	}
+	accepted := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"   ", ""},
+		{" win1250 ", "WIN1250"},
+		{"WIN1252", "WIN1252"},
+		{"iso8859_1", "ISO8859_1"},
+		{" ASCII ", "ASCII"},
+	}
+	for _, test := range accepted {
+		t.Run("accepts/"+test.input, func(t *testing.T) {
+			cfg := &DBConfig{InterBase: &InterBaseConfig{CatalogTextCharset: test.input}}
+			got, err := interBaseCatalogTextCharset(cfg)
+			if err != nil || got != test.want {
+				t.Fatalf("interBaseCatalogTextCharset(%q) = (%q, %v), want (%q, nil)", test.input, got, err, test.want)
+			}
+		})
+	}
+
+	for _, input := range []string{"NONE", "OCTETS", "UTF8", "UNICODE_FSS", "latin1", "WIN1250\x00"} {
+		t.Run("rejects/"+input, func(t *testing.T) {
+			cfg := &DBConfig{
+				Driver:    dialect.DatabaseDriverInterBase,
+				Path:      "/fixture.ib",
+				User:      "tester",
+				InterBase: &InterBaseConfig{CatalogTextCharset: input},
+			}
+			_, err := interBaseCatalogTextCharset(cfg)
+			if err == nil || !strings.Contains(err.Error(), "connections[].interbase.catalogTextCharset") {
+				t.Fatalf("interBaseCatalogTextCharset(%q) error = %v, want key-specific validation error", input, err)
+			}
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "connections[].interbase.catalogTextCharset") {
+				t.Fatalf("DBConfig.Validate(%q) error = %v, want key-specific validation error", input, err)
+			}
+		})
+	}
+	if _, err := interBaseCatalogTextCharset(nil); err == nil {
+		t.Fatal("interBaseCatalogTextCharset(nil) returned nil error")
+	}
+}
+
+func TestInterBaseCatalogTextCharsetConfigMappingIsIndependent(t *testing.T) {
+	cfg := &DBConfig{
+		Driver: dialect.DatabaseDriverInterBase, Path: "/fixture.ib", User: "tester",
+		Params:    map[string]string{"charset": "UTF8"},
+		InterBase: &InterBaseConfig{CatalogTextCharset: " win1250 "},
+	}
+	got, err := interBaseConnectionConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Charset != "UTF8" || got.CatalogTextCharset != "WIN1250" {
+		t.Fatalf("independent charset mapping failed: %#v", got)
+	}
+}
+
+func TestInterBaseCatalogTextCharsetYAML(t *testing.T) {
+	var cfg DBConfig
+	if err := yaml.Unmarshal([]byte("driver: interbase\nuser: tester\npath: /fixture.ib\ninterbase:\n  catalogTextCharset: win1252\n"), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.InterBase == nil || cfg.InterBase.CatalogTextCharset != "win1252" {
+		t.Fatalf("YAML catalogTextCharset = %#v, want win1252", cfg.InterBase)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("DBConfig.Validate() error = %v", err)
+	}
+
+	cfg.Driver = dialect.DatabaseDriverPostgreSQL
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "connections[].interbase") {
+		t.Fatalf("non-InterBase config error = %v, want unsupported interbase block", err)
+	}
+}
+
 func TestInterBaseCharsetMatchesDriverAllowlist(t *testing.T) {
 	// interbase-go normalizeCharset (interbase.go:383-392) accepts exactly these
 	// five names, and the empty value defaults to UTF8. That normalizer is
