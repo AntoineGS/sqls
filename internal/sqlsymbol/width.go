@@ -209,7 +209,10 @@ func (a *Analysis) concatenationWidth(items []lexeme, c Catalog) (int, bool) {
 		if !ok {
 			return 0, false
 		}
-		total += partWidth
+		total, ok = addWidthBounds(total, partWidth)
+		if !ok {
+			return 0, false
+		}
 		found = true
 		start = i + 2
 		i++
@@ -221,7 +224,15 @@ func (a *Analysis) concatenationWidth(items []lexeme, c Catalog) (int, bool) {
 	if !ok {
 		return 0, false
 	}
-	return total + partWidth, true
+	return addWidthBounds(total, partWidth)
+}
+
+func addWidthBounds(left, right int) (int, bool) {
+	maxInt := int(^uint(0) >> 1)
+	if left < 0 || right < 0 || right > maxInt-left {
+		return 0, false
+	}
+	return left + right, true
 }
 
 func stringLiteralWidth(text string, item lexeme) (int, bool) {
@@ -284,7 +295,11 @@ func (a *Analysis) callWidth(items []lexeme, c Catalog) (int, bool, bool) {
 		if !known {
 			return 0, false, true
 		}
-		if sourceWidth, ok := a.expressionWidthRange(arguments[:from], c); ok && sourceWidth < length {
+		sourceWidth, ok := a.expressionWidthRange(arguments[:from], c)
+		if !ok {
+			return 0, false, true
+		}
+		if sourceWidth < length {
 			length = sourceWidth
 		}
 		return length, true, true

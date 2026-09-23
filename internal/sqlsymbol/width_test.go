@@ -1,6 +1,7 @@
 package sqlsymbol
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 
@@ -92,7 +93,30 @@ func TestExpressionWidth(t *testing.T) {
 			},
 			wantOK: false,
 		},
+		{
+			name: "substring with unresolved source stays unknown",
+			text: `CREATE PROCEDURE P AS BEGIN SELECT SUBSTRING(MISSING_COLUMN FROM 1 FOR 5) FROM SRC; END`,
+			expr: `SUBSTRING(MISSING_COLUMN FROM 1 FOR 5)`,
+			catalog: widthTestCatalog{
+				"SRC": {{Name: "VALUE", Type: "VARCHAR(10)"}},
+			},
+			wantOK: false,
+		},
 	}
+	maxInt := int(^uint(0) >> 1)
+	tests = append(tests, struct {
+		name      string
+		text      string
+		expr      string
+		catalog   Catalog
+		wantWidth int
+		wantOK    bool
+	}{
+		name:   "concatenation width overflow stays unknown",
+		text:   `CREATE PROCEDURE P (X VARCHAR(` + strconv.Itoa(maxInt) + `), Y VARCHAR(1)) AS BEGIN RESULT = X || Y; END`,
+		expr:   `X || Y`,
+		wantOK: false,
+	})
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
