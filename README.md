@@ -102,7 +102,7 @@ connections:
     params:
       charset: UTF8
     interbase:
-      catalogTextCharset: WIN1250
+      catalogTextCharset: WIN1252
 ```
 
 `catalogTextCharset` accepts `WIN1250`, `WIN1252`, `ISO8859_1`, or `ASCII`,
