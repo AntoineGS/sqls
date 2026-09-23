@@ -2,10 +2,10 @@
 
 ## Scope and safety
 
-- sqls base revision: `a15aba999212968222640d144c693f82c3b602a0` (branch `feat/interbase-legacy-catalog-text`); full-range test revision `b6231878df4678a2f80721f022ad34bfea25edaa`; timeout-diagnostic commit `2b3120f727dd1a7c22643ad206a54b8b9540f7a2`; capability-preserving snapshot privacy forwarder commit `4c11e7f7a9d5043352e2dd191123c8a564e0f906`.
+- sqls base revision: `a15aba999212968222640d144c693f82c3b602a0` (branch `feat/interbase-legacy-catalog-text`); full-range test revision `b6231878df4678a2f80721f022ad34bfea25edaa`; timeout-diagnostic commit `2b3120f727dd1a7c22643ad206a54b8b9540f7a2`; capability-preserving snapshot privacy forwarder commit `4c11e7f7a9d5043352e2dd191123c8a564e0f906`; deployed native binary revision `3de1b1a56c8570573cd3f74f91cbd6cb00f37af9` (later results-only commit not embedded).
 - Local `interbase-go` replacement: `../interbase-go`, revision `8009fefe498428adb36420b5eabd8938eae3d3f3`.
 - Real validation was performed with the owner-confirmed `WIN1252` setting. `É` alone was not treated as code-page evidence; the owner confirmed the intended code page.
-- The opt-in test loads the existing config and complete SQL document from the environment, copies the connection and nested InterBase config, and changes only the in-memory copy. It issues catalog reads only. No SQL from the document was executed, no business-database writes were performed, and no personal config/editor files were changed.
+- The opt-in test loads the existing config and complete SQL document from the environment, copies the connection and nested InterBase config, and changes only the in-memory copy. It issues catalog reads only. No SQL from the document was executed and no business-database writes were performed. A separate, explicitly authorized editor rollout changed the personal config and executable only after read-only validation; see Editor publication below.
 - Config/document paths and connection information are intentionally omitted. Set `SQLS_LEGACY_CATALOG_CONFIG`, `SQLS_LEGACY_CATALOG_CHARSET`, and `SQLS_LEGACY_CATALOG_DOCUMENT` to absolute config/document paths and the confirmed charset to run the acceptance test.
 
 ## Real catalog and document acceptance
@@ -86,15 +86,17 @@ CGO_ENABLED=1 go test -tags interbase ./internal/handler -count=1
 | `go test ./... -count=1` | PASS |
 | `CGO_ENABLED=1 go test -tags interbase ./... -count=1` | PASS |
 | `make build-interbase` | PASS |
-| `go version -m ./sqls` | Go `go1.27.1`; includes `-tags=interbase`, `CGO_ENABLED=1`, linux/amd64, and `vcs.revision=a8c4a1362709f607264905980829aec87feb83c8` at the final code revision before this results-note update |
+| `go version -m ./sqls` | Go `go1.27.1`; includes `-tags=interbase`, `CGO_ENABLED=1`, linux/amd64, and `vcs.revision=3de1b1a56c8570573cd3f74f91cbd6cb00f37af9` for the deployed native executable |
 | `ldd ./sqls` | PASS; links `/opt/interbase/lib/libgds.so` |
 | `git diff --check` | PASS |
 
-The executable is an ignored worktree build artifact, not a deployment artifact or commit candidate; no executable was copied into the editor path.
+The worktree executable remains an ignored build artifact, not a commit candidate. The corresponding verified binary was copied atomically into the editor path only after the owner's authorization; see Editor publication.
 
 ## Editor publication
 
-**PENDING owner action.** Neovim publication was not validated from this worktree. The owner must enable `interbase.catalogTextCharset: WIN1252` for the intended connection, deploy the verified executable at the path used by the editor, restart its LSP client, open the full document, and inspect the new diagnostics/log interval. Confirm the warning code/range/severity and absence of the procedure-source transliteration failure. No editor settings or publication paths were changed here. Do not claim end-to-end editor acceptance until that step is observed.
+**PASS, explicitly authorized by the owner.** The personal YAML was backed up privately before adding `interbase.catalogTextCharset: WIN1252` to the **first** InterBase connection only; the second connection remained unchanged and the config retained mode 0600. The previous editor-path executable was backed up privately, then replaced atomically with the verified native-tagged binary. The deployed binary reports `CGO_ENABLED=1`, `-tags=interbase`, revision `3de1b1a56c8570573cd3f74f91cbd6cb00f37af9`, and dynamic `libgds.so` linkage. Neither backup nor any personal config content was copied into the repository.
+
+The active Neovim session had the complete SQL document loaded. After restarting its `sqls` LSP, a **new** client (id 3) attached to that buffer and published `interbase-singleton-select` in diagnostic namespace `nvim.lsp.sqls.3`, at zero-based **`272:4–272:10`** (one-based line 273), severity **2 (warning)**. A read of the new LSP log interval found **zero** `Cannot transliterate character between character sets` messages. The previous stopped client process was terminated after a graceful LSP disable did not exit its process; the new client remained active.
 
 ## Follow-up boundary
 
