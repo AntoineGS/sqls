@@ -450,12 +450,12 @@ found := diagnosticsForSnapshot(documentDiagnosticsSnapshot{
 
 Also analyze a copy replacing that one predicate with `config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' AND BRANCHID = '00'`; require the warning on that statement to disappear. Preserve other unrelated diagnostics in the full document.
 
-- [ ] **3. Establish the code page before real validation.** Present the owner with the current WIN1250 config and the evidence limit: C9/É is shared with WIN1252. Use known expected text/configuration or representative distinguishing characters to confirm the encoding. If it is not confirmed, the implementation can be tested with synthetic fixtures, but deployment remains unverified. Do not choose a code page merely because it eliminates the exception.
+- [x] **3. Establish the code page before real validation.** Owner confirmed `WIN1252` for the affected connection during implementation. Earlier WIN1250 examples were provisional: C9/É alone could not distinguish them. Do not choose a code page merely because it eliminates the exception.
 
-- [ ] **4. Run read-only real acceptance.** For this environment, the config and document paths are `~/.config/sqls/config.yml` and `~/OneDrive/Dev/sqls_tests.sql`. After WIN1250 is confirmed, the command is:
+- [ ] **4. Run read-only real acceptance.** For this environment, the config and document paths are `~/.config/sqls/config.yml` and `~/OneDrive/Dev/sqls_tests.sql`. With owner-confirmed WIN1252, the command is:
 
 ```sh
-SQLS_LEGACY_CATALOG_CONFIG="$HOME/.config/sqls/config.yml" SQLS_LEGACY_CATALOG_CHARSET=WIN1250 SQLS_LEGACY_CATALOG_DOCUMENT="$HOME/OneDrive/Dev/sqls_tests.sql" CGO_ENABLED=1 go test -tags interbase ./internal/handler -run '^TestInterBaseLiveLegacyCatalogSingleton$' -count=1 -v -timeout=6m
+SQLS_LEGACY_CATALOG_CONFIG="$HOME/.config/sqls/config.yml" SQLS_LEGACY_CATALOG_CHARSET=WIN1252 SQLS_LEGACY_CATALOG_DOCUMENT="$HOME/OneDrive/Dev/sqls_tests.sql" CGO_ENABLED=1 go test -tags interbase ./internal/handler -run '^TestInterBaseLiveLegacyCatalogSingleton$' -count=1 -v -timeout=6m
 ```
 
 Record actual procedure count (1,775 is historical, not a permanent assertion), source check, catalog completion, actual index columns, and diagnostic line. If another catalog category fails, retain its exact error and investigate it; do not expand the override to all fields or suppress errors to pass.

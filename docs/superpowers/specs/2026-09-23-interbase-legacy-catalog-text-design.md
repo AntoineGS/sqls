@@ -2,6 +2,8 @@
 
 Status: implementation handoff approved by the user's takeover request. Database repair and production-database writes are not authorized.
 
+Rollout update: the owner confirmed `WIN1252` for the affected connection during implementation. Earlier `WIN1250` examples were provisional, not deployment defaults.
+
 ## Goal and assumptions
 
 Read existing legacy procedure source correctly, complete the sqls catalog load, and restore the `interbase-singleton-select` diagnostic for the partial `BRANCH_CONFIG` key query.
