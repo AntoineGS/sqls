@@ -19,6 +19,7 @@ type metadataTxState struct {
 	opens, closes              int
 	queryInTx                  bool
 	rollbackErr                error
+	cancelOnRollback           context.CancelFunc
 	width                      driver.Value
 }
 
@@ -77,6 +78,9 @@ func (tx *metadataTx) Rollback() error {
 	defer tx.conn.state.mu.Unlock()
 	tx.conn.state.rollbacks++
 	tx.conn.inTx = false
+	if tx.conn.state.cancelOnRollback != nil {
+		tx.conn.state.cancelOnRollback()
+	}
 	return tx.conn.state.rollbackErr
 }
 func (r *metadataRows) Columns() []string { return []string{"width"} }
@@ -151,12 +155,12 @@ func TestInterBaseMetadataTransactionRollbackFailureDiscardsPatch(t *testing.T) 
 	}
 }
 
-func TestInterBaseMetadataTransactionCancellationDiscardsPatch(t *testing.T) {
+func TestInterBaseMetadataTransactionCancellationDuringRollbackDiscardsPatch(t *testing.T) {
 	state := &metadataTxState{width: int64(127), rollbackErr: sql.ErrTxDone}
 	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
 	ctx, cancel := context.WithCancel(context.Background())
+	state.cancelOnRollback = cancel
 	patch, err := db.runMetadataRead(ctx, func(context.Context, schema.Queryer, int) (MetadataPatch, error) {
-		cancel()
 		return MetadataPatch{Count: 9}, nil
 	})
 	if !errors.Is(err, context.Canceled) || patch.Count != 0 {
@@ -164,5 +168,23 @@ func TestInterBaseMetadataTransactionCancellationDiscardsPatch(t *testing.T) {
 	}
 	if state.rollbacks != 1 {
 		t.Fatalf("rollbacks = %d, want 1", state.rollbacks)
+	}
+}
+
+func TestInterBaseMetadataTransactionPanicRollsBack(t *testing.T) {
+	state := &metadataTxState{width: int64(127)}
+	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
+	panicked := false
+	func() {
+		defer func() { panicked = recover() != nil }()
+		_, _ = db.runMetadataRead(context.Background(), func(context.Context, schema.Queryer, int) (MetadataPatch, error) {
+			panic("injected read panic")
+		})
+	}()
+	if !panicked {
+		t.Fatal("read callback panic did not propagate")
+	}
+	if state.rollbacks != 1 {
+		t.Fatalf("rollbacks = %d, want 1 after panic", state.rollbacks)
 	}
 }

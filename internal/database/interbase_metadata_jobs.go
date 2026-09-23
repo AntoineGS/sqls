@@ -30,6 +30,12 @@ func (db *InterBaseDBRepository) runMetadataRead(ctx context.Context, read inter
 			err = errors.Join(err, fmt.Errorf("interbase: rollback metadata snapshot: %w", rollbackErr))
 			result = MetadataPatch{}
 		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			result = MetadataPatch{}
+			if !errors.Is(err, ctxErr) {
+				err = errors.Join(err, ctxErr)
+			}
+		}
 	}()
 
 	width, err := interBaseMetadataIdentifierWidth(ctx, tx)
