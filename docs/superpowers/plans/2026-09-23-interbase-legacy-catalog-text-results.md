@@ -29,7 +29,7 @@ CGO_ENABLED=1 go test -tags interbase ./internal/handler \
 - Re-analysis after adding the `BRANCHID = '00'` predicate removed the target warning while preserving unrelated diagnostics.
 - No additional catalog category failed.
 
-The first full-document run exposed a test-only coordinate mistake: the assertion used the absolute document offset instead of LSP's line-relative UTF-16 character. The observed diagnostic was at zero-based `272:4–272:10`; the assertion now derives line-relative UTF-16 coordinates and the final live run passes. No catalog or document acceptance condition was relaxed.
+The live run recorded above preceded the independent review follow-up and verified the code/line behavior. During coordinate debugging, the observed diagnostic range was zero-based `272:4–272:10`. The test now calculates and asserts the complete start/end UTF-16 range for the actual `SELECT` token. The full live test has not been rerun after adding that end-range assertion; the primary orchestrator had a separate read-only live run in progress, so this worker avoided competing for its database/config/output. Do not treat the prior live run as direct evidence that the new end-range assertion passed. No catalog or document acceptance condition was relaxed.
 
 Opt-in guard check (environment variables absent):
 

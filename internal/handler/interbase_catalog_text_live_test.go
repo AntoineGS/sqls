@@ -122,43 +122,46 @@ func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	line := strings.Count(text[:offset], "\n")
 	selectOffset := offset + strings.Index(interBaseLiveSingletonNeedle, "SELECT")
 	lineStart := strings.LastIndex(text[:selectOffset], "\n") + 1
-	character := utf16Units(text[lineStart:selectOffset])
+	expectedRange := lsp.Range{
+		Start: lsp.Position{Line: line, Character: utf16Units(text[lineStart:selectOffset])},
+		End:   lsp.Position{Line: line, Character: utf16Units(text[lineStart : selectOffset+len("SELECT")])},
+	}
 	variant := conn.DriverVariant()
 	if variant.Driver != dialect.DatabaseDriverInterBase {
 		t.Fatal("opened connection does not report InterBase")
 	}
 	cacheSnapshot := snapshotDiagnosticCatalog(cache)
 	found := diagnosticsForSnapshot(documentDiagnosticsSnapshot{text: text, variant: variant, cacheSnapshot: cacheSnapshot})
-	if !hasSingletonDiagnosticAtPosition(found, line, character) {
-		t.Fatalf("expected interbase-singleton-select diagnostic absent at zero-based line %d, character %d", line, character)
+	if !hasSingletonDiagnosticAtRange(found, expectedRange) {
+		t.Fatalf("expected interbase-singleton-select diagnostic absent at range %+v", expectedRange)
 	}
 	t.Logf("full-document interbase-singleton-select diagnostic verified at one-based line %d", line+1)
 
 	corrected := strings.Replace(text, "config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS'", "config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' AND BRANCHID = '00'", 1)
 	correctedFound := diagnosticsForSnapshot(documentDiagnosticsSnapshot{text: corrected, variant: variant, cacheSnapshot: cacheSnapshot})
-	if hasSingletonDiagnosticAtPosition(correctedFound, line, character) {
+	if hasSingletonDiagnosticAtRange(correctedFound, expectedRange) {
 		t.Fatalf("interbase-singleton-select diagnostic remained at target statement after adding BRANCHID predicate")
 	}
-	if !sameDiagnosticsExceptTargetSingleton(found, correctedFound, line, character) {
+	if !sameDiagnosticsExceptTargetSingleton(found, correctedFound, expectedRange) {
 		t.Fatal("adding BRANCHID predicate changed unrelated full-document diagnostics")
 	}
 	t.Log("corrected full document no longer reports the target singleton warning; unrelated diagnostics preserved")
 }
 
-func hasSingletonDiagnosticAtPosition(diagnostics []lsp.Diagnostic, line, character int) bool {
+func hasSingletonDiagnosticAtRange(diagnostics []lsp.Diagnostic, expected lsp.Range) bool {
 	for _, diagnostic := range diagnostics {
-		if diagnosticCode(diagnostic) == "interbase-singleton-select" && int(diagnostic.Range.Start.Line) == line && int(diagnostic.Range.Start.Character) == character {
+		if diagnosticCode(diagnostic) == "interbase-singleton-select" && diagnostic.Range == expected {
 			return true
 		}
 	}
 	return false
 }
 
-func sameDiagnosticsExceptTargetSingleton(before, after []lsp.Diagnostic, line, character int) bool {
+func sameDiagnosticsExceptTargetSingleton(before, after []lsp.Diagnostic, expected lsp.Range) bool {
 	filtered := func(diagnostics []lsp.Diagnostic) []lsp.Diagnostic {
 		result := make([]lsp.Diagnostic, 0, len(diagnostics))
 		for _, diagnostic := range diagnostics {
-			if diagnosticCode(diagnostic) == "interbase-singleton-select" && int(diagnostic.Range.Start.Line) == line && int(diagnostic.Range.Start.Character) == character {
+			if diagnosticCode(diagnostic) == "interbase-singleton-select" && diagnostic.Range == expected {
 				continue
 			}
 			result = append(result, diagnostic)
