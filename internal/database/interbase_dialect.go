@@ -68,9 +68,10 @@ func resolveInterBaseDialect(alias string, requested int, reported int64, diagEr
 		return interBaseDialectDecision{
 			Resolved: requested,
 			Warnings: []string{fmt.Sprintf(
-				"interbase: connection %q is configured for SQL dialect %d but the database reports SQL dialect %d; "+
-					"sqls will lex and render types as dialect %d. Remove `dialect` or set `dialect: 0` to follow the database.",
-				alias, requested, reported, requested,
+				"interbase: connection %q uses configured SQL dialect %d but the source database reports dialect %d; "+
+					"sql parsing and query attachment use dialect %d, while catalog DDL reconstruction uses source database dialect %d. "+
+					"Remove `dialect` or set `dialect: 0` to follow the source database for parsing and query attachment.",
+				alias, requested, reported, requested, reported,
 			)},
 		}
 

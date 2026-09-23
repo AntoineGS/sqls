@@ -62,7 +62,7 @@ func TestResolveRelationTargetOwnershipAndShadowing(t *testing.T) {
 
 func TestInterBaseRelationDefinitionWritesColumnSnapshotRange(t *testing.T) {
 	server := newDefinitionServer(t)
-	ddl := `CREATE TABLE "CUSTOMERINVOICE" ("AMOUNTPAID" NUMERIC(15,2), "BALANCE" INTEGER, "INVOICE" INTEGER)`
+	ddl := `CREATE TABLE "CUSTOMERINVOICE" ("AMOUNTPAID" NUMERIC(15,2) /* normalized legacy scaled DOUBLE */, "BALANCE" INTEGER, "INVOICE" INTEGER)`
 	repo := newStubDDLRepository(func(_ context.Context, kind database.ObjectKind, name string) (string, error) {
 		if kind != database.ObjectKindTable || name != "CUSTOMERINVOICE" {
 			t.Errorf("ObjectDDL(%q,%q)", kind, name)
@@ -99,6 +99,9 @@ func TestInterBaseRelationDefinitionWritesColumnSnapshotRange(t *testing.T) {
 	}
 	if !strings.Contains(string(content), `CREATE TABLE "CUSTOMERINVOICE"`) {
 		t.Errorf("snapshot missing DDL: %s", content)
+	}
+	if !strings.Contains(string(content), "normalized legacy scaled DOUBLE") {
+		t.Errorf("strict-first navigation lost inline Dialect 1 type provenance: %s", content)
 	}
 	if _, err := os.Stat(filepath.Dir(path)); err != nil {
 		t.Fatal(err)
@@ -304,8 +307,8 @@ func TestInterBaseRelationDefinitionFallsBackToCatalogDescriptionForUnsupportedT
 			query:    "SELECT * FROM IMPORT_ORDER_LINE_ITEMS",
 			selected: `"IMPORT_ORDER_LINE_ITEMS"`,
 			wantRange: lsp.Range{
-				Start: lsp.Position{Line: 6, Character: 10},
-				End:   lsp.Position{Line: 6, Character: 35},
+				Start: lsp.Position{Line: 5, Character: 13},
+				End:   lsp.Position{Line: 5, Character: 38},
 			},
 		},
 		{
@@ -316,8 +319,8 @@ func TestInterBaseRelationDefinitionFallsBackToCatalogDescriptionForUnsupportedT
 			query:    "SELECT p.AMOUNT FROM IMPORT_ORDER_PAYMENT p",
 			selected: `"AMOUNT"`,
 			wantRange: lsp.Range{
-				Start: lsp.Position{Line: 8, Character: 14},
-				End:   lsp.Position{Line: 8, Character: 22},
+				Start: lsp.Position{Line: 7, Character: 2},
+				End:   lsp.Position{Line: 7, Character: 10},
 			},
 		},
 	}
@@ -362,16 +365,16 @@ func TestInterBaseRelationDefinitionFallsBackToCatalogDescriptionForUnsupportedT
 			content := readDefinitionSnapshot(t, got)
 			for _, want := range []string{
 				`"` + tt.table + `"`,
-				"NUMERIC(15, 2) (normalized legacy display; not recovered SQL)",
-				"Strict executable DDL",
-				"not executable SQL",
+				"normalized legacy display; not recovered SQL",
+				"Catalog reconstruction; unsupported table facets may be incomplete.",
+				"CREATE TABLE",
 			} {
 				if !strings.Contains(content, want) {
 					t.Errorf("snapshot missing %q:\n%s", want, content)
 				}
 			}
-			if strings.Contains(content, "CREATE TABLE") {
-				t.Errorf("informational description contains executable CREATE TABLE text:\n%s", content)
+			if strings.Contains(content, "Strict executable DDL could not be reproduced") {
+				t.Errorf("fallback has redundant strict-refusal banner:\n%s", content)
 			}
 			if got[0].Range != tt.wantRange {
 				t.Fatalf("range = %+v, want %+v", got[0].Range, tt.wantRange)
@@ -383,6 +386,213 @@ func TestInterBaseRelationDefinitionFallsBackToCatalogDescriptionForUnsupportedT
 			end, ok := symbolOffset(content, got[0].Range.End)
 			if !ok || content[start:end] != tt.selected {
 				t.Fatalf("range selects %q, want exactly %q", content[start:end], tt.selected)
+			}
+		})
+	}
+}
+
+func TestInterBaseRelationDefinitionAcceptsExactUnquotedSQLDescriptionSpans(t *testing.T) {
+	const table, column = "IMPORT_ORDER_PAYMENT", "AMOUNT"
+	body := "-- Informational catalog description; not executable DDL.\nCREATE TABLE " + table + " (\n  " + column + " NUMERIC(15, 2)\n)"
+	tableStart := strings.Index(body, table)
+	columnStart := strings.Index(body, column)
+	description := database.TableDescription{
+		Body:  body,
+		Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(table)},
+		Columns: []database.DescriptionColumn{{
+			Name: column,
+			Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(column)},
+		}},
+	}
+	server := newDefinitionServer(t)
+	repo := newStubTableDescriptionRepository(
+		func(context.Context, database.ObjectKind, string) (string, error) {
+			return "", database.ErrUnsupportedDDL
+		},
+		func(context.Context, string) (database.TableDescription, error) { return description, nil },
+	)
+	query := "SELECT p.AMOUNT FROM IMPORT_ORDER_PAYMENT p"
+	got, err := server.interBaseRelationDefinition(context.Background(), repo, tableDescriptionCatalog(table, column), query,
+		lsp.Position{Character: strings.Index(query, column) + 1},
+		dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase1})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("interBaseRelationDefinition() = %v, %v; want exact SQL-shaped fallback location", got, err)
+	}
+	content := readDefinitionSnapshot(t, got)
+	if !strings.Contains(content, "CREATE TABLE "+table) || strings.Contains(content, "Strict executable DDL could not be reproduced") {
+		t.Fatalf("fallback snapshot = %q; want SQL-shaped reconstruction and no redundant refusal banner", content)
+	}
+	start, ok := symbolOffset(content, got[0].Range.Start)
+	if !ok || content[start:start+len(column)] != column {
+		t.Fatalf("range does not select exact unquoted column %q", column)
+	}
+}
+
+func TestInterBaseRelationDefinitionRejectsSpansIntoComments(t *testing.T) {
+	const table, column = "IMPORT_ORDER_PAYMENT", "AMOUNT"
+	query := "SELECT p.AMOUNT FROM IMPORT_ORDER_PAYMENT p"
+	cache := tableDescriptionCatalog(table, column)
+	for _, targetColumn := range []bool{false, true} {
+		name := "table"
+		if targetColumn {
+			name = "column"
+		}
+		t.Run(name, func(t *testing.T) {
+			description := normalizedTableDescription(table, column)
+			quotedTable := `"` + table + `"`
+			quotedColumn := `"` + column + `"`
+			comment := "-- exact name in comment: " + quotedTable + " " + quotedColumn + "\n"
+			description.Body = comment + description.Body
+			description.Table.Start += len(comment)
+			description.Table.End += len(comment)
+			description.Columns[0].Span.Start += len(comment)
+			description.Columns[0].Span.End += len(comment)
+			if targetColumn {
+				start := strings.Index(comment, quotedColumn)
+				description.Columns[0].Span = database.DescriptionSpan{Start: start, End: start + len(quotedColumn)}
+			} else {
+				start := strings.Index(comment, quotedTable)
+				description.Table = database.DescriptionSpan{Start: start, End: start + len(quotedTable)}
+			}
+			repo := newStubTableDescriptionRepository(
+				func(context.Context, database.ObjectKind, string) (string, error) {
+					return "", database.ErrUnsupportedDDL
+				},
+				func(context.Context, string) (database.TableDescription, error) { return description, nil },
+			)
+			pos := strings.Index(query, table) + 1
+			if targetColumn {
+				pos = strings.Index(query, column) + 1
+			}
+			got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo, cache, query,
+				lsp.Position{Character: pos},
+				dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase1})
+			if err != nil || len(got) != 0 {
+				t.Fatalf("definition = %v, %v; comment span must be rejected", got, err)
+			}
+		})
+	}
+}
+
+func TestInterBaseRelationDefinitionAcceptsUnicodeQuotedDialect3Names(t *testing.T) {
+	const table, column = "DÉTAILS", "MÜNCHEN"
+	quotedTable, quotedColumn := `"`+table+`"`, `"`+column+`"`
+	body := "-- Informational catalog description; not executable DDL.\nCREATE TABLE " + quotedTable + " (\n  " + quotedColumn + " VARCHAR(20)\n)"
+	tableStart, columnStart := strings.Index(body, quotedTable), strings.Index(body, quotedColumn)
+	description := database.TableDescription{
+		Body:  body,
+		Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
+		Columns: []database.DescriptionColumn{{Name: column,
+			Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(quotedColumn)}}},
+	}
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {table}},
+		ColumnsWithParent: map[string][]*database.ColumnDesc{"\t" + table: {
+			{ColumnBase: database.ColumnBase{Table: table, Name: column}},
+		}},
+	}
+	repo := newStubTableDescriptionRepository(
+		func(context.Context, database.ObjectKind, string) (string, error) {
+			return "", database.ErrUnsupportedDDL
+		},
+		func(context.Context, string) (database.TableDescription, error) { return description, nil },
+	)
+	query := "SELECT " + quotedColumn + " FROM " + quotedTable
+	columnAt := strings.Index(query, quotedColumn)
+	got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo, cache, query,
+		lsp.Position{Character: utf16Len(query[:columnAt]) + 1},
+		dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+	if err != nil || len(got) != 1 {
+		t.Fatalf("interBaseRelationDefinition() = %v, %v; want one Unicode quoted identifier location", got, err)
+	}
+	content := readDefinitionSnapshot(t, got)
+	start, ok := symbolOffset(content, got[0].Range.Start)
+	if !ok || content[start:start+len(quotedColumn)] != quotedColumn {
+		t.Fatalf("Unicode range did not select exact quoted name %q", quotedColumn)
+	}
+}
+
+func TestInterBaseRelationDefinitionAcceptsSupportedRelationShapes(t *testing.T) {
+	const table, column = "TEMP_DATA", "PAYLOAD"
+	quotedTable, quotedColumn := `"`+table+`"`, `"`+column+`"`
+	shapes := []struct {
+		name   string
+		prefix string
+		suffix string
+	}{
+		{name: "global temporary delete rows", prefix: "CREATE GLOBAL TEMPORARY TABLE "},
+		{name: "global temporary preserve rows", prefix: "CREATE GLOBAL TEMPORARY TABLE ", suffix: " ON COMMIT PRESERVE ROWS"},
+		{name: "external table", prefix: "CREATE TABLE ", suffix: " EXTERNAL FILE 'temp.dat'"},
+	}
+	for _, shape := range shapes {
+		t.Run(shape.name, func(t *testing.T) {
+			body := "-- Informational catalog description; not executable DDL.\n" + shape.prefix + quotedTable + shape.suffix + " (\n  " + quotedColumn + " /* type unknown: catalog type unavailable */\n)"
+			tableStart, columnStart := strings.Index(body, quotedTable), strings.Index(body, quotedColumn)
+			description := database.TableDescription{
+				Body:  body,
+				Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
+				Columns: []database.DescriptionColumn{{Name: column,
+					Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(quotedColumn)}}},
+			}
+			query := "SELECT PAYLOAD FROM TEMP_DATA"
+			for _, selectColumn := range []bool{false, true} {
+				targetName := "table"
+				pos := strings.Index(query, table) + 1
+				if selectColumn {
+					targetName = "column"
+					pos = strings.Index(query, column) + 1
+				}
+				t.Run(targetName, func(t *testing.T) {
+					repo := newStubTableDescriptionRepository(
+						func(context.Context, database.ObjectKind, string) (string, error) {
+							return "", database.ErrUnsupportedDDL
+						},
+						func(context.Context, string) (database.TableDescription, error) { return description, nil },
+					)
+					got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo,
+						tableDescriptionCatalog(table, column), query, lsp.Position{Character: pos},
+						dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+					if err != nil || len(got) != 1 {
+						t.Fatalf("definition = %v, %v; expected %s shape to navigate", got, err, shape.name)
+					}
+					if !strings.Contains(readDefinitionSnapshot(t, got), "type unknown: catalog type unavailable") {
+						t.Fatalf("%s reconstruction lost the local unknown-type note", shape.name)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestInterBaseRelationDefinitionRejectsBlockCommentedDeclarations(t *testing.T) {
+	const table, column = "IMPORT_ORDER_PAYMENT", "AMOUNT"
+	quotedTable, quotedColumn := `"`+table+`"`, `"`+column+`"`
+	body := "-- Informational catalog description; not executable DDL.\n/*\nCREATE TABLE " + quotedTable + " (\n  " + quotedColumn + " INTEGER\n)\n*/"
+	tableStart, columnStart := strings.Index(body, quotedTable), strings.Index(body, quotedColumn)
+	description := database.TableDescription{
+		Body:  body,
+		Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
+		Columns: []database.DescriptionColumn{{Name: column,
+			Span: database.DescriptionSpan{Start: columnStart, End: columnStart + len(quotedColumn)}}},
+	}
+	query := "SELECT p.AMOUNT FROM IMPORT_ORDER_PAYMENT p"
+	for _, selectColumn := range []bool{false, true} {
+		t.Run(map[bool]string{false: "table", true: "column"}[selectColumn], func(t *testing.T) {
+			pos := strings.Index(query, table) + 1
+			if selectColumn {
+				pos = strings.Index(query, column) + 1
+			}
+			repo := newStubTableDescriptionRepository(
+				func(context.Context, database.ObjectKind, string) (string, error) {
+					return "", database.ErrUnsupportedDDL
+				},
+				func(context.Context, string) (database.TableDescription, error) { return description, nil },
+			)
+			got, err := newDefinitionServer(t).interBaseRelationDefinition(context.Background(), repo,
+				tableDescriptionCatalog(table, column), query, lsp.Position{Character: pos},
+				dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+			if err != nil || len(got) != 0 {
+				t.Fatalf("definition = %v, %v; block-commented declaration must be rejected", got, err)
 			}
 		})
 	}
@@ -480,7 +690,7 @@ func TestInterBaseRelationDefinitionDoesNotUseCatalogDescriptionForUnsafeFallbac
 			wantDescCalls:  1,
 		},
 		{
-			name:           "non-comment description body",
+			name:           "malformed description body",
 			ctx:            context.Background(),
 			withCapability: true,
 			ddlErr:         database.ErrUnsupportedDDL,
@@ -576,14 +786,14 @@ func normalizedTableDescription(table, column string) database.TableDescription 
 	quotedColumn := `"` + strings.ReplaceAll(column, `"`, `""`) + `"`
 	body := strings.Join([]string{
 		"-- Informational catalog description; not executable DDL.",
-		"-- Table: " + quotedTable,
-		"-- Catalog note: " + quotedColumn + " is mentioned here, not at its column span.",
-		"-- Column: 🐟 " + quotedColumn,
-		"--   Type label: NUMERIC(15, 2) (normalized legacy display; not recovered SQL)",
-		"--   Type provenance: conventional numeric display normalized from legacy scaled DOUBLE catalog metadata.",
+		"CREATE TABLE " + quotedTable + " (",
+		"  -- Catalog note: 🐟 declaration spans identify only exact names.",
+		"  " + quotedColumn + " NUMERIC(15, 2) /* normalized legacy display; not recovered SQL */",
+		"  -- Type provenance: conventional numeric display normalized from legacy scaled DOUBLE catalog metadata.",
+		")",
 	}, "\n")
 	tableStart := strings.Index(body, quotedTable)
-	columnStart := strings.LastIndex(body, quotedColumn)
+	columnStart := strings.Index(body, quotedColumn)
 	return database.TableDescription{
 		Body:  body,
 		Table: database.DescriptionSpan{Start: tableStart, End: tableStart + len(quotedTable)},
@@ -596,7 +806,7 @@ func normalizedTableDescription(table, column string) database.TableDescription 
 
 func descriptionWithNonCommentLine(table, column string) database.TableDescription {
 	description := normalizedTableDescription(table, column)
-	description.Body = strings.Replace(description.Body, "-- Informational catalog description; not executable DDL.", "CREATE TABLE", 1)
+	description.Body = strings.Replace(description.Body, "CREATE TABLE ", "BROKEN TABLE ", 1)
 	return description
 }
 

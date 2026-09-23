@@ -236,9 +236,10 @@ func TestDBConnectionDriverVariant(t *testing.T) {
 
 func TestCreateRepositoryFromConnectionPrefersConnFactory(t *testing.T) {
 	conn := &DBConnection{
-		Driver:       dialect.DatabaseDriverInterBase,
-		Variant:      dialect.SQLVariantInterBase1,
-		DatabaseName: "db.example.test/3050:/srv/interbase/example.ib",
+		Driver:           dialect.DatabaseDriverInterBase,
+		Variant:          dialect.SQLVariantInterBase1,
+		SourceSQLDialect: 3,
+		DatabaseName:     "db.example.test/3050:/srv/interbase/example.ib",
 	}
 
 	repo, err := CreateRepositoryFromConnection(dialect.DatabaseDriverInterBase, conn)
@@ -251,6 +252,9 @@ func TestCreateRepositoryFromConnectionPrefersConnFactory(t *testing.T) {
 	}
 	if got, want := ib.SQLDialect, 1; got != want {
 		t.Errorf("repository SQLDialect = %d, want %d", got, want)
+	}
+	if got, want := ib.SourceSQLDialect, 3; got != want {
+		t.Errorf("repository SourceSQLDialect = %d, want %d", got, want)
 	}
 	if got, want := ib.DatabaseName, conn.DatabaseName; got != want {
 		t.Errorf("repository DatabaseName = %q, want %q", got, want)

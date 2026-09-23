@@ -1581,6 +1581,64 @@ func TestInterBaseObjectDDL(t *testing.T) {
 	}
 }
 
+func TestInterBaseObjectDDLUsesDialect1Renderer(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	if _, err := db.Exec(`UPDATE "RDB$FIELDS" SET "RDB$FIELD_TYPE" = 35 WHERE "RDB$FIELD_NAME" = 'PARENT_A'`); err != nil {
+		t.Fatal(err)
+	}
+	// The attached client uses Dialect 3, while diagnostics identify this
+	// database as Dialect 1. DDL must follow source semantics, not the client.
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 1}
+	ddl, err := repository.ObjectDDL(context.Background(), ObjectKindDomain, "PARENT_A")
+	if err != nil {
+		t.Fatalf("ObjectDDL(PARENT_A) error = %v", err)
+	}
+	if !strings.Contains(ddl, `CREATE DOMAIN PARENT_A AS DATE`) {
+		t.Fatalf("Dialect 1 domain DDL = %q, want PARENT_A declared DATE", ddl)
+	}
+
+	description, err := repository.TableDescription(context.Background(), "PARENT")
+	if err != nil {
+		t.Fatalf("TableDescription(PARENT) error = %v", err)
+	}
+	if !strings.Contains(description.Body, `PARENT_A PARENT_A`) {
+		t.Fatalf("Dialect 1 table description = %q, want the named domain declaration", description.Body)
+	}
+}
+
+func TestInterBaseObjectDDLDialect1ScaledDoubleIsReconstructedInline(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	if _, err := db.Exec(`UPDATE "RDB$RELATION_FIELDS" SET "RDB$FIELD_SOURCE" = 'RDB$1', "RDB$DEFAULT_SOURCE" = ' DEFAULT 1.25 ', "RDB$NULL_FLAG" = 1 WHERE "RDB$RELATION_NAME" = 'PARENT' AND TRIM("RDB$FIELD_NAME") = 'PARENT_A'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE "RDB$FIELDS" SET "RDB$FIELD_TYPE" = 27, "RDB$FIELD_SUB_TYPE" = 0, "RDB$FIELD_SCALE" = -2, "RDB$FIELD_PRECISION" = NULL WHERE "RDB$FIELD_NAME" = 'RDB$1'`); err != nil {
+		t.Fatal(err)
+	}
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 1}
+	ddl, err := repository.ObjectDDL(context.Background(), ObjectKindTable, "PARENT")
+	if err != nil {
+		t.Fatalf("ObjectDDL(PARENT) error = %v", err)
+	}
+	for _, want := range []string{
+		"PARENT_A NUMERIC(15, 2)",
+		"legacy scaled DOUBLE; canonical Dialect 1 NUMERIC",
+		"DEFAULT 1.25",
+		"NOT NULL",
+		"PRIMARY KEY",
+	} {
+		if !strings.Contains(ddl, want) {
+			t.Errorf("Dialect 1 ObjectDDL missing %q: %s", want, ddl)
+		}
+	}
+	description, err := repository.TableDescription(context.Background(), "PARENT")
+	if err != nil {
+		t.Fatalf("TableDescription(PARENT) error = %v", err)
+	}
+	if !strings.Contains(description.Body, "NUMERIC(15, 2)") || !strings.Contains(description.Body, "legacy scaled DOUBLE; canonical Dialect 1 NUMERIC") {
+		t.Errorf("Dialect 1 catalog description omitted normalized type provenance: %s", description.Body)
+	}
+}
+
 func TestInterBaseObjectDDLDoesNotNormalizeNames(t *testing.T) {
 	// schema matches catalog names exactly and does not case-fold
 	// (Catalog.Table(ctx, "CUSTOMER   ") returns nil for padding; the same
@@ -1629,7 +1687,7 @@ func TestInterBaseUnsupportedDDLWithoutDetailStillMatchesTheSentinel(t *testing.
 
 func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 	db := openInterBaseSchemaFixture(t)
-	source := &InterBaseDBRepository{Conn: db, SQLDialect: 3, DatabaseName: "/srv/interbase/example.ib"}
+	source := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 1, DatabaseName: "/srv/interbase/example.ib"}
 	ctx := context.Background()
 
 	snapshot, closeSnapshot, err := source.CatalogSnapshot(ctx)
@@ -1656,9 +1714,9 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 	if bound.snapshot == nil {
 		t.Fatal("the returned repository is not bound to a snapshot")
 	}
-	if bound.SQLDialect != source.SQLDialect || bound.DatabaseName != source.DatabaseName {
-		t.Errorf("snapshot repository = (%d, %q), want the source's (%d, %q)",
-			bound.SQLDialect, bound.DatabaseName, source.SQLDialect, source.DatabaseName)
+	if bound.SQLDialect != source.SQLDialect || bound.SourceSQLDialect != source.SourceSQLDialect || bound.DatabaseName != source.DatabaseName {
+		t.Errorf("snapshot repository = (client dialect %d, source dialect %d, %q), want the source's (%d, %d, %q)",
+			bound.SQLDialect, bound.SourceSQLDialect, bound.DatabaseName, source.SQLDialect, source.SourceSQLDialect, source.DatabaseName)
 	}
 
 	// The snapshot serves the same answers as the direct path.

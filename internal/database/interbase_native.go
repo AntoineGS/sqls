@@ -107,6 +107,10 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 
 	diagnostics, diagErr := interBaseDiagnostics(conn)
 	decision := resolveInterBaseDialect(alias, cfg.Dialect, diagnostics.SQLDialect, diagErr)
+	sourceDialect := decision.Resolved
+	if diagErr == nil && (diagnostics.SQLDialect == 1 || diagnostics.SQLDialect == 3) {
+		sourceDialect = int(diagnostics.SQLDialect)
+	}
 
 	if decision.Reattach {
 		// The single extra attach, paid only by a Dialect 1 database.
@@ -118,11 +122,12 @@ func interBaseOpen(cfg *DBConfig) (*DBConnection, error) {
 	}
 
 	return &DBConnection{
-		Conn:         conn,
-		Driver:       dialect.DatabaseDriverInterBase,
-		Variant:      dialect.InterBaseSQLVariant(decision.Resolved),
-		DatabaseName: attachment,
-		Warnings:     decision.Warnings,
+		Conn:             conn,
+		Driver:           dialect.DatabaseDriverInterBase,
+		Variant:          dialect.InterBaseSQLVariant(decision.Resolved),
+		SourceSQLDialect: sourceDialect,
+		DatabaseName:     attachment,
+		Warnings:         decision.Warnings,
 	}, nil
 }
 

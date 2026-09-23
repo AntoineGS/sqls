@@ -680,9 +680,10 @@ func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBReposit
 	}
 
 	bound := &InterBaseDBRepository{
-		Conn:         db.Conn,
-		SQLDialect:   db.SQLDialect,
-		DatabaseName: db.DatabaseName,
+		Conn:             db.Conn,
+		SQLDialect:       db.SQLDialect,
+		SourceSQLDialect: db.SourceSQLDialect,
+		DatabaseName:     db.DatabaseName,
 		snapshot: &interBaseCatalogSnapshot{
 			catalog: catalog,
 			bulk:    bulk,
