@@ -612,10 +612,10 @@ func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*Func
 	if err != nil {
 		return nil, err
 	}
-	return db.functionDescriptions(functions)
+	return functionDescriptions(functions)
 }
 
-func (db *InterBaseDBRepository) functionDescriptions(functions []schema.Function) ([]*FunctionDesc, error) {
+func functionDescriptions(functions []schema.Function) ([]*FunctionDesc, error) {
 	result := make([]*FunctionDesc, 0, len(functions))
 	for _, function := range functions {
 		arguments := make([]*FunctionArgumentDesc, 0, len(function.Arguments))

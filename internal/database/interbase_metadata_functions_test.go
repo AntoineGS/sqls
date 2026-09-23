@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"sort"
 	"testing"
+
+	"interbase-go/schema"
 )
 
 func TestInterBaseMetadataFunctionsMatchLegacyWithConstantQueries(t *testing.T) {
@@ -105,6 +107,25 @@ func TestInterBaseMetadataFunctionsKeepEmptyAndUnsupportedRendering(t *testing.T
 	}
 	if got := patch.Cache.Catalog.Functions[catalogCacheKey("UDF_UNSUPPORTED")]; got == nil || got.ReturnType != "" || len(got.Arguments) != 1 || got.Arguments[0].Type != "" {
 		t.Fatalf("unsupported rendering descriptor = %#v", got)
+	}
+}
+
+func TestInterBaseFunctionDescriptionsIsStandalone(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	want, err := (&InterBaseDBRepository{Conn: db}).DescribeFunctions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	functions, err := schema.New(db).Functions(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := functionDescriptions(functions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("standalone descriptors differ\n got: %#v\nwant: %#v", got, want)
 	}
 }
 

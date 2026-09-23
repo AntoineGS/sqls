@@ -81,7 +81,7 @@ ORDER BY a.RDB$FUNCTION_NAME, a.RDB$ARGUMENT_POSITION`, functionName)
 	if err != nil {
 		return MetadataPatch{}, err
 	}
-	descriptions, err := db.functionDescriptions(functions)
+	descriptions, err := functionDescriptions(functions)
 	if err != nil {
 		return MetadataPatch{}, err
 	}
