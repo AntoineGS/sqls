@@ -103,23 +103,19 @@ func (a *Analysis) updateFindings(items []lexeme, c Catalog) []Finding {
 			}
 		}
 		assignments, ok := splitTopLevel(items[set+1:setEnd], token.Comma)
-		if !ok {
+		if !ok || !completeAssignmentList(a.Text, assignments) || !completeSelectTail(a.Text, items[setEnd:end]) {
 			continue
 		}
+		statementFindings := make([]Finding, 0)
 		for _, assignment := range assignments {
-			if len(assignment) < 3 {
-				continue
-			}
 			eq := topLevelTokenIndex(assignment, token.Eq)
-			if eq <= 0 || eq >= len(assignment)-1 {
-				continue
-			}
 			destination, ok := updateDestination(a.Text, assignment[:eq], target, c)
 			if !ok {
 				continue
 			}
-			findings = append(findings, a.findingForDestination(assignment[eq+1:], destination, c)...)
+			statementFindings = append(statementFindings, a.findingForDestination(assignment[eq+1:], destination, c)...)
 		}
+		findings = append(findings, statementFindings...)
 		i = end
 	}
 	return findings
@@ -272,6 +268,9 @@ func (a *Analysis) insertSelectFindings(items []lexeme, selectIndex, end int, co
 	if from+1 >= end || (!isNameToken(items[from+1]) && items[from+1].Token.Kind != token.LParen) {
 		return nil, false
 	}
+	if !completeSelectTail(a.Text, items[from+1:end]) {
+		return nil, false
+	}
 	projections, ok := splitTopLevel(items[selectIndex+1:from], token.Comma)
 	if !ok || len(projections) != len(columns) {
 		return nil, false
@@ -317,6 +316,9 @@ func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catal
 	if from+1 >= end || (!isNameToken(items[from+1]) && items[from+1].Token.Kind != token.LParen) {
 		return nil, false
 	}
+	if !completeSelectTail(a.Text, items[from+1:end]) {
+		return nil, false
+	}
 	projections, ok := splitTopLevel(items[selectIndex+1:into], token.Comma)
 	if !ok {
 		return nil, false
@@ -331,14 +333,14 @@ func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catal
 		if len(target) == 2 && target[0].Token.Kind == token.Colon {
 			nameIndex = 1
 		} else if len(target) != 1 {
-			return nil, false
+			continue
 		}
 		if !isNameToken(target[nameIndex]) {
-			return nil, false
+			continue
 		}
 		resolution := a.Resolve(target[nameIndex].Span.Start)
 		if resolution.Role != Local || resolution.Symbol == nil {
-			return nil, false
+			continue
 		}
 		destinations[i] = widthDestination{
 			span:     resolution.Span,
@@ -492,6 +494,105 @@ func topLevelTokenIndex(items []lexeme, kind token.Kind) int {
 		}
 	}
 	return -1
+}
+
+func completeAssignmentList(text string, assignments [][]lexeme) bool {
+	if len(assignments) == 0 {
+		return false
+	}
+	for _, assignment := range assignments {
+		if len(assignment) < 3 {
+			return false
+		}
+		eq := topLevelTokenIndex(assignment, token.Eq)
+		if eq <= 0 || eq >= len(assignment)-1 || !completeExpression(text, assignment[eq+1:]) {
+			return false
+		}
+	}
+	return true
+}
+
+func completeSelectTail(text string, items []lexeme) bool {
+	if topLevelWordIndex(items, "UNION") >= 0 || topLevelWordIndex(items, "RETURNING") >= 0 || topLevelWordIndex(items, "RETURNING_VALUES") >= 0 {
+		return false
+	}
+	if !completeClauseExpression(text, items, "WHERE", "", []string{"GROUP", "HAVING", "ORDER", "ROWS", "PLAN"}) ||
+		!completeClauseExpression(text, items, "GROUP", "BY", []string{"HAVING", "ORDER", "ROWS", "PLAN"}) ||
+		!completeClauseExpression(text, items, "HAVING", "", []string{"ORDER", "ROWS", "PLAN"}) ||
+		!completeClauseExpression(text, items, "ORDER", "BY", []string{"ROWS", "PLAN"}) ||
+		!completeClauseExpression(text, items, "ROWS", "", []string{"PLAN"}) ||
+		!completeClauseExpression(text, items, "PLAN", "", nil) ||
+		!completeClauseExpression(text, items, "ON", "", []string{"JOIN", "WHERE", "GROUP", "HAVING", "ORDER", "ROWS", "PLAN"}) {
+		return false
+	}
+	depth := 0
+	for i, item := range items {
+		switch item.Token.Kind {
+		case token.LParen:
+			depth++
+		case token.RParen:
+			depth--
+		}
+		if depth == 0 && isWord(item, "JOIN") {
+			if i+1 >= len(items) || (!isNameToken(items[i+1]) && items[i+1].Token.Kind != token.LParen) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func completeClauseExpression(text string, items []lexeme, clause, requiredWord string, boundaries []string) bool {
+	clauseIndex := topLevelWordIndex(items, clause)
+	if clauseIndex < 0 {
+		return true
+	}
+	bodyStart := clauseIndex + 1
+	if requiredWord != "" {
+		if bodyStart >= len(items) || !isWord(items[bodyStart], requiredWord) {
+			return false
+		}
+		bodyStart++
+	}
+	bodyEnd := len(items)
+	for _, boundary := range boundaries {
+		if relative := topLevelWordIndex(items[bodyStart:], boundary); relative >= 0 && bodyStart+relative < bodyEnd {
+			bodyEnd = bodyStart + relative
+		}
+	}
+	return completeExpression(text, items[bodyStart:bodyEnd])
+}
+
+func completeExpression(text string, items []lexeme) bool {
+	if len(items) == 0 || !balancedExpression(items) {
+		return false
+	}
+	first, last := items[0], items[len(items)-1]
+	switch first.Token.Kind {
+	case token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq, token.Period, token.Comma:
+		return false
+	case token.Char:
+		if text[first.Span.Start:first.Span.End] == "|" {
+			return false
+		}
+	}
+	switch last.Token.Kind {
+	case token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq,
+		token.Plus, token.Minus, token.Mult, token.Div, token.Caret, token.Mod,
+		token.Comma, token.Period, token.Colon, token.DoubleColon:
+		return false
+	case token.Char:
+		if text[last.Span.Start:last.Span.End] == "|" {
+			return false
+		}
+	case token.SQLKeyword:
+		for _, word := range []string{"AND", "OR", "IS", "LIKE", "NOT", "IN", "BETWEEN", "FROM", "FOR", "AS", "BY", "TO"} {
+			if isWord(last, word) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func statementSQLDepths(items []lexeme) ([]int, map[int]int) {

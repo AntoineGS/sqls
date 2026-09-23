@@ -68,6 +68,19 @@ END`,
 			occurrences: []int{1},
 			wantText:    []string{"SRC.VALUE", "SMALL", "40", "20"},
 		},
+		{
+			name: "select into skips unresolved target independently",
+			text: `CREATE PROCEDURE P AS
+DECLARE VARIABLE SMALL VARCHAR(20);
+BEGIN
+  SELECT SRC.VALUE, SRC.VALUE INTO :SMALL, :UNKNOWN_TARGET FROM SRC;
+  SMALL = SMALL;
+END`,
+			catalog:     testCatalog{columns: map[string][]ColumnType{"SRC": {{Name: "VALUE", Type: "VARCHAR(40)"}}}},
+			markers:     []string{"SMALL"},
+			occurrences: []int{1},
+			wantText:    []string{"SRC.VALUE", "SMALL", "40", "20"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -133,6 +146,21 @@ func TestWidthAssignmentsStaySilentWhenUnproven(t *testing.T) {
 			name: "incomplete values row",
 			text: `CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) VALUES ('abcdefghijklmnopqrstu'; END`,
 			catalog: testCatalog{columns: map[string][]ColumnType{
+				"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}},
+			}},
+		},
+		{
+			name: "incomplete trailing update assignment",
+			text: `CREATE PROCEDURE P (LARGE VARCHAR(40)) AS BEGIN UPDATE DST SET VALUE = :LARGE, OTHER =; END`,
+			catalog: testCatalog{columns: map[string][]ColumnType{
+				"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}, {Name: "OTHER", Type: "VARCHAR(20)"}},
+			}},
+		},
+		{
+			name: "incomplete insert select predicate",
+			text: `CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC WHERE; END`,
+			catalog: testCatalog{columns: map[string][]ColumnType{
+				"SRC": {{Name: "VALUE", Type: "VARCHAR(40)"}},
 				"DST": {{Name: "VALUE", Type: "VARCHAR(20)"}},
 			}},
 		},
