@@ -135,6 +135,32 @@ func TestInferParameterTypesLeavesOctetsAndTimeToPicker(t *testing.T) {
 	}
 }
 
+func TestInferParameterTypesUsesCharacterCharsetIDToRejectOctets(t *testing.T) {
+	batch := compileInferenceBatch(t, "SELECT :varchar_octets, :char_octets, :none_charset, :collated_utf8 FROM T", 3)
+	descriptors := []database.InputDescriptor{
+		{Kind: "VARCHAR", Subtype: 1},
+		{Kind: "CHAR", Subtype: 0x101},
+		{Kind: "VARCHAR", Subtype: 0},
+		{Kind: "CHAR", Subtype: 0x104},
+	}
+	result, err := inferParameterTypes(context.Background(), batch, func(context.Context, string) ([]database.InputDescriptor, error) {
+		return descriptors, nil
+	}, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []int{0, 1} {
+		if result[index].InferredType != "" || result[index].DatabaseType != "" {
+			t.Errorf("OCTETS descriptor %+v inferred a type, want picker fallback", result[index])
+		}
+	}
+	for _, index := range []int{2, 3} {
+		if result[index].InferredType != "text" {
+			t.Errorf("ordinary character descriptor %+v inferredType = %q, want text", result[index], result[index].InferredType)
+		}
+	}
+}
+
 func TestInferParameterTypesDoesNotGuessDialectOneDecimal(t *testing.T) {
 	batch := compileInferenceBatch(t, "SELECT :amount FROM T", 1)
 	result, err := inferParameterTypes(context.Background(), batch, func(context.Context, string) ([]database.InputDescriptor, error) {

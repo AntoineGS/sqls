@@ -110,6 +110,12 @@ func inferredInputType(descriptor database.InputDescriptor, sqlDialect int) (wir
 
 	switch kind {
 	case "CHAR", "CHARACTER", "VARCHAR", "CHARACTER VARYING", "NCHAR", "NVARCHAR":
+		// SQLDA stores the character set in sqlsubtype's low byte; the high
+		// byte can carry a collation. Charset ID 1 is OCTETS, including when
+		// collation bits make the full subtype look different.
+		if uint16(descriptor.Subtype)&0x00ff == 1 {
+			return "", "", false
+		}
 		return "text", kind, true
 	case "SMALLINT", "INTEGER", "BIGINT", "SHORT", "LONG", "INT64":
 		if descriptor.Scale == 0 {
