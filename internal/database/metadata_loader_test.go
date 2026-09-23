@@ -313,12 +313,29 @@ func TestMetadataLoaderGenerationAndStartErrors(t *testing.T) {
 	}
 }
 
-func TestMetadataLoaderAbsentPlan(t *testing.T) {
+func TestMetadataLoaderUsesGenericPlanWhenAbsent(t *testing.T) {
 	loader := NewMetadataLoader()
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
-	if _, err := loader.Start(context.Background(), 1, NewMockDBRepository(nil)); !errors.Is(err, ErrInvalidMetadataPlan) {
-		t.Fatalf("Start error = %v", err)
+	load, err := loader.Start(context.Background(), 1, NewMockDBRepository(nil))
+	if err != nil {
+		t.Fatalf("Start() with generic repository error = %v", err)
+	}
+	waitLoad(t, load)
+	snapshot := loader.Snapshot()
+	if !snapshot.Settled() {
+		t.Fatalf("generic metadata snapshot did not settle: %#v", snapshot.Status)
+	}
+	for _, kind := range []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataColumnsAll, MetadataForeignKeys} {
+		if got := snapshot.Status[kind].State; got != MetadataReady {
+			t.Errorf("generic %s state = %s, want ready", kind, got)
+		}
+	}
+	if _, ok := snapshot.Cache.Database("world"); !ok {
+		t.Error("generic schemas were not published")
+	}
+	if _, ok := snapshot.Cache.ColumnDatabase("world", "city"); !ok {
+		t.Error("generic columns were not published")
 	}
 }
 
