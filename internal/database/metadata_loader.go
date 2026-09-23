@@ -108,11 +108,7 @@ func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRe
 	}
 	l.mu.Unlock()
 
-	planner, ok := repo.(MetadataPlanRepository)
-	if !ok {
-		return nil, fmt.Errorf("%w: repository does not provide MetadataPlan", ErrInvalidMetadataPlan)
-	}
-	plan := planner.MetadataPlan()
+	plan := metadataPlanFor(repo)
 	if err := validateMetadataPlan(plan); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrInvalidMetadataPlan, err)
 	}
