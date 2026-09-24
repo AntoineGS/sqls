@@ -110,9 +110,19 @@ not overwrite it.
 
 ### Provenance and artifacts
 
-- sqls source revision: `bc13d88109002d7e0f01e3bd98ef63bfef287525` (baseline
-  `bc13d88`); InterBase driver replacement revision:
-  `b0effe31a418407e60cd42491ac3904b7e67d350` (`../interbase-go`).
+- Candidate sqls source revision: `bc13d88109002d7e0f01e3bd98ef63bfef287525`
+  (`bc13d88`). This is the candidate source, not the preserved baseline's
+  revision.
+- Plan 2 records the preserved baseline binary as built from sqls `e8bf840` with
+  the `interbase-go` archive recorded as `1fdfc620`. Plan 3 identifies that
+  frozen archive as `1fdfc6204fd04c567a36bfecbbd3825141c908db`, extracted from a
+  Git archive at `/tmp/opencode/interbase-go-1fdf`. The current candidate's local
+  `../interbase-go` source has no `.git` directory and was verified against
+  `/tmp/opencode/interbase-go-1fdf` with `diff -qr` (no differences). Thus the
+  candidate driver provenance is the recorded frozen archive, not a commit
+  derived from `git -C ../interbase-go rev-parse HEAD` (which walks up to the
+  sqls repository). The baseline's recorded build provenance is not independently
+  verifiable from the binary hash alone.
 - Host: Linux/amd64, Intel Core i7-9700 CPU @ 3.00GHz; Go toolchain reported
   `go1.27.1-X:nodwarf5`, CGO enabled. This differs from the design's declared
   Go 1.25.7 and is recorded as the actual measurement environment.
@@ -123,9 +133,10 @@ not overwrite it.
   `/tmp/opencode/sqls-metadata-benchmark`; SHA-256
   `fab6e66adb95ed18046953ace1ca8f4fb1cd5675465c4b079c85d0a736cdc3fb`.
 - Preserved baseline binary at `/tmp/opencode/sqls-performance-baseline`,
-  SHA-256 `86ec5c0cd3a7ca3380eff7fc9a19ad63cf65beab0eb0ce35795b13f130a5f027`.
-  Its source revision could not be established from the available local
-  provenance, so no baseline commit/version is asserted.
+  SHA-256 `86ec5c0cd3a7ca3380eff7fc9a19ad63cf65beab0eb0ce35795b13f130a5f027`;
+  its recorded build provenance is sqls `e8bf840` / driver archive `1fdfc620`
+  as above, not candidate revision `bc13d88` (binary provenance not independently
+  verifiable from its hash).
 - No InterBase server/version, dialect, database identity or size, relation /
   column / procedure / index counts, client-to-database network placement, or
   server/OS cache state can be reported without database access. No benchmark
