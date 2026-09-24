@@ -1,4 +1,4 @@
-package database
+package catalog
 
 import (
 	"context"
@@ -55,13 +55,13 @@ type MetadataSnapshot struct {
 	Revision    uint64
 	Started     bool
 	StartFailed bool
-	Cache       *DBCache
+	Cache       *Cache
 	Status      map[MetadataKind]MetadataStatus
 }
 
 // MetadataPatch is one job's cache fragment and accounting information.
 type MetadataPatch struct {
-	Cache        *DBCache
+	Cache        *Cache
 	Count        int
 	Queries      int
 	QueriesKnown bool
@@ -71,7 +71,7 @@ type MetadataPatch struct {
 type MetadataJob struct {
 	Kind      MetadataKind
 	DependsOn []MetadataKind
-	Run       func(context.Context, *DBCache) (MetadataPatch, error)
+	Run       func(context.Context, *Cache) (MetadataPatch, error)
 }
 
 // MetadataPlan is the bounded set of category loads a repository supports.

@@ -2,10 +2,19 @@ package database
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/sqls-server/sqls/catalog"
 )
+
+// groupForeignKeys and validateForeignKey are thin delegates to the catalog
+// package's exported equivalents, kept under their original unexported names
+// so every existing call site in this package and its tests needs no edit.
+func groupForeignKeys(keys []*ForeignKey) (map[string]map[string][]*ForeignKey, error) {
+	return catalog.GroupForeignKeys(keys)
+}
+func validateForeignKey(key *ForeignKey) error { return catalog.ValidateForeignKey(key) }
 
 // metadataPlanFor prefers a repository's explicit driver plan. Generic
 // repositories are adapted from their existing calls and kept serial until
@@ -37,7 +46,7 @@ func metadataPlanFor(repo DBRepository) MetadataPlan {
 					current = sorted[0]
 				}
 			}
-			fragment.defaultSchema = current
+			fragment.DefaultSchema = current
 			return MetadataPatch{Cache: fragment, Count: len(fragment.Schemas)}, nil
 		}},
 		MetadataJob{Kind: MetadataRelations, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
@@ -54,7 +63,7 @@ func metadataPlanFor(repo DBRepository) MetadataPlan {
 			return MetadataPatch{Cache: fragment, Count: count}, nil
 		}},
 		MetadataJob{Kind: MetadataColumnsCurrent, DependsOn: []MetadataKind{MetadataSchemas}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
-			columns, err := repo.DescribeDatabaseTableBySchema(ctx, cache.defaultSchema)
+			columns, err := repo.DescribeDatabaseTableBySchema(ctx, cache.DefaultSchema)
 			if err != nil {
 				return MetadataPatch{}, err
 			}
@@ -68,7 +77,7 @@ func metadataPlanFor(repo DBRepository) MetadataPlan {
 			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(cloneColumnDescs(columns))}, Count: len(columns)}, nil
 		}},
 		MetadataJob{Kind: MetadataForeignKeys, DependsOn: []MetadataKind{MetadataSchemas}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
-			keys, err := repo.DescribeForeignKeysBySchema(ctx, cache.defaultSchema)
+			keys, err := repo.DescribeForeignKeysBySchema(ctx, cache.DefaultSchema)
 			if err != nil {
 				return MetadataPatch{}, err
 			}
@@ -79,8 +88,8 @@ func metadataPlanFor(repo DBRepository) MetadataPlan {
 			return MetadataPatch{Cache: &DBCache{ForeignKeys: grouped}, Count: len(keys)}, nil
 		}},
 	)
-	if catalog, ok := repo.(CatalogRepository); ok {
-		plan.Jobs = append(plan.Jobs, catalogMetadataJobs(catalog)...)
+	if catalogRepo, ok := repo.(CatalogRepository); ok {
+		plan.Jobs = append(plan.Jobs, catalogMetadataJobs(catalogRepo)...)
 	}
 	return plan
 }
@@ -255,36 +264,4 @@ func cloneIndexDesc(index *IndexDesc) *IndexDesc {
 	copy := *index
 	copy.Columns = append([]string(nil), index.Columns...)
 	return &copy
-}
-
-func groupForeignKeys(keys []*ForeignKey) (map[string]map[string][]*ForeignKey, error) {
-	grouped := make(map[string]map[string][]*ForeignKey)
-	for i, key := range keys {
-		if err := validateForeignKey(key); err != nil {
-			return nil, fmt.Errorf("malformed foreign key at index %d: %w", i, err)
-		}
-		pair := (*key)[0]
-		left, right := pair[0].Table, pair[1].Table
-		if grouped[left] == nil {
-			grouped[left] = make(map[string][]*ForeignKey)
-		}
-		grouped[left][right] = append(grouped[left][right], key)
-		if grouped[right] == nil {
-			grouped[right] = make(map[string][]*ForeignKey)
-		}
-		grouped[right][left] = append(grouped[right][left], key)
-	}
-	return grouped, nil
-}
-
-func validateForeignKey(key *ForeignKey) error {
-	if key == nil || len(*key) == 0 {
-		return fmt.Errorf("missing table pair")
-	}
-	for pairIndex, pair := range *key {
-		if len(pair) != 2 || pair[0] == nil || pair[1] == nil {
-			return fmt.Errorf("pair %d is missing a table endpoint", pairIndex)
-		}
-	}
-	return nil
 }

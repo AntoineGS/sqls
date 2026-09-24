@@ -211,7 +211,7 @@ func TestMetadataGenericSchemaFallbackIsDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("schemas job error = %v", err)
 	}
-	if got := patch.Cache.defaultSchema; got != "Alpha" {
+	if got := patch.Cache.DefaultSchema; got != "Alpha" {
 		t.Errorf("fallback default schema = %q, want Alpha", got)
 	}
 }
