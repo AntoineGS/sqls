@@ -290,6 +290,11 @@ func (s *Server) publishDiagnosticsSnapshot(ctx context.Context, conn *jsonrpc2.
 	if !s.diagnosticsSnapshotCurrent(snapshot) {
 		return
 	}
+	// LSP requires an array even when there are no findings. A nil Go slice
+	// encodes as null, which clients cannot treat as a diagnostics list.
+	if diagnostics == nil {
+		diagnostics = []lsp.Diagnostic{}
+	}
 	version := snapshot.version
 	params := lsp.PublishDiagnosticsParams{
 		URI:         snapshot.uri,

@@ -44,9 +44,10 @@ func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T)
 }
 
 type diagnosticsNotification struct {
-	URI         string           `json:"uri"`
-	Version     *int             `json:"version"`
-	Diagnostics []lsp.Diagnostic `json:"diagnostics"`
+	URI            string           `json:"uri"`
+	Version        *int             `json:"version"`
+	Diagnostics    []lsp.Diagnostic `json:"diagnostics"`
+	rawDiagnostics json.RawMessage
 }
 
 type diagnosticsClient struct {
@@ -75,12 +76,34 @@ func (c *diagnosticsClient) Handle(_ context.Context, _ *jsonrpc2.Conn, req *jso
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return
 	}
+	var wire map[string]json.RawMessage
+	if err := json.Unmarshal(*req.Params, &wire); err != nil {
+		return
+	}
+	params.rawDiagnostics = append(json.RawMessage(nil), wire["diagnostics"]...)
 	c.mu.Lock()
 	c.notifications = append(c.notifications, params)
 	c.mu.Unlock()
 	select {
 	case c.changed <- struct{}{}:
 	default:
+	}
+}
+
+func TestPreAttachDiagnosticsPublishesEmptyArray(t *testing.T) {
+	const uri = "file:///pre-attach.sql"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.server.stateMu.Lock()
+	tx.server.dbConn = nil
+	tx.server.connectionState = connectionConnecting
+	tx.server.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.files[uri] = &File{Text: "SELECT * FROM T", Version: 1}
+	tx.server.stateMu.Unlock()
+
+	tx.server.publishDocumentDiagnostics(tx.ctx, tx.serverConn, uri)
+	got := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if string(got.rawDiagnostics) != "[]" {
+		t.Fatalf("pre-attachment diagnostics JSON = %s, want [] (not null)", got.rawDiagnostics)
 	}
 }
 
