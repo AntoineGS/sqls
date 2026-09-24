@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
@@ -29,24 +28,18 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
-
-	dbCache := s.worker.Cache()
-	res, err := hoverWithDriverVariant(text, params, dbCache, s.parserDriverVariant())
+	res, err := hoverWithDriverVariant(snapshot.Text, params, snapshot.Cache, snapshot.Variant)
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		return nil, err
 	}
 
 	// Not having a repository is not a hover failure: the catalog summary
 	// needs none, and a DDL problem must never surface as a JSON-RPC error.
-	repo, repoErr := s.newDBRepository(ctx)
-	if repoErr != nil {
-		repo = nil
-	}
-	if augmented := s.interBaseHover(ctx, repo, dbCache, params, text, res); augmented != nil {
+	if augmented := s.interBaseHover(ctx, snapshot.Repository, snapshot.Cache, params, snapshot.Text, res, snapshot.Generation, snapshot.Variant); augmented != nil {
 		return augmented, nil
 	}
 	if err != nil {
@@ -274,6 +267,13 @@ func hoverContentFromIdent(ctx *hoverContext, identName string, dbCache *databas
 		// find table
 		cols, ok := dbCache.ColumnDescs(tableName)
 		if ok {
+			// InterBase can publish relation columns before its view category
+			// settles. In that interval a view is also present in the relation
+			// column map, so columns alone cannot prove this is a table. Legacy
+			// caches without explicit view status retain their prior behavior.
+			if _, tracked := dbCache.Metadata[database.MetadataViews]; tracked && !dbCache.MetadataReady(database.MetadataViews) {
+				return nil
+			}
 			return tableHoverInfo(tableName, cols)
 		}
 	}

@@ -24,14 +24,15 @@ import (
 )
 
 const (
-	CommandExecuteQuery     = "executeQuery"
-	CommandShowDatabases    = "showDatabases"
-	CommandShowSchemas      = "showSchemas"
-	CommandShowConnections  = "showConnections"
-	CommandSwitchDatabase   = "switchDatabase"
-	CommandSwitchConnection = "switchConnections"
-	CommandShowTables       = "showTables"
-	CommandExplainQuery     = "explainQuery"
+	CommandExecuteQuery       = "executeQuery"
+	CommandShowDatabases      = "showDatabases"
+	CommandShowSchemas        = "showSchemas"
+	CommandShowConnections    = "showConnections"
+	CommandSwitchDatabase     = "switchDatabase"
+	CommandSwitchConnection   = "switchConnections"
+	CommandShowTables         = "showTables"
+	CommandExplainQuery       = "explainQuery"
+	CommandShowMetadataStatus = "sqls.showMetadataStatus"
 )
 
 const lateCancellationNote = "Note: the cancellation request arrived after the statement completed; the result\nbelow is the real result.\n\n"
@@ -157,6 +158,8 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 	switch params.Command {
 	case CommandExecuteQuery:
 		return s.executeQuery(ctx, params)
+	case CommandShowMetadataStatus:
+		return s.showMetadataStatus(ctx, params)
 	case CommandShowDatabases:
 		return s.showDatabases(ctx, params)
 	case CommandShowSchemas:
@@ -178,15 +181,11 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 }
 
 func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	// parse execute command arguments
-	s.stateMu.RLock()
-	connected := s.dbConn != nil
-	s.stateMu.RUnlock()
-	if !connected {
-		return nil, errors.New("database connection is not open")
+	_, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		return nil, err
 	}
+	defer unlock()
 
 	showVertical := showVerticalRequested(params)
 
@@ -208,6 +207,11 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	if !ok {
 		return nil, fmt.Errorf("document not found, %q", uri)
 	}
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		return nil, err
+	}
+	text = snapshot.Text
 
 	// extract target query
 	if params.Range != nil {
@@ -219,13 +223,13 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	if s.parserDriver() == dialect.DatabaseDriverInterBase {
+	if snapshot.Variant.Driver == dialect.DatabaseDriverInterBase {
 		text = queryparams.ExecutableSelects(text)
 	}
-	if err := s.refuseLegacyNamedParameters(text); err != nil {
+	if err := s.refuseLegacyNamedParametersWithVariant(text, snapshot.Variant); err != nil {
 		return nil, err
 	}
-	stmts, err := getStatementsWithDriverVariant(text, s.parserDriverVariant())
+	stmts, err := getStatementsWithDriverVariant(text, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
@@ -241,7 +245,7 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 
 	// execute statements
 	rendered, err := renderStatements(ctx, len(queries), func(i int) (string, error) {
-		return s.runStatement(ctx, queries[i], showVertical)
+		return s.runStatementWithSnapshot(ctx, queries[i], showVertical, snapshot)
 	})
 	if err != nil {
 		return nil, err
@@ -291,6 +295,34 @@ func (s *Server) runStatement(ctx context.Context, query string, vertical bool, 
 	return s.runRoutedStatement(ctx, query, vertical, s.statementRouting(query), args...)
 }
 
+func (s *Server) runStatementWithSnapshot(ctx context.Context, query string, vertical bool, snapshot editorSnapshot, args ...any) (string, error) {
+	if snapshot.Repository == nil {
+		return "", ErrNoConnection
+	}
+	routing := statementRoutingWithSnapshot(query, snapshot.Variant, snapshot.Cache)
+	return s.runRoutedStatementWithRepository(ctx, query, vertical, routing, snapshot.Repository, args...)
+}
+
+func (s *Server) runRoutedStatementWithRepository(ctx context.Context, query string, vertical bool, routing procedureRouting, repo database.DBRepository, args ...any) (string, error) {
+	var result string
+	var err error
+	switch {
+	case routing.isQuery:
+		result, err = s.renderQueryWithRepository(ctx, repo, query, vertical, true, nil, args...)
+	case routing.returnsRows:
+		result, err = s.renderQueryWithRepository(ctx, repo, query, vertical, false, []string{executeProcedureOneRowNote}, args...)
+	default:
+		result, err = s.execWithRepository(ctx, repo, query, args...)
+	}
+	if err != nil && routing.unknown && cancellationNotice(ctx, err) == "" {
+		return fmt.Sprintf("Exec failed: %v\n\n"+unknownProcedureHint+"\n", err, routing.name), nil
+	}
+	if err == nil && routing.unknown && routing.metadataIncomplete {
+		return result + fmt.Sprintf("\n"+unknownProcedureHint+"\n", routing.name), nil
+	}
+	return result, err
+}
+
 func (s *Server) runRoutedStatement(ctx context.Context, query string, vertical bool, routing procedureRouting, args ...any) (string, error) {
 	if routing.isQuery {
 		return s.query(ctx, query, vertical, args...)
@@ -307,6 +339,9 @@ func (s *Server) runRoutedStatement(ctx context.Context, query string, vertical 
 	if err != nil && routing.unknown && cancellationNotice(ctx, err) == "" {
 		return fmt.Sprintf("Exec failed: %v\n\n"+unknownProcedureHint+"\n", err, routing.name), nil
 	}
+	if err == nil && routing.unknown && routing.metadataIncomplete {
+		return res + fmt.Sprintf("\n"+unknownProcedureHint+"\n", routing.name), nil
+	}
 	return res, err
 }
 
@@ -318,6 +353,16 @@ func (s *Server) statementRouting(query string) procedureRouting {
 		return procedureRouting{isQuery: true}
 	}
 	return s.interBaseProcedureRouting(query)
+}
+
+func statementRoutingWithSnapshot(query string, variant dialect.DriverVariant, cache *database.DBCache) procedureRouting {
+	if _, isQuery := database.QueryExecType(query, ""); isQuery {
+		return procedureRouting{isQuery: true}
+	}
+	if variant.Driver == dialect.DatabaseDriverInterBase {
+		return interBaseProcedureRouting(query, cache)
+	}
+	return procedureRouting{}
 }
 
 // procedureRouting is the once-and-only-once routing decision for a
@@ -334,6 +379,9 @@ type procedureRouting struct {
 	// unknown is true when the statement is an EXECUTE PROCEDURE call whose
 	// procedure the cache could not resolve.
 	unknown bool
+	// metadataIncomplete distinguishes an absent signature from a conclusive
+	// miss in a successfully loaded procedure category.
+	metadataIncomplete bool
 }
 
 // interBaseProcedureRouting decides how to run an EXECUTE PROCEDURE statement,
@@ -350,15 +398,22 @@ func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
 		return procedureRouting{}
 	}
 
-	cache := s.worker.Cache()
+	return interBaseProcedureRouting(query, s.metadata.Cache())
+}
+
+func interBaseProcedureRouting(query string, cache *database.DBCache) procedureRouting {
+	name := interBaseProcedureName(query)
+	if name == "" {
+		return procedureRouting{}
+	}
 	if cache == nil || !cache.HasCatalog() {
-		return procedureRouting{name: name, unknown: true}
+		return procedureRouting{name: name, unknown: true, metadataIncomplete: true}
 	}
 	// The accessor normalises the name it is given, so the identifier goes in
 	// exactly as the user typed it.
 	desc, ok := cache.Procedure(name)
 	if !ok {
-		return procedureRouting{name: name, unknown: true}
+		return procedureRouting{name: name, unknown: true, metadataIncomplete: !cache.MetadataReady(database.MetadataProcedures)}
 	}
 	return procedureRouting{name: name, returnsRows: len(desc.OutputParameters) > 0}
 }
@@ -475,6 +530,15 @@ func (s *Server) queryProcedure(ctx context.Context, query string, vertical bool
 
 func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowReadOnly bool, notes []string, args ...any) (string, error) {
 	result, scanErr := s.queryResult(ctx, query, allowReadOnly, args...)
+	return renderQueryResultWithNotes(ctx, result, scanErr, vertical, notes)
+}
+
+func (s *Server) renderQueryWithRepository(ctx context.Context, repo database.DBRepository, query string, vertical, allowReadOnly bool, notes []string, args ...any) (string, error) {
+	result, scanErr := queryResultWithRepository(ctx, repo, query, allowReadOnly, args...)
+	return renderQueryResultWithNotes(ctx, result, scanErr, vertical, notes)
+}
+
+func renderQueryResultWithNotes(ctx context.Context, result *database.QueryResult, scanErr error, vertical bool, notes []string) (string, error) {
 	if result == nil {
 		return "", scanErr
 	}
@@ -555,6 +619,10 @@ func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bo
 	if err != nil {
 		return nil, err
 	}
+	return queryResultWithRepository(ctx, repo, query, allowReadOnly, args...)
+}
+
+func queryResultWithRepository(ctx context.Context, repo database.DBRepository, query string, allowReadOnly bool, args ...any) (*database.QueryResult, error) {
 	if len(args) > 0 {
 		read, err := boundReadFor(repo, allowReadOnly)
 		if err != nil {
@@ -668,7 +736,12 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...
 	if err != nil {
 		return "", err
 	}
+	return s.execWithRepository(ctx, repo, query, args...)
+}
+
+func (s *Server) execWithRepository(ctx context.Context, repo database.DBRepository, query string, args ...any) (string, error) {
 	var result sql.Result
+	var err error
 	if len(args) > 0 {
 		bound, boundErr := boundExecFor(repo)
 		if boundErr != nil {
@@ -694,12 +767,11 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...
 }
 
 func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	databases, err := repo.Databases(ctx)
 	if err != nil {
 		return nil, err
@@ -708,12 +780,11 @@ func (s *Server) showDatabases(ctx context.Context, params lsp.ExecuteCommandPar
 }
 
 func (s *Server) showSchemas(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	schemas, err := repo.Schemas(ctx)
 	if err != nil {
 		return nil, err
@@ -753,8 +824,6 @@ func isNoOpDatabaseSwitch(ctx context.Context, repo database.DBRepository, dbNam
 }
 
 func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <DB Name>")
 	}
@@ -767,30 +836,34 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 	// user selects the database to connect to, so there is nothing to validate.
 	// newDBRepository takes stateMu internally, so this is safe to call while
 	// holding only connMu.
+	if !s.connMu.TryRLock() {
+		return nil, errConnectionChanging
+	}
 	repo, err := s.newDBRepository(ctx)
 	switch {
 	case errors.Is(err, ErrNoConnection):
 		// fall through: nothing to validate yet.
 	case err != nil:
+		s.connMu.RUnlock()
 		return nil, err
 	default:
 		if err := validateDatabaseSwitch(ctx, repo, dbName); err != nil {
+			s.connMu.RUnlock()
 			return nil, err
 		}
 		if isNoOpDatabaseSwitch(ctx, repo, dbName) {
 			// Already open: see isNoOpDatabaseSwitch for why reconnecting
 			// would break rather than refresh it.
+			s.connMu.RUnlock()
 			return nil, nil
 		}
 	}
-
-	// Change current database
-	s.stateMu.Lock()
-	s.curDBName = dbName
-	s.stateMu.Unlock()
-
-	// close and reconnection to database
-	if err := s.reconnectionDB(ctx); err != nil {
+	s.connMu.RUnlock()
+	cfg, index, _ := s.desiredConnection()
+	if cfg != nil {
+		cfg.DBName = dbName
+	}
+	if err := awaitConnectionIntent(ctx, s.coordinator.RequestExplicit(ctx, cfg, index, dbName)); err != nil {
 		return nil, err
 	}
 
@@ -798,10 +871,8 @@ func (s *Server) switchDatabase(ctx context.Context, params lsp.ExecuteCommandPa
 }
 
 func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
 	results := []string{}
-	conns := s.getConfig().Connections
+	conns := s.connectionConfigsSnapshot()
 	for i, conn := range conns {
 		var desc string
 		if conn.DataSourceName != "" {
@@ -825,8 +896,6 @@ func (s *Server) showConnections(ctx context.Context, params lsp.ExecuteCommandP
 }
 
 func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.Lock()
-	defer s.connMu.Unlock()
 	if len(params.Arguments) != 1 {
 		return nil, fmt.Errorf("required arguments were not provided: <Connection Index>")
 	}
@@ -837,9 +906,9 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 
 	var index int
 
-	cfg := s.getConfig()
-	if cfg != nil {
-		for i, conn := range cfg.Connections {
+	connections := s.connectionConfigsSnapshot()
+	if len(connections) != 0 {
+		for i, conn := range connections {
 			if conn.Alias == indexStr {
 				index = i + 1
 				break
@@ -858,13 +927,14 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 	}
 	index = index - 1
 
-	// Reconnect database
-	s.stateMu.Lock()
-	s.curConnectionIndex = index
-	s.stateMu.Unlock()
-
-	// close and reconnection to database
-	if err := s.reconnectionDB(ctx); err != nil {
+	if index >= len(connections) || connections[index] == nil {
+		return nil, fmt.Errorf("connection index %d is out of range", index+1)
+	}
+	connectionCfg := connections[index]
+	s.stateMu.RLock()
+	dbName := s.curDBName
+	s.stateMu.RUnlock()
+	if err := awaitConnectionIntent(ctx, s.coordinator.RequestExplicit(ctx, connectionCfg, index, dbName)); err != nil {
 		return nil, err
 	}
 
@@ -872,12 +942,11 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 }
 
 func (s *Server) showTables(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
-	repo, err := s.newDBRepository(ctx)
+	repo, unlock, err := s.acquireReadyConnection()
 	if err != nil {
 		return "", err
 	}
+	defer unlock()
 	m, err := repo.SchemaTables(ctx)
 	if err != nil {
 		return nil, err

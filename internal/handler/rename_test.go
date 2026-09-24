@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
@@ -211,6 +214,26 @@ END`
 	}
 	if edits[2].Range.Start.Character != 43 {
 		t.Fatalf("colon-prefixed edit started at UTF-16 character %d, want identifier start", edits[2].Range.Start.Character)
+	}
+}
+
+func TestRenameUsesConfiguredEditorSnapshotBeforeAttachment(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverInterBase, Dialect: 1}}}
+	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE old_name INTEGER;\nBEGIN\n  old_name = 1;\nEND"
+	if err := s.openFileAtVersion(testFileURI, "sql", text, 1); err != nil {
+		t.Fatal(err)
+	}
+	params := lsp.RenameParams{TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 3, Character: 3}, NewName: "new_name"}
+	data, _ := json.Marshal(params)
+	result, err := s.handleTextDocumentRename(context.Background(), nil, &jsonrpc2.Request{Params: (*json.RawMessage)(&data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit, ok := result.(*lsp.WorkspaceEdit)
+	if !ok || edit == nil || len(edit.Changes[testFileURI]) != 2 {
+		t.Fatalf("configured InterBase rename = %#v, want declaration and use edits", result)
 	}
 }
 

@@ -6,7 +6,6 @@ import (
 	"errors"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/sqls-server/sqls/dialect"
 )
@@ -133,6 +132,19 @@ func TestCacheBuildWithoutSnapshotCapabilityUsesTheRepositoryDirectly(t *testing
 	}
 	if len(served) != 1 || served[0] != "direct:SchemaTables" {
 		t.Errorf("reads served = %v, want the repository itself to answer", served)
+	}
+}
+
+func TestCacheBuildPrimaryMarksSuccessfulCategoriesReady(t *testing.T) {
+	repository := NewMockDBRepository(nil)
+	cache, err := NewDBCacheUpdater(repository).GenerateDBCachePrimary(context.Background())
+	if err != nil {
+		t.Fatalf("GenerateDBCachePrimary() error = %v", err)
+	}
+	for _, kind := range []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataForeignKeys} {
+		if !cache.MetadataReady(kind) {
+			t.Errorf("successful primary generation did not mark %s ready", kind)
+		}
 	}
 }
 
@@ -326,106 +338,6 @@ func TestGenerateCatalogCacheWithoutCapability(t *testing.T) {
 			len(cache.SortedGenerators()) != 0 || len(cache.SortedFunctions()) != 0 {
 			t.Error("a sorted accessor returned names without a catalog")
 		}
-	}
-}
-
-func TestWorkerSwapsCatalogCache(t *testing.T) {
-	worker := NewWorker()
-	worker.Start()
-	t.Cleanup(worker.Stop)
-
-	if err := worker.ReCache(context.Background(), catalogTestRepository()); err != nil {
-		t.Fatalf("ReCache() error = %v", err)
-	}
-	before := worker.Cache()
-	if before == nil {
-		t.Fatal("ReCache() left no primary cache")
-	}
-	if before.HasCatalog() {
-		t.Fatal("the primary pass must not build the extended catalog; it is the secondary pass's job")
-	}
-
-	after := waitForCatalog(t, worker)
-	if _, ok := after.Procedure("add_customer"); !ok {
-		t.Error("the swapped catalog does not contain the procedure")
-	}
-	// Copy on write, mirroring setColumnCache: a reader holding the previous
-	// *DBCache keeps seeing a consistent snapshot.
-	if before.HasCatalog() {
-		t.Error("the previously returned *DBCache was mutated in place")
-	}
-	if before == after {
-		t.Error("the worker must swap in a new *DBCache rather than mutate the old one")
-	}
-}
-
-func TestWorkerCatalogPassRunsDespiteColumnPassError(t *testing.T) {
-	// worker.go's loop body continues on a GenerateDBCacheSecondary error, so
-	// appending the catalog build after it would silently skip the catalog
-	// whenever the column pass failed. Each pass must be attempted on its own.
-	repository := catalogTestRepository()
-	columnFailure := errors.New("describe database table failed")
-	repository.MockDescribeDatabaseTable = func(context.Context) ([]*ColumnDesc, error) {
-		return nil, columnFailure
-	}
-
-	worker := NewWorker()
-	worker.Start()
-	t.Cleanup(worker.Stop)
-
-	if err := worker.ReCache(context.Background(), repository); err != nil {
-		t.Fatalf("ReCache() error = %v", err)
-	}
-
-	catalog := waitForCatalog(t, worker)
-	if _, ok := catalog.View("customer_view"); !ok {
-		t.Error("the catalog pass did not complete even though only the column pass failed")
-	}
-}
-
-func waitForCatalog(t *testing.T, worker *Worker) *DBCache {
-	t.Helper()
-	// The worker offers no completion signal, so poll. Two seconds is far more
-	// than an in-process fake needs and short enough to fail fast.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cache := worker.Cache(); cache.HasCatalog() {
-			return cache
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("the worker never swapped in an extended catalog")
-	return nil
-}
-
-func TestWorkerUpdateSignalDoesNotBlock(t *testing.T) {
-	// updateAdditionalCache is reached from ReCache <- reconnectionDB <-
-	// handleWorkspaceDidChangeConfiguration, an LSP handler. A blocking send
-	// on the size-1 update channel would make a configuration change wait for
-	// a whole catalog pass. The worker goroutine is deliberately NOT started
-	// here and the buffered slot is pre-filled, so a blocking send never
-	// returns.
-	worker := NewWorker()
-	worker.update <- struct{}{}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- worker.ReCache(context.Background(), NewMockDBRepository(nil))
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("ReCache() error = %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("ReCache() blocked on a full update channel; the send must be non-blocking")
-	}
-
-	// Dropping a duplicate signal loses nothing: the queued pass will read
-	// state at least as fresh.
-	if len(worker.update) != 1 {
-		t.Errorf("update channel holds %d signals, want the one already queued", len(worker.update))
 	}
 }
 

@@ -24,12 +24,11 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
-
-	res, err := SignatureHelpWithDriverVariant(text, params, s.worker.Cache(), s.parserDriverVariant())
+	res, err := SignatureHelpWithDriverVariant(snapshot.Text, params, snapshot.Cache, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}

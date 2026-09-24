@@ -246,6 +246,10 @@ func (s *Server) interBaseDefinition(ctx context.Context, repo database.DBReposi
 }
 
 func (s *Server) interBaseDefinitionWithVariant(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.DefinitionParams, text string, dv dialect.DriverVariant) (lsp.Definition, error) {
+	return s.interBaseDefinitionWithSnapshot(ctx, repo, dbCache, params, text, dv, s.snapshotContext())
+}
+
+func (s *Server) interBaseDefinitionWithSnapshot(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.DefinitionParams, text string, dv dialect.DriverVariant, sc snapshotContext) (lsp.Definition, error) {
 	if s.snapshots == nil || repo == nil {
 		return nil, nil
 	}
@@ -261,17 +265,22 @@ func (s *Server) interBaseDefinitionWithVariant(ctx context.Context, repo databa
 	ddlCtx, cancel := context.WithTimeout(ctx, definitionDDLTimeout)
 	defer cancel()
 	ddl, ddlErr := ddlRepo.ObjectDDL(ddlCtx, target.kind, target.name)
+	if !s.snapshotGenerationCurrent(sc.generation) {
+		return nil, nil
+	}
 
 	body, note, ok := snapshotBodyFor(ddl, ddlErr, target)
 	if !ok {
 		return nil, nil
 	}
 
-	sc := s.snapshotContext()
 	content, bannerLines := renderSnapshot(target, sc, s.snapshots.now(), body, note)
-	path, err := s.snapshots.write(sc, string(target.kind), target.name, content)
+	path, published, err := s.writeDefinitionSnapshot(sc, string(target.kind), target.name, content)
 	if err != nil {
-		log.Printf("sqls: write %s snapshot for %q: %v", target.kind, target.name, err)
+		log.Printf("sqls: write %s snapshot candidate for %q: %v", target.kind, target.name, err)
+		return nil, nil
+	}
+	if !published {
 		return nil, nil
 	}
 

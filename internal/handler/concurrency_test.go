@@ -153,6 +153,7 @@ type stubBackend struct {
 	mu             sync.Mutex
 	gates          map[string]*stubGate
 	served         []stubQuery
+	execServed     []string
 	openedDB       []*sql.DB
 	readOnly       bool
 	readOnlyServed []string
@@ -201,6 +202,18 @@ func (b *stubBackend) queries() []stubQuery {
 	return append([]stubQuery(nil), b.served...)
 }
 
+func (b *stubBackend) recordExec(query string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.execServed = append(b.execServed, query)
+}
+
+func (b *stubBackend) execs() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.execServed...)
+}
+
 // enableReadOnlyQuerier makes the next repository the factory builds implement
 // database.ReadOnlyQuerier. Call it before the connection is established —
 // before tx.addWorkspaceConfig — because the factory runs at that point and a
@@ -242,7 +255,7 @@ func (b *stubBackend) opened() []*sql.DB {
 }
 
 // setProcedures makes the stub repository a database.CatalogRepository, so the
-// worker's catalog pass builds DBCache.Catalog from it. Call it before
+// metadata catalog jobs build DBCache.Catalog from it. Call it before
 // tx.addWorkspaceConfig, which is what triggers the connection and the cache
 // build.
 func (b *stubBackend) setProcedures(procs []*database.ProcedureDesc) {
@@ -284,6 +297,7 @@ func (r *stubRepository) Query(ctx context.Context, query string) (*sql.Rows, er
 var errStubExecRejected = errors.New("interbase: statement requires execution as a query")
 
 func (r *stubRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
+	r.backend.recordExec(query)
 	if name := interBaseProcedureName(query); name != "" {
 		procs := r.backend.describedProcedures()
 		if len(procs) > 0 && !procedureNamed(procs, name) {
@@ -437,23 +451,20 @@ func stubInterBaseConnections(aliases ...string) *config.Config {
 	return &config.Config{Connections: conns}
 }
 
-// waitForCatalog polls until the worker's asynchronous catalog pass lands.
-// addWorkspaceConfig reaches ReCache, which only signals the worker goroutine
-// (worker.go:122-129); issuing a command straight afterwards races that
-// goroutine, so routing tests that depend on HasCatalog() must wait first.
-// database/cache_test.go defines an equivalent helper, but it is unexported in
-// the database package's test binary and unreachable from here.
-func waitForCatalog(t *testing.T, worker *database.Worker) *database.DBCache {
+// waitForCatalog waits for the current metadata generation to settle, then
+// asserts the loader published catalog data. It never polls or guesses timing.
+func waitForCatalog(t *testing.T, server *Server) *database.DBCache {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cache := worker.Cache(); cache.HasCatalog() {
-			return cache
-		}
-		time.Sleep(5 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.metadata.Wait(ctx); err != nil {
+		t.Fatalf("wait for metadata: %v", err)
 	}
-	t.Fatal("the worker never swapped in an extended catalog")
-	return nil
+	snapshot := server.metadata.Snapshot()
+	if snapshot == nil || snapshot.Cache == nil || !snapshot.Cache.HasCatalog() {
+		t.Fatal("metadata loader settled without a catalog")
+	}
+	return snapshot.Cache
 }
 
 func init() {

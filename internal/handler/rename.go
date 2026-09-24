@@ -26,19 +26,20 @@ func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Co
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
+	text := snapshot.Text
 
-	res, handled, err := localRename(text, params, s.parserDriverVariant())
+	res, handled, err := localRename(text, params, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
 	if handled {
 		return res, nil
 	}
-	res, err = renameWithDriverVariant(text, params, s.parserDriverVariant())
+	res, err = renameWithDriverVariant(text, params, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}

@@ -3,9 +3,9 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
+	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/formatter"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
@@ -20,12 +20,11 @@ func (s *Server) handleTextDocumentFormatting(ctx context.Context, conn *jsonrpc
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
-
-	textEdits, err := formatter.FormatWithDriverVariant(text, params, s.getConfig(), s.parserDriverVariant())
+	textEdits, err := formatter.FormatWithDriverVariant(snapshot.Text, params, &config.Config{LowercaseKeywords: snapshot.LowercaseKeywords}, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
@@ -45,8 +44,8 @@ func (s *Server) handleTextDocumentRangeFormatting(ctx context.Context, conn *js
 		return nil, err
 	}
 
-	if _, ok := s.fileText(params.TextDocument.URI); !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	if _, err := s.captureEditorSnapshot(params.TextDocument.URI); err != nil {
+		return nil, err
 	}
 
 	textEdits := []lsp.TextEdit{}

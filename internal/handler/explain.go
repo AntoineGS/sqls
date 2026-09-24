@@ -47,8 +47,11 @@ var explainMutatingTypes = map[string]bool{
 const explainArrayColumnMarker = "array results are unsupported"
 
 func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandParams) (result interface{}, err error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
+	repo, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 
 	if len(params.Arguments) == 0 {
 		return nil, fmt.Errorf("required arguments were not provided: <File URI>")
@@ -61,6 +64,14 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	if !ok {
 		return nil, fmt.Errorf("document not found, %q", uri)
 	}
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		return nil, err
+	}
+	if snapshot.Repository != nil {
+		repo = snapshot.Repository
+	}
+	text = snapshot.Text
 
 	// -show-vertical is deliberately not accepted: a plan is not a table.
 	if params.Range != nil {
@@ -72,15 +83,11 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	queries, err := s.explainQueries(text)
+	queries, err := explainQueriesWithVariant(text, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
 
-	repo, err := s.newDBRepository(ctx)
-	if err != nil {
-		return nil, err
-	}
 	explainer, err := explainRepositoryFor(repo)
 	if err != nil {
 		return nil, err
@@ -102,7 +109,10 @@ func (s *Server) explainQuery(ctx context.Context, params lsp.ExecuteCommandPara
 // never prompts for or binds a value. Everything else — including a selection
 // the parameter compiler rejects — takes the ordinary parser path unchanged.
 func (s *Server) explainQueries(text string) ([]string, error) {
-	variant := s.parserDriverVariant()
+	return explainQueriesWithVariant(text, s.parserDriverVariant())
+}
+
+func explainQueriesWithVariant(text string, variant dialect.DriverVariant) ([]string, error) {
 	if variant.Driver == dialect.DatabaseDriverInterBase {
 		batch, err := queryparams.Compile(text, variant.Variant.InterBaseSQLDialect())
 		if err == nil && len(batch.Parameters) > 0 {
@@ -114,7 +124,7 @@ func (s *Server) explainQueries(text string) ([]string, error) {
 		}
 	}
 
-	stmts, err := getStatementsWithDriver(text, s.parserDriver())
+	stmts, err := getStatementsWithDriverVariant(text, variant)
 	if err != nil {
 		return nil, err
 	}

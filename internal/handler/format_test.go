@@ -113,6 +113,25 @@ func TestFormattingBase(t *testing.T) {
 	testFormatting(t, testCase, formattingOptionTab, lowerCaseConfig)
 }
 
+func TestFormattingWithoutConnection(t *testing.T) {
+	tx := newTestContext()
+	tx.initServer(t)
+	defer tx.tearDown()
+	const uri = testFileURI
+	tx.textDocumentDidOpen(t, uri, "select 1")
+	var edits []lsp.TextEdit
+	err := tx.conn.Call(tx.ctx, "textDocument/formatting", lsp.DocumentFormattingParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: uri},
+		Options:      formattingOptionTab,
+	}, &edits)
+	if err != nil {
+		t.Fatalf("formatting without a connection: %v", err)
+	}
+	if len(edits) != 1 || edits[0].NewText == "" {
+		t.Fatalf("formatting edits = %#v, want one formatted result", edits)
+	}
+}
+
 func TestFormattingMinimal(t *testing.T) {
 	// Add minimal case test
 	minimalTestCase := []formattingTestCase{

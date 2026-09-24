@@ -31,10 +31,9 @@ type documentDiagnosticsSnapshot struct {
 	revision        uint64
 	variant         dialect.DriverVariant
 	generation      int
-	cacheGeneration int
-	cacheReady      bool
 	cache           *database.DBCache
 	cacheSnapshot   sqlsymbol.Catalog
+	dialectResolved bool
 }
 
 type diagnosticCatalog struct {
@@ -67,7 +66,7 @@ func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) 
 
 // snapshotDiagnosticCatalog copies the cache metadata used by analysis. The
 // DBCache is copy-on-write, but copying names, types, and their available order
-// keeps this analysis independent of subsequent worker refreshes.
+// keeps this analysis independent of subsequent metadata publications.
 func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 	if cache == nil {
 		return nil
@@ -103,7 +102,7 @@ func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 // standalone unique indexes in the extended catalog. Wait for that complete
 // catalog: column primary-key flags alone cannot rule out other unique keys.
 func diagnosticUniqueKeys(cache *database.DBCache, table string, columns []sqlsymbol.ColumnType) ([][]string, bool) {
-	if !cache.HasCatalog() {
+	if !cache.HasCatalog() || !cache.ColumnsReady() || !cache.MetadataReady(database.MetadataViews, database.MetadataIndexes) {
 		return nil, false
 	}
 	for _, view := range cache.Catalog.Views {
@@ -149,43 +148,42 @@ func diagnosticUniqueKeys(cache *database.DBCache, table string, columns []sqlsy
 }
 
 func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, bool) {
-	s.stateMu.RLock()
-	file, ok := s.files[uri]
-	if !ok {
-		s.stateMu.RUnlock()
+	editor, err := s.captureEditorSnapshot(uri)
+	if err != nil {
 		return documentDiagnosticsSnapshot{}, false
 	}
 	snapshot := documentDiagnosticsSnapshot{
-		uri:             uri,
-		text:            file.Text,
-		version:         file.Version,
-		revision:        file.Revision,
-		generation:      s.connGeneration,
-		cacheGeneration: s.diagnosticsCacheGeneration,
-		cacheReady:      s.diagnosticsCacheGeneration == s.connGeneration,
+		uri:             editor.URI,
+		text:            editor.Text,
+		version:         editor.Version,
+		revision:        editor.Revision,
+		generation:      editor.Generation,
+		variant:         editor.Variant,
+		cache:           editor.Cache,
+		dialectResolved: editor.DialectResolved,
 	}
-	if s.dbConn != nil {
-		snapshot.variant = s.dbConn.DriverVariant()
-	}
-	s.stateMu.RUnlock()
-
-	if snapshot.cacheReady {
-		snapshot.cache = s.worker.Cache()
-		if snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
-			snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
-		}
+	if snapshot.CacheReadyForDiagnostics() {
+		snapshot.cacheSnapshot = s.diagnosticCatalogFor(snapshot.cache)
 	}
 	return snapshot, true
+}
+
+func (snapshot documentDiagnosticsSnapshot) CacheReadyForDiagnostics() bool {
+	return snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase && snapshot.cache.ColumnsReady()
 }
 
 func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot) bool {
 	s.stateMu.RLock()
 	file, open := s.files[snapshot.uri]
 	current := open && file.Version == snapshot.version && file.Revision == snapshot.revision &&
-		s.connGeneration == snapshot.generation &&
-		s.diagnosticsCacheGeneration == snapshot.cacheGeneration
+		s.connGeneration == snapshot.generation
 	if s.dbConn == nil {
-		current = current && snapshot.variant == (dialect.DriverVariant{})
+		cfg := cloneConnectionConfig(s.curDBCfg)
+		if cfg == nil {
+			cfg = selectedConfig(s.effectiveConfigLocked(), s.initOptionDBConfig, s.curConnectionIndex)
+		}
+		configured := configuredDriverVariant(cfg)
+		current = current && configured == snapshot.variant
 	} else {
 		current = current && s.dbConn.DriverVariant() == snapshot.variant
 	}
@@ -193,10 +191,30 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	if !current {
 		return false
 	}
-	if snapshot.cacheReady {
-		return s.worker.Cache() == snapshot.cache
+	meta := s.metadata.Snapshot()
+	return meta != nil && meta.Generation == uint64(snapshot.generation) && meta.Cache == snapshot.cache
+}
+
+// configuredDriverVariant mirrors the pre-attachment parser selection used by
+// captureEditorSnapshot. It is deliberately local-only so the diagnostics
+// publication fence can compare identity without I/O or recursively acquiring
+// stateMu.
+func configuredDriverVariant(cfg *database.DBConfig) dialect.DriverVariant {
+	if cfg == nil {
+		return dialect.DriverVariant{}
 	}
-	return true
+	variant := dialect.DriverVariant{Driver: cfg.Driver}
+	if cfg.Driver == dialect.DatabaseDriverInterBase {
+		switch cfg.Dialect {
+		case 1:
+			variant.Variant = dialect.SQLVariantInterBase1
+		case 3:
+			variant.Variant = dialect.SQLVariantInterBase3
+		default:
+			variant.Variant = dialect.SQLVariantInterBase3
+		}
+	}
+	return variant
 }
 
 func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.Conn, uri string) {
@@ -204,7 +222,14 @@ func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.
 	if !ok {
 		return
 	}
-	diagnostics := diagnosticsForSnapshot(snapshot)
+	var diagnostics []lsp.Diagnostic
+	if snapshot.dialectResolved || snapshot.variant.Driver != dialect.DatabaseDriverInterBase {
+		if s.diagnosticAnalyzer != nil {
+			diagnostics = s.diagnosticAnalyzer(snapshot)
+		} else {
+			diagnostics = diagnosticsForSnapshot(snapshot)
+		}
+	}
 	s.publishDiagnosticsSnapshot(ctx, conn, snapshot, diagnostics)
 }
 
@@ -307,6 +332,41 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 	}
 	sort.Strings(uris)
 	for _, uri := range uris {
+		if ctx.Err() != nil {
+			return
+		}
 		s.publishDocumentDiagnostics(ctx, conn, uri)
+	}
+}
+
+// diagnosticCatalogFor memoizes the immutable diagnostic projection for the
+// current copy-on-write cache. Metadata status-only revisions retain the same
+// cache pointer; data changes publish a new one and replace this single entry.
+func (s *Server) diagnosticCatalogFor(cache *database.DBCache) sqlsymbol.Catalog {
+	s.diagnosticCatalogMu.Lock()
+	defer s.diagnosticCatalogMu.Unlock()
+	if cache == nil {
+		s.diagnosticCache = nil
+		s.derivedCatalog = nil
+		return nil
+	}
+	if s.diagnosticCache != cache {
+		s.derivedCatalog = snapshotDiagnosticCatalog(cache)
+		s.diagnosticCache = cache
+	}
+	return s.derivedCatalog
+}
+
+// signalDiagnostics coalesces refresh requests into one bounded wake. Dirty
+// state must be marked before this method is called.
+func (s *Server) signalDiagnostics() {
+	select {
+	case <-s.lifecycleCtx.Done():
+		return
+	default:
+	}
+	select {
+	case s.diagnosticsWake <- struct{}{}:
+	default:
 	}
 }

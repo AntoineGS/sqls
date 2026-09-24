@@ -23,7 +23,7 @@ func TestDidChangeDuringAsyncQueryDoesNotRaceOnFileText(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -71,7 +71,7 @@ func TestSwitchConnectionWaitsForInFlightQuery(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary", "secondary"))
@@ -138,7 +138,7 @@ func TestQueryAfterSwitchUsesNewConnection(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary", "secondary"))
@@ -186,7 +186,7 @@ func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T)
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
@@ -201,7 +201,7 @@ func TestWorkspaceConfigurationChangeDuringAsyncCommandDoesNotRace(t *testing.T)
 	}()
 	time.Sleep(200 * time.Millisecond)
 
-	tx.addWorkspaceConfig(t, stubConnections("primary", "secondary"))
+	tx.changeWorkspaceConfig(t, stubConnections("primary", "secondary"))
 
 	gate.release()
 	select {
@@ -215,7 +215,7 @@ func TestCancelledQueryRendersTheCancelledMessage(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	tx.addWorkspaceConfig(t, stubConnections("primary"))

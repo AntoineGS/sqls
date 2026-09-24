@@ -95,6 +95,12 @@ func (u *DBCacheGenerator) generateDBCachePrimary(ctx context.Context) (*DBCache
 	if err != nil {
 		return nil, err
 	}
+	dbCache.Metadata = map[MetadataKind]MetadataState{
+		MetadataSchemas:        MetadataReady,
+		MetadataRelations:      MetadataReady,
+		MetadataColumnsCurrent: MetadataReady,
+		MetadataForeignKeys:    MetadataReady,
+	}
 	return dbCache, nil
 }
 
@@ -171,10 +177,31 @@ type DBCache struct {
 	SchemaTables      map[string][]string
 	ColumnsWithParent map[string][]*ColumnDesc
 	ForeignKeys       map[string]map[string][]*ForeignKey
+	Metadata          map[MetadataKind]MetadataState
+	PrimaryKeyColumns map[string]map[string]struct{}
 	// Catalog holds extended catalog objects. It is nil when the active
 	// repository does not implement CatalogRepository, and also before the
 	// first successful secondary pass.
 	Catalog *CatalogCache
+}
+
+// MetadataReady reports whether every explicitly requested category completed.
+// An absent category is unknown; empty result maps do not imply readiness.
+func (dc *DBCache) MetadataReady(kinds ...MetadataKind) bool {
+	if dc == nil || len(kinds) == 0 {
+		return false
+	}
+	for _, kind := range kinds {
+		if dc.Metadata[kind] != MetadataReady {
+			return false
+		}
+	}
+	return true
+}
+
+// ColumnsReady reports whether either supported column view has completed.
+func (dc *DBCache) ColumnsReady() bool {
+	return dc != nil && (dc.MetadataReady(MetadataColumnsCurrent) || dc.MetadataReady(MetadataColumnsAll))
 }
 
 func (dc *DBCache) Database(dbName string) (db string, ok bool) {

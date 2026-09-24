@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
@@ -27,12 +26,11 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
-
-	dv := s.parserDriverVariant()
+	text, dv := snapshot.Text, snapshot.Variant
 	var analysis *sqlsymbol.Analysis
 	var offset int
 	if dv.Driver == dialect.DatabaseDriverInterBase {
@@ -69,16 +67,13 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 	if contextual {
-		dbCache := s.worker.Cache()
-		repo, err := s.newDBRepository(ctx)
-		if err != nil {
+		if snapshot.Repository == nil {
 			return nil, nil
 		}
-		return s.interBaseContextualDefinitionWithAnalysis(ctx, repo, dbCache, text, params.Position, dv, analysis)
+		return s.interBaseContextualDefinitionWithSnapshot(ctx, snapshot.Repository, snapshot.Cache, text, params.Position, dv, analysis, snapshot.SourceContext)
 	}
 
-	dbCache := s.worker.Cache()
-	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, dbCache, dv)
+	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, snapshot.Cache, dv)
 	if err != nil {
 		return nil, err
 	}
@@ -89,11 +84,10 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 
 	// Not having a repository is not a definition failure: for every driver
 	// without a catalog, the alias path above is the whole feature.
-	repo, err := s.newDBRepository(ctx)
-	if err != nil {
+	if snapshot.Repository == nil {
 		return nil, nil
 	}
-	return s.interBaseDefinition(ctx, repo, dbCache, params, text)
+	return s.interBaseDefinitionWithSnapshot(ctx, snapshot.Repository, snapshot.Cache, params, text, dv, snapshot.SourceContext)
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {

@@ -21,14 +21,26 @@ import (
 // stored UNPADDED because SQLite compares TEXT byte for byte, while names that
 // are only ever displayed keep their catalog padding so trimming stays pinned.
 func openInterBaseScalableFixture(t *testing.T, relationCount int) *sql.DB {
+	return openInterBaseScalableFixtureWithFault(t, relationCount, nil)
+}
+
+func openInterBaseScalableFixtureWithFault(t *testing.T, relationCount int, fault *interBaseFixtureFault) *sql.DB {
 	t.Helper()
 
 	name := fmt.Sprintf("file:interbase_bulk_%d?mode=memory&cache=shared", interBaseFixtureSequence.Add(1))
+	if fault != nil {
+		interBaseFixtureFaults.Store(name, fault)
+	}
 	db, err := sql.Open("sqlite3_interbase_catalog", name)
 	if err != nil {
 		t.Fatalf("sql.Open(sqlite3_interbase_catalog) error = %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		_ = db.Close()
+		if fault != nil {
+			interBaseFixtureFaults.Delete(name)
+		}
+	})
 	db.SetMaxIdleConns(4)
 
 	for _, statement := range interBaseFixtureTables {

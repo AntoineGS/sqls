@@ -20,11 +20,11 @@ func (s *Server) handleReferences(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
+	if err != nil {
+		return nil, err
 	}
-	return localReferences(params.TextDocument.URI, text, params, s.parserDriverVariant())
+	return localReferences(params.TextDocument.URI, snapshot.Text, params, snapshot.Variant)
 }
 
 func localReferences(uri, text string, params lsp.ReferenceParams, dv dialect.DriverVariant) ([]lsp.Location, error) {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/sourcegraph/jsonrpc2"
 
+	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/internal/queryparams"
 )
@@ -30,7 +31,7 @@ func newParameterFixture(t *testing.T, text string, prepare func(*parameterBacke
 	tx := newTestContext()
 	tx.setup(t)
 	t.Cleanup(tx.tearDown)
-	t.Cleanup(tx.server.worker.Stop)
+	t.Cleanup(func() { _ = tx.server.Stop() })
 
 	backend := installParameterBackend(t)
 	if prepare != nil {
@@ -38,11 +39,11 @@ func newParameterFixture(t *testing.T, text string, prepare func(*parameterBacke
 	}
 	tx.addWorkspaceConfig(t, stubQueryParametersConnections("primary", "secondary"))
 
-	// The catalog lands on the worker's asynchronous pass, so a routing
+	// The catalog lands on the metadata loader's asynchronous jobs, so a routing
 	// assertion issued straight afterwards would race it and fall to the
 	// unknown-procedure branch.
 	if len(backend.describedProcedures()) > 0 {
-		waitForCatalog(t, tx.server.worker)
+		waitForCatalog(t, tx.server)
 	}
 	tx.textDocumentDidOpen(t, testFileURI, text)
 	return &parameterFixture{tx: tx, backend: backend}
@@ -76,6 +77,68 @@ func (f *parameterFixture) execute(t *testing.T, sub *lsp.QueryParameterSubmissi
 		ParameterValues: sub,
 	}, &got)
 	return got, err
+}
+
+func TestParameterPreparationHoldsConnectionReadLockUntilDescribeCompletes(t *testing.T) {
+	f := newParameterFixture(t, "SELECT :ID FROM T", func(b *parameterBackend) {
+		b.setInputDescription("SELECT ? FROM T", []database.InputDescriptor{{Kind: "INTEGER"}}, nil)
+	})
+	gate := f.backend.gate("SELECT ? FROM T")
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.tx.server.getQueryParameters(f.tx.ctx, lsp.ExecuteCommandParams{
+			Command: CommandGetQueryParameters, Arguments: []interface{}{testFileURI},
+		})
+		done <- err
+	}()
+	gate.waitEntered(t)
+	if f.tx.server.connMu.TryLock() {
+		f.tx.server.connMu.Unlock()
+		t.Fatal("connection switch could acquire write lock during input preparation")
+	}
+	gate.release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("parameter discovery did not complete after releasing DescribeInputs")
+	}
+	if !f.tx.server.connMu.TryLock() {
+		t.Fatal("parameter discovery leaked connection read lock")
+	}
+	f.tx.server.connMu.Unlock()
+}
+
+func TestExplainHoldsConnectionReadLockUntilPlanCompletes(t *testing.T) {
+	f := newParameterFixture(t, "SELECT 42 FROM T", nil)
+	gate := f.backend.gate("SELECT 42")
+	done := make(chan error, 1)
+	go func() {
+		_, err := f.tx.server.explainQuery(f.tx.ctx, lsp.ExecuteCommandParams{
+			Command: CommandExplainQuery, Arguments: []interface{}{testFileURI},
+		})
+		done <- err
+	}()
+	gate.waitEntered(t)
+	if f.tx.server.connMu.TryLock() {
+		f.tx.server.connMu.Unlock()
+		t.Fatal("connection switch could acquire write lock during ExplainPlan")
+	}
+	gate.release()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("explain did not complete after releasing the plan gate")
+	}
+	if !f.tx.server.connMu.TryLock() {
+		t.Fatal("explain leaked connection read lock")
+	}
+	f.tx.server.connMu.Unlock()
 }
 
 // submissionFor builds what a client sends back after prompting: the exact
@@ -700,7 +763,7 @@ func TestParameterExplainZeroMarkerStatementKeepsItsExistingPath(t *testing.T) {
 // wrong reason.
 func TestParameterExecutionProcedureCatalogIsResolved(t *testing.T) {
 	f := newParameterFixture(t, "EXECUTE PROCEDURE MYPROC(:CODE)", withProcedures)
-	cache := f.tx.server.worker.Cache()
+	cache := f.tx.server.metadata.Cache()
 	if !cache.HasCatalog() {
 		t.Fatal("the catalog never arrived; the routing assertions would be vacuous")
 	}

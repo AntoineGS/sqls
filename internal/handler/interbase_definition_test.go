@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -739,7 +741,7 @@ func newStubDDLRepository(ddl func(context.Context, database.ObjectKind, string)
 func newDefinitionServer(t *testing.T) *Server {
 	t.Helper()
 	server := NewServer()
-	t.Cleanup(server.worker.Stop)
+	t.Cleanup(func() { _ = server.Stop() })
 	server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	server.curDBCfg = &database.DBConfig{
 		Alias:          "local_ib",
@@ -791,8 +793,11 @@ func TestInterBaseDefinitionProcedureWritesReadOnlySnapshot(t *testing.T) {
 		t.Errorf("URI = %q, want a file:// URI — a client that cannot open the scheme is worse than no location", got[0].URI)
 	}
 
-	path := filepath.Join(server.snapshots.root,
-		snapshotDirName(server.snapshotContext().identity, os.Getpid()), "procedure", "MYPROC.sql")
+	uri, err := url.Parse(got[0].URI)
+	if err != nil {
+		t.Fatal("parse snapshot URI:", err)
+	}
+	path := uri.Path
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal("Stat snapshot:", err)
@@ -821,6 +826,143 @@ func TestInterBaseDefinitionProcedureWritesReadOnlySnapshot(t *testing.T) {
 		if !strings.Contains(string(content), want) {
 			t.Errorf("snapshot does not contain %q:\n%s", want, content)
 		}
+	}
+}
+
+func TestInterBaseDefinitionDoesNotWriteAfterGenerationSwitch(t *testing.T) {
+	server := newDefinitionServer(t)
+	server.stateMu.Lock()
+	server.connGeneration = 1
+	server.stateMu.Unlock()
+	entered, release := make(chan struct{}), make(chan struct{})
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+		close(entered)
+		<-release
+		return "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN\n  SUSPEND;\nEND", nil
+	})
+	sc := snapshotContextForConfig(1, server.curDBCfg)
+	done := make(chan lsp.Definition, 1)
+	go func() {
+		got, _ := server.interBaseDefinitionWithSnapshot(context.Background(), repo, definitionCatalog(), definitionParamsAt(20), "execute procedure myproc", dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, sc)
+		done <- got
+	}()
+	<-entered
+	server.stateMu.Lock()
+	server.connGeneration = 2
+	server.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "connection-b", DataSourceName: "localhost/3050:/db/b.ib"}
+	server.stateMu.Unlock()
+	close(release)
+	if got := <-done; len(got) != 0 {
+		t.Fatalf("definition = %v, want no location after switch", got)
+	}
+	if !snapshotRootIsEmpty(t, server.snapshots) {
+		t.Fatal("stale DDL created a snapshot after the generation switch")
+	}
+}
+
+func gateNextSnapshotWrite(store *sourceSnapshotStore) (entered <-chan string, release chan<- struct{}) {
+	started := make(chan string, 1)
+	resume := make(chan struct{})
+	var once sync.Once
+	store.writeFile = func(path string, content []byte, mode os.FileMode) error {
+		once.Do(func() {
+			started <- path
+			<-resume
+		})
+		return os.WriteFile(path, content, mode)
+	}
+	return started, resume
+}
+
+func TestInterBaseDefinitionSwitchDuringCandidateWriteKeepsBAndDiscardsA(t *testing.T) {
+	server := newDefinitionServer(t)
+	server.stateMu.Lock()
+	server.connGeneration = 1
+	server.stateMu.Unlock()
+	entered, release := gateNextSnapshotWrite(server.snapshots)
+	ddlRepo := func() *stubDDLRepository {
+		return newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+			return "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN\n  SUSPEND;\nEND", nil
+		})
+	}
+	text, dv := "execute procedure myproc", dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}
+	resultA := make(chan lsp.Definition, 1)
+	go func() {
+		got, _ := server.interBaseDefinitionWithSnapshot(context.Background(), ddlRepo(), definitionCatalog(), definitionParamsAt(20), text, dv,
+			snapshotContextForConfig(1, &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "A", DataSourceName: "db-a"}))
+		resultA <- got
+	}()
+	pathA := <-entered
+
+	server.stateMu.Lock()
+	server.connGeneration = 2
+	server.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "B", DataSourceName: "db-a"}
+	server.stateMu.Unlock()
+	resultB := make(chan lsp.Definition, 1)
+	go func() {
+		got, _ := server.interBaseDefinitionWithSnapshot(context.Background(), ddlRepo(), definitionCatalog(), definitionParamsAt(20), text, dv,
+			snapshotContextForConfig(2, &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "B", DataSourceName: "db-a"}))
+		resultB <- got
+	}()
+	close(release)
+
+	gotA, gotB := <-resultA, <-resultB
+	if len(gotA) != 0 {
+		t.Fatalf("A locations after B began: %+v", gotA)
+	}
+	if len(gotB) != 1 {
+		t.Fatalf("B locations = %+v, want one", gotB)
+	}
+	u, err := url.Parse(gotB[0].URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentB, err := os.ReadFile(u.Path)
+	if err != nil {
+		t.Fatalf("read B snapshot: %v", err)
+	}
+	if !strings.Contains(string(contentB), "-- connection: B") {
+		t.Fatalf("B snapshot content has wrong identity: %s", contentB)
+	}
+	if _, err := os.Stat(filepath.Dir(filepath.Dir(pathA))); !os.IsNotExist(err) {
+		t.Fatalf("stale A candidate directory still exists (stat err %v)", err)
+	}
+}
+
+func TestInterBaseRelationDefinitionStopDoesNotWaitForCandidateWrite(t *testing.T) {
+	server := newDefinitionServer(t)
+	server.stateMu.Lock()
+	server.connGeneration = 1
+	server.stateMu.Unlock()
+	entered, release := gateNextSnapshotWrite(server.snapshots)
+	ddl := `CREATE TABLE "CUSTOMERINVOICE" ("BALANCE" INTEGER, "INVOICE" INTEGER)`
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) { return ddl, nil })
+	text := "UPDATE CUSTOMERINVOICE SET BALANCE = INVOICE"
+	pos := lsp.Position{Line: 0, Character: strings.Index(text, "BALANCE") + 1}
+	result := make(chan lsp.Definition, 1)
+	go func() {
+		got, _ := server.interBaseRelationDefinition(context.Background(), repo, relationCatalog(), text, pos,
+			dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+		result <- got
+	}()
+	path := <-entered
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- server.Stop() }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatal("Stop:", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stop blocked behind in-flight snapshot filesystem write")
+	}
+	close(release)
+	if got := <-result; len(got) != 0 {
+		t.Fatalf("stopped definition locations = %+v, want none", got)
+	}
+	<-server.cleanupDone
+	if _, err := os.Stat(filepath.Dir(filepath.Dir(path))); !os.IsNotExist(err) {
+		t.Fatalf("stale stopped candidate directory still exists (stat err %v)", err)
 	}
 }
 
@@ -897,8 +1039,11 @@ func TestInterBaseDefinitionUnsupportedDDLUsesVerbatimSource(t *testing.T) {
 				t.Fatalf("got %d locations, want 1", len(got))
 			}
 
-			path := filepath.Join(server.snapshots.root,
-				snapshotDirName(server.snapshotContext().identity, os.Getpid()), tt.kind, tt.file)
+			uri, err := url.Parse(got[0].URI)
+			if err != nil {
+				t.Fatal("parse snapshot URI:", err)
+			}
+			path := uri.Path
 			content, err := os.ReadFile(path)
 			if err != nil {
 				t.Fatal("ReadFile:", err)
@@ -1050,7 +1195,7 @@ func TestInterBaseDefinitionFallsBackToAliasResolution(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantDefault)
 	tx.server.snapshots = newTestSnapshotStore(t)
 
@@ -1122,7 +1267,7 @@ func TestDefinitionWithoutAConnectionReturnsNoLocations(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	// Deliberately no configureInterBaseTestServer and no connection.
 
 	tx.textDocumentDidOpen(t, testFileURI, "SELECT * FROM MYPROC")

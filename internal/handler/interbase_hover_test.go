@@ -84,6 +84,7 @@ func interBaseHoverCache(t *testing.T) *database.DBCache {
 			},
 		},
 	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
 	return cache
 }
 
@@ -94,7 +95,7 @@ func interBaseHoverCache(t *testing.T) *database.DBCache {
 func interBaseHoverServer(t *testing.T) *Server {
 	t.Helper()
 	server := NewServer()
-	t.Cleanup(server.worker.Stop)
+	t.Cleanup(func() { _ = server.Stop() })
 	server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	return server
 }
@@ -111,7 +112,7 @@ func hoverAt(t *testing.T, server *Server, repo database.DBRepository, cache *da
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		t.Fatal("hoverWithDriver:", err)
 	}
-	return server.interBaseHover(context.Background(), repo, cache, params, text, base)
+	return server.interBaseHover(context.Background(), repo, cache, params, text, base, server.connectionGeneration(), server.parserDriverVariant())
 }
 
 func TestResolveInterBaseHoverTarget(t *testing.T) {
@@ -166,6 +167,71 @@ func TestResolveInterBaseHoverTarget(t *testing.T) {
 				t.Errorf("name = %q, want %q", got.name, tt.wantName)
 			}
 		})
+	}
+}
+
+func TestResolveInterBaseHoverTargetRequiresReadyViewsForTableFallback(t *testing.T) {
+	cache := &database.DBCache{
+		ColumnsWithParent: map[string][]*database.ColumnDesc{"\tV": {
+			{ColumnBase: database.ColumnBase{Table: "V", Name: "ID"}},
+		}},
+		Catalog:  &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading},
+	}
+	text := "SELECT * FROM V"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "V")},
+	}}
+	if _, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase); ok {
+		t.Fatal("relation with unresolved view category was classified as a table DDL target")
+	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	got, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase)
+	if !ok || got.kind != database.ObjectKindTable || got.name != "V" {
+		t.Fatalf("ready-empty views table fallback = %+v, %v", got, ok)
+	}
+}
+
+func TestResolveInterBaseHoverTargetUsesKnownViewWhileViewsLoading(t *testing.T) {
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {"V"}},
+		Catalog: &database.CatalogCache{Views: map[string]*database.ViewDesc{
+			"V": {Name: "V"},
+		}},
+		Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading},
+	}
+	text := "SELECT * FROM V"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "V")},
+	}}
+	got, _, ok := resolveInterBaseHoverTarget(text, params, cache, dialect.DatabaseDriverInterBase)
+	if !ok || got.kind != database.ObjectKindView || got.name != "V" {
+		t.Fatalf("known view match while category loads = %+v, %v", got, ok)
+	}
+}
+
+func TestHoverDoesNotUseColumnTableFallbackUntilViewsReady(t *testing.T) {
+	cache := interBaseHoverCache(t)
+	text := "SELECT * FROM MYVIEW"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "MYVIEW")},
+	}}
+	cache.Metadata[database.MetadataViews] = database.MetadataLoading
+	got, err := hoverWithDriverVariant(text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil && !errors.Is(err, ErrNoHover) {
+		t.Fatal("hover while views are loading:", err)
+	}
+	if got != nil {
+		t.Fatalf("unresolved view was reported as a table: %+v", got)
+	}
+
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	got, err = hoverWithDriverVariant(text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal("hover after views are ready:", err)
+	}
+	if got == nil || !strings.Contains(got.Contents.Value, "MYVIEW") {
+		t.Fatalf("ready view should retain positive column-backed hover, got %+v", got)
 	}
 }
 
@@ -451,7 +517,7 @@ func TestInterBaseHoverEndToEndKeepsExistingColumnHover(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 	configureInterBaseTestServer(t, tx, dialect.SQLVariantInterBase1)
 
 	tx.textDocumentDidOpen(t, testFileURI, "select rdb$relation_id from rdb$database")
@@ -639,7 +705,7 @@ func TestHoverMemoLockIsNotHeldAcrossObjectDDL(t *testing.T) {
 	}
 	done := make(chan *lsp.Hover, 1)
 	go func() {
-		done <- server.interBaseHover(context.Background(), repo, cache, params, "execute procedure myproc", nil)
+		done <- server.interBaseHover(context.Background(), repo, cache, params, "execute procedure myproc", nil, server.connectionGeneration(), server.parserDriverVariant())
 	}()
 
 	select {

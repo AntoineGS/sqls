@@ -38,6 +38,31 @@ func testSnapshotContext() snapshotContext {
 	}
 }
 
+func TestSnapshotCandidatesHaveUniqueDirectoriesAndIsolatedCleanup(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	first, err := store.writeCandidate(testSnapshotContext(), "procedure", "MYPROC", "A source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.writeCandidate(testSnapshotContext(), "procedure", "MYPROC", "B source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.path == second.path {
+		t.Fatalf("candidate paths collide: %q", first.path)
+	}
+	if filepath.Base(first.path) != "MYPROC.sql" || filepath.Base(second.path) != "MYPROC.sql" {
+		t.Fatalf("candidate basenames = %q and %q", filepath.Base(first.path), filepath.Base(second.path))
+	}
+	first.remove()
+	if _, err := os.Stat(first.path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded candidate stat error = %v, want not-exist", err)
+	}
+	if got, err := os.ReadFile(second.path); err != nil || string(got) != "B source" {
+		t.Fatalf("other candidate after cleanup = %q, %v", got, err)
+	}
+}
+
 func TestSnapshotStoreWritesUnderConnectionAndKindDirectories(t *testing.T) {
 	store := newTestSnapshotStore(t)
 	sc := testSnapshotContext()
@@ -534,6 +559,23 @@ func TestSnapshotStoreRemoveAllIsSafeOnANilStore(t *testing.T) {
 	store.RemoveAll()
 }
 
+func TestSnapshotStoreBeginShutdownDoesNotWaitForWriteMutex(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	store.mu.Lock() // models a write/prune blocked in filesystem I/O.
+	done := make(chan struct{})
+	go func() { store.BeginShutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		store.mu.Unlock()
+		t.Fatal("BeginShutdown blocked behind the snapshot write mutex")
+	}
+	store.mu.Unlock()
+	if _, err := store.write(snapshotContext{generation: 1, identity: "after-shutdown"}, "procedure", "P", "source"); err == nil {
+		t.Fatal("write succeeded after the shutdown fence was set")
+	}
+}
+
 func TestSnapshotsRemovedOnShutdown(t *testing.T) {
 	server := NewServer()
 	store := newTestSnapshotStore(t)
@@ -546,6 +588,11 @@ func TestSnapshotsRemovedOnShutdown(t *testing.T) {
 
 	if err := server.Stop(); err != nil {
 		t.Fatal("Stop:", err)
+	}
+	select {
+	case <-server.cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup worker did not finish")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("snapshot survived a clean shutdown (err=%v)", err)
@@ -567,25 +614,24 @@ func TestSnapshotsRemovedEvenWhenConnectionCloseFails(t *testing.T) {
 		t.Fatal("write:", err)
 	}
 
-	// Stop must report the close failure *and* still clean up. A half-dead
-	// InterBase attachment is exactly the shutdown that fails, and it must not
-	// be the shutdown that leaves database source on disk.
-	if err := server.Stop(); !errors.Is(err, closeErr) {
-		t.Fatalf("Stop() = %v, want %v", err, closeErr)
+	// Stop schedules cleanup; native Close errors are logged and do not delay
+	// the protocol response. Await the private cleanup fence before inspecting.
+	if err := server.Stop(); err != nil {
+		t.Fatalf("Stop() scheduling error = %v", err)
+	}
+	select {
+	case <-server.cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup worker did not finish")
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Errorf("snapshot survived a failing shutdown (err=%v)", err)
-	}
-	select {
-	case <-server.worker.Done():
-	default:
-		t.Error("Stop returned without stopping the worker")
 	}
 }
 
 func TestSnapshotContextTracksTheConnectionGeneration(t *testing.T) {
 	server := NewServer()
-	defer server.worker.Stop()
+	defer server.Stop()
 
 	server.curDBCfg = &database.DBConfig{
 		Alias:          "local_ib",
@@ -612,7 +658,7 @@ func TestSnapshotContextTracksTheConnectionGeneration(t *testing.T) {
 
 func TestSnapshotContextWithoutAConnection(t *testing.T) {
 	server := NewServer()
-	defer server.worker.Stop()
+	defer server.Stop()
 
 	sc := server.snapshotContext()
 	if sc.label == "" {

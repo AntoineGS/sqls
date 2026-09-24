@@ -62,11 +62,15 @@ func testProcedures() []*database.ProcedureDesc {
 }
 
 func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureDesc) (string, *stubBackend) {
+	return runProcedureCommandWithProcedureState(t, text, procs, nil, "")
+}
+
+func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*database.ProcedureDesc, procedureState *database.MetadataState, omitCachedProcedure string) (string, *stubBackend) {
 	t.Helper()
 	tx := newTestContext()
 	tx.setup(t)
 	t.Cleanup(tx.tearDown)
-	t.Cleanup(tx.server.worker.Stop)
+	t.Cleanup(func() { _ = tx.server.Stop() })
 
 	backend := installStubBackend(t)
 	if procs != nil {
@@ -74,20 +78,19 @@ func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureD
 	}
 	tx.addWorkspaceConfig(t, stubInterBaseConnections("interbase"))
 
-	// The catalog lands on the worker's SECONDARY, asynchronous pass:
-	// addWorkspaceConfig reaches ReCache, which only signals the worker
-	// goroutine (worker.go:95-97). Issuing the command straight afterwards
-	// races that goroutine, HasCatalog() is still false, and routing falls to
-	// the unknown-procedure branch — so the two tests that assert the Query
-	// path would fail or, worse, flake. Wait for the catalog first.
-	//
-	// waitForCatalog is the polling helper the catalog-migration plan adds
-	// alongside GenerateCatalogCache. If that plan has not landed, add it
-	// there rather than duplicating it here.
+	// Keep the readiness assertion explicit: this fixture waits for the loader
+	// generation rather than relying on timing after configuration.
 	if procs != nil {
-		waitForCatalog(t, tx.server.worker)
-		if !tx.server.worker.Cache().HasCatalog() {
+		waitForCatalog(t, tx.server)
+		cache := tx.server.metadata.Cache()
+		if !cache.HasCatalog() {
 			t.Fatal("the catalog never arrived; every routing assertion below would be vacuous")
+		}
+		if procedureState != nil {
+			cache.Metadata[database.MetadataProcedures] = *procedureState
+		}
+		if omitCachedProcedure != "" {
+			delete(cache.Catalog.Procedures, omitCachedProcedure)
 		}
 	}
 
@@ -101,6 +104,45 @@ func runProcedureCommand(t *testing.T, text string, procs []*database.ProcedureD
 		t.Fatal("conn.Call workspace/executeCommand:", err)
 	}
 	return got, backend
+}
+
+func TestExecuteProcedureWithFailedProcedureMetadataRemainsUnknown(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", []*database.ProcedureDesc{{Name: "OTHER"}}, &failed, "")
+	if queries := backend.queries(); len(queries) != 0 {
+		t.Fatalf("Query served %d statements without a known procedure signature", len(queries))
+	}
+	if !strings.Contains(got, "MYPROC is not in the catalog cache") || !strings.Contains(got, "switch to this connection again") {
+		t.Errorf("result = %q, want existing unknown-metadata explanation", got)
+	}
+	if strings.Contains(got, "no output") || strings.Contains(got, "has no output") {
+		t.Errorf("result = %q, failed metadata must not be described as a procedure without outputs", got)
+	}
+}
+
+func TestExecuteProcedureUsesKnownDescriptorWhileCategoryFailed(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed, "")
+	if queries := backend.queries(); len(queries) != 1 {
+		t.Fatalf("Query served %d statements for a present descriptor, want 1", len(queries))
+	}
+	if strings.Contains(got, "not in the catalog cache") {
+		t.Errorf("known descriptor was discarded because category state is failed: %q", got)
+	}
+}
+
+func TestExecuteProcedureUnknownWhileMetadataFailedHintsEvenWhenExecSucceeds(t *testing.T) {
+	failed := database.MetadataFailed
+	got, backend := runProcedureCommandWithProcedureState(t, "EXECUTE PROCEDURE MYPROC(1);", testProcedures(), &failed, "MYPROC")
+	if execs := backend.execs(); len(execs) != 1 {
+		t.Fatalf("Exec served %d statements, want exactly one", len(execs))
+	}
+	if queries := backend.queries(); len(queries) != 0 {
+		t.Fatalf("Query served %d statements; unresolved procedure must not be retried as Query", len(queries))
+	}
+	if !strings.Contains(got, "MYPROC is not in the catalog cache") || !strings.Contains(got, "switch to this connection again") {
+		t.Errorf("successful Exec result = %q, want visible unknown-metadata hint", got)
+	}
 }
 
 func TestExecuteProcedureWithOutputUsesQueryPath(t *testing.T) {
@@ -158,7 +200,7 @@ func TestExecuteProcedureUnknownProcedureUsesExecAndExplainsCacheRefresh(t *test
 }
 
 func TestExecuteProcedureWithoutCatalogUsesExecPath(t *testing.T) {
-	// The window before the worker's catalog pass lands: HasCatalog() is false
+	// The window before a catalog category lands: HasCatalog() is false
 	// and routing falls back to today's unconditional Exec, which is not a
 	// regression.
 	got, backend := runProcedureCommand(t, "EXECUTE PROCEDURE MYPROC(1);", nil)
@@ -183,17 +225,17 @@ func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
 	defer tx.tearDown()
-	defer tx.server.worker.Stop()
+	defer tx.server.Stop()
 
 	backend := installStubBackend(t)
 	backend.setProcedures(testProcedures())
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
 
-	waitForCatalog(t, tx.server.worker)
-	if !tx.server.worker.Cache().HasCatalog() {
+	waitForCatalog(t, tx.server)
+	if !tx.server.metadata.Cache().HasCatalog() {
 		t.Fatal("the non-InterBase connection has no catalog; this test would pass for the wrong reason")
 	}
-	if _, ok := tx.server.worker.Cache().Procedure("MYPROC"); !ok {
+	if _, ok := tx.server.metadata.Cache().Procedure("MYPROC"); !ok {
 		t.Fatal("MYPROC is not in the cache; routing would return unknown regardless of the driver")
 	}
 

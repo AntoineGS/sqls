@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -23,15 +24,33 @@ import (
 // the pure-Go catalog reader can be exercised without a server.
 type interBaseFixtureDriver struct{ inner driver.Driver }
 
+type interBaseFixtureFault struct {
+	match   string
+	stage   string
+	err     error
+	gate    <-chan struct{}
+	entered chan<- struct{}
+}
+
+var interBaseFixtureFaults sync.Map // map[DSN]*interBaseFixtureFault
+
 func (d interBaseFixtureDriver) Open(name string) (driver.Conn, error) {
 	conn, err := d.inner.Open(name)
 	if err != nil {
 		return nil, err
 	}
-	return interBaseFixtureConn{Conn: conn}, nil
+	faultValue, _ := interBaseFixtureFaults.Load(name)
+	var fault *interBaseFixtureFault
+	if faultValue != nil {
+		fault = faultValue.(*interBaseFixtureFault)
+	}
+	return interBaseFixtureConn{Conn: conn, fault: fault}, nil
 }
 
-type interBaseFixtureConn struct{ driver.Conn }
+type interBaseFixtureConn struct {
+	driver.Conn
+	fault *interBaseFixtureFault
+}
 
 func interBaseFixtureRewrite(query string) string {
 	return strings.ReplaceAll(query, "NOT STARTING WITH 'RDB$'", "NOT LIKE 'RDB$%'")
@@ -56,15 +75,96 @@ func interBaseFixtureCountPrepares(t *testing.T) func() int64 {
 // routes every statement through PrepareContext, where the rewrite applies.
 func (c interBaseFixtureConn) Prepare(query string) (driver.Stmt, error) {
 	interBaseFixturePrepares.Add(1)
-	return c.Conn.Prepare(interBaseFixtureRewrite(query))
+	stmt, err := c.Conn.Prepare(interBaseFixtureRewrite(query))
+	if err != nil {
+		return nil, err
+	}
+	return interBaseFixtureStmt{Stmt: stmt, query: query, fault: c.fault}, nil
 }
 
 func (c interBaseFixtureConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
 	interBaseFixturePrepares.Add(1)
 	if preparer, ok := c.Conn.(driver.ConnPrepareContext); ok {
-		return preparer.PrepareContext(ctx, interBaseFixtureRewrite(query))
+		stmt, err := preparer.PrepareContext(ctx, interBaseFixtureRewrite(query))
+		if err != nil {
+			return nil, err
+		}
+		return interBaseFixtureStmt{Stmt: stmt, query: query, fault: c.fault}, nil
 	}
-	return c.Conn.Prepare(interBaseFixtureRewrite(query))
+	stmt, err := c.Conn.Prepare(interBaseFixtureRewrite(query))
+	if err != nil {
+		return nil, err
+	}
+	return interBaseFixtureStmt{Stmt: stmt, query: query, fault: c.fault}, nil
+}
+
+type interBaseFixtureStmt struct {
+	driver.Stmt
+	query string
+	fault *interBaseFixtureFault
+}
+
+func (s interBaseFixtureStmt) Query(args []driver.Value) (driver.Rows, error) {
+	return s.queryRows(func() (driver.Rows, error) { return s.Stmt.Query(args) })
+}
+
+func (s interBaseFixtureStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	queryer, ok := s.Stmt.(driver.StmtQueryContext)
+	if !ok {
+		return nil, driver.ErrSkip
+	}
+	return s.queryRows(func() (driver.Rows, error) { return queryer.QueryContext(ctx, args) })
+}
+
+func (s interBaseFixtureStmt) queryRows(query func() (driver.Rows, error)) (driver.Rows, error) {
+	f := s.fault
+	if f != nil && strings.Contains(s.query, f.match) {
+		if f.entered != nil {
+			select {
+			case f.entered <- struct{}{}:
+			default:
+			}
+		}
+		if f.gate != nil {
+			<-f.gate
+		}
+		if f.stage == "query" {
+			return nil, f.err
+		}
+	}
+	rows, err := query()
+	if err != nil || f == nil || !strings.Contains(s.query, f.match) {
+		return rows, err
+	}
+	return &interBaseFixtureFaultRows{Rows: rows, fault: f}, nil
+}
+
+type interBaseFixtureFaultRows struct {
+	driver.Rows
+	fault *interBaseFixtureFault
+	first bool
+}
+
+func (r *interBaseFixtureFaultRows) Next(dest []driver.Value) error {
+	if r.fault.stage == "iterate" {
+		return r.fault.err
+	}
+	err := r.Rows.Next(dest)
+	if err == nil && !r.first {
+		r.first = true
+		if r.fault.stage == "scan" && len(dest) > 0 {
+			dest[0] = struct{}{}
+		}
+	}
+	return err
+}
+
+func (r *interBaseFixtureFaultRows) Close() error {
+	err := r.Rows.Close()
+	if r.fault.stage == "close" {
+		return r.fault.err
+	}
+	return err
 }
 
 func (c interBaseFixtureConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
@@ -1698,9 +1798,8 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 		t.Fatal("CatalogSnapshot() returned a nil closer")
 	}
 
-	// A new repository, not the receiver: ReCache runs on a handler goroutine
-	// while the worker's secondary pass runs on its own, so a shared mutable
-	// snapshot field would race.
+	// A new repository, not the receiver: independently scheduled metadata jobs
+	// can use snapshots concurrently, so a shared mutable snapshot field would race.
 	if snapshot == DBRepository(source) {
 		t.Fatal("CatalogSnapshot() returned the source repository; it must return a new one")
 	}

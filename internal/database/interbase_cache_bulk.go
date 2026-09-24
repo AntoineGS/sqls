@@ -59,20 +59,15 @@ import (
 // SQL_TEXT decode and remain subject to the same truncation.
 const interBaseBulkIdentifierCastWidth = 67
 
-// interBaseBulkIdentifierCast renders CAST(ref AS VARCHAR(n)) for one
-// identifier column reference, so interBaseBulkIdentifierCastWidth has a
-// single point of truth: the width used to validate the fix live against
-// NRF01 and the width every query below actually selects with cannot drift
-// apart.
-func interBaseBulkIdentifierCast(ref string) string {
-	return fmt.Sprintf("CAST(%s AS VARCHAR(%d))", ref, interBaseBulkIdentifierCastWidth)
-}
-
-var interBaseBulkRelationsQuery = fmt.Sprintf(`
+func interBaseBulkRelationsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s
 FROM RDB$RELATIONS r
 WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-ORDER BY r.RDB$RELATION_NAME`, interBaseBulkIdentifierCast("r.RDB$RELATION_NAME"))
+ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME", width))
+}
+
+var interBaseBulkRelationsQuery = interBaseBulkRelationsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkColumnsQuery is the driver's per-relation column projection
 // restricted to the fields ColumnDesc renders, and widened to every user
@@ -82,7 +77,16 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseBulkIdentifierCast("r.RDB$RELATION_NAME"
 // The driver also reads the column's own collation (its rco join); ColumnDesc
 // renders the domain's type alone, so that join is left out rather than paid
 // for on every column of every relation.
-var interBaseBulkColumnsQuery = fmt.Sprintf(`
+func interBaseBulkColumnsQueryForWidth(width int) string {
+	return interBaseBulkColumnsQueryForRelationFilter(width, "")
+}
+
+func interBaseBulkViewColumnsQueryForWidth(width int) string {
+	return interBaseBulkColumnsQueryForRelationFilter(width, "\n  AND r.RDB$VIEW_BLR IS NOT NULL")
+}
+
+func interBaseBulkColumnsQueryForRelationFilter(width int, relationFilter string) string {
+	return fmt.Sprintf(`
 SELECT %s, %s, %s,
        rf.RDB$NULL_FLAG, rf.RDB$DEFAULT_SOURCE,
        %s, f.RDB$COMPUTED_SOURCE, f.RDB$DEFAULT_SOURCE,
@@ -97,14 +101,17 @@ LEFT JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = rf.RDB$FIELD_SOURCE
 LEFT JOIN RDB$CHARACTER_SETS cs ON cs.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
 LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                            AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
-WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+ WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0%s
 ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
-	interBaseBulkIdentifierCast("rf.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("rf.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("rf.RDB$FIELD_SOURCE"),
-	interBaseBulkIdentifierCast("f.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("cs.RDB$CHARACTER_SET_NAME"),
-	interBaseBulkIdentifierCast("co.RDB$COLLATION_NAME"))
+		interBaseMetadataIdentifier("rf.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("rf.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("rf.RDB$FIELD_SOURCE", width),
+		interBaseMetadataIdentifier("f.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("cs.RDB$CHARACTER_SET_NAME", width),
+		interBaseMetadataIdentifier("co.RDB$COLLATION_NAME", width), relationFilter)
+}
+
+var interBaseBulkColumnsQuery = interBaseBulkColumnsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkPrimaryKeyFieldsQuery returns one row per primary-key field.
 // The key flag is a membership test, so the fields need no ordering; the
@@ -117,7 +124,8 @@ ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
 // (review.md residual concern 1). Unreachable through normal DDL — InterBase
 // itself never flags a user relation's own index system — but cheap to close
 // and closes the one documented divergence from the loader it replaces.
-var interBaseBulkPrimaryKeyFieldsQuery = fmt.Sprintf(`
+func interBaseBulkPrimaryKeyFieldsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s, %s
 FROM RDB$RELATION_CONSTRAINTS pk
 JOIN RDB$RELATIONS r ON r.RDB$RELATION_NAME = pk.RDB$RELATION_NAME
@@ -126,8 +134,11 @@ JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
   AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
   AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0`,
-	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("s.RDB$FIELD_NAME"))
+		interBaseMetadataIdentifier("pk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("s.RDB$FIELD_NAME", width))
+}
+
+var interBaseBulkPrimaryKeyFieldsQuery = interBaseBulkPrimaryKeyFieldsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkForeignKeyFieldsQuery returns one row per foreign-key field,
 // paired with the referenced field at the same index segment position. That
@@ -145,7 +156,8 @@ WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
 // names a real unique/primary-key constraint with a real index, so a missing
 // pi row means a corrupt catalog, the same "drop the whole key" stance the
 // query already takes for a missing enforcing index.
-var interBaseBulkForeignKeyFieldsQuery = fmt.Sprintf(`
+func interBaseBulkForeignKeyFieldsQueryForWidth(width int) string {
+	return fmt.Sprintf(`
 SELECT %s, %s, %s,
        %s, %s
 FROM RDB$RELATION_CONSTRAINTS fk
@@ -162,11 +174,14 @@ WHERE fk.RDB$CONSTRAINT_TYPE = 'FOREIGN KEY'
   AND COALESCE(fi.RDB$SYSTEM_FLAG, 0) = 0
   AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0
 ORDER BY fk.RDB$CONSTRAINT_NAME, fs.RDB$FIELD_POSITION`,
-	interBaseBulkIdentifierCast("fk.RDB$CONSTRAINT_NAME"),
-	interBaseBulkIdentifierCast("fk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("fs.RDB$FIELD_NAME"),
-	interBaseBulkIdentifierCast("pk.RDB$RELATION_NAME"),
-	interBaseBulkIdentifierCast("ps.RDB$FIELD_NAME"))
+		interBaseMetadataIdentifier("fk.RDB$CONSTRAINT_NAME", width),
+		interBaseMetadataIdentifier("fk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("fs.RDB$FIELD_NAME", width),
+		interBaseMetadataIdentifier("pk.RDB$RELATION_NAME", width),
+		interBaseMetadataIdentifier("ps.RDB$FIELD_NAME", width))
+}
+
+var interBaseBulkForeignKeyFieldsQuery = interBaseBulkForeignKeyFieldsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
 // interBaseBulkRelation is one relation with its ordered columns, in the shape
 // columnDescription already consumes. A relation with no columns keeps its
@@ -268,23 +283,7 @@ func interBaseBulkQuery(ctx context.Context, queryer schema.Queryer, what, query
 }
 
 func interBaseBulkRelations(ctx context.Context, queryer schema.Queryer) ([]interBaseBulkRelation, error) {
-	relations := make([]interBaseBulkRelation, 0)
-	err := interBaseBulkQuery(ctx, queryer, "relations", interBaseBulkRelationsQuery, func(rows *sql.Rows) error {
-		var name sql.NullString
-		if err := rows.Scan(&name); err != nil {
-			return err
-		}
-		relationName, err := interBaseRequiredName(name, "relation name")
-		if err != nil {
-			return err
-		}
-		relations = append(relations, interBaseBulkRelation{name: relationName})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return relations, nil
+	return interBaseBulkRelationsForQuery(ctx, queryer, interBaseBulkRelationsQuery)
 }
 
 // interBaseBulkLoadColumns fills in each relation's columns from one read of
@@ -296,16 +295,7 @@ func interBaseBulkLoadColumns(ctx context.Context, queryer schema.Queryer, relat
 	for index, relation := range relations {
 		positions[relation.name] = index
 	}
-
-	return interBaseBulkQuery(ctx, queryer, "columns", interBaseBulkColumnsQuery, func(rows *sql.Rows) error {
-		var raw interBaseBulkColumnRow
-		if err := rows.Scan(raw.destinations()...); err != nil {
-			return err
-		}
-		relationName, column, err := raw.column()
-		if err != nil {
-			return err
-		}
+	return interBaseBulkScanColumns(ctx, queryer, interBaseBulkIdentifierCastWidth, func(relationName string, column schema.Column) error {
 		index, ok := positions[relationName]
 		if !ok {
 			// The relation list was read first. A column naming a relation it
@@ -318,11 +308,44 @@ func interBaseBulkLoadColumns(ctx context.Context, queryer schema.Queryer, relat
 	})
 }
 
+// interBaseBulkScanColumns reads the common column projection and delegates
+// each fully validated row to consume. Independent metadata jobs and the
+// legacy whole-catalog snapshot share this scan so descriptor inputs cannot
+// drift.
+func interBaseBulkScanColumns(ctx context.Context, queryer schema.Queryer, width int, consume func(string, schema.Column) error) error {
+	return interBaseBulkScanColumnsWithQuery(ctx, queryer, interBaseBulkColumnsQueryForWidth(width), consume)
+}
+
+func interBaseBulkScanColumnsWithQuery(ctx context.Context, queryer schema.Queryer, query string, consume func(string, schema.Column) error) error {
+	return interBaseBulkQuery(ctx, queryer, "columns", query, func(rows *sql.Rows) error {
+		var raw interBaseBulkColumnRow
+		if err := rows.Scan(raw.destinations()...); err != nil {
+			return err
+		}
+		relationName, column, err := raw.column()
+		if err != nil {
+			return err
+		}
+		return consume(relationName, column)
+	})
+}
+
 // interBaseBulkPrimaryKeys indexes every primary-key field of every user
 // relation. The map is the one columnDescription consults for the key flag.
 func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[string]struct{}, error) {
 	primaryKeys := make(map[string]struct{})
-	err := interBaseBulkQuery(ctx, queryer, "primary key fields", interBaseBulkPrimaryKeyFieldsQuery, func(rows *sql.Rows) error {
+	err := interBaseBulkScanPrimaryKeyFields(ctx, queryer, interBaseBulkIdentifierCastWidth, func(relation, field string) error {
+		primaryKeys[interBaseRelationColumnKey(relation, field)] = struct{}{}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return primaryKeys, nil
+}
+
+func interBaseBulkScanPrimaryKeyFields(ctx context.Context, queryer schema.Queryer, width int, consume func(string, string) error) error {
+	return interBaseBulkQuery(ctx, queryer, "primary key fields", interBaseBulkPrimaryKeyFieldsQueryForWidth(width), func(rows *sql.Rows) error {
 		var relationName, fieldName sql.NullString
 		if err := rows.Scan(&relationName, &fieldName); err != nil {
 			return err
@@ -335,13 +358,8 @@ func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[
 		if err != nil {
 			return err
 		}
-		primaryKeys[interBaseRelationColumnKey(relation, field)] = struct{}{}
-		return nil
+		return consume(relation, field)
 	})
-	if err != nil {
-		return nil, err
-	}
-	return primaryKeys, nil
 }
 
 // interBaseBulkForeignKeys groups foreign-key field rows into one mapping per
@@ -353,6 +371,10 @@ func interBaseBulkPrimaryKeys(ctx context.Context, queryer schema.Queryer) (map[
 // is dropped whole: half a foreign key would complete a join with a column
 // that does not participate in it.
 func interBaseBulkForeignKeys(ctx context.Context, queryer schema.Queryer) ([]interBaseForeignKeyMapping, error) {
+	return interBaseBulkForeignKeysWithQuery(ctx, queryer, interBaseBulkForeignKeyFieldsQuery)
+}
+
+func interBaseBulkForeignKeysWithQuery(ctx context.Context, queryer schema.Queryer, query string) ([]interBaseForeignKeyMapping, error) {
 	type constraintIdentity struct {
 		relationName   string
 		constraintName string
@@ -362,7 +384,7 @@ func interBaseBulkForeignKeys(ctx context.Context, queryer schema.Queryer) ([]in
 	mappings := make(map[constraintIdentity]*interBaseForeignKeyMapping)
 	incomplete := make(map[constraintIdentity]struct{})
 
-	err := interBaseBulkQuery(ctx, queryer, "foreign key fields", interBaseBulkForeignKeyFieldsQuery, func(rows *sql.Rows) error {
+	err := interBaseBulkQuery(ctx, queryer, "foreign key fields", query, func(rows *sql.Rows) error {
 		var constraintName, relationName, fieldName, referencedRelation, referencedField sql.NullString
 		if err := rows.Scan(&constraintName, &relationName, &fieldName, &referencedRelation, &referencedField); err != nil {
 			return err

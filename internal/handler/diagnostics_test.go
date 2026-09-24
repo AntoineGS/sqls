@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net"
 	"strings"
@@ -17,6 +18,30 @@ import (
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
+
+func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	s.stateMu.Lock()
+	s.connGeneration = 1
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	s.files["file:///catalog.sql"] = &File{Text: "SELECT * FROM T"}
+	s.stateMu.Unlock()
+	s.metadata.Reset(1)
+	before, ok := s.diagnosticsSnapshot("file:///catalog.sql")
+	if !ok {
+		t.Fatal("snapshot missing for open document")
+	}
+	if before.cacheSnapshot != nil {
+		t.Fatalf("catalog built before columns ready: %#v", before.cacheSnapshot)
+	}
+	cache := s.metadata.Cache()
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
+	after, ok := s.diagnosticsSnapshot("file:///catalog.sql")
+	if !ok || after.cacheSnapshot == nil {
+		t.Fatal("catalog was not captured after ColumnsReady became true")
+	}
+}
 
 type diagnosticsNotification struct {
 	URI         string           `json:"uri"`
@@ -92,10 +117,17 @@ func newDiagnosticsTestContext(t *testing.T, driver dialect.DatabaseDriver) *dia
 	t.Helper()
 	ctx := context.Background()
 	server := NewServer()
-	t.Cleanup(func() { server.worker.Stop() })
+	// These tests drive diagnostic publication explicitly; disable the
+	// constructor callback so its asynchronous startup signal cannot race and
+	// duplicate a document-open notification.
+	server.metadata.SetChangedCallback(nil)
+	t.Cleanup(func() { server.Stop() })
 	server.stateMu.Lock()
 	server.dbConn = &database.DBConnection{Driver: driver}
+	server.connectionState = connectionReady
+	server.connGeneration = 1
 	server.stateMu.Unlock()
+	server.metadata.Reset(1)
 	clientEnd, serverEnd := net.Pipe()
 	client := newDiagnosticsClient()
 	clientConn := jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(clientEnd, jsonrpc2.VSCodeObjectCodec{}), client)
@@ -137,19 +169,6 @@ func diagnosticsRepository(types map[string]string) *database.MockDBRepository {
 			return nil, nil
 		},
 	}
-}
-
-func waitForDiagnosticCacheReplacement(t *testing.T, worker *database.Worker, previous *database.DBCache) *database.DBCache {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if cache := worker.Cache(); cache != nil && cache != previous {
-			return cache
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for asynchronous cache replacement")
-	return nil
 }
 
 func diagnosticTypes(destinationType string) map[string]string {
@@ -195,6 +214,53 @@ func diagnosticCode(diagnostic lsp.Diagnostic) string {
 	return *diagnostic.Code
 }
 
+func TestDiagnosticUniqueKeysRequiresCompleteCatalogInputs(t *testing.T) {
+	cache := &database.DBCache{
+		Catalog: &database.CatalogCache{
+			Views: map[string]*database.ViewDesc{},
+			Indexes: map[string]*database.IndexDesc{
+				"UQ_T": {Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}},
+			},
+			IndexesByTable: map[string][]*database.IndexDesc{"T": {{Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}}}},
+		},
+		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataColumnsCurrent: database.MetadataReady,
+			database.MetadataViews:          database.MetadataLoading,
+			database.MetadataIndexes:        database.MetadataReady,
+		},
+	}
+	columns := []sqlsymbol.ColumnType{{Name: "ID", Type: "INTEGER"}}
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("incomplete view classification cannot prove table keys")
+	}
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	cache.Metadata[database.MetadataIndexes] = database.MetadataLoading
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("loading indexes cannot prove a complete unique-key set")
+	}
+	cache.Metadata[database.MetadataIndexes] = database.MetadataReady
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
+		t.Fatal("failed columns cannot prove a complete unique-key set")
+	}
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
+	keys, known := diagnosticUniqueKeys(cache, "T", columns)
+	if !known || len(keys) != 1 || len(keys[0]) != 1 || keys[0][0] != "ID" {
+		t.Fatalf("complete catalog keys = %v, known=%v; want [[ID]], true", keys, known)
+	}
+	cache.Catalog.Indexes = map[string]*database.IndexDesc{}
+	cache.Catalog.IndexesByTable = map[string][]*database.IndexDesc{}
+	keys, known = diagnosticUniqueKeys(cache, "T", columns)
+	if !known || len(keys) != 0 {
+		t.Fatalf("ready-empty indexes keys = %v, known=%v; want empty, true", keys, known)
+	}
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
+	cache.Metadata[database.MetadataColumnsAll] = database.MetadataReady
+	if _, known := diagnosticUniqueKeys(cache, "T", columns); !known {
+		t.Fatal("all-columns readiness should satisfy the columns requirement")
+	}
+}
+
 func diagnosticSource(diagnostic lsp.Diagnostic) string {
 	if diagnostic.Source == nil {
 		return ""
@@ -210,10 +276,7 @@ func TestPublishInterBaseDiagnosticsAndLifecycle(t *testing.T) {
 	const uri = "file:///diagnostics-lifecycle.sql"
 	text := "/*😀*/ CREATE PROCEDURE P AS DECLARE VARIABLE UNUSED VARCHAR(10); BEGIN UNUSED = 'x'; INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, text, 1)
 
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
@@ -294,10 +357,7 @@ func TestInterBaseDiagnosticsAcceptance(t *testing.T) {
 	initialText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	fixedText := "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN LOCAL_VALUE = LOCAL_VALUE; INSERT INTO DST (VALUE) SELECT CAST(SRC.VALUE AS VARCHAR(20)) FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, initialText, 1)
 
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
@@ -360,10 +420,7 @@ func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 	const uri = "file:///diagnostics-cache.sql"
 	text := "CREATE PROCEDURE P AS BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(20)"))); err != nil {
-		t.Fatal("seed initial diagnostic cache:", err)
-	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, tx.server.worker.Cache())
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(20)")))
 	tx.open(t, uri, text, 1)
 	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1
@@ -372,15 +429,12 @@ func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 		t.Fatalf("initial diagnostics = %+v, want truncation warning", initial.Diagnostics)
 	}
 
-	oldCache := tx.server.worker.Cache()
-	if err := tx.server.worker.ReCache(tx.ctx, diagnosticsRepository(diagnosticTypes("VARCHAR(50)"))); err != nil {
-		t.Fatal("refresh diagnostic cache:", err)
-	}
-	primaryCache := tx.server.worker.Cache()
+	oldCache := tx.server.metadata.Cache()
+	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(50)")))
+	primaryCache := tx.server.metadata.Cache()
 	if primaryCache == oldCache {
-		t.Fatal("worker cache pointer did not refresh")
+		t.Fatal("metadata cache pointer did not refresh")
 	}
-	waitForDiagnosticCacheReplacement(t, tx.server.worker, primaryCache)
 	refreshed := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 0
 	})
@@ -483,6 +537,9 @@ func TestPublishDiagnosticsDoesNotSendDelayedOlderVersion(t *testing.T) {
 		return n.Version != nil && *n.Version == 4 && len(n.Diagnostics) == 0
 	})
 	assertVersion(t, latest, 4)
+	if tx.server.diagnosticsSnapshotCurrent(oldSnapshot) {
+		t.Fatal("old diagnostics snapshot remained current after version change")
+	}
 
 	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, oldSnapshot, oldDiagnostics)
 	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
@@ -519,13 +576,13 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 	}
 	oldDiagnostics := diagnosticsForSnapshot(oldSnapshot)
 
-	// Model the fenced state transition used by reconnectionDB. The new
+	// Model the fenced state transition used by the coordinator. The new
 	// attachment is non-InterBase, so republishing must clear its old findings.
 	tx.server.diagnosticsPublishMu.Lock()
 	tx.server.stateMu.Lock()
 	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverMySQL}
 	tx.server.connGeneration++
-	tx.server.diagnosticsCacheGeneration = -1
+	tx.server.metadata.Reset(uint64(tx.server.connGeneration))
 	tx.server.stateMu.Unlock()
 	tx.server.diagnosticsPublishMu.Unlock()
 	tx.server.republishOpenDiagnostics(tx.ctx)
@@ -533,6 +590,9 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 0
 	})
 	assertVersion(t, cleared, 1)
+	if tx.server.diagnosticsSnapshotCurrent(oldSnapshot) {
+		t.Fatal("old diagnostics snapshot remained current after connection transition")
+	}
 
 	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, oldSnapshot, oldDiagnostics)
 	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {

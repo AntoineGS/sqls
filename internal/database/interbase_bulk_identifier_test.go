@@ -99,6 +99,22 @@ func TestInterBaseBulkQueriesCastEveryIdentifierColumnToVarchar(t *testing.T) {
 	}
 }
 
+func TestInterBaseBulkQueryBuildersUseRequestedIdentifierWidth(t *testing.T) {
+	for _, query := range []string{
+		interBaseBulkRelationsQueryForWidth(127),
+		interBaseBulkColumnsQueryForWidth(127),
+		interBaseBulkPrimaryKeyFieldsQueryForWidth(127),
+		interBaseBulkForeignKeyFieldsQueryForWidth(127),
+	} {
+		if !strings.Contains(query, "VARCHAR(127)") {
+			t.Fatalf("query did not use requested width:\n%s", query)
+		}
+		if strings.Contains(query, "VARCHAR(67)") {
+			t.Fatalf("query retained legacy width:\n%s", query)
+		}
+	}
+}
+
 // TestInterBaseBulkQueriesKeepJoinsAndOrderOnRawColumns pins the requirement
 // that only the SELECT list is rewritten: JOIN and ORDER BY must still
 // compare/sort the original catalog CHAR columns, not the CAST projection, so

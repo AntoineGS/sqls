@@ -1,5 +1,14 @@
 # InterBase integration — execution order
 
+## Current performance/readiness planning package
+
+See [the 2026-09-23 handoff index](2026-09-23-metadata-performance-handoff.md)
+for the new four-plan, 21-task package covering progressive startup, isolated
+metadata jobs, InterBase bulk loading, and performance verification. Its design
+and dependency order supersede the older startup/cache assumptions where noted.
+
+## Earlier integration plans
+
 Nine implementation plans across two repositories deepen the InterBase
 integration in sqls. Each plan is self-contained and states its own
 dependencies; this file records the order they have to run in and the rules for

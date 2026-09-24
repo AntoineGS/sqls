@@ -182,7 +182,7 @@ func (b *parameterBackend) enterGate(ctx context.Context, sql string) error {
 }
 
 // setProcedures makes the fixture repository a database.CatalogRepository, so
-// the worker's catalog pass builds DBCache.Catalog from it and procedure
+// the metadata catalog jobs build DBCache.Catalog from it and procedure
 // routing has descriptors to consult. Call it before the connection is
 // established — before tx.addWorkspaceConfig — because the factory runs at
 // that point and a method set cannot be changed afterwards.
@@ -310,6 +310,9 @@ func (r *parameterFixtureBase) Exec(ctx context.Context, query string) (sql.Resu
 
 func (r *parameterFixtureBase) ExplainPlan(ctx context.Context, query string) (string, error) {
 	r.backend.recordExplain(query)
+	if err := r.backend.enterGate(ctx, query); err != nil {
+		return "", err
+	}
 	return "PLAN (T NATURAL)", nil
 }
 

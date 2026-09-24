@@ -375,8 +375,10 @@ func (db *InterBaseDBRepository) DescribeViews(ctx context.Context) ([]*ViewDesc
 		return nil, err
 	}
 
-	// A view has no primary key, so no constraint read is needed: passing an
-	// empty index keeps the column rendering identical to a table's.
+	return db.viewDescriptions(views), nil
+}
+
+func (db *InterBaseDBRepository) viewDescriptions(views []schema.Relation) []*ViewDesc {
 	noPrimaryKeys := map[string]struct{}{}
 	result := make([]*ViewDesc, 0, len(views))
 	for _, view := range views {
@@ -384,16 +386,9 @@ func (db *InterBaseDBRepository) DescribeViews(ctx context.Context) ([]*ViewDesc
 		for _, column := range view.Columns {
 			columns = append(columns, db.columnDescription(view.Name, column, noPrimaryKeys))
 		}
-		result = append(result, &ViewDesc{
-			Schema:      "",
-			Name:        view.Name,
-			OwnerName:   view.OwnerName,
-			ViewSource:  view.ViewSource,
-			Description: view.Description,
-			Columns:     columns,
-		})
+		result = append(result, &ViewDesc{Schema: "", Name: view.Name, OwnerName: view.OwnerName, ViewSource: view.ViewSource, Description: view.Description, Columns: columns})
 	}
-	return result, nil
+	return result
 }
 
 func (db *InterBaseDBRepository) DescribeGenerators(ctx context.Context) ([]*GeneratorDesc, error) {
@@ -450,6 +445,10 @@ func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexD
 	if err != nil {
 		return nil, err
 	}
+	return db.indexDescriptions(indexes), nil
+}
+
+func (db *InterBaseDBRepository) indexDescriptions(indexes []schema.Index) []*IndexDesc {
 	result := make([]*IndexDesc, 0, len(indexes))
 	for _, index := range indexes {
 		columns := make([]string, 0, len(index.Segments))
@@ -468,7 +467,7 @@ func (db *InterBaseDBRepository) DescribeIndexes(ctx context.Context) ([]*IndexD
 			Description:    index.Description,
 		})
 	}
-	return result, nil
+	return result
 }
 
 var _ CatalogRepository = (*InterBaseDBRepository)(nil)
@@ -482,6 +481,10 @@ func (db *InterBaseDBRepository) DescribeProcedures(ctx context.Context) ([]*Pro
 	if err != nil {
 		return nil, err
 	}
+	return db.procedureDescriptions(procedures), nil
+}
+
+func (db *InterBaseDBRepository) procedureDescriptions(procedures []schema.Procedure) []*ProcedureDesc {
 	result := make([]*ProcedureDesc, 0, len(procedures))
 	for _, procedure := range procedures {
 		result = append(result, &ProcedureDesc{
@@ -494,7 +497,7 @@ func (db *InterBaseDBRepository) DescribeProcedures(ctx context.Context) ([]*Pro
 			OutputParameters: db.parameterDescriptions(procedure.OutputParameters, ParameterOutput),
 		})
 	}
-	return result, nil
+	return result
 }
 
 // parameterDescriptions maps one direction's parameters, already ordered by
@@ -609,6 +612,10 @@ func (db *InterBaseDBRepository) DescribeFunctions(ctx context.Context) ([]*Func
 	if err != nil {
 		return nil, err
 	}
+	return functionDescriptions(functions)
+}
+
+func functionDescriptions(functions []schema.Function) ([]*FunctionDesc, error) {
 	result := make([]*FunctionDesc, 0, len(functions))
 	for _, function := range functions {
 		arguments := make([]*FunctionArgumentDesc, 0, len(function.Arguments))
@@ -654,8 +661,8 @@ var _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil)
 // size, instead of a query per relation and several per constraint.
 //
 // The returned repository is new. The receiver is never mutated, because
-// ReCache runs on a handler goroutine while the worker's secondary pass runs
-// on its own; a shared mutable snapshot field would race.
+// independently scheduled metadata jobs may use separate snapshots
+// concurrently; a shared mutable snapshot field would race.
 func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBRepository, func() error, error) {
 	if db == nil || db.Conn == nil {
 		return nil, nil, errors.New("interbase: database connection is nil")

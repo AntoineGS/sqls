@@ -98,6 +98,9 @@ func resolveInterBaseHoverTarget(text string, params lsp.HoverParams, dbCache *d
 		return hoverTarget{kind: database.ObjectKindFunction, name: desc.Name}, identRange, true
 	}
 	if cols, ok := dbCache.ColumnDescs(name); ok {
+		if !dbCache.MetadataReady(database.MetadataViews) {
+			return hoverTarget{}, lsp.Range{}, false
+		}
 		canonical := name
 		if len(cols) > 0 {
 			canonical = cols[0].Table
@@ -186,8 +189,8 @@ func renderObjectDDL(ctx context.Context, repo database.DDLRepository, kind data
 // capability-bearing repository: interbase_common.go's init already claims the
 // InterBase driver name in database.driverFactories and RegisterFactory panics
 // on a duplicate.
-func (s *Server) interBaseHover(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.HoverParams, text string, base *lsp.Hover) *lsp.Hover {
-	target, identRange, ok := resolveInterBaseHoverTarget(text, params, dbCache, s.parserDriver())
+func (s *Server) interBaseHover(ctx context.Context, repo database.DBRepository, dbCache *database.DBCache, params lsp.HoverParams, text string, base *lsp.Hover, generation int, dv dialect.DriverVariant) *lsp.Hover {
+	target, identRange, ok := resolveInterBaseHoverTarget(text, params, dbCache, dv.Driver)
 	if !ok {
 		return nil
 	}
@@ -203,7 +206,7 @@ func (s *Server) interBaseHover(ctx context.Context, repo database.DBRepository,
 		identRange = base.Range
 	}
 
-	value += s.objectDDLMarkdown(ctx, repo, target)
+	value += s.objectDDLMarkdown(ctx, repo, target, generation)
 
 	return &lsp.Hover{
 		Contents: lsp.MarkupContent{Kind: lsp.Markdown, Value: value},
@@ -215,7 +218,7 @@ func (s *Server) interBaseHover(ctx context.Context, repo database.DBRepository,
 // none to show. ObjectKindFunction is never attempted: the contract states it
 // always returns ErrUnsupportedDDL, so calling it would guarantee a wasted
 // round trip and a note line on every hover of an external function.
-func (s *Server) objectDDLMarkdown(ctx context.Context, repo database.DBRepository, target hoverTarget) string {
+func (s *Server) objectDDLMarkdown(ctx context.Context, repo database.DBRepository, target hoverTarget, generation int) string {
 	if target.kind == database.ObjectKindFunction || repo == nil {
 		return ""
 	}
@@ -223,7 +226,7 @@ func (s *Server) objectDDLMarkdown(ctx context.Context, repo database.DBReposito
 	if !ok {
 		return ""
 	}
-	rendered := s.memoisedObjectDDL(ctx, ddlRepo, target)
+	rendered := s.memoisedObjectDDL(ctx, ddlRepo, target, generation)
 	return rendered
 }
 
@@ -250,11 +253,10 @@ func (s *Server) connectionGeneration() int {
 // ObjectDDL is bounded at three seconds. Two hovers on the same cold object
 // can therefore both make the call; that duplicate is much cheaper than
 // freezing every other request for the duration.
-func (s *Server) memoisedObjectDDL(ctx context.Context, repo database.DDLRepository, target hoverTarget) string {
-	key := ddlKey{kind: target.kind, name: target.name}
+func (s *Server) memoisedObjectDDL(ctx context.Context, repo database.DDLRepository, target hoverTarget, generation int) string {
+	key := ddlKey{generation: generation, kind: target.kind, name: target.name}
 
 	s.stateMu.RLock()
-	key.generation = s.connGeneration
 	rendered, hit := s.ddlMemo[key]
 	s.stateMu.RUnlock()
 	if hit {

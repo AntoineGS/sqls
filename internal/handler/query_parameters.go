@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -28,9 +29,11 @@ const parameterProtocolVersion = 1
 // the selected SQL text, its identity for stale-submission detection, and the
 // driver variant to compile it under.
 type parameterSelection struct {
-	Text    string
-	Context lsp.QueryParameterContext
-	Variant dialect.DriverVariant
+	Text       string
+	Context    lsp.QueryParameterContext
+	Variant    dialect.DriverVariant
+	Cache      *database.DBCache
+	Repository database.DBRepository
 }
 
 // parameterSelection resolves the requested document/range and the active
@@ -52,16 +55,15 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		return parameterSelection{}, fmt.Errorf("specify the file uri as a string")
 	}
 
-	s.stateMu.RLock()
-	f, ok := s.files[uri]
-	if !ok {
-		s.stateMu.RUnlock()
-		return parameterSelection{}, fmt.Errorf("document not found, %q", uri)
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		return parameterSelection{}, err
 	}
-	text := f.Text
+	text := snapshot.Text
+	variant := snapshot.Variant
+	s.stateMu.RLock()
 	dbConn := s.dbConn
-	cfg := s.curDBCfg
-	generation := s.connGeneration
+	cfg := cloneConnectionConfig(s.curDBCfg)
 	s.stateMu.RUnlock()
 
 	if params.Range != nil {
@@ -81,7 +83,6 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		)
 	}
 
-	variant := dbConn.DriverVariant()
 	sqlDialect := variant.Variant.InterBaseSQLDialect()
 
 	queryKey, err := hashJSON([]interface{}{sqlDialect, selected})
@@ -97,11 +98,13 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		Text: selected,
 		Context: lsp.QueryParameterContext{
 			Version:              parameterProtocolVersion,
-			ConnectionGeneration: generation,
+			ConnectionGeneration: snapshot.Generation,
 			QueryKey:             queryKey,
 			DocumentKey:          documentKey,
 		},
-		Variant: variant,
+		Variant:    variant,
+		Cache:      snapshot.Cache,
+		Repository: snapshot.Repository,
 	}
 
 	if variant.Driver == dialect.DatabaseDriverInterBase {
@@ -157,21 +160,34 @@ func validateSelectionRange(text string, r lsp.Range) error {
 }
 
 // getQueryParameters discovers the named parameters in the requested
-// document/range. An unsupported connection (including no connection at all)
-// simply reports supported=false so the client can fall back to the legacy
-// execution flow. An available InterBase input describer may enrich named
-// parameters with safe value-type suggestions; preparation failures preserve
-// the discovered names and leave affected suggestions empty.
+// document/range. With no configured connection, it reports supported=false so
+// the client can fall back to the legacy execution flow. During an attachment
+// transition it instead returns the transient readiness error. An available
+// InterBase input describer may enrich named parameters with safe value-type
+// suggestions; preparation failures preserve the discovered names and leave
+// affected suggestions empty.
 func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteCommandParams) (interface{}, error) {
-	s.connMu.RLock()
-	defer s.connMu.RUnlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	repo, unlock, err := s.acquireReadyConnection()
+	if err != nil {
+		if errors.Is(err, errConnectionChanging) {
+			return nil, err
+		}
+		if errors.Is(err, errNoReadyConnection) {
+			return lsp.QueryParameterDiscovery{QueryParameterContext: lsp.QueryParameterContext{Version: parameterProtocolVersion}}, nil
+		}
+		return nil, err
+	}
+	defer unlock()
 
 	sel, err := s.parameterSelection(params)
 	if err != nil {
 		return nil, err
+	}
+	if sel.Repository != nil {
+		repo = sel.Repository
 	}
 
 	discovery := lsp.QueryParameterDiscovery{
@@ -194,23 +210,20 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		repo, repoErr := s.newDBRepository(ctx)
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		if repoErr == nil {
-			if describer, ok := repo.(database.InputDescriber); ok {
-				inferred, inferErr := inferParameterTypes(
-					ctx,
-					batch,
-					describer.DescribeInputs,
-					sel.Variant.Variant.InterBaseSQLDialect(),
-				)
-				if inferErr != nil {
-					return nil, inferErr
-				}
-				discovery.Parameters = inferred
+		if describer, ok := repo.(database.InputDescriber); ok {
+			inferred, inferErr := inferParameterTypes(
+				ctx,
+				batch,
+				describer.DescribeInputs,
+				sel.Variant.Variant.InterBaseSQLDialect(),
+			)
+			if inferErr != nil {
+				return nil, inferErr
 			}
+			discovery.Parameters = inferred
 		}
 	}
 	return discovery, nil
@@ -219,12 +232,13 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 // boundStatement is one preflighted statement of a parameterized batch: the
 // exact SQL that will be sent, its ordered arguments, and the route resolved
 // once, before anything ran. The routing decision travels with the statement
-// so execution never asks a possibly-replaced worker cache a second time and
+// so execution never asks a possibly-replaced metadata cache a second time and
 // gets a different answer for a statement already under way.
 type boundStatement struct {
 	sql     string
 	args    []any
 	routing procedureRouting
+	repo    database.DBRepository
 }
 
 // executeBoundStatements runs a submitted parameter batch. The caller holds
@@ -237,7 +251,7 @@ func (s *Server) executeBoundStatements(ctx context.Context, params lsp.ExecuteC
 		return nil, err
 	}
 	rendered, err := renderStatements(ctx, len(plan), func(i int) (string, error) {
-		return s.runRoutedStatement(ctx, plan[i].sql, vertical, plan[i].routing, plan[i].args...)
+		return s.runRoutedStatementWithRepository(ctx, plan[i].sql, vertical, plan[i].routing, plan[i].repo, plan[i].args...)
 	})
 	if err != nil {
 		return nil, err
@@ -277,16 +291,17 @@ func (s *Server) preflightBoundBatch(ctx context.Context, params lsp.ExecuteComm
 		return nil, err
 	}
 
-	repo, err := s.newDBRepository(ctx)
-	if err != nil {
-		return nil, err
+	repo := sel.Repository
+	if repo == nil {
+		return nil, ErrNoConnection
 	}
 	plan := make([]boundStatement, 0, len(batch.Statements))
 	for i, stmt := range batch.Statements {
 		bound := boundStatement{
 			sql:     stmt.SQL,
 			args:    args[i],
-			routing: s.statementRouting(stmt.SQL),
+			routing: statementRoutingWithSnapshot(stmt.SQL, sel.Variant, sel.Cache),
+			repo:    repo,
 		}
 		if err := boundRouteSupported(repo, bound); err != nil {
 			return nil, err
@@ -355,7 +370,10 @@ func boundRouteSupported(repo database.DBRepository, stmt boundStatement) error 
 // bare "?" — keeps the unparameterized path it has always taken, with the
 // driver as the authority on it.
 func (s *Server) refuseLegacyNamedParameters(text string) error {
-	variant := s.parserDriverVariant()
+	return s.refuseLegacyNamedParametersWithVariant(text, s.parserDriverVariant())
+}
+
+func (s *Server) refuseLegacyNamedParametersWithVariant(text string, variant dialect.DriverVariant) error {
 	if variant.Driver != dialect.DatabaseDriverInterBase {
 		return nil
 	}
