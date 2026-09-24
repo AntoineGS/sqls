@@ -12,8 +12,6 @@ import (
 // is safe and only the first call has effect.
 type Lease struct {
 	registry *Registry
-	entry    *registryEntry
-	scopeKey scopeKey
 	track    *track
 	key      Key
 
@@ -111,6 +109,6 @@ func (l *Lease) Subscribe() *Subscription {
 // (Key, Scope) cancels and closes the underlying provider.
 func (l *Lease) Release() {
 	l.releaseOnce.Do(func() {
-		l.registry.releaseTrackRef(l.entry, l.scopeKey, l.track)
+		l.registry.releaseTrackRef(l.track)
 	})
 }
