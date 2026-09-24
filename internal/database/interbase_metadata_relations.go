@@ -122,6 +122,16 @@ func (db *InterBaseDBRepository) readMetadataColumns(ctx context.Context, q sche
 // shared upper-cased ColumnDescs/ColumnDatabase: two exact-identity
 // relations that fold to the same case must not merge into one view's
 // column list, the same requirement a table detail read has.
+//
+// Key is always forced to "NO" (see interBaseViewColumnForDescription),
+// matching the old standalone viewDescriptions path exactly: InterBase
+// views are never primary-key-bearing in this cache's model, and
+// ColumnsByID's cached descriptors carry whatever Key state the columns
+// and primary-keys bulk categories happen to have merged by the moment
+// this job was admitted -- "" before MetadataPrimaryKeys merges, "NO"
+// after. That is a race between two independently scheduled bulk jobs,
+// not real per-view data, so it must never leak into a published view
+// column's Key.
 func (db *InterBaseDBRepository) readMetadataViewsFromColumns(ctx context.Context, q schema.Queryer, width int, cache *DBCache) (MetadataPatch, error) {
 	names := make([]string, 0)
 	byName := make(map[string]*ViewDesc)
@@ -144,7 +154,7 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME"
 			return fmt.Errorf("duplicate view header %q", name)
 		}
 		columns, _ := cache.ColumnDescsByID(name)
-		byName[name] = &ViewDesc{Schema: "", Name: name, OwnerName: trimInterBaseCatalogName(owner), ViewSource: viewSource, Description: description, Columns: columns}
+		byName[name] = &ViewDesc{Schema: "", Name: name, OwnerName: trimInterBaseCatalogName(owner), ViewSource: viewSource, Description: description, Columns: interBaseViewColumnsWithoutKey(columns)}
 		names = append(names, name)
 		return nil
 	})
@@ -159,6 +169,26 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME"
 		byID[interBaseByIDKey(ObjectKindView, view.Name)] = view
 	}
 	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: byDescription, ViewsByID: byID}}, Count: len(names)}, nil
+}
+
+// interBaseViewColumnsWithoutKey returns copies of columns with Key forced
+// to "NO", matching the old standalone viewDescriptions path's constant
+// (built with an always-empty primary-key set). columns comes from the
+// shared ColumnsByID cache, whose descriptors' Key field reflects whichever
+// bulk categories (columns, primary keys) had merged by the moment the
+// views job was admitted -- a race outcome, not real per-view data -- so
+// the cached value must never be forwarded as-is.
+func interBaseViewColumnsWithoutKey(columns []*ColumnDesc) []*ColumnDesc {
+	// A non-nil empty slice, matching the old standalone viewDescriptions
+	// path (make([]*ColumnDesc, 0, len(view.Columns))): a view with zero
+	// columns must compare equal to that legacy shape, not diverge to nil.
+	result := make([]*ColumnDesc, 0, len(columns))
+	for _, column := range columns {
+		copy := *column
+		copy.Key = "NO"
+		result = append(result, &copy)
+	}
+	return result
 }
 
 func (db *InterBaseDBRepository) readMetadataPrimaryKeys(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {

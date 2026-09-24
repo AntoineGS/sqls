@@ -5,8 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/metadata"
@@ -121,53 +122,29 @@ func TestInterBaseMetadataProviderDetailReusesBulkFacts(t *testing.T) {
 // TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad is Review Focus
 // #3's actual scenario, which TestInterBaseMetadataProviderDetailReusesBulkFacts
 // deliberately does not exercise: a detail request arriving WHILE its
-// required bulk category may still be loading must join/share that
-// in-flight load, not just avoid re-querying after everything has already
-// settled. It compares the total query count of a baseline run (full
-// settlement first, no racing) against a run that fires every request
-// concurrently immediately after Acquire, before ever waiting for
-// readiness. If joining an in-flight bulk category were broken (a bypassed
-// dependency wait, a duplicate job launch, a race in the new Views/Columns
-// DependsOn wiring), the racing run's total would diverge from the
-// deterministic baseline.
+// required bulk category is still loading must join/share that in-flight
+// load, not trigger a second, independent read of the same data. Unlike a
+// pure timing race (which could pass for the wrong reason if the bulk job
+// happens to finish before the detail goroutine starts), this test uses the
+// fixture's gate/entered mechanism to PROVE the columns query has genuinely
+// started -- and is still blocked -- before the detail request is issued,
+// then asserts zero additional prepares happen while it stays blocked.
 func TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad(t *testing.T) {
-	newFixtureRepo := func(t *testing.T) *InterBaseDBRepository {
-		t.Helper()
-		db := openInterBaseSchemaFixture(t)
-		insertInterBaseDetailRegressionFixtures(t, db)
-		return &InterBaseDBRepository{Conn: db, SQLDialect: 3}
-	}
+	const columnsQueryMatch = "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\nORDER BY rf.RDB$RELATION_NAME"
 
-	requests := []metadata.Request{
-		{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "CUSTOMER"}, Facet: "columns", Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindProcedure, Name: "ADD_CUSTOMER"}, Facet: "source", Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindDomain, Name: "EMAIL_ADDRESS"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindTrigger, Name: "CUSTOMER_BI"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindIndex, Name: "IDX_CUSTOMER_PK"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindGenerator, Name: "GEN_CUSTOMER_ID"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
-		{Object: catalog.ObjectID{Kind: ObjectKindView, Name: "CUSTOMER_VIEW"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
-	}
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var columnsMatches atomic.Int64
+	fault := &interBaseFixtureFault{match: columnsQueryMatch, stage: "gate", gate: release, entered: entered, matches: &columnsMatches}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	insertInterBaseDetailRegressionFixtures(t, db)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
 
-	// Baseline: settle the whole plan first, with no detail request racing
-	// it, then serve every one of the same requests; this is the
-	// deterministic per-fixture total the racing run below must match.
-	baselineCounter := interBaseFixtureCountPrepares(t)
-	_, baselineLease := acquireInterBaseTestLease(t, newFixtureRepo(t))
-	for _, req := range requests {
-		if _, err := baselineLease.Detail(context.Background(), req); err != nil {
-			t.Fatalf("baseline Detail(%s) error = %v", req.Facet, err)
-		}
-	}
-	baselineQueries := baselineCounter()
-
-	// Concurrent: acquire WITHOUT waiting for readiness, then fire every
-	// request concurrently -- racing the still-scheduling/still-running
-	// bulk plan -- before ever settling, then finish settling and compare.
-	concurrentCounter := interBaseFixtureCountPrepares(t)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 	registry := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3, MaxDetailBytes: 64 << 20})
-	t.Cleanup(func() { _ = registry.Close(ctx) })
-	provider := &interBaseTestProvider{db: newFixtureRepo(t)}
+	t.Cleanup(func() { _ = registry.Close(context.Background()) })
+	provider := &interBaseTestProvider{db: repo}
 	factory := func(context.Context) (metadata.Provider, error) { return provider, nil }
 	lease, err := registry.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "test://" + t.Name()}, metadata.Scope{Principal: "TESTER"}, factory)
 	if err != nil {
@@ -175,27 +152,71 @@ func TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad(t *testing.T) {
 	}
 	t.Cleanup(lease.Release)
 
-	var wg sync.WaitGroup
-	errs := make([]error, len(requests))
-	for i, req := range requests {
-		wg.Add(1)
-		go func(i int, req metadata.Request) {
-			defer wg.Done()
-			_, errs[i] = lease.Detail(ctx, req)
-		}(i, req)
+	// Block until the bulk columns query has genuinely started (and is now
+	// parked on the gate) before issuing any detail request.
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		close(release)
+		t.Fatalf("bulk columns query did not gate: %v", ctx.Err())
 	}
-	wg.Wait()
-	for i, err := range errs {
-		if err != nil {
-			t.Fatalf("racing Detail(%s) error = %v", requests[i].Facet, err)
-		}
+
+	// Confirm the gated query genuinely ran exactly once so far (the bulk
+	// columns job's own attempt), before the detail request enters.
+	if got := columnsMatches.Load(); got != 1 {
+		close(release)
+		t.Fatalf("columns query match count before Detail() = %d, want 1 (the bulk job's own attempt)", got)
+	}
+
+	// Fire the detail request while the columns bulk query is still
+	// blocked mid-flight. It Requires Relations+ColumnsCurrent, so it must
+	// join the same in-flight columns load rather than starting a second,
+	// independent one.
+	req := metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "CUSTOMER"}, Facet: "columns", Consistency: metadata.Committed}
+	detailDone := make(chan struct{})
+	var detail metadata.Detail
+	var detailErr error
+	go func() {
+		defer close(detailDone)
+		detail, detailErr = lease.Detail(ctx, req)
+	}()
+
+	// While the gate stays closed, the detail request must be waiting on
+	// the SAME in-flight bulk category, not have triggered a second,
+	// independent columns query: the match count must stay at 1.
+	select {
+	case <-detailDone:
+		close(release)
+		t.Fatalf("Detail() returned before the gated bulk columns query was released: err=%v", detailErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := columnsMatches.Load(); got != 1 {
+		close(release)
+		t.Fatalf("columns query match count while gated = %d, want 1 (Detail must join the in-flight load, not start a second query)", got)
+	}
+
+	close(release)
+
+	select {
+	case <-detailDone:
+	case <-ctx.Done():
+		t.Fatalf("Detail() did not complete after releasing the gate: %v", ctx.Err())
+	}
+	if detailErr != nil {
+		t.Fatalf("Detail() error = %v", detailErr)
+	}
+	if len(detail.Columns) == 0 {
+		t.Fatal("Detail() returned no columns for CUSTOMER")
 	}
 
 	if err := metadatatest.WaitReady(ctx, lease); err != nil {
 		t.Fatalf("WaitReady() error = %v", err)
 	}
-	if got := concurrentCounter(); got != baselineQueries {
-		t.Fatalf("total queries racing detail requests against the in-flight bulk load = %d, want %d (same as the fully-settled baseline; joining an in-flight bulk category must not cause an extra query)", got, baselineQueries)
+	// Exactly one columns query ran in total: the gated bulk job's own
+	// attempt. The detail request never triggered a second one, whether
+	// it arrived before or after the gate opened.
+	if got := columnsMatches.Load(); got != 1 {
+		t.Fatalf("columns query match count after settlement = %d, want 1 (exactly the bulk job's own read)", got)
 	}
 }
 
@@ -376,11 +397,24 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		}
 	})
 
-	t.Run("CP1252 source text retained verbatim", func(t *testing.T) {
+	// This asserts byte-for-byte STORAGE/RETRIEVAL preservation only: the
+	// SQLite-backed fixture stores and returns the Go string's bytes
+	// unchanged, so it never passes through the driver's real NONE-charset/
+	// CP1252 decoding (that decode only exists in the cgo native driver,
+	// exercised over a live attachment). Real CP1252 decoding coverage
+	// (raw catalog bytes -> correctly decoded UTF-8, e.g. the "CRÉATION"
+	// assertion) lives in
+	// internal/handler/interbase_catalog_text_live_test.go's
+	// TestInterBaseLiveLegacyCatalogSingleton, which is build-tagged
+	// interbase && cgo && linux && amd64 and requires
+	// SQLS_LEGACY_CATALOG_CONFIG/CHARSET/DOCUMENT to run against a real
+	// database; it is a live-only test with no in-process mock equivalent
+	// possible for the native decode step itself.
+	t.Run("non-ASCII source bytes preserved verbatim through the retained-fact path (storage/retrieval only, not real CP1252 decoding)", func(t *testing.T) {
 		procedure := catalog.ObjectID{Kind: ObjectKindProcedure, Name: "CP1252_SOURCE_PROC"}
 		got, err := lease.Detail(ctx, metadata.Request{Object: procedure, Facet: "source", Consistency: metadata.Committed})
 		if err != nil {
-			t.Fatalf("Detail(CP1252 procedure source) error = %v", err)
+			t.Fatalf("Detail(CP1252-range-byte procedure source) error = %v", err)
 		}
 		want := "BEGIN\n  --\xe9\xe8\xe0 M\xfcller caf\xe9\n  SELECT 1 FROM RDB$DATABASE;\nEND"
 		if got.Text != want {
@@ -557,7 +591,12 @@ func insertInterBaseDetailRegressionFixtures(t *testing.T, db *sql.DB) {
 	// but this driver's bulk queries cast through
 	// interBaseBulkIdentifierCastWidth (67 bytes), so a name in the 32-67
 	// range must round-trip through the exact-identity path exactly, not
-	// get silently truncated or misresolved.
+	// get silently truncated or misresolved. This fixture is SQLite-backed
+	// and never truncates a stored TEXT value, so this only proves the
+	// metadata pipeline carries a long identifier through end to end; it
+	// does not exercise the real driver's own identifier-length cast
+	// workaround (interBaseBulkIdentifierCastWidth's CAST(... AS
+	// VARCHAR(67)) projection), which only runs against a live database.
 	longName := "LONG_IDENTIFIER_EXCEEDING_31_BYTES_OK"
 	if len(longName) <= 31 {
 		t.Fatalf("fixture bug: longName %q is only %d bytes, want >31", longName, len(longName))
@@ -566,10 +605,13 @@ func insertInterBaseDetailRegressionFixtures(t *testing.T, db *sql.DB) {
 		longName, 70002, 0, 0, nil, "BEGIN\n  SELECT 1 FROM RDB$DATABASE;\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
 		t.Fatal(err)
 	}
-	// CP1252/non-ASCII source text: the NONE-charset/CP1252 decoding path
-	// this whole effort cares about must preserve non-ASCII bytes in
-	// retained source verbatim, never mangling them on the retained-fact
-	// path this task builds.
+	// Non-ASCII (CP1252-range) source bytes: this only exercises the
+	// STORAGE/RETRIEVAL path (this SQLite-backed fixture stores and
+	// returns the Go string's bytes unchanged) -- it never passes through
+	// the real driver's NONE-charset/CP1252 decoding, which only exists in
+	// the cgo native driver over a live attachment. See the "non-ASCII
+	// source bytes preserved verbatim" subtest below for the full
+	// disclosure and pointer to the live decoding coverage.
 	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURES" VALUES (?,?,?,?,?,?,?,?,?)`,
 		"CP1252_SOURCE_PROC", 70003, 0, 0, nil, "BEGIN\n  --\xe9\xe8\xe0 M\xfcller caf\xe9\n  SELECT 1 FROM RDB$DATABASE;\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
 		t.Fatal(err)

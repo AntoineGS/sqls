@@ -30,6 +30,13 @@ type interBaseFixtureFault struct {
 	err     error
 	gate    <-chan struct{}
 	entered chan<- struct{}
+	// matches counts every query whose text matches match, gated or not.
+	// It exists so a test can assert a specific query ran exactly once
+	// (e.g. no duplicate/racing read of the same bulk category) without
+	// the assertion being confused by other, unrelated concurrent bulk
+	// jobs' own prepares. Nil is safe; only tests that need this counter
+	// set it.
+	matches *atomic.Int64
 }
 
 var interBaseFixtureFaults sync.Map // map[DSN]*interBaseFixtureFault
@@ -119,6 +126,9 @@ func (s interBaseFixtureStmt) QueryContext(ctx context.Context, args []driver.Na
 func (s interBaseFixtureStmt) queryRows(query func() (driver.Rows, error)) (driver.Rows, error) {
 	f := s.fault
 	if f != nil && strings.Contains(s.query, f.match) {
+		if f.matches != nil {
+			f.matches.Add(1)
+		}
 		if f.entered != nil {
 			select {
 			case f.entered <- struct{}{}:
@@ -194,13 +204,31 @@ var interBaseFixtureSequence atomic.Int64
 // read-only transaction and a second pooled connection can be open at once.
 func openInterBaseSchemaFixture(t *testing.T) *sql.DB {
 	t.Helper()
+	return openInterBaseSchemaFixtureWithFault(t, nil)
+}
+
+// openInterBaseSchemaFixtureWithFault is openInterBaseSchemaFixture with an
+// optional query-level fault/gate (see interBaseFixtureFault), so a test can
+// hold a specific bulk query open mid-flight against the full CUSTOMER/
+// ADD_CUSTOMER schema this fixture builds, not just the scalable T001-style
+// fixture openInterBaseScalableFixtureWithFault produces.
+func openInterBaseSchemaFixtureWithFault(t *testing.T, fault *interBaseFixtureFault) *sql.DB {
+	t.Helper()
 
 	name := fmt.Sprintf("file:interbase_catalog_%d?mode=memory&cache=shared", interBaseFixtureSequence.Add(1))
+	if fault != nil {
+		interBaseFixtureFaults.Store(name, fault)
+	}
 	db, err := sql.Open("sqlite3_interbase_catalog", name)
 	if err != nil {
 		t.Fatalf("sql.Open(sqlite3_interbase_catalog) error = %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
+	t.Cleanup(func() {
+		_ = db.Close()
+		if fault != nil {
+			interBaseFixtureFaults.Delete(name)
+		}
+	})
 	db.SetMaxIdleConns(4)
 
 	for _, statement := range interBaseFixtureTables {
@@ -313,8 +341,12 @@ func openInterBaseSchemaFixture(t *testing.T) *sql.DB {
 			indexName, interBaseFixed(fieldName), position, nil)
 	}
 	segment("IDX_CUSTOMER_PK", "ID", 0)
-	segment("IDX_PARENT_PK", "PARENT_B", 0)
+	// Inserted out of position order (position 1's row first, then position
+	// 0's): a loader that trusted insertion order instead of the position
+	// column would report PARENT_A, PARENT_B instead of the correct
+	// PARENT_B, PARENT_A.
 	segment("IDX_PARENT_PK", "PARENT_A", 1)
+	segment("IDX_PARENT_PK", "PARENT_B", 0)
 	segment("IDX_CHILD_FK", "CHILD_B", 0)
 	segment("IDX_CHILD_FK", "CHILD_A", 1)
 	segment("IDX_CUSTOMER_CODE", "CODE", 0)

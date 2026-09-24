@@ -45,6 +45,63 @@ func TestInterBaseMetadataViewsMatchLegacyAndUseConstantQueries(t *testing.T) {
 	}
 }
 
+// TestInterBaseMetadataPlanViewsMatchLegacy exercises readMetadataViewsFromColumns
+// through the actual MetadataPlan() (the function production wires up for
+// MetadataViews since the views-reuse-columns fix), not the standalone
+// readMetadataViews function TestInterBaseMetadataViewsMatchLegacyAndUseConstantQueries
+// above still covers. It runs the real loader end to end and compares the
+// published views against DescribeViews, the same legacy oracle, so the
+// function actually used in production has its own equivalence coverage.
+func TestInterBaseMetadataPlanViewsMatchLegacy(t *testing.T) {
+	for _, size := range []int{1, 100} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			db := openInterBaseScalableFixture(t, size)
+			insertMetadataViewFixtures(t, db, size)
+			repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+			ctx := context.Background()
+			want, err := repo.DescribeViews(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, view := range want {
+				for _, column := range view.Columns {
+					// readMetadataViewsFromColumns always forces "NO" (see
+					// interBaseViewColumnsWithoutKey); DescribeViews's
+					// standalone path already returns "NO" via an
+					// always-empty primary-key set, so this is not a
+					// behavior change, only stated for clarity.
+					column.Key = "NO"
+				}
+			}
+
+			loader := NewMetadataLoader()
+			t.Cleanup(loader.Stop)
+			loader.Reset(1)
+			load, err := loader.Start(ctx, 1, repo)
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitLoad(t, load)
+			snapshot := loader.Snapshot()
+			if snapshot.Status[MetadataViews].State != MetadataReady {
+				t.Fatalf("views state = %s, want ready", snapshot.Status[MetadataViews].State)
+			}
+			got := make([]*ViewDesc, 0, len(snapshot.Cache.Catalog.Views))
+			for _, view := range snapshot.Cache.Catalog.Views {
+				got = append(got, view)
+			}
+			sort.Slice(got, func(i, j int) bool { return got[i].Name < got[j].Name })
+			sort.Slice(want, func(i, j int) bool { return want[i].Name < want[j].Name })
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("view descriptors differ\n got: %#v\nwant: %#v", got, want)
+			}
+			if snapshot.Status[MetadataViews].Count != size {
+				t.Fatalf("Count = %d, want %d", snapshot.Status[MetadataViews].Count, size)
+			}
+		})
+	}
+}
+
 func TestInterBaseBulkViewColumnsQueryExplicitlyRestrictsToViews(t *testing.T) {
 	query := interBaseBulkViewColumnsQueryForWidth(127)
 	if !strings.Contains(query, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\n  AND r.RDB$VIEW_BLR IS NOT NULL") {

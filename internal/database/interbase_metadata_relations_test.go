@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"interbase-go/schema"
 )
@@ -228,6 +229,132 @@ func TestInterBaseMetadataColumnsDoNotRequireRelationsAndPKCanMergeEitherOrder(t
 				t.Errorf("pkFirst=%v column %s Key=%q, want %q", pkFirst, column.Name, column.Key, want)
 			}
 		}
+	}
+}
+
+// TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionOrder
+// is the required regression for the view-column Key determinism bug: since
+// readMetadataViewsFromColumns (the actual MetadataPlan() Views Run function
+// since the views-reuse-columns fix) reads each view's columns from the
+// ColumnsByID cache snapshot captured at the moment the Views job is
+// admitted, and that snapshot's Key field depends on whether
+// MetadataPrimaryKeys has already merged, the published Key must not be
+// allowed to vary with that race. It forces BOTH admission orders through
+// the real Loader/MetadataPlan and the fixture's gate/entered mechanism
+// (not a direct mergeMetadata unit call) so a regression at the actual
+// scheduling/admission level, not just in the pure merge function, is
+// caught.
+func TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionOrder(t *testing.T) {
+	const columnsQueryMatch = "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0\nORDER BY rf.RDB$RELATION_NAME"
+	const primaryKeysQueryMatch = "pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'"
+
+	t.Run("primary keys merge before views admitted", func(t *testing.T) {
+		release := make(chan struct{})
+		entered := make(chan struct{}, 1)
+		fault := &interBaseFixtureFault{match: columnsQueryMatch, stage: "gate", gate: release, entered: entered}
+		db := openInterBaseScalableFixtureWithFault(t, 1, fault)
+		insertMetadataViewFixtures(t, db, 2)
+
+		loader := NewMetadataLoader()
+		t.Cleanup(loader.Stop)
+		loader.Reset(1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			close(release)
+			t.Fatalf("columns query did not gate: %v", ctx.Err())
+		}
+		// PrimaryKeys has no dependency on Columns; with Columns held open,
+		// it is free to complete and merge first.
+		waitForInterBaseMetadataStatus(t, ctx, loader, MetadataPrimaryKeys, MetadataReady)
+		close(release)
+		waitLoad(t, load)
+		assertInterBaseViewColumnsKeyIsNO(t, loader.Snapshot())
+	})
+
+	t.Run("views run before primary keys merge", func(t *testing.T) {
+		release := make(chan struct{})
+		entered := make(chan struct{}, 1)
+		fault := &interBaseFixtureFault{match: primaryKeysQueryMatch, stage: "gate", gate: release, entered: entered}
+		db := openInterBaseScalableFixtureWithFault(t, 1, fault)
+		insertMetadataViewFixtures(t, db, 2)
+
+		loader := NewMetadataLoader()
+		t.Cleanup(loader.Stop)
+		loader.Reset(1)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-entered:
+		case <-ctx.Done():
+			close(release)
+			t.Fatalf("primary keys query did not gate: %v", ctx.Err())
+		}
+		// Views depends only on ColumnsCurrent, not PrimaryKeys, so with
+		// PrimaryKeys held open, Views is free to be admitted and complete
+		// while the shared cache still has no PK-enriched Key data at all.
+		waitForInterBaseMetadataStatus(t, ctx, loader, MetadataViews, MetadataReady)
+		close(release)
+		waitLoad(t, load)
+		assertInterBaseViewColumnsKeyIsNO(t, loader.Snapshot())
+	})
+}
+
+// waitForInterBaseMetadataStatus blocks until kind reaches want in loader's
+// current snapshot, using the loader's own change callback rather than
+// polling, or until ctx is done.
+func waitForInterBaseMetadataStatus(t *testing.T, ctx context.Context, loader *MetadataLoader, kind MetadataKind, want MetadataState) {
+	t.Helper()
+	changed := make(chan struct{}, 1)
+	loader.SetChangedCallback(func() {
+		select {
+		case changed <- struct{}{}:
+		default:
+		}
+	})
+	defer loader.SetChangedCallback(nil)
+	for {
+		if loader.Snapshot().Status[kind].State == want {
+			return
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			t.Fatalf("%s did not reach %s: %v (status=%+v)", kind, want, ctx.Err(), loader.Snapshot().Status[kind])
+		}
+	}
+}
+
+// assertInterBaseViewColumnsKeyIsNO asserts every published view column's
+// Key is the deterministic constant "NO" (matching the old standalone
+// viewDescriptions path), regardless of whether MetadataPrimaryKeys had
+// already merged by the time MetadataViews was admitted.
+func assertInterBaseViewColumnsKeyIsNO(t *testing.T, snapshot *MetadataSnapshot) {
+	t.Helper()
+	if snapshot.Status[MetadataViews].State != MetadataReady {
+		t.Fatalf("views state = %s, want ready", snapshot.Status[MetadataViews].State)
+	}
+	found := false
+	for _, view := range snapshot.Cache.Catalog.Views {
+		for _, column := range view.Columns {
+			found = true
+			if column.Key != "NO" {
+				t.Errorf("view %s column %s Key = %q, want \"NO\"", view.Name, column.Name, column.Key)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("no view columns were published to check")
 	}
 }
 
