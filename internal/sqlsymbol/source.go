@@ -96,6 +96,37 @@ func lex(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 	return result, nil
 }
 
+// scriptDelimiterOffsets returns, in document order, the byte offset where
+// each SET TERM custom (non-";") statement delimiter begins. lex() consumes
+// a custom delimiter without producing any lexeme for it at all (only
+// ordinary ";" boundaries are represented as Semicolon lexemes), so
+// diagnostic statement-boundary detection cannot see those boundaries
+// without this separate, lightweight mirror of lex()'s own segment
+// splitting. It changes nothing about what lex() returns to its other
+// callers (navigation, rename).
+func scriptDelimiterOffsets(text string) []int {
+	active := ";"
+	var offsets []int
+	for offset := 0; offset < len(text); {
+		end, delimiter, err := nextDelimiter(text, offset, active)
+		if err != nil {
+			return offsets
+		}
+		segment := text[offset:end]
+		next, isDirective := setTermDelimiter(segment)
+		if isDirective {
+			active = next
+		} else if delimiter != "" && delimiter != ";" {
+			offsets = append(offsets, end)
+		}
+		if delimiter == "" {
+			break
+		}
+		offset = end + len(delimiter)
+	}
+	return offsets
+}
+
 func lexRaw(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 	tokenizer := token.NewTokenizer(strings.NewReader(text), dialect.DialectForDriverVariant(dv))
 	result := make([]lexeme, 0)

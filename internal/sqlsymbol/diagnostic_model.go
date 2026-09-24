@@ -30,11 +30,12 @@ type diagnosticModel struct {
 
 	derivedFor       map[relationSourceKey]int  // owning query + alias -> the derived table's own inner query index
 	procedureNameFor map[relationSourceKey]Name // owning query + alias -> the FROM-clause callable's procedure name
+	cteColumns       map[int][]Name             // CTE query index -> its explicit WITH-column-list names, in order
 
 	unionOf     []int   // per query index: the union-chain group it belongs to, or -1
 	unionGroups [][]int // group id -> ordered arm query indices
 
-	recognizedWith []itemRange // WITH statements successfully modeled (non-recursive, no UNION in a CTE body)
+	recognizedWith []itemRange // WITH statements successfully modeled (no nested SELECT in any CTE body or the final query)
 	malformed      []itemRange // statement regions statement recovery had to skip over
 
 	ddl []modelDDL // CREATE/ALTER/DROP object identities, in document order
@@ -88,7 +89,7 @@ type modelQuery struct {
 
 type modelDDL struct {
 	key string // Name.Key() of the object CREATE/ALTER/DROP named
-	at  int    // item index of the statement that invalidated it
+	end int    // item index one past the DDL statement's own content
 }
 
 type relationSourceKey struct {
@@ -114,7 +115,8 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 		return m
 	}
 	depths, matching := sqlDepths(items)
-	m.statements = splitStatements(items)
+	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text))
+	m.statements = splitStatements(items, boundaryAfter)
 
 	raw := discoverSQLQueries(items, a.contexts, depths)
 	for i := range raw {
@@ -148,9 +150,13 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 
 	m.buildQueryAt(len(items))
 	m.connectRelationSources(a.Text, items, depths, matching)
-	m.computeOutputs(a.Text)
-	m.detectUnionGroups(items)
+	// DDL detection must run before computeOutputs: expandStar resolves
+	// through resolveRelationOutput, which checks DDLInvalidated while
+	// computing a query's own output shape, not only when a caller later
+	// asks for it.
 	m.ddl = detectDDL(a.Text, items, m.statements)
+	m.computeOutputs(a.Text)
+	m.detectUnionGroups(items, depths)
 
 	for _, stmt := range m.statements {
 		if stmt.Malformed {
@@ -172,6 +178,15 @@ func (m *diagnosticModel) Statements() []modelStatement {
 // correlating/enclosing query outward. It includes WITH/CTE names,
 // derived-table aliases, and correlated-subquery scopes that the navigation
 // binder's a.sqlScopes does not model.
+//
+// Caveat: a derived table's own body currently also has the outer query's
+// scope appended past its innermost level, because the existing binder's
+// parent-walk cannot distinguish "derived table body" from "correlated
+// subquery" nesting. This is safe-direction-only -- it can only add an
+// extra candidate relation and so suppress a finding, never fabricate a
+// false "Present" resolution -- but the innermost level should not be
+// assumed exhaustive proof of what a derived table's body can see. A future
+// task may want to tag each scope level with its nesting kind to narrow this.
 func (m *diagnosticModel) RelationScope(i int) [][]RelationRef {
 	if i < 0 || i >= len(m.queryAt) {
 		return nil
@@ -213,7 +228,7 @@ func (m *diagnosticModel) RelationOutput(i int, ref RelationRef) ([]ColumnFact, 
 	for qi := m.queryAt[i]; qi >= 0; qi = m.queries[qi].parent {
 		for _, candidate := range m.queries[qi].relations {
 			if relationRefEqual(candidate, ref) {
-				return m.resolveRelationOutput(qi, ref)
+				return m.resolveRelationOutput(i, qi, ref)
 			}
 		}
 	}
@@ -250,12 +265,15 @@ func (m *diagnosticModel) UnionOutput(i int) (modelOutput, bool) {
 }
 
 // DDLInvalidated reports whether name was named by an earlier CREATE/ALTER/
-// DROP statement at or before item position i in this analysis, making
-// catalog-derived claims about it unsafe to trust from that point on.
+// DROP statement that has already fully ended before item position i in this
+// analysis, making catalog-derived claims about it unsafe to trust from that
+// point on. Positions within the DDL statement's own extent (its own object
+// name, column list, or body) report false: invalidation begins with the
+// next statement, not partway through the statement that causes it.
 func (m *diagnosticModel) DDLInvalidated(i int, name Name) bool {
 	key := name.Key()
 	for _, d := range m.ddl {
-		if d.key == key && d.at < i {
+		if d.key == key && i >= d.end {
 			return true
 		}
 	}
@@ -288,7 +306,13 @@ func (m *diagnosticModel) Unsupported(i int) bool {
 	return false
 }
 
-func (m *diagnosticModel) resolveRelationOutput(owner int, ref RelationRef) ([]ColumnFact, bool) {
+// resolveRelationOutput resolves ref's column list as seen from item
+// position at (used only to evaluate DDLInvalidated against that position;
+// owner identifies the query that ref belongs to). CTE and derived-table
+// outputs come from the model's own computed body shape and are unaffected
+// by catalog DDL; real-table and procedure lookups check DDLInvalidated
+// first and report unknown rather than trusting stale catalog data.
+func (m *diagnosticModel) resolveRelationOutput(at, owner int, ref RelationRef) ([]ColumnFact, bool) {
 	// A FROM-clause callable procedure and a derived table share the same
 	// RelationRef shape (empty Name, alias-only): relationAt's callable
 	// branch mirrors its LParen/derived-table branch. Check both keyed
@@ -298,6 +322,9 @@ func (m *diagnosticModel) resolveRelationOutput(owner int, ref RelationRef) ([]C
 		return m.queryOutputColumns(inner)
 	}
 	if procName, ok := m.procedureNameFor[key]; ok {
+		if m.DDLInvalidated(at, procName) {
+			return nil, false
+		}
 		if m.semantic != nil {
 			if fact, knowledge := m.semantic.ProcedureInfo(procName); knowledge == Present && fact.OutputsKnown {
 				return fact.Outputs, true
@@ -310,6 +337,9 @@ func (m *diagnosticModel) resolveRelationOutput(owner int, ref RelationRef) ([]C
 	}
 	if inner, ok := m.cteFor(owner, ref.Name.Key()); ok {
 		return m.queryOutputColumns(inner)
+	}
+	if m.DDLInvalidated(at, ref.Name) {
+		return nil, false
 	}
 	if m.semantic != nil {
 		if fact, knowledge := m.semantic.RelationInfo(ref.Name); knowledge == Present && fact.ColumnsKnown {
@@ -399,43 +429,74 @@ func statementIndexAt(statements []modelStatement, pos int) int {
 	return -1
 }
 
-// splitStatements delimits each candidate statement using
-// completeStatementEnd (the same recovery boundary width/singleton
-// diagnostics already use), falling back to the document end for a final
-// statement with no explicit terminator. A statement that never reaches a
-// balanced state is reported Malformed and recovery resumes at the next
-// top-level ";", so a later safely delimited statement is never hidden.
-func splitStatements(items []lexeme) []modelStatement {
+// boundaryAfterItems marks, for each item index, whether a SET TERM custom
+// script delimiter falls immediately after that item -- the item-index
+// equivalent of a Semicolon lexeme, for the one boundary kind lex() does not
+// represent as a lexeme at all. items and offsets must both be in ascending
+// document order (as significantLexemes and scriptDelimiterOffsets produce).
+func boundaryAfterItems(items []lexeme, offsets []int) []bool {
+	marks := make([]bool, len(items))
+	item := 0
+	for _, offset := range offsets {
+		last := -1
+		for item < len(items) && items[item].Span.Start < offset {
+			last = item
+			item++
+		}
+		if last >= 0 {
+			marks[last] = true
+		}
+	}
+	return marks
+}
+
+// splitStatements delimits each candidate statement using the same
+// depth-tracking recovery boundary completeStatementEnd uses (width/singleton
+// diagnostics reuse that function directly; this model additionally treats a
+// SET TERM boundary in boundaryAfter as an equally valid terminator, since
+// lex() does not represent that boundary as a lexeme), falling back to the
+// document end for a final statement with no explicit terminator. A
+// statement that never reaches a balanced state is reported Malformed and
+// recovery resumes at the next top-level ";" or SET TERM boundary, so a
+// later safely delimited statement is never hidden.
+func splitStatements(items []lexeme, boundaryAfter []bool) []modelStatement {
 	var statements []modelStatement
 	i := 0
 	for i < len(items) {
 		start := i
-		end, terminated, ok := statementEnd(items, start)
+		end, consumeSemicolon, ok := statementEnd(items, start, boundaryAfter)
 		if ok {
 			statements = append(statements, modelStatement{Start: start, End: end})
 			i = end
-			if terminated {
+			if consumeSemicolon {
 				i++
 			}
 			continue
 		}
-		resume := end
-		for resume < len(items) && items[resume].Token.Kind != token.Semicolon {
-			resume++
-		}
-		statements = append(statements, modelStatement{Start: start, End: resume, Malformed: true})
-		i = resume
-		if i < len(items) {
-			i++
-		}
+		contentEnd, nextStart := recoveryBoundary(items, start, boundaryAfter)
+		statements = append(statements, modelStatement{Start: start, End: contentEnd, Malformed: true})
+		i = nextStart
 	}
 	return statements
 }
 
-func statementEnd(items []lexeme, start int) (end int, terminated bool, ok bool) {
-	if e, complete := completeStatementEnd(items, start); complete {
-		return e, true, true
+// recoveryBoundary finds the next safe statement boundary at or after start,
+// whether an ordinary ";" token or a SET TERM boundary, for malformed
+// statement recovery. contentEnd excludes a terminating ";" token; nextStart
+// is where the next statement begins.
+func recoveryBoundary(items []lexeme, start int, boundaryAfter []bool) (contentEnd, nextStart int) {
+	for i := start; i < len(items); i++ {
+		if items[i].Token.Kind == token.Semicolon {
+			return i, i + 1
+		}
+		if i < len(boundaryAfter) && boundaryAfter[i] {
+			return i + 1, i + 1
+		}
 	}
+	return len(items), len(items)
+}
+
+func statementEnd(items []lexeme, start int, boundaryAfter []bool) (end int, consumeSemicolon bool, ok bool) {
 	depth := 0
 	for i := start; i < len(items); i++ {
 		switch items[i].Token.Kind {
@@ -452,6 +513,9 @@ func statementEnd(items []lexeme, start int) (end int, terminated bool, ok bool)
 			}
 			return i, true, true
 		}
+		if depth == 0 && i < len(boundaryAfter) && boundaryAfter[i] {
+			return i + 1, false, true
+		}
 	}
 	if depth != 0 {
 		return len(items), false, false
@@ -467,14 +531,21 @@ type withParse struct {
 type cteDef struct {
 	name               Name
 	bodyStart, bodyEnd int
+	columns            []Name // explicit WITH <name> (<col>,...) list, nil when absent
 }
 
 // parseWithStatement recognizes WITH <name> [(<col>,...)] AS (<select>)
 // [, <name2> AS (<select2>)]* <select-using-those-names>, over a single
-// statement's own item range. A UNION anywhere inside a CTE body is left
-// unrecognized rather than guessing whether it is recursive: this task
-// cannot safely distinguish the two, and treating it as ordinary would risk
-// modeling a recursive CTE as if it terminated after one pass.
+// statement's own item range. Any nested SELECT (a subquery, EXISTS, IN, or
+// a UNION arm -- UNION's second arm is itself introduced by a SELECT
+// keyword) anywhere inside a CTE body or the final SELECT, beyond that
+// body/query's own leading SELECT, is left unrecognized rather than
+// partially modeled: per-arm UNION output shapes, correlated/nested scopes,
+// and recursive self-reference detection inside a WITH are not yet
+// implemented, and silently modeling only part of the statement would hide
+// real content from RelationScope while still reporting it supported. The
+// whole WITH statement is rejected in that case; callers must fall back to
+// Unsupported, which then reports true for its entire span.
 func parseWithStatement(text string, items []lexeme, start, end int, matching map[int]int) (withParse, bool) {
 	if start >= end || !isWord(items[start], "WITH") {
 		return withParse{}, false
@@ -491,9 +562,14 @@ func parseWithStatement(text string, items []lexeme, start, end int, matching ma
 			return withParse{}, false
 		}
 		i++
+		var columns []Name
 		if i < end && items[i].Token.Kind == token.LParen {
 			close, ok := matching[i]
 			if !ok || close >= end {
+				return withParse{}, false
+			}
+			columns, ok = columnListNames(text, items[i+1:close])
+			if !ok {
 				return withParse{}, false
 			}
 			i = close + 1
@@ -513,11 +589,11 @@ func parseWithStatement(text string, items []lexeme, start, end int, matching ma
 		if bodyStart >= close || !isWord(items[bodyStart], "SELECT") {
 			return withParse{}, false
 		}
-		if topLevelWordIndex(items[bodyStart:close], "UNION") >= 0 {
+		if containsNestedSelect(items[bodyStart+1 : close]) {
 			return withParse{}, false
 		}
 		seen[name.Key()] = true
-		ctes = append(ctes, cteDef{name: name, bodyStart: bodyStart, bodyEnd: close})
+		ctes = append(ctes, cteDef{name: name, bodyStart: bodyStart, bodyEnd: close, columns: columns})
 		i = close + 1
 		if i < end && items[i].Token.Kind == token.Comma {
 			i++
@@ -528,7 +604,44 @@ func parseWithStatement(text string, items []lexeme, start, end int, matching ma
 	if i >= end || !isWord(items[i], "SELECT") {
 		return withParse{}, false
 	}
+	if containsNestedSelect(items[i+1 : end]) {
+		return withParse{}, false
+	}
 	return withParse{ctes: ctes, finalStart: i}, true
+}
+
+// containsNestedSelect reports whether items contains a SELECT keyword
+// anywhere, at any nesting depth. Callers scope items to exclude a query's
+// own leading SELECT, so any match here indicates a subquery or UNION arm.
+func containsNestedSelect(items []lexeme) bool {
+	for _, item := range items {
+		if isWord(item, "SELECT") {
+			return true
+		}
+	}
+	return false
+}
+
+// columnListNames parses a parenthesized comma-separated identifier list
+// (a CTE's explicit output-column-name list) into ordered Names. ok is false
+// for anything other than plain identifiers separated by commas.
+func columnListNames(text string, items []lexeme) ([]Name, bool) {
+	parts, ok := splitTopLevel(items, token.Comma)
+	if !ok {
+		return nil, false
+	}
+	names := make([]Name, len(parts))
+	for i, part := range parts {
+		if len(part) != 1 || !isNameToken(part[0]) {
+			return nil, false
+		}
+		name, ok := nameFromLexeme(text, part[0])
+		if !ok {
+			return nil, false
+		}
+		names[i] = name
+	}
+	return names, true
 }
 
 func (m *diagnosticModel) buildWithStatement(text string, items []lexeme, depths []int, matching map[int]int, stmt modelStatement) bool {
@@ -543,6 +656,12 @@ func (m *diagnosticModel) buildWithStatement(text string, items []lexeme, depths
 			start: cte.bodyStart, end: cte.bodyEnd, parent: -1, kind: "SELECT",
 			baseDepth: synthetic.baseDepth, relations: relations, cteName: cte.name.Key(),
 		})
+		if len(cte.columns) > 0 {
+			if m.cteColumns == nil {
+				m.cteColumns = make(map[int][]Name)
+			}
+			m.cteColumns[len(m.queries)-1] = cte.columns
+		}
 	}
 	synthetic := sqlQuery{start: parsed.finalStart, end: stmt.End, baseDepth: depths[parsed.finalStart], kind: "SELECT", parent: -1}
 	relations, _, _ := queryRelations(text, items, synthetic, depths, matching)
@@ -636,13 +755,39 @@ func (m *diagnosticModel) connectRelationSources(text string, items []lexeme, de
 	}
 }
 
+// computeOutputs computes each query's own projected output shape, in
+// m.queries order. That order matters: a CTE's explicit column-list rename
+// is applied immediately after computing that CTE's own output, before any
+// later query (which can only reference earlier-declared CTEs or the CTE
+// itself, per standard WITH scoping) has its own output computed -- so a
+// star-expansion referencing that CTE always sees the renamed shape.
 func (m *diagnosticModel) computeOutputs(text string) {
 	for qi := range m.queries {
 		if m.queries[qi].kind != "SELECT" {
 			continue
 		}
 		m.computeSelectOutput(text, qi)
+		if columns, ok := m.cteColumns[qi]; ok {
+			m.applyCTEColumnList(qi, columns)
+		}
 	}
+}
+
+// applyCTEColumnList overrides qi's computed output column names with an
+// explicit WITH-declared column list, positionally. If the list's count does
+// not match the body's own proven output count, the CTE's output becomes
+// entirely unknown rather than guessing a partial mapping.
+func (m *diagnosticModel) applyCTEColumnList(qi int, columns []Name) {
+	q := &m.queries[qi]
+	if !q.output.CountKnown || len(q.output.Columns) != len(columns) {
+		q.output = modelOutput{}
+		return
+	}
+	renamed := make([]modelOutputColumn, len(columns))
+	for i, name := range columns {
+		renamed[i] = modelOutputColumn{Name: name, NameKnown: true}
+	}
+	q.output = modelOutput{Columns: renamed, CountKnown: true}
 }
 
 func (m *diagnosticModel) computeSelectOutput(text string, qi int) {
@@ -659,10 +804,10 @@ func (m *diagnosticModel) computeSelectOutput(text string, qi int) {
 	}
 	q.targetStart = q.start + 1
 	q.targetEnd = q.start + 1 + columnEnd
-	q.output = m.computeProjection(text, body[:columnEnd], q.relations)
+	q.output = m.computeProjection(text, qi, body[:columnEnd], q.relations)
 }
 
-func (m *diagnosticModel) computeProjection(text string, items []lexeme, relations []RelationRef) modelOutput {
+func (m *diagnosticModel) computeProjection(text string, owner int, items []lexeme, relations []RelationRef) modelOutput {
 	items = trimSetQuantifier(items)
 	if len(items) == 0 {
 		return modelOutput{}
@@ -677,7 +822,7 @@ func (m *diagnosticModel) computeProjection(text string, items []lexeme, relatio
 			return modelOutput{}
 		}
 		if isStarProjection(part) {
-			expanded, ok := m.expandStar(text, part, relations)
+			expanded, ok := m.expandStar(text, owner, part, relations)
 			if !ok {
 				return modelOutput{}
 			}
@@ -703,7 +848,14 @@ func isStarProjection(part []lexeme) bool {
 	return len(part) == 3 && isNameToken(part[0]) && part[1].Token.Kind == token.Period && part[2].Token.Kind == token.Mult
 }
 
-func (m *diagnosticModel) expandStar(text string, part []lexeme, relations []RelationRef) ([]modelOutputColumn, bool) {
+// expandStar resolves a SELECT * or qualified alias.* projection through the
+// same relation-output path as RelationOutput (CTE and derived-table shapes,
+// procedure outputs, then real catalog columns, each checked against
+// DDLInvalidated) rather than reading the catalog directly, so star
+// expansion cannot mistake a real table for a same-named CTE that shadows it
+// in this scope, and cannot bake in a catalog shape a DDL statement earlier
+// in this same document has already made stale.
+func (m *diagnosticModel) expandStar(text string, owner int, part []lexeme, relations []RelationRef) ([]modelOutputColumn, bool) {
 	var qualifier *Name
 	if len(part) == 3 {
 		name, ok := nameFromLexeme(text, part[0])
@@ -730,10 +882,11 @@ func (m *diagnosticModel) expandStar(text string, part []lexeme, relations []Rel
 			return nil, false
 		}
 	}
-	if target == nil || target.Name.Key() == "" || m.catalog == nil {
+	if target == nil {
 		return nil, false
 	}
-	cols, ok := m.catalog.Columns(target.Name)
+	at := m.queries[owner].start
+	cols, ok := m.resolveRelationOutput(at, owner, *target)
 	if !ok {
 		return nil, false
 	}
@@ -760,7 +913,7 @@ func singleProjectionColumn(text string, part []lexeme) modelOutputColumn {
 	return modelOutputColumn{}
 }
 
-func (m *diagnosticModel) detectUnionGroups(items []lexeme) {
+func (m *diagnosticModel) detectUnionGroups(items []lexeme, depths []int) {
 	m.unionOf = make([]int, len(m.queries))
 	for i := range m.unionOf {
 		m.unionOf[i] = -1
@@ -782,8 +935,13 @@ func (m *diagnosticModel) detectUnionGroups(items []lexeme) {
 				// discoverSQLQueries closes a sibling query exactly at the
 				// next sibling's start (closeQueriesAtDepth), so prev.end
 				// equals next.start; the UNION/UNION ALL keyword between
-				// the arms is inside prev's own range, at its tail.
-				if prev.statementIndex != next.statementIndex || !unionBetween(items, prev.start, next.start) {
+				// the arms is inside prev's own range, at its tail. Require
+				// the UNION token itself to be at prev's own baseDepth, not
+				// merely somewhere in the byte range, so a nested UNION
+				// inside one sibling's own subquery (for example within an
+				// unrelated EXISTS(...)) can never be mistaken for the
+				// separator between two unrelated top-level siblings.
+				if prev.statementIndex != next.statementIndex || !unionBetween(items, depths, prev.baseDepth, prev.start, next.start) {
 					m.flushUnionGroup(current)
 					current = nil
 				}
@@ -805,12 +963,12 @@ func (m *diagnosticModel) flushUnionGroup(arms []int) {
 	}
 }
 
-func unionBetween(items []lexeme, from, to int) bool {
+func unionBetween(items []lexeme, depths []int, baseDepth, from, to int) bool {
 	for i := from; i < to && i < len(items); i++ {
 		if items[i].Token.Kind == token.Semicolon {
 			return false
 		}
-		if isWord(items[i], "UNION") {
+		if depths[i] == baseDepth && isWord(items[i], "UNION") {
 			return true
 		}
 	}
@@ -833,7 +991,7 @@ func detectDDL(text string, items []lexeme, statements []modelStatement) []model
 			continue
 		}
 		if name, ok := ddlInvalidatedName(text, items, stmt.Start, stmt.End); ok {
-			ddls = append(ddls, modelDDL{key: name.Key(), at: stmt.Start})
+			ddls = append(ddls, modelDDL{key: name.Key(), end: stmt.End})
 		}
 	}
 	return ddls

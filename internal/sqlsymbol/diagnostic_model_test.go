@@ -244,6 +244,176 @@ func TestDiagnosticModelDDLInvalidatesLaterUse(t *testing.T) {
 	}
 }
 
+// --- Fix round 1: C1/C2 -- a WITH statement containing any nested SELECT
+// (subquery or UNION arm) anywhere in a CTE body or the final SELECT is
+// rejected wholesale rather than partially modeled.
+
+func TestDiagnosticModelWithContainingSubqueryIsFullyUnsupported(t *testing.T) {
+	text := `WITH Q AS (SELECT ID FROM T) SELECT Q.ID FROM Q WHERE EXISTS (SELECT 1 FROM U WHERE U.ID = Q.ID);`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	withPos := itemAt(t, m, text, "WITH", 0)
+	if !m.Unsupported(withPos) {
+		t.Fatalf("Unsupported(WITH) = false, want true: this WITH's final SELECT contains a nested subquery that isn't per-scope modeled")
+	}
+	innerUID := itemAt(t, m, text, "U.ID", 0) + 2
+	if !m.Unsupported(innerUID) {
+		t.Fatalf("Unsupported(U.ID) = false, want true: a subquery nested inside an unrecognized WITH must not silently expose a partial scope")
+	}
+	if scope := m.RelationScope(innerUID); scope != nil {
+		t.Fatalf("RelationScope(U.ID) = %+v, want nil: an unrecognized WITH statement's content is not modeled at all, not partially modeled as [[Q]]", scope)
+	}
+}
+
+func TestDiagnosticModelWithFinalUnionIsFullyUnsupported(t *testing.T) {
+	text := `WITH Q AS (SELECT ID FROM T) SELECT ID FROM Q UNION SELECT V FROM U;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	withPos := itemAt(t, m, text, "WITH", 0)
+	if !m.Unsupported(withPos) {
+		t.Fatalf("Unsupported(WITH) = false, want true: a top-level UNION in the WITH statement's final SELECT is not modeled per-arm")
+	}
+}
+
+// --- Fix round 1: C3 -- an explicit CTE column list renames the body's own
+// output positionally; a count mismatch makes the CTE's output unknown.
+
+func TestDiagnosticModelCTEExplicitColumnListRenamesOutput(t *testing.T) {
+	text := `WITH Q (A) AS (SELECT ID FROM T) SELECT Q.A FROM Q;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	outerA := itemAt(t, m, text, "Q.A", 0) + 2
+	scope := m.RelationScope(outerA)
+	if len(scope) == 0 || len(scope[0]) != 1 {
+		t.Fatalf("RelationScope(Q.A) = %+v, want a single Q relation", scope)
+	}
+	ref := scope[0][0]
+	columns, ok := m.RelationOutput(outerA, ref)
+	if !ok || len(columns) != 1 || columns[0].Name != "A" {
+		t.Fatalf("RelationOutput(Q) = %+v, %v, want [{A}]: the explicit column list renames the body's own ID", columns, ok)
+	}
+}
+
+func TestDiagnosticModelCTEExplicitColumnListCountMismatchIsUnknown(t *testing.T) {
+	text := `WITH Q (A, B) AS (SELECT ID FROM T) SELECT ID FROM Q;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	i := itemAt(t, m, text, "FROM Q", 0) + 1
+	scope := m.RelationScope(i)
+	if len(scope) == 0 || len(scope[0]) != 1 {
+		t.Fatalf("RelationScope(Q) = %+v, want a single Q relation", scope)
+	}
+	ref := scope[0][0]
+	if _, ok := m.RelationOutput(i, ref); ok {
+		t.Fatalf("RelationOutput(Q) ok = true, want false: the explicit column list count (2) does not match the body's own output count (1)")
+	}
+}
+
+// --- Fix round 1: C4/I5 -- SET TERM custom delimiters split statements and
+// are visible to DDL detection, for every DDL statement in the block.
+
+func TestDiagnosticModelSetTermSplitsStatementsAndDDL(t *testing.T) {
+	text := "SET TERM ^ ;\nCREATE TABLE A (ID INTEGER)^\nCREATE TABLE B (ID INTEGER)^\nSELECT ID FROM B^\nSET TERM ;^\n"
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	statements := m.Statements()
+	if len(statements) != 3 {
+		t.Fatalf("Statements() = %+v, want 3 statements split across the SET TERM block", statements)
+	}
+	for i, stmt := range statements {
+		if stmt.Malformed {
+			t.Fatalf("Statements()[%d] = %+v, want cleanly modeled (not malformed)", i, stmt)
+		}
+	}
+	selectPos := itemAt(t, m, text, "SELECT", 0)
+	if !m.DDLInvalidated(selectPos, Name{Text: "A"}) {
+		t.Fatalf("DDLInvalidated(A) = false, want true: A was CREATEd earlier in the same SET TERM block")
+	}
+	if !m.DDLInvalidated(selectPos, Name{Text: "B"}) {
+		t.Fatalf("DDLInvalidated(B) = false, want true: B was CREATEd earlier in the same SET TERM block")
+	}
+	if m.DDLInvalidated(selectPos, Name{Text: "Z"}) {
+		t.Fatalf("DDLInvalidated(Z) = true, want false: Z was never touched by DDL")
+	}
+	// The current fix only makes statement-boundary and DDL detection aware
+	// of the SET TERM delimiter; the navigation binder's own token contexts
+	// (buildContexts in resolve.go) still do not reset at a custom
+	// delimiter, so this SELECT's contexts stay contextUnsupported and
+	// RelationScope cannot resolve B here. Unsupported correctly reports
+	// that instead of a false conclusion, which is the safe fallback: a
+	// caller checking Unsupported before trusting RelationScope is not
+	// misled.
+	if !m.Unsupported(selectPos) {
+		t.Fatalf("Unsupported(SELECT in SET TERM block) = false, want true: navigation's own context tracking does not reset at a SET TERM boundary")
+	}
+}
+
+// --- Fix round 1: C5 -- UNION grouping only accepts a UNION token at the
+// exact same nesting depth as the candidate sibling queries, so an unrelated
+// UNION nested deeper inside one sibling cannot merge unrelated top-level
+// siblings into a false UNION chain.
+
+func TestDiagnosticModelUnionGroupingRespectsNestingDepth(t *testing.T) {
+	text := `SELECT T.ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.ID IN (SELECT ID FROM T UNION SELECT ID FROM U)) AND EXISTS (SELECT 2 FROM U);`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	firstExists := itemAt(t, m, text, "SELECT 1", 0)
+	if _, ok := m.UnionOutput(firstExists); ok {
+		t.Fatalf("UnionOutput(first EXISTS) ok = true, want false: this EXISTS subquery merely contains an unrelated nested UNION at a deeper depth")
+	}
+	secondExists := itemAt(t, m, text, "SELECT 2", 0)
+	if _, ok := m.UnionOutput(secondExists); ok {
+		t.Fatalf("UnionOutput(second EXISTS) ok = true, want false: sibling EXISTS subqueries are not UNION arms of each other")
+	}
+}
+
+// --- Fix round 1: I1 -- DDLInvalidated excludes positions within the DDL
+// statement's own extent, matching its documented contract.
+
+func TestDiagnosticModelDDLInvalidatedExcludesOwnStatementBody(t *testing.T) {
+	text := `CREATE VIEW W AS SELECT ID FROM W;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	secondW := itemAt(t, m, text, "FROM W", 0) + 1
+	if m.DDLInvalidated(secondW, Name{Text: "W"}) {
+		t.Fatalf("DDLInvalidated(W) inside the CREATE VIEW's own body = true, want false: invalidation begins with the next statement, not partway through the DDL statement's own extent")
+	}
+}
+
+// --- Fix round 1: I2/I3 -- star expansion resolves through the same
+// relation-output path as RelationOutput, so it respects CTE shadowing and
+// DDL invalidation instead of reading the catalog directly.
+
+func TestDiagnosticModelStarExpansionRespectsCTEShadowing(t *testing.T) {
+	text := `WITH T AS (SELECT ID FROM U) SELECT * FROM T;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	star := itemAt(t, m, text, "*", 0)
+	out, ok := m.TargetOutput(star)
+	if !ok || !out.CountKnown || len(out.Columns) != 1 || !out.Columns[0].NameKnown || out.Columns[0].Name.Key() != "ID" {
+		t.Fatalf("TargetOutput(SELECT * FROM T) = %+v, %v, want the CTE T's single ID column, not the real table T's 4 columns", out, ok)
+	}
+}
+
+func TestDiagnosticModelStarExpansionRespectsDDLInvalidation(t *testing.T) {
+	text := `CREATE TABLE T (ID INTEGER); SELECT * FROM T;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	star := itemAt(t, m, text, "*", 0)
+	out, ok := m.TargetOutput(star)
+	if !ok {
+		t.Fatalf("TargetOutput(SELECT * FROM T) ok = false, want true: the star token is inside a modeled query's own target list")
+	}
+	if out.CountKnown {
+		t.Fatalf("TargetOutput(SELECT * FROM T).CountKnown = true, want false: T's catalog columns are stale after an earlier CREATE TABLE T in this same document")
+	}
+}
+
+func TestDiagnosticModelRelationOutputRespectsDDLInvalidation(t *testing.T) {
+	text := `CREATE TABLE T (ID INTEGER); SELECT ID FROM T;`
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	idPos := itemAt(t, m, text, "SELECT ID FROM T", 0) + 1
+	scope := m.RelationScope(idPos)
+	if len(scope) == 0 || len(scope[0]) != 1 {
+		t.Fatalf("RelationScope(ID) = %+v, want a single T relation", scope)
+	}
+	ref := scope[0][0]
+	if _, ok := m.RelationOutput(idPos, ref); ok {
+		t.Fatalf("RelationOutput(T) ok = true, want false: T's catalog columns are stale after an earlier CREATE TABLE T in this same document")
+	}
+}
+
 func TestDiagnosticModelKnownProcedureOutputInFrom(t *testing.T) {
 	text := `SELECT X.OUT1 FROM P(1, 2) X;`
 	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
