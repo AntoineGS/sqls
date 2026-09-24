@@ -28,14 +28,15 @@ func (a *Analysis) nullComparisonFindings() []Finding {
 		switch {
 		case isWord(item, "WHERE"):
 			findings = append(findings, a.clauseNullFindings(items, depths, i,
-				[]string{"GROUP", "HAVING", "ORDER", "ROWS", "PLAN", "UNION", "RETURNING", "RETURNING_VALUES"},
+				[]string{"GROUP", "HAVING", "ORDER", "ROWS", "PLAN", "UNION", "RETURNING", "RETURNING_VALUES", "INTO", "DO", "FOR"},
 				true, true)...)
 		case isWord(item, "HAVING"):
 			findings = append(findings, a.clauseNullFindings(items, depths, i,
-				[]string{"ORDER", "ROWS", "PLAN"}, true, true)...)
+				[]string{"ORDER", "ROWS", "PLAN", "INTO", "DO", "FOR"}, true, true)...)
 		case isWord(item, "ON"):
 			findings = append(findings, a.clauseNullFindings(items, depths, i,
-				[]string{"JOIN", "WHERE", "GROUP", "HAVING", "ORDER", "ROWS", "PLAN"}, true, true)...)
+				[]string{"JOIN", "WHERE", "GROUP", "HAVING", "ORDER", "ROWS", "PLAN", "INTO", "DO", "FOR",
+					"LEFT", "RIGHT", "INNER", "FULL", "OUTER"}, true, true)...)
 		case isWord(item, "WHEN"):
 			findings = append(findings, a.clauseNullFindings(items, depths, i, []string{"THEN"}, false, false)...)
 		case isWord(item, "IF"):
@@ -85,12 +86,30 @@ func clauseBody(items []lexeme, depths []int, keywordIndex int, boundaryWords []
 			return 0, 0, false
 		}
 		for _, word := range boundaryWords {
-			if isWord(items[i], word) {
+			if boundaryWordMatches(items, i, word) {
 				return bodyStart, i, true
 			}
 		}
 	}
 	return 0, 0, false
+}
+
+// boundaryWordMatches reports whether items[i] is the clause-boundary
+// keyword word. LEFT and RIGHT are also InterBase scalar string functions
+// (LEFT(str, n), RIGHT(str, n)); as a join qualifier (LEFT/RIGHT [OUTER]
+// JOIN) neither is ever immediately followed by "(", so that one-token
+// lookahead disambiguates a chained join's own qualifier from a call to
+// either function appearing within the clause body itself.
+func boundaryWordMatches(items []lexeme, i int, word string) bool {
+	if !isWord(items[i], word) {
+		return false
+	}
+	switch word {
+	case "LEFT", "RIGHT":
+		return i+1 >= len(items) || items[i+1].Token.Kind != token.LParen
+	default:
+		return true
+	}
 }
 
 func (a *Analysis) clauseNullFindings(items []lexeme, depths []int, keywordIndex int, boundaryWords []string, semicolonOK, depthDropOK bool) []Finding {

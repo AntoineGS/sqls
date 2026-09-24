@@ -113,6 +113,53 @@ func TestDiagnosticNullComparisonNestedSubqueryWhere(t *testing.T) {
 		nil, "interbase-null-comparison", 1)
 }
 
+// --- FOR SELECT ... INTO :var DO loops: INTO/DO must end a WHERE/HAVING/ON
+// clause body, or the loop body's own assignment is misread as part of the
+// clause's comparison (fix round 1, Critical). ---
+
+func TestDiagnosticNullComparisonForSelectIntoDoNotSwallowedByWhere(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE R INTEGER; BEGIN FOR SELECT A FROM T WHERE ID > 0 INTO :R DO BEGIN R = NULL; SUSPEND; END END",
+		nil, "interbase-null-comparison", 0)
+}
+
+func TestDiagnosticNullComparisonForSelectIntoDoIsNotNullNotSwallowed(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE X INTEGER; DECLARE VARIABLE V INTEGER; BEGIN FOR SELECT A FROM T WHERE ID IS NOT NULL INTO :X DO BEGIN V = NULL; END END",
+		nil, "interbase-null-comparison", 0)
+}
+
+func TestDiagnosticNullComparisonForSelectIntoDoSingleStatementBodyNotSwallowed(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE X INTEGER; DECLARE VARIABLE V INTEGER; BEGIN FOR SELECT A FROM T WHERE ID = 1 AND B > 0 INTO :X DO V = NULL; END",
+		nil, "interbase-null-comparison", 0)
+}
+
+func TestDiagnosticNullComparisonForSelectIntoDoOnClauseNotSwallowed(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE X INTEGER; DECLARE VARIABLE V INTEGER; BEGIN FOR SELECT A FROM T JOIN U ON T.ID > U.ID INTO :X DO V = NULL; END",
+		nil, "interbase-null-comparison", 0)
+}
+
+func TestDiagnosticNullComparisonForSelectIntoDoHavingClauseNotSwallowed(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE X INTEGER; DECLARE VARIABLE V INTEGER; BEGIN FOR SELECT A FROM T GROUP BY A HAVING COUNT(*) > 1 INTO :X DO V = NULL; END",
+		nil, "interbase-null-comparison", 0)
+}
+
+// --- missed detections from the same root cause: a clause body clipped too
+// early by an unrecognized boundary (fix round 1, Important). ---
+
+func TestDiagnosticNullComparisonJoinQualifierEndsOnClause(t *testing.T) {
+	requireCodeCount(t,
+		"SELECT ID FROM T JOIN U ON T.ID = NULL LEFT JOIN W ON U.ID = W.ID;",
+		nil, "interbase-null-comparison", 1)
+}
+
+func TestDiagnosticNullComparisonForUpdateEndsWhereClause(t *testing.T) {
+	requireCodeCount(t, "SELECT ID FROM T WHERE V = NULL FOR UPDATE;", nil, "interbase-null-comparison", 1)
+}
+
 // --- span covers the whole comparison expression ---
 
 func TestDiagnosticNullComparisonSpan(t *testing.T) {
