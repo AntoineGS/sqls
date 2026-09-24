@@ -45,17 +45,16 @@ func (s *Server) metadataStatus() lsp.MetadataStatusResult {
 		if !ok {
 			continue
 		}
-		started := status.StartedAt
-		if started.IsZero() {
-			started = status.QueuedAt
-		}
 		var duration time.Duration
-		if !started.IsZero() {
+		if !status.StartedAt.IsZero() {
 			end := status.FinishedAt
 			if end.IsZero() {
 				end = time.Now()
 			}
-			duration = end.Sub(started)
+			duration = end.Sub(status.StartedAt)
+			if duration < 0 {
+				duration = 0
+			}
 		}
 		category := lsp.MetadataCategoryStatus{Kind: string(kind), State: string(status.State), Count: status.Count, DurationMS: duration.Milliseconds()}
 		switch status.State {

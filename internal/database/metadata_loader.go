@@ -73,15 +73,21 @@ func (l *MetadataLoader) Reset(generation uint64) {
 	if l.cancel != nil {
 		l.cancel()
 	}
+	var retired *MetadataSnapshot
 	if l.snapshot != nil {
 		status := cloneMap(l.snapshot.Status)
+		changed := false
 		for kind, value := range status {
 			if value.State == MetadataPending || value.State == MetadataLoading {
 				value.State, value.FinishedAt = MetadataCancelled, time.Now()
 				status[kind] = value
+				changed = true
 			}
 		}
 		l.snapshot = &MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, StartFailed: l.snapshot.StartFailed, Cache: l.snapshot.Cache, Status: status}
+		if changed {
+			retired = l.snapshot
+		}
 		l.closeDoneLocked()
 	}
 	l.generation, l.started, l.startFailed = generation, false, false
@@ -90,6 +96,10 @@ func (l *MetadataLoader) Reset(generation uint64) {
 	l.snapshot = &MetadataSnapshot{Generation: generation, Revision: 1, Cache: newMetadataCache(), Status: emptyMetadataStatus()}
 	callback := l.callback
 	l.mu.Unlock()
+	if retired != nil {
+		logCancelledMetadataStatuses(retired)
+		logMetadataGeneration(retired)
+	}
 	callMetadataCallback(callback)
 }
 
@@ -479,7 +489,11 @@ func (l *MetadataLoader) setStatus(generation uint64, kind MetadataKind, status 
 	statuses[kind] = status
 	l.publishLocked(next)
 	callback := l.callback
+	terminal := terminalMetadataState(status.State)
 	l.mu.Unlock()
+	if terminal {
+		logMetadataJob(generation, kind, status)
+	}
 	callMetadataCallback(callback)
 }
 
@@ -506,19 +520,29 @@ func (l *MetadataLoader) settleCancelled(generation uint64) {
 		l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
 	}
 	l.closeDoneLocked()
+	snapshot := l.snapshot
 	callback := l.callback
 	l.mu.Unlock()
 	if changed {
+		for kind, status := range statuses {
+			if status.State == MetadataCancelled {
+				logMetadataJob(generation, kind, status)
+			}
+		}
+		logMetadataGeneration(snapshot)
 		callMetadataCallback(callback)
 	}
 }
 
 func (l *MetadataLoader) finish(generation uint64) {
 	l.mu.Lock()
+	var snapshot *MetadataSnapshot
 	if l.generation == generation {
 		l.closeDoneLocked()
+		snapshot = l.snapshot
 	}
 	l.mu.Unlock()
+	logMetadataGeneration(snapshot)
 }
 
 func (l *MetadataLoader) closeDoneLocked() {
@@ -565,6 +589,7 @@ func (l *MetadataLoader) Stop() {
 	if l.cancel != nil {
 		l.cancel()
 	}
+	var cancelled *MetadataSnapshot
 	if l.snapshot != nil {
 		statuses := cloneMap(l.snapshot.Status)
 		changed := false
@@ -577,11 +602,16 @@ func (l *MetadataLoader) Stop() {
 		}
 		if changed {
 			l.publishLocked(&MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
+			cancelled = l.snapshot
 		}
 	}
 	l.closeDoneLocked()
 	callback := l.callback
 	l.mu.Unlock()
+	if cancelled != nil {
+		logCancelledMetadataStatuses(cancelled)
+		logMetadataGeneration(cancelled)
+	}
 	callMetadataCallback(callback)
 }
 

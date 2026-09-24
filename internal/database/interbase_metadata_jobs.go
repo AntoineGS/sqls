@@ -22,33 +22,36 @@ func (db *InterBaseDBRepository) runMetadataRead(ctx context.Context, read inter
 	}
 	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelSnapshot})
 	if err != nil {
-		return MetadataPatch{}, fmt.Errorf("interbase: begin metadata snapshot: %w", err)
+		return MetadataPatch{QueriesKnown: true}, fmt.Errorf("interbase: begin metadata snapshot: %w", err)
 	}
+	counter := &metadataQueryCounter{queryer: tx}
+	result.QueriesKnown = true
 	defer func() {
 		rollbackErr := tx.Rollback()
 		if rollbackErr != nil && !(errors.Is(rollbackErr, sql.ErrTxDone) && ctx.Err() != nil) {
 			err = errors.Join(err, fmt.Errorf("interbase: rollback metadata snapshot: %w", rollbackErr))
-			result = MetadataPatch{}
+			result.Cache = nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			result = MetadataPatch{}
+			result.Cache = nil
 			if !errors.Is(err, ctxErr) {
 				err = errors.Join(err, ctxErr)
 			}
 		}
+		result.Queries, result.QueriesKnown = counter.queries, true
 	}()
 
-	width, err := interBaseMetadataIdentifierWidth(ctx, tx)
+	width, err := interBaseMetadataIdentifierWidth(ctx, counter)
 	if err != nil {
-		return MetadataPatch{}, err
+		return result, err
 	}
-	result, err = read(ctx, tx, width)
+	result, err = read(ctx, counter, width)
 	if err != nil {
-		result = MetadataPatch{}
+		result.Cache = nil
 		return result, err
 	}
 	if err := ctx.Err(); err != nil {
-		result = MetadataPatch{}
+		result.Cache = nil
 		return result, err
 	}
 	return result, nil
@@ -66,33 +69,35 @@ func (db *InterBaseDBRepository) runMetadataRepositoryRead(ctx context.Context, 
 	}
 	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelSnapshot})
 	if err != nil {
-		return MetadataPatch{}, fmt.Errorf("interbase: begin metadata snapshot: %w", err)
+		return MetadataPatch{QueriesKnown: true}, fmt.Errorf("interbase: begin metadata snapshot: %w", err)
 	}
+	counter := &metadataQueryCounter{queryer: tx}
 	defer func() {
 		rollbackErr := tx.Rollback()
 		if rollbackErr != nil && !(errors.Is(rollbackErr, sql.ErrTxDone) && ctx.Err() != nil) {
 			err = errors.Join(err, fmt.Errorf("interbase: rollback metadata snapshot: %w", rollbackErr))
-			result = MetadataPatch{}
+			result.Cache = nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			result = MetadataPatch{}
+			result.Cache = nil
 			if !errors.Is(err, ctxErr) {
 				err = errors.Join(err, ctxErr)
 			}
 		}
+		result.Queries, result.QueriesKnown = counter.queries, true
 	}()
 	bound := &InterBaseDBRepository{
 		Conn: db.Conn, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect,
 		DatabaseName: db.DatabaseName,
-		snapshot:     &interBaseCatalogSnapshot{catalog: schema.New(tx)},
+		snapshot:     &interBaseCatalogSnapshot{catalog: schema.New(counter)},
 	}
 	result, err = read(ctx, bound)
 	if err != nil {
-		result = MetadataPatch{}
+		result.Cache = nil
 		return result, err
 	}
 	if err := ctx.Err(); err != nil {
-		result = MetadataPatch{}
+		result.Cache = nil
 		return result, err
 	}
 	return result, nil
@@ -103,7 +108,7 @@ func (db *InterBaseDBRepository) runMetadataRepositoryRead(ctx context.Context, 
 func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 	return MetadataPlan{Parallelism: 3, Jobs: []MetadataJob{
 		{Kind: MetadataSchemas, Run: func(context.Context, *DBCache) (MetadataPatch, error) {
-			return MetadataPatch{Cache: &DBCache{Schemas: map[string]string{"": ""}}, Count: 1}, nil
+			return MetadataPatch{Cache: &DBCache{Schemas: map[string]string{"": ""}}, Count: 1, QueriesKnown: true}, nil
 		}},
 		{Kind: MetadataRelations, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataRelations)

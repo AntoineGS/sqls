@@ -198,9 +198,9 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			}
 
 			after := connection.Conn.Stats()
-			t.Logf("dialect=%d categories=%d db.Stats WaitCount delta=%d WaitDuration delta=%s; per-job query counts are not instrumented by database/sql", dialect, len(snapshot.Status), after.WaitCount-before.WaitCount, after.WaitDuration-before.WaitDuration)
+			t.Logf("dialect=%d categories=%d db.Stats pool-wide WaitCount delta=%d pool-wide WaitDuration delta=%s", dialect, len(snapshot.Status), after.WaitCount-before.WaitCount, after.WaitDuration-before.WaitDuration)
 			for kind, status := range snapshot.Status {
-				t.Logf("category=%s state=%s count=%d queries=%d queries-known=%t", kind, status.State, status.Count, status.Queries, status.QueriesKnown)
+				t.Logf("category=%s state=%s count=%d queries=%d queries-known=%t queue=%s run=%s", kind, status.State, status.Count, status.Queries, status.QueriesKnown, metadataJobMetrics(status).Queue, metadataJobMetrics(status).Run)
 			}
 		})
 	}

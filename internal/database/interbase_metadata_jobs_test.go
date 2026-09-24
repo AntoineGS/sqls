@@ -130,7 +130,7 @@ func TestInterBaseMetadataTransactionOwnsReadOnlySnapshot(t *testing.T) {
 	state := &metadataTxState{width: int64(127)}
 	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
 	called := false
-	_, err := db.runMetadataRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+	patch, err := db.runMetadataRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 		called = true
 		if state.opens != 1 {
 			t.Fatalf("open connections while reading = %d, want one", state.opens)
@@ -150,6 +150,9 @@ func TestInterBaseMetadataTransactionOwnsReadOnlySnapshot(t *testing.T) {
 	if !called {
 		t.Fatal("read callback was not called")
 	}
+	if !patch.QueriesKnown || patch.Queries != 2 {
+		t.Fatalf("successful query accounting = %+v, want width discovery and one data query", patch)
+	}
 	if state.options.ReadOnly != true || state.options.Isolation != driver.IsolationLevel(sql.LevelSnapshot) {
 		t.Fatalf("BeginTx options = %+v", state.options)
 	}
@@ -158,12 +161,36 @@ func TestInterBaseMetadataTransactionOwnsReadOnlySnapshot(t *testing.T) {
 	}
 }
 
+func TestInterBaseMetadataTransactionRetainsQueriesOnReadFailure(t *testing.T) {
+	state := &metadataTxState{width: int64(127)}
+	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
+	failure := errors.New("read failed after two queries")
+	patch, err := db.runMetadataRead(context.Background(), func(ctx context.Context, queryer schema.Queryer, _ int) (MetadataPatch, error) {
+		for range 2 {
+			rows, queryErr := queryer.QueryContext(ctx, "metadata read")
+			if queryErr != nil {
+				return MetadataPatch{}, queryErr
+			}
+			if closeErr := rows.Close(); closeErr != nil {
+				return MetadataPatch{}, closeErr
+			}
+		}
+		return MetadataPatch{Count: 4}, failure
+	})
+	if !errors.Is(err, failure) {
+		t.Fatalf("read error = %v, want injected failure", err)
+	}
+	if patch.Cache != nil || patch.Count != 4 || !patch.QueriesKnown || patch.Queries != 3 {
+		t.Fatalf("failed read metrics = %+v, want discarded cache, count=4 and 3 attempted queries", patch)
+	}
+}
+
 func TestInterBaseMetadataTransactionRollbackFailureDiscardsPatch(t *testing.T) {
 	state := &metadataTxState{width: int64(127), rollbackErr: errors.New("rollback failed")}
 	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
 	patch, err := db.runMetadataRead(context.Background(), func(context.Context, schema.Queryer, int) (MetadataPatch, error) { return MetadataPatch{Count: 1}, nil })
-	if err == nil || patch.Count != 0 {
-		t.Fatalf("patch=%+v err=%v", patch, err)
+	if err == nil || patch.Cache != nil || patch.Count != 1 || !patch.QueriesKnown || patch.Queries != 1 {
+		t.Fatalf("patch=%+v err=%v; expected failed read count/query metrics with cache discarded", patch, err)
 	}
 }
 
@@ -175,8 +202,8 @@ func TestInterBaseMetadataTransactionCancellationDuringRollbackDiscardsPatch(t *
 	patch, err := db.runMetadataRead(ctx, func(context.Context, schema.Queryer, int) (MetadataPatch, error) {
 		return MetadataPatch{Count: 9}, nil
 	})
-	if !errors.Is(err, context.Canceled) || patch.Count != 0 {
-		t.Fatalf("patch=%+v err=%v, want empty patch and context.Canceled", patch, err)
+	if !errors.Is(err, context.Canceled) || patch.Cache != nil || patch.Count != 9 || !patch.QueriesKnown || patch.Queries != 1 {
+		t.Fatalf("patch=%+v err=%v, want retained count/query metrics, discarded cache and context.Canceled", patch, err)
 	}
 	if state.rollbacks != 1 {
 		t.Fatalf("rollbacks = %d, want 1", state.rollbacks)
@@ -505,6 +532,9 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 			snapshot := loader.Snapshot()
 			if got := snapshot.Status[tc.kind].State; got != MetadataFailed {
 				t.Fatalf("%s state = %s; match %q failed to reach real reader SQL", tc.kind, got, tc.match)
+			}
+			if !snapshot.Status[tc.kind].QueriesKnown || snapshot.Status[tc.kind].Queries == 0 {
+				t.Errorf("failed %s query metrics = %+v, want known nonzero attempts", tc.kind, snapshot.Status[tc.kind])
 			}
 			if snapshot.Cache.MetadataReady(tc.kind) {
 				t.Fatalf("failed %s category was published ready", tc.kind)

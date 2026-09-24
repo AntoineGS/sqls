@@ -208,6 +208,59 @@ func TestMetadataStatusFailedAndBlockedJobsOverJSONRPC(t *testing.T) {
 	}
 }
 
+func TestMetadataStatusQueuedCancellationHasZeroRunDuration(t *testing.T) {
+	s, _, _ := newMetadataStatusRPC(t, false)
+	s.stateMu.Lock()
+	s.connectionState = connectionReady
+	s.connGeneration = 23
+	s.stateMu.Unlock()
+	s.metadata.Reset(23)
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	load, err := s.metadata.Start(ctx, 23, metadataStatusPlanRepository{MockDBRepository: &database.MockDBRepository{}, plan: metadataStatusPlanWithQueuedJob(started)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("first metadata job did not start")
+	}
+	cancel()
+	select {
+	case <-load.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancelled metadata generation did not settle")
+	}
+	result := s.metadataStatus()
+	for _, category := range result.Categories {
+		if category.Kind == string(database.MetadataRelations) && category.DurationMS != 0 {
+			t.Fatalf("queued cancellation duration = %dms, want zero", category.DurationMS)
+		}
+	}
+}
+
+type metadataStatusPlanRepository struct {
+	*database.MockDBRepository
+	plan database.MetadataPlan
+}
+
+func (r metadataStatusPlanRepository) MetadataPlan() database.MetadataPlan { return r.plan }
+
+func metadataStatusPlanWithQueuedJob(started chan<- struct{}) database.MetadataPlan {
+	return database.MetadataPlan{Parallelism: 1, Jobs: []database.MetadataJob{
+		{Kind: database.MetadataSchemas, Run: func(ctx context.Context, _ *database.DBCache) (database.MetadataPatch, error) {
+			close(started)
+			<-ctx.Done()
+			return database.MetadataPatch{}, ctx.Err()
+		}},
+		{Kind: database.MetadataRelations, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+			return database.MetadataPatch{}, nil
+		}},
+	}}
+}
+
 func TestMetadataStatusIsNonblockingAndDoesNotLeakErrors(t *testing.T) {
 	tx := newTestContext()
 	tx.setup(t)
