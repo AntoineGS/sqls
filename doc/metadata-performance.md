@@ -43,10 +43,12 @@ go run ./script/metadata-benchmark \
 ```
 
 Use `-scenario refresh` to start one process, initialize and warm its metadata,
-then time `switchConnections` for connection `"1"`. Refresh timings start just
-before the switch command; warm-up is excluded. Each run has its own watchdog.
-Timeouts terminate and reap their server process. Polling is fixed at 100 ms and
-completion probes use the cache-only LSP completion request (no DDL hover).
+then wait for both expected completion sentinels and nondegraded settlement
+before timing `switchConnections` for connection `"1"`. Refresh timings start
+just before the switch command; warm-up is excluded. Each run has its own
+watchdog. Timeouts terminate and reap their server process. Polling is fixed at
+100 ms and completion probes use the cache-only LSP completion request (no DDL
+hover).
 
 ## Interpret and report
 
@@ -59,6 +61,16 @@ coarse primary/catalog completion log events and completion sentinels; it has no
 attach milestone. Candidate status milestones come from the advertised
 `sqls.showMetadataStatus` pull command. A run is successful only when both probe
 sentinels are present and metadata is settled without degradation.
+
+`loadingCompletionLatencyMs` reports pooled p50/p95 cache-only completion
+response latency samples from successful runs. Samples are included only when
+the request was dispatched while metadata was loading; post-settlement probes
+are not included. The runner keeps at most one outstanding request per surface
+and caps loading samples at five requests per surface per measured run. It may
+issue one validation request after settlement only when that surface's sentinel
+was not observed during loading. A settled run missing either sentinel is
+classified degraded, not successful; an already-degraded settlement terminates
+immediately even if either sentinel has not appeared.
 
 Retain alongside the report (not in it) the database identifier, table/object
 counts, server and driver commits/versions, host/OS, client-to-database network

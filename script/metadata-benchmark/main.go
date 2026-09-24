@@ -26,6 +26,9 @@ import (
 )
 
 const pollInterval = 100 * time.Millisecond
+const maxLoadingSamplesPerSurface = 5
+
+var errDegradedWarmup = errors.New("refresh warm-up degraded")
 
 type milestone struct {
 	line string
@@ -49,11 +52,20 @@ type runResult struct {
 	SettledMS           *float64  `json:"settledMs"`
 	CompletionLatencyMS []float64 `json:"completionLatencyMs"`
 	Observer            string    `json:"observer"`
+	tableLatencyMS      []float64 `json:"-"`
+	columnLatencyMS     []float64 `json:"-"`
 }
 
 type percentile struct {
 	P50 *float64 `json:"p50"`
 	P95 *float64 `json:"p95"`
+}
+type completionResponse struct {
+	table   bool
+	items   []lsp.CompletionItem
+	latency float64
+	valid   bool
+	sampled bool
 }
 type report struct {
 	aggregateReport
@@ -176,8 +188,14 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 		if err != nil {
 			return timeoutOrError(ctx, result)
 		}
-		priorGeneration, err = waitForSettlement(ctx, conn, logCh, statusSupported)
+		result.Observer = observerName(statusSupported)
+		priorGeneration, err = warmupRefresh(ctx, conn, p, logCh, result.Observer)
 		if err != nil {
+			if errors.Is(err, errDegradedWarmup) {
+				result.Outcome = "degraded"
+				sendShutdown(ctx, conn)
+				return result
+			}
 			return timeoutOrError(ctx, result)
 		}
 		for {
@@ -201,20 +219,17 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 		}
 		result.ProtocolReadyMS = protocolReady
 	}
-	result.Observer = "legacy-log"
-	if statusSupported {
-		result.Observer = "status"
-	}
+	result.Observer = observerName(statusSupported)
 
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	var tableReady, colReady bool
 	var settled, degraded bool
-	type pendingProbe struct {
-		waiter *jsonrpc2.Waiter
-		start  time.Time
-	}
-	var tableWait, colWait *pendingProbe
+	var tableInFlight, colInFlight bool
+	var tableLoadingSamples, colLoadingSamples int
+	var tableValidationIssued, colValidationIssued bool
+	var tableCompleted, colCompleted bool
+	responses := make(chan completionResponse, 4)
 	for {
 		select {
 		case <-ctx.Done():
@@ -224,14 +239,45 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 				logCh = nil
 				continue
 			}
-			if strings.Contains(event.line, "Update db cache primary complete") && result.RelationReadyMS == nil {
+			if result.Observer == "legacy-log" && strings.Contains(event.line, "Update db cache primary complete") && result.RelationReadyMS == nil {
 				result.RelationReadyMS = elapsedAt(started, event.at)
 			}
-			if strings.Contains(event.line, "Update catalog cache complete") {
+			if result.Observer == "legacy-log" && strings.Contains(event.line, "Update catalog cache complete") {
 				settled = true
 				if result.SettledMS == nil {
 					result.SettledMS = elapsedAt(started, event.at)
 				}
+			}
+		case response := <-responses:
+			if response.table {
+				tableInFlight = false
+				tableCompleted = true
+			} else {
+				colInFlight = false
+				colCompleted = true
+			}
+			if response.valid && response.sampled {
+				result.CompletionLatencyMS = append(result.CompletionLatencyMS, response.latency)
+				if response.table {
+					result.tableLatencyMS = append(result.tableLatencyMS, response.latency)
+				} else {
+					result.columnLatencyMS = append(result.columnLatencyMS, response.latency)
+				}
+			}
+			if containsLabel(response.items, func() string {
+				if response.table {
+					return p.ExpectedTable
+				}
+				return p.ExpectedColumn
+			}()) {
+				if response.table {
+					tableReady = true
+				} else {
+					colReady = true
+				}
+			}
+			if tableReady && colReady && result.BasicReadyMS == nil {
+				result.BasicReadyMS = elapsed(started)
 			}
 		case <-ticker.C:
 			if result.Observer == "status" {
@@ -249,58 +295,10 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 							result.RelationReadyMS = elapsed(started)
 						}
 					}
+					wasSettled := settled
 					settled, degraded = status.Settled, status.Degraded
-				}
-			}
-			if tableReady && colReady && result.BasicReadyMS == nil {
-				result.BasicReadyMS = elapsed(started)
-			}
-			if result.BasicReadyMS != nil && settled && result.SettledMS == nil {
-				result.SettledMS = elapsed(started)
-			}
-			if tableWait == nil {
-				w, e := conn.DispatchCall(ctx, "textDocument/completion", completionParams(p, p.TablePosition))
-				if e == nil {
-					tableWait = &pendingProbe{waiter: &w, start: time.Now()}
-				}
-			}
-			if colWait == nil {
-				w, e := conn.DispatchCall(ctx, "textDocument/completion", completionParams(p, p.ColumnPosition))
-				if e == nil {
-					colWait = &pendingProbe{waiter: &w, start: time.Now()}
-				}
-			}
-			for _, pending := range []struct {
-				wait  **pendingProbe
-				table bool
-			}{{&tableWait, true}, {&colWait, false}} {
-				if *pending.wait == nil {
-					continue
-				}
-				var raw json.RawMessage
-				if err := (*pending.wait).waiter.Wait(ctx, &raw); err != nil {
-					if ctx.Err() != nil {
-						return timeoutOrError(ctx, result)
-					}
-					*pending.wait = nil
-					continue
-				}
-				latencyMS := float64(time.Since((*pending.wait).start)) / float64(time.Millisecond)
-				result.CompletionLatencyMS = append(result.CompletionLatencyMS, latencyMS)
-				*pending.wait = nil
-				items, err := decodeCompletion(raw)
-				if err != nil {
-					continue
-				}
-				label := p.ExpectedColumn
-				if pending.table {
-					label = p.ExpectedTable
-				}
-				if containsLabel(items, label) {
-					if pending.table {
-						tableReady = true
-					} else {
-						colReady = true
+					if settled && !wasSettled && result.SettledMS == nil {
+						result.SettledMS = elapsed(started)
 					}
 				}
 			}
@@ -309,16 +307,53 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 			}
 			if result.BasicReadyMS != nil && settled && result.SettledMS == nil {
 				result.SettledMS = elapsed(started)
+			}
+			if !tableInFlight && ((!settled && tableLoadingSamples < maxLoadingSamplesPerSurface) || (settled && !tableReady && !tableValidationIssued)) {
+				loading := !settled
+				if loading {
+					tableLoadingSamples++
+				} else {
+					tableValidationIssued = true
+				}
+				tableInFlight = dispatchCompletion(ctx, conn, p.TablePosition, true, loading, responses)
+			}
+			if !colInFlight && ((!settled && colLoadingSamples < maxLoadingSamplesPerSurface) || (settled && !colReady && !colValidationIssued)) {
+				loading := !settled
+				if loading {
+					colLoadingSamples++
+				} else {
+					colValidationIssued = true
+				}
+				colInFlight = dispatchCompletion(ctx, conn, p.ColumnPosition, false, loading, responses)
+			}
+			if tableReady && colReady && result.BasicReadyMS == nil {
+				result.BasicReadyMS = elapsed(started)
+			}
+			if result.BasicReadyMS != nil && settled && result.SettledMS == nil {
+				result.SettledMS = elapsed(started)
+			}
+			if settled && degraded {
+				if result.SettledMS == nil {
+					result.SettledMS = elapsed(started)
+				}
+				result.Outcome = "degraded"
+				sendShutdown(ctx, conn)
+				return result
 			}
 			if settled && result.BasicReadyMS != nil {
 				if result.SettledMS == nil {
 					result.SettledMS = elapsed(started)
 				}
-				if degraded || !tableReady || !colReady {
+				if !tableReady || !colReady {
 					result.Outcome = "degraded"
 				} else {
 					result.Outcome = "success"
 				}
+				sendShutdown(ctx, conn)
+				return result
+			}
+			if settled && !degraded && tableCompleted && colCompleted && !tableInFlight && !colInFlight && (!tableReady || !colReady) {
+				result.Outcome = "degraded"
 				sendShutdown(ctx, conn)
 				return result
 			}
@@ -352,12 +387,39 @@ func supportsStatus(result map[string]interface{}) bool {
 	}
 	return false
 }
-func completionParams(p probe, pos lsp.Position) map[string]interface{} {
+func completionParams(pos lsp.Position) map[string]interface{} {
 	return map[string]interface{}{"textDocument": map[string]interface{}{"uri": "file:///metadata-benchmark.sql"}, "position": pos, "context": map[string]interface{}{"triggerKind": 1}}
 }
 func sendShutdown(ctx context.Context, conn *jsonrpc2.Conn) {
 	_ = conn.Call(ctx, "shutdown", nil, nil)
 	_ = conn.Notify(ctx, "exit", nil)
+}
+func observerName(statusSupported bool) string {
+	if statusSupported {
+		return "status"
+	}
+	return "legacy-log"
+}
+func dispatchCompletion(ctx context.Context, conn *jsonrpc2.Conn, pos lsp.Position, table, loading bool, responses chan<- completionResponse) bool {
+	started := time.Now()
+	waiter, err := conn.DispatchCall(ctx, "textDocument/completion", completionParams(pos))
+	if err != nil {
+		return false
+	}
+	go func() {
+		var raw json.RawMessage
+		err := waiter.Wait(ctx, &raw)
+		items, decodeErr := decodeCompletion(raw)
+		response := completionResponse{table: table, items: items, valid: err == nil && decodeErr == nil, sampled: loading}
+		if loading && response.valid {
+			response.latency = float64(time.Since(started)) / float64(time.Millisecond)
+		}
+		select {
+		case responses <- response:
+		case <-ctx.Done():
+		}
+	}()
+	return true
 }
 func timeoutOrError(ctx context.Context, result runResult) runResult {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -396,9 +458,12 @@ func decodeCompletion(raw json.RawMessage) ([]lsp.CompletionItem, error) {
 	return list.Items, err
 }
 
-func waitForSettlement(ctx context.Context, conn *jsonrpc2.Conn, logs <-chan milestone, statusSupported bool) (uint64, error) {
+func warmupRefresh(ctx context.Context, conn *jsonrpc2.Conn, p probe, logs <-chan milestone, observer string) (uint64, error) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
+	responses := make(chan completionResponse, 4)
+	var tableReady, colReady, tableInFlight, colInFlight, settled, degraded bool
+	var generation uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -408,16 +473,36 @@ func waitForSettlement(ctx context.Context, conn *jsonrpc2.Conn, logs <-chan mil
 				logs = nil
 				continue
 			}
-			if strings.Contains(event.line, "Update catalog cache complete") {
-				return 0, nil
+			if observer == "legacy-log" && strings.Contains(event.line, "Update catalog cache complete") {
+				settled = true
+			}
+		case response := <-responses:
+			if response.table {
+				tableInFlight = false
+				tableReady = tableReady || containsLabel(response.items, p.ExpectedTable)
+			} else {
+				colInFlight = false
+				colReady = colReady || containsLabel(response.items, p.ExpectedColumn)
 			}
 		case <-ticker.C:
-			if !statusSupported {
-				continue
+			if observer == "status" {
+				var status lsp.MetadataStatusResult
+				if err := conn.Call(ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{Command: "sqls.showMetadataStatus"}, &status); err == nil {
+					generation = status.Generation
+					settled, degraded = status.Settled, status.Degraded
+				}
 			}
-			var s lsp.MetadataStatusResult
-			if conn.Call(ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{Command: "sqls.showMetadataStatus"}, &s) == nil && s.Settled {
-				return s.Generation, nil
+			if settled && degraded {
+				return generation, errDegradedWarmup
+			}
+			if settled && tableReady && colReady {
+				return generation, nil
+			}
+			if !tableReady && !tableInFlight {
+				tableInFlight = dispatchCompletion(ctx, conn, p.TablePosition, true, false, responses)
+			}
+			if !colReady && !colInFlight {
+				colInFlight = dispatchCompletion(ctx, conn, p.ColumnPosition, false, false, responses)
 			}
 		}
 	}
@@ -448,15 +533,16 @@ func (s *stdioStream) Write(p []byte) (int, error) { return s.w.Write(p) }
 func (s *stdioStream) Close() error                { e := s.w.Close(); _ = s.r.Close(); return e }
 
 type aggregateReport struct {
-	SuccessfulRuns  int            `json:"successfulRuns"`
-	FailedRuns      int            `json:"failedRuns"`
-	Outcomes        map[string]int `json:"outcomes"`
-	ProtocolReadyMS percentile     `json:"protocolReadyMs"`
-	AttachReadyMS   percentile     `json:"attachReadyMs"`
-	RelationReadyMS percentile     `json:"relationReadyMs"`
-	BasicReadyMS    percentile     `json:"basicReadyMs"`
-	SettledMS       percentile     `json:"settledMs"`
-	Runs            []runResult    `json:"runs"`
+	SuccessfulRuns             int            `json:"successfulRuns"`
+	FailedRuns                 int            `json:"failedRuns"`
+	Outcomes                   map[string]int `json:"outcomes"`
+	ProtocolReadyMS            percentile     `json:"protocolReadyMs"`
+	AttachReadyMS              percentile     `json:"attachReadyMs"`
+	RelationReadyMS            percentile     `json:"relationReadyMs"`
+	BasicReadyMS               percentile     `json:"basicReadyMs"`
+	SettledMS                  percentile     `json:"settledMs"`
+	LoadingCompletionLatencyMS percentile     `json:"loadingCompletionLatencyMs"`
+	Runs                       []runResult    `json:"runs"`
 }
 
 func aggregate(results []runResult) aggregateReport {
@@ -476,6 +562,11 @@ func aggregate(results []runResult) aggregateReport {
 	all.RelationReadyMS = percentiles(good, func(r runResult) *float64 { return r.RelationReadyMS })
 	all.BasicReadyMS = percentiles(good, func(r runResult) *float64 { return r.BasicReadyMS })
 	all.SettledMS = percentiles(good, func(r runResult) *float64 { return r.SettledMS })
+	var loadingLatencies []float64
+	for _, run := range good {
+		loadingLatencies = append(loadingLatencies, run.CompletionLatencyMS...)
+	}
+	all.LoadingCompletionLatencyMS = percentileValues(loadingLatencies)
 	return all
 }
 func percentiles(rs []runResult, field func(runResult) *float64) percentile {
@@ -485,6 +576,9 @@ func percentiles(rs []runResult, field func(runResult) *float64) percentile {
 			values = append(values, *v)
 		}
 	}
+	return percentileValues(values)
+}
+func percentileValues(values []float64) percentile {
 	if len(values) == 0 {
 		return percentile{}
 	}
