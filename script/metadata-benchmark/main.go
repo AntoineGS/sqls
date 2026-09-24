@@ -308,8 +308,8 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 			if result.BasicReadyMS != nil && settled && result.SettledMS == nil {
 				result.SettledMS = elapsed(started)
 			}
-			if !tableInFlight && ((!settled && tableLoadingSamples < maxLoadingSamplesPerSurface) || (settled && !tableReady && !tableValidationIssued)) {
-				loading := !settled
+			if !tableInFlight && ((!settled && (!tableReady || tableLoadingSamples < maxLoadingSamplesPerSurface)) || (settled && !tableReady && !tableValidationIssued)) {
+				loading := !settled && tableLoadingSamples < maxLoadingSamplesPerSurface
 				if loading {
 					tableLoadingSamples++
 				} else {
@@ -317,8 +317,8 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 				}
 				tableInFlight = dispatchCompletion(ctx, conn, p.TablePosition, true, loading, responses)
 			}
-			if !colInFlight && ((!settled && colLoadingSamples < maxLoadingSamplesPerSurface) || (settled && !colReady && !colValidationIssued)) {
-				loading := !settled
+			if !colInFlight && ((!settled && (!colReady || colLoadingSamples < maxLoadingSamplesPerSurface)) || (settled && !colReady && !colValidationIssued)) {
+				loading := !settled && colLoadingSamples < maxLoadingSamplesPerSurface
 				if loading {
 					colLoadingSamples++
 				} else {

@@ -66,11 +66,14 @@ sentinels are present and metadata is settled without degradation.
 response latency samples from successful runs. Samples are included only when
 the request was dispatched while metadata was loading; post-settlement probes
 are not included. The runner keeps at most one outstanding request per surface
-and caps loading samples at five requests per surface per measured run. It may
-issue one validation request after settlement only when that surface's sentinel
-was not observed during loading. A settled run missing either sentinel is
-classified degraded, not successful; an already-degraded settlement terminates
-immediately even if either sentinel has not appeared.
+and caps latency samples at five requests per surface per measured run. If a
+sentinel is still missing after the sample cap, readiness probes continue at the
+100 ms polling cadence (without adding latency samples) until the sentinel
+appears or metadata settles. It may issue one validation request after
+settlement only when that surface's sentinel was not observed during loading.
+A settled run missing either sentinel is classified degraded, not successful;
+an already-degraded settlement terminates immediately even if either sentinel
+has not appeared.
 
 Retain alongside the report (not in it) the database identifier, table/object
 counts, server and driver commits/versions, host/OS, client-to-database network

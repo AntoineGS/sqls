@@ -209,6 +209,19 @@ func TestStdioRunnerDelayedInitializedWorkAndOutOfOrderReplies(t *testing.T) {
 	}
 }
 
+func TestReadinessProbesContinueAfterLoadingLatencySampleCap(t *testing.T) {
+	result := runOne(context.Background(), helperServer(t, "sentinel-after-five"), "unused", testProbe(), "cold-process", 4*time.Second)
+	if result.Outcome != "success" {
+		t.Fatalf("late-sentinel run outcome = %q", result.Outcome)
+	}
+	if result.BasicReadyMS == nil || result.SettledMS == nil || *result.BasicReadyMS >= *result.SettledMS {
+		t.Fatalf("basic readiness should precede catalog settlement after the sixth probe: basic=%v settled=%v", result.BasicReadyMS, result.SettledMS)
+	}
+	if len(result.tableLatencyMS) != 5 {
+		t.Fatalf("table loading latency samples = %d, want cap 5", len(result.tableLatencyMS))
+	}
+}
+
 func TestRefreshWarmupIgnoresLegacyLogsForStatusObserver(t *testing.T) {
 	result := runOne(context.Background(), helperServer(t, "candidate-log-contamination"), "unused", testProbe(), "refresh", 2*time.Second)
 	if result.Outcome != "success" || result.Observer != "status" {
@@ -263,12 +276,13 @@ func helperServerWithPID(t *testing.T, mode string) (string, string) {
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 
 type fixtureHandler struct {
-	mu         sync.Mutex
-	mode       string
-	readyAt    time.Time
-	generation uint64
-	tableSeen  bool
-	columnSeen bool
+	mu            sync.Mutex
+	mode          string
+	readyAt       time.Time
+	generation    uint64
+	tableSeen     bool
+	columnSeen    bool
+	tableRequests int
 }
 
 func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *jsonrpc2.Request) {
@@ -288,6 +302,8 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 			h.readyAt = time.Now().Add(120 * time.Millisecond)
 		} else if h.mode == "candidate-log-contamination" {
 			h.readyAt = time.Now().Add(180 * time.Millisecond)
+		} else if h.mode == "sentinel-after-five" {
+			h.readyAt = time.Now().Add(1500 * time.Millisecond)
 		} else {
 			h.readyAt = time.Now()
 		}
@@ -307,13 +323,33 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 		h.mu.Lock()
 		mode := h.mode
 		readyAt := h.readyAt
+		if params.Position.Character == 8 {
+			h.tableRequests++
+		}
+		tableRequestNumber := h.tableRequests
 		h.mu.Unlock()
 		if params.Position.Character == 8 {
 			tableDelay := 120 * time.Millisecond
 			if mode == "malformed-completion" {
 				tableDelay = 10 * time.Millisecond
 			}
+			if mode == "sentinel-after-five" {
+				tableDelay = 5 * time.Millisecond
+			}
 			time.Sleep(tableDelay)
+			if mode == "sentinel-after-five" {
+				label := "OTHER"
+				if tableRequestNumber >= 6 {
+					label = "TABLE_SENTINEL"
+				}
+				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": label}})
+				if tableRequestNumber >= 6 {
+					h.mu.Lock()
+					h.tableSeen = true
+					h.mu.Unlock()
+				}
+				return
+			}
 			if (mode == "candidate-log-contamination" || mode == "failed-catalog") && time.Now().Before(readyAt) {
 				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": "OTHER"}})
 				return
