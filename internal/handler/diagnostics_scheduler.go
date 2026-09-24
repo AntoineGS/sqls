@@ -43,6 +43,7 @@ func (s *Server) takeDiagnosticWork() ([]string, bool) {
 }
 
 func (s *Server) runDiagnosticSignals() {
+	defer close(s.diagnosticsDone)
 	for {
 		select {
 		case <-s.lifecycleCtx.Done():

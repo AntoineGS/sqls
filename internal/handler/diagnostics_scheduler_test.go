@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -44,26 +43,21 @@ func TestDiagnosticsCoalescesDirtyDocumentsAndAllOpenBit(t *testing.T) {
 }
 
 func TestDiagnosticsLatestRevisionAndSingleAnalyzerAcrossBurst(t *testing.T) {
-	s := NewServer()
-	defer s.Stop()
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverMySQL)
+	s := tx.server
 	const uri = "file:///burst.sql"
 	s.stateMu.Lock()
-	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverMySQL}
+	s.notificationConn = tx.serverConn
 	s.files[uri] = &File{Text: "initial", Version: 1, Revision: 1}
 	s.stateMu.Unlock()
 
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
 	var active, peak atomic.Int32
-	var versionsMu sync.Mutex
-	var versions []int
 	s.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
 		current := active.Add(1)
 		for previous := peak.Load(); current > previous && !peak.CompareAndSwap(previous, current); previous = peak.Load() {
 		}
-		versionsMu.Lock()
-		versions = append(versions, snapshot.version)
-		versionsMu.Unlock()
 		entered <- struct{}{}
 		<-release
 		active.Add(-1)
@@ -78,30 +72,85 @@ func TestDiagnosticsLatestRevisionAndSingleAnalyzerAcrossBurst(t *testing.T) {
 	}
 
 	for i := 0; i < 50; i++ {
-		s.signalDiagnostics()
+		s.queueAllDiagnostics()
 	}
 	s.stateMu.Lock()
 	s.files[uri] = &File{Text: "latest", Version: 9, Revision: 9}
 	s.stateMu.Unlock()
-	s.queueDiagnosticDocument(uri)
-	close(release)
-
-	deadline := time.After(5 * time.Second)
-	for {
-		versionsMu.Lock()
-		finishedLatest := len(versions) >= 2 && versions[len(versions)-1] == 9
-		versionsMu.Unlock()
-		if finishedLatest {
-			break
-		}
-		select {
-		case <-entered:
-		case <-deadline:
-			t.Fatal("worker did not analyze the latest revision")
-		}
+	s.diagnosticWorkMu.Lock()
+	if !s.diagnosticAllOpen || len(s.diagnosticDocuments) != 0 {
+		s.diagnosticWorkMu.Unlock()
+		t.Fatalf("pending metadata work was not coalesced: all=%v documents=%d", s.diagnosticAllOpen, len(s.diagnosticDocuments))
 	}
+	pendingDocuments := len(s.diagnosticDocuments)
+	s.diagnosticWorkMu.Unlock()
+	if pendingDocuments != 0 || len(s.diagnosticsWake) > 1 {
+		t.Fatalf("unbounded pending work: documents=%d wake=%d", pendingDocuments, len(s.diagnosticsWake))
+	}
+	close(release)
+	latest := tx.client.next(t, uri, func(notification diagnosticsNotification) bool {
+		return notification.Version != nil && *notification.Version == 9
+	})
+	assertVersion(t, latest, 9)
 	if got := peak.Load(); got != 1 {
 		t.Fatalf("peak concurrent analyzers = %d, want 1", got)
+	}
+	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
+		t.Fatal("send notification barrier:", err)
+	}
+	select {
+	case <-tx.client.barrier:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for notification barrier")
+	}
+	tx.client.mu.Lock()
+	defer tx.client.mu.Unlock()
+	for _, notification := range tx.client.notifications {
+		if notification.URI == uri && notification.Version != nil && *notification.Version == 1 {
+			t.Fatalf("stale version 1 notification was published: %+v", notification)
+		}
+	}
+}
+
+func TestDiagnosticsStopCancelsRemainingAllOpenAnalysis(t *testing.T) {
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverMySQL)
+	s := tx.server
+	first, second := "file:///stop-first.sql", "file:///stop-second.sql"
+	s.stateMu.Lock()
+	s.notificationConn = tx.serverConn
+	s.files[first] = &File{Text: "first", Version: 1, Revision: 1}
+	s.files[second] = &File{Text: "second", Version: 1, Revision: 2}
+	s.stateMu.Unlock()
+
+	entered := make(chan string, 2)
+	release := make(chan struct{})
+	s.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+		entered <- snapshot.uri
+		<-release
+		return nil
+	}
+	s.queueAllDiagnostics()
+	select {
+	case uri := <-entered:
+		if uri != first {
+			t.Fatalf("first all-open URI = %s, want sorted first URI %s", uri, first)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not enter first all-open analysis")
+	}
+	if err := s.Stop(); err != nil {
+		t.Fatal("stop server:", err)
+	}
+	close(release)
+	select {
+	case <-s.diagnosticsDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("diagnostics worker did not stop")
+	}
+	select {
+	case uri := <-entered:
+		t.Fatalf("analysis started for %s after Stop", uri)
+	default:
 	}
 }
 

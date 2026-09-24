@@ -84,6 +84,7 @@ type Server struct {
 	cleanupQueue     chan *database.DBConnection
 	cleanupFinal     chan *database.DBConnection
 	diagnosticsWake  chan struct{}
+	diagnosticsDone  chan struct{}
 	stopOnce         sync.Once
 	fileRevision     uint64
 	notificationConn *jsonrpc2.Conn
@@ -126,6 +127,7 @@ func NewServer() *Server {
 		cleanupQueue:        make(chan *database.DBConnection, 2),
 		cleanupFinal:        make(chan *database.DBConnection, 1),
 		diagnosticsWake:     make(chan struct{}, 1),
+		diagnosticsDone:     make(chan struct{}),
 		diagnosticDocuments: make(map[string]struct{}),
 	}
 	server.metadata.SetChangedCallback(func() {

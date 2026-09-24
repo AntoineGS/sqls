@@ -305,6 +305,9 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 	}
 	sort.Strings(uris)
 	for _, uri := range uris {
+		if ctx.Err() != nil {
+			return
+		}
 		s.publishDocumentDiagnostics(ctx, conn, uri)
 	}
 }
