@@ -312,7 +312,7 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 				loading := !settled && tableLoadingSamples < maxLoadingSamplesPerSurface
 				if loading {
 					tableLoadingSamples++
-				} else {
+				} else if settled {
 					tableValidationIssued = true
 				}
 				tableInFlight = dispatchCompletion(ctx, conn, p.TablePosition, true, loading, responses)
@@ -321,7 +321,7 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 				loading := !settled && colLoadingSamples < maxLoadingSamplesPerSurface
 				if loading {
 					colLoadingSamples++
-				} else {
+				} else if settled {
 					colValidationIssued = true
 				}
 				colInFlight = dispatchCompletion(ctx, conn, p.ColumnPosition, false, loading, responses)

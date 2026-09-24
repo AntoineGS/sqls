@@ -222,6 +222,28 @@ func TestReadinessProbesContinueAfterLoadingLatencySampleCap(t *testing.T) {
 	}
 }
 
+func TestPostCapReadinessMissDoesNotConsumeSettlementValidation(t *testing.T) {
+	server, pidFile := helperServerWithPID(t, "sentinel-at-settlement")
+	result := runOne(context.Background(), server, "unused", testProbe(), "cold-process", 4*time.Second)
+	if result.Outcome != "success" || result.BasicReadyMS == nil || result.SettledMS == nil {
+		t.Fatalf("sentinel available at settlement did not complete successfully: %+v", result)
+	}
+	if *result.BasicReadyMS < *result.SettledMS {
+		t.Fatalf("fixture exposed sentinel before settlement: basic=%v settled=%v", *result.BasicReadyMS, *result.SettledMS)
+	}
+	if len(result.tableLatencyMS) != 5 {
+		t.Fatalf("table latency samples=%d, want cap 5", len(result.tableLatencyMS))
+	}
+	countBytes, err := os.ReadFile(pidFile + ".tables")
+	if err != nil {
+		t.Fatalf("read table probe count: %v", err)
+	}
+	count, err := strconv.Atoi(strings.TrimSpace(string(countBytes)))
+	if err != nil || count <= 5 {
+		t.Fatalf("table probes=%q, want more than five loading misses plus settlement validation", countBytes)
+	}
+}
+
 func TestRefreshWarmupIgnoresLegacyLogsForStatusObserver(t *testing.T) {
 	result := runOne(context.Background(), helperServer(t, "candidate-log-contamination"), "unused", testProbe(), "refresh", 2*time.Second)
 	if result.Outcome != "success" || result.Observer != "status" {
@@ -266,7 +288,7 @@ func helperServerWithPID(t *testing.T, mode string) (string, string) {
 	dir := t.TempDir()
 	script := dir + "/server"
 	pidFile := filepath.Join(dir, "child.pid")
-	content := "#!/bin/sh\nSQLS_BENCH_HELPER=1 SQLS_BENCH_MODE=" + mode + " SQLS_BENCH_PIDFILE=" + shellQuote(pidFile) + " SQLS_BENCH_SWITCHFILE=" + shellQuote(pidFile+".switch") + " exec " + shellQuote(path) + " -test.run=^TestHelperProcess$\n"
+	content := "#!/bin/sh\nSQLS_BENCH_HELPER=1 SQLS_BENCH_MODE=" + mode + " SQLS_BENCH_PIDFILE=" + shellQuote(pidFile) + " SQLS_BENCH_SWITCHFILE=" + shellQuote(pidFile+".switch") + " SQLS_BENCH_TABLECOUNTFILE=" + shellQuote(pidFile+".tables") + " exec " + shellQuote(path) + " -test.run=^TestHelperProcess$\n"
 	if err := os.WriteFile(script, []byte(content), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -304,6 +326,8 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 			h.readyAt = time.Now().Add(180 * time.Millisecond)
 		} else if h.mode == "sentinel-after-five" {
 			h.readyAt = time.Now().Add(1500 * time.Millisecond)
+		} else if h.mode == "sentinel-at-settlement" {
+			h.readyAt = time.Now().Add(1500 * time.Millisecond)
 		} else {
 			h.readyAt = time.Now()
 		}
@@ -329,6 +353,9 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 		tableRequestNumber := h.tableRequests
 		h.mu.Unlock()
 		if params.Position.Character == 8 {
+			if countFile := os.Getenv("SQLS_BENCH_TABLECOUNTFILE"); countFile != "" {
+				_ = os.WriteFile(countFile, []byte(strconv.Itoa(tableRequestNumber)), 0600)
+			}
 			tableDelay := 120 * time.Millisecond
 			if mode == "malformed-completion" {
 				tableDelay = 10 * time.Millisecond
@@ -344,6 +371,19 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 				}
 				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": label}})
 				if tableRequestNumber >= 6 {
+					h.mu.Lock()
+					h.tableSeen = true
+					h.mu.Unlock()
+				}
+				return
+			}
+			if mode == "sentinel-at-settlement" {
+				label := "OTHER"
+				if !time.Now().Before(readyAt) {
+					label = "TABLE_SENTINEL"
+				}
+				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": label}})
+				if label == "TABLE_SENTINEL" {
 					h.mu.Lock()
 					h.tableSeen = true
 					h.mu.Unlock()
