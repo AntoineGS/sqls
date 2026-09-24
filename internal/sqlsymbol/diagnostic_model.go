@@ -45,11 +45,28 @@ type diagnosticModel struct {
 	// concept, built directly from the already-parsed RelationRef list.
 	relationDeclPositions map[int]bool
 
+	// relationPositions maps a query index to its own q.relations, paired
+	// 1:1 with the item index where each relation reference's own text
+	// begins (queryRelationDetails' scan) -- the actual, query-boundary-
+	// aware candidate list unknown-relation checking uses, rather than a
+	// naive "name immediately after any FROM keyword" scan that cannot
+	// distinguish a query's own FROM clause from FROM used as function-
+	// call syntax (for example EXTRACT(YEAR FROM col) or TRIM(... FROM
+	// col)).
+	relationPositions map[int][]relationDetail
+
 	unionOf     []int   // per query index: the union-chain group it belongs to, or -1
 	unionGroups [][]int // group id -> ordered arm query indices
 
 	recognizedWith []itemRange // WITH statements successfully modeled (no nested SELECT in any CTE body or the final query)
 	malformed      []itemRange // statement regions statement recovery had to skip over
+
+	// recognizedTriggerBodies is each discovered trigger's own [bodyStart,
+	// bodyEnd) span (a trigger the shared binder's whole-statement
+	// contextUnsupported classification would otherwise hide from
+	// Unsupported-gated rules, the same reason recognizedWith exists for
+	// WITH statements above). See Unsupported's own doc comment.
+	recognizedTriggerBodies []itemRange
 
 	ddl []modelDDL // CREATE/ALTER/DROP object identities, in document order
 }
@@ -98,6 +115,17 @@ type modelQuery struct {
 	targetEnd      int
 	cteName        string // non-empty (Name.Key()) when this query is a CTE body
 	statementIndex int
+
+	// malformedProjection is true when this query's own projection list
+	// contains a genuinely empty comma-separated segment (for example a
+	// trailing comma right before FROM, or two consecutive commas) --
+	// computeProjection's own signal that the SELECT list itself did not
+	// parse cleanly, distinct from the many other reasons a query's output
+	// can be legitimately CountKnown=false (an unprovable star projection
+	// over zero, multiple, or unknown-column relations). Name-checking
+	// rules withhold every finding for such a query: a statement whose own
+	// projection list is this broken should not be trusted for anything.
+	malformedProjection bool
 }
 
 type modelDDL struct {
@@ -163,13 +191,20 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 
 	m.buildQueryAt(len(items))
 	m.connectRelationSources(a.Text, items, depths, matching)
-	m.computeRelationDeclPositions(a.Text, items, depths, matching)
+	m.computeRelationPositions(a.Text, items, depths, matching)
 	// DDL detection must run before computeOutputs: expandStar resolves
 	// through resolveRelationOutput, which checks DDLInvalidated while
 	// computing a query's own output shape, not only when a caller later
 	// asks for it.
 	m.ddl = detectDDL(a.Text, items, m.statements)
 	m.computeOutputs(a.Text)
+	// buildTriggerQueries runs after the ordinary top-level pass above has
+	// already built m.queryAt/m.queryByStart/m.statements/m.ddl, since a
+	// trigger-embedded query's own relation checks (DDLInvalidated, CTE
+	// shadowing) depend on that state already being in place; it updates
+	// those same structures directly for its own additions rather than
+	// triggering a second top-level pass.
+	m.buildTriggerQueries(a.Text, items, depths, matching)
 	m.detectUnionGroups(items, depths)
 
 	for _, stmt := range m.statements {
@@ -299,7 +334,11 @@ func (m *diagnosticModel) DDLInvalidated(i int, name Name) bool {
 // otherwise-unrecognized WITH, or a malformed statement skipped by recovery.
 // A recognized non-recursive WITH's own body and final query report false,
 // even though the navigation binder still classifies that whole statement as
-// unsupported for its own (unrelated) purposes.
+// unsupported for its own (unrelated) purposes -- and likewise a recognized
+// CREATE TRIGGER body (parseTrigger validated its shape): resolve.go's
+// buildContexts has no CREATE TRIGGER recognition at all, so it classifies
+// a whole trigger statement contextUnsupported end to end, unrelated to
+// whether this model actually understands its embedded SQL.
 func (m *diagnosticModel) Unsupported(i int) bool {
 	if i < 0 || i >= len(m.items) {
 		return false
@@ -311,6 +350,11 @@ func (m *diagnosticModel) Unsupported(i int) bool {
 	}
 	if m.analysis != nil && i < len(m.analysis.contexts) && m.analysis.contexts[i].kind == contextUnsupported {
 		for _, r := range m.recognizedWith {
+			if i >= r.start && i < r.end {
+				return false
+			}
+		}
+		for _, r := range m.recognizedTriggerBodies {
 			if i >= r.start && i < r.end {
 				return false
 			}
@@ -686,19 +730,25 @@ func (m *diagnosticModel) buildWithStatement(text string, items []lexeme, depths
 	return true
 }
 
-// queryRelationDetails mirrors queryRelations' FROM/JOIN scan for a SELECT
-// query, additionally recording the item index each relation reference began
-// at. queryRelations itself does not expose this position; the model needs
-// it to connect a derived table's alias to its own inner query, and a
-// FROM-clause procedure call's alias to its catalog identity.
+// queryRelationDetails mirrors queryRelations' own target-detection and
+// FROM/JOIN scan for every query kind, additionally recording the item
+// index each relation reference began at. queryRelations itself does not
+// expose this position; the model needs it for several purposes: connecting
+// a derived table's alias to its own inner query, a FROM-clause procedure
+// call's alias to its catalog identity, and giving unknown-relation
+// checking a query-boundary-aware candidate position for every one of
+// q.relations (including an UPDATE/INSERT/DELETE target), rather than a
+// naive "name immediately after any FROM keyword" scan that cannot
+// distinguish a query's own FROM clause from FROM used as function-call
+// syntax (for example EXTRACT(YEAR FROM col) or TRIM(... FROM col)).
 func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []int, matching map[int]int) []relationDetail {
-	if query.kind != "SELECT" || query.start >= query.end {
+	if query.start >= query.end {
 		return nil
 	}
 	seen := make(map[int]bool)
 	var details []relationDetail
-	addAt := func(index int) int {
-		ref, next, ok := relationAt(text, items, index, query.end, depths, matching, true)
+	addAt := func(index int, callable bool) int {
+		ref, next, ok := relationAt(text, items, index, query.end, depths, matching, callable)
 		if !ok || seen[index] {
 			return index
 		}
@@ -706,6 +756,22 @@ func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []
 		details = append(details, relationDetail{ref: ref, start: index, end: next})
 		return next - 1
 	}
+
+	switch query.kind {
+	case "UPDATE":
+		if index := nextName(items, query.start+1, query.end); index >= 0 {
+			addAt(index, false)
+		}
+	case "INSERT":
+		if index := wordAfter(items, query.start+1, query.end, "INTO"); index >= 0 {
+			addAt(index, false)
+		}
+	case "DELETE":
+		if index := wordAfter(items, query.start+1, query.end, "FROM"); index >= 0 {
+			addAt(index, false)
+		}
+	}
+
 	inFrom := false
 	for i := query.start + 1; i < query.end; i++ {
 		if depths[i] != query.baseDepth {
@@ -718,16 +784,19 @@ func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []
 		switch {
 		case isWord(items[i], "FROM"), isWord(items[i], "USING"):
 			inFrom = true
+			if isWord(items[i], "FROM") && query.kind == "DELETE" {
+				inFrom = false
+			}
 		case isWord(items[i], "JOIN"):
 			inFrom = true
-			i = addAt(i + 1)
+			i = addAt(i+1, true)
 		case inFrom && items[i].Token.Kind == token.Comma:
-			i = addAt(i + 1)
+			i = addAt(i+1, true)
 		case inFrom && isQueryClause(items[i]):
 			inFrom = false
 		}
-		if isWord(items[i], "FROM") {
-			i = addAt(i + 1)
+		if isWord(items[i], "FROM") && query.kind == "SELECT" {
+			i = addAt(i+1, true)
 		}
 	}
 	return details
@@ -770,28 +839,30 @@ func (m *diagnosticModel) connectRelationSources(text string, items []lexeme, de
 	}
 }
 
-// computeRelationDeclPositions builds relationDeclPositions from the same
-// per-query relation detail scan connectRelationSources already performs,
-// but for every relation (not only the alias-only derived-table/callable
-// ones connectRelationSources itself keys). A derived table's own body
-// belongs to a separate, independently modeled inner query and is
-// deliberately not swept in here: only its alias token is a declaration
-// from the outer query's point of view. A plain table or a FROM-clause
-// callable's whole [start, end) span (name, and call-arguments if any, and
-// alias if any) is swept, since none of it is ever a column value
-// reference in the owning query's own scope -- including call arguments,
-// whose column-existence validation this task does not attempt.
-func (m *diagnosticModel) computeRelationDeclPositions(text string, items []lexeme, depths []int, matching map[int]int) {
+// computeRelationPositions builds relationDeclPositions and
+// relationPositions together from one per-query relation detail scan
+// (queryRelationDetails, now general across every query kind, not just
+// SELECT). relationDeclPositions covers every relation (not only the
+// alias-only derived-table/callable ones connectRelationSources itself
+// keys): a derived table's own body belongs to a separate, independently
+// modeled inner query and is deliberately not swept in here, only its
+// alias token is a declaration from the outer query's point of view; a
+// plain table, an UPDATE/INSERT/DELETE target, or a FROM-clause callable's
+// whole [start, end) span (name, and call-arguments if any, and alias if
+// any) is swept, since none of it is ever a column value reference in the
+// owning query's own scope -- including call arguments, whose column-
+// existence validation this task does not attempt. relationPositions keeps
+// the same per-query detail list itself, for RelationCandidates.
+func (m *diagnosticModel) computeRelationPositions(text string, items []lexeme, depths []int, matching map[int]int) {
 	m.relationDeclPositions = make(map[int]bool)
-	for _, q := range m.queries {
-		if q.kind != "SELECT" {
-			continue
-		}
+	m.relationPositions = make(map[int][]relationDetail)
+	for qi, q := range m.queries {
 		synthetic := sqlQuery{start: q.start, end: q.end, baseDepth: q.baseDepth, kind: q.kind}
 		details := queryRelationDetails(text, items, synthetic, depths, matching)
 		if len(details) != len(q.relations) {
 			continue
 		}
+		m.relationPositions[qi] = details
 		for k, ref := range q.relations {
 			source, end := details[k].start, details[k].end
 			if source < 0 || end > len(items) || source >= end {
@@ -807,6 +878,120 @@ func (m *diagnosticModel) computeRelationDeclPositions(text string, items []lexe
 				m.relationDeclPositions[p] = true
 			}
 		}
+	}
+}
+
+// RelationCandidates returns query qi's own modeled relations (the same
+// list RelationScope's innermost level exposes for qi when i falls inside
+// qi), paired with each relation's own item-index position in the source.
+func (m *diagnosticModel) RelationCandidates(qi int) []relationDetail {
+	return append([]relationDetail(nil), m.relationPositions[qi]...)
+}
+
+// queryChain returns the same query-index walk RelationScope(i) uses to
+// build its own chain (m.queryAt[i], then each query's own parent,
+// outward), so a caller that also needs RelationScope's per-level owning
+// query index -- not just its relations -- can keep both aligned by
+// position without RelationScope itself needing to expose query indices.
+func (m *diagnosticModel) queryChain(i int) []int {
+	if i < 0 || i >= len(m.queryAt) {
+		return nil
+	}
+	var chain []int
+	for qi := m.queryAt[i]; qi >= 0; qi = m.queries[qi].parent {
+		chain = append(chain, qi)
+	}
+	return chain
+}
+
+// buildTriggerQueries additively models each trigger body's own embedded
+// SQL statement (SELECT/UPDATE/INSERT/DELETE) as a query, the same way
+// procedure bodies' embedded SQL is already modeled by the ordinary
+// discoverSQLQueries pass above. CREATE TRIGGER bodies get no such
+// treatment from the shared binder: resolve.go's buildContexts has no
+// CREATE TRIGGER recognition at all (unlike CREATE PROCEDURE), so a whole
+// trigger statement's span is classified contextUnsupported end to end,
+// and discoverSQLQueries (which requires contextSQL/contextExecute) never
+// discovers anything inside one. This reuses Task 3's own
+// newTriggerBodyContext/discoverTriggers (diagnostic_locals.go) -- built
+// for a narrower purpose (finding procedural vs SQL regions for local-
+// variable detection) but equally able to delimit each embedded SQL
+// statement's own [start, end) span here -- over a trigger body already
+// known to have a syntactically valid, supported shape (parseTrigger only
+// ever returns ok=true for that recognized subset).
+func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depths []int, matching map[int]int) {
+	for _, trg := range discoverTriggers(text, items) {
+		m.recognizedTriggerBodies = append(m.recognizedTriggerBodies, itemRange{trg.bodyStart, trg.bodyEnd})
+		ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
+		start := -1
+		for idx := trg.bodyStart + 1; idx < trg.bodyEnd; idx++ {
+			i := idx - trg.bodyStart
+			if start < 0 && ctx.inSQL[i] && isQueryStart(items[idx]) {
+				start = idx
+			}
+			if start >= 0 && !ctx.inSQL[i] {
+				m.addTriggerQuery(text, items, depths, matching, start, idx)
+				start = -1
+			}
+		}
+		if start >= 0 {
+			m.addTriggerQuery(text, items, depths, matching, start, trg.bodyEnd)
+		}
+	}
+}
+
+// addTriggerQuery models one trigger-embedded SQL statement's [start, end)
+// span exactly as a standalone top-level statement would be: the same
+// queryRelations scan, no parent (a trigger body is not a lexically
+// enclosing query RelationScope should correlate through). It is appended
+// after buildQueryAt/connectRelationSources/computeRelationPositions/
+// computeOutputs have already run over the ordinary top-level queries, so
+// it updates m.queryAt/m.queryByStart/m.relationPositions/
+// m.relationDeclPositions directly here rather than relying on a second
+// pass over those functions, and computes its own output shape directly
+// when it is a SELECT so alias-visibility checking works the same as any
+// other SELECT.
+func (m *diagnosticModel) addTriggerQuery(text string, items []lexeme, depths []int, matching map[int]int, start, end int) {
+	if start >= end {
+		return
+	}
+	q := sqlQuery{start: start, end: end, baseDepth: depths[start], parent: -1, kind: itemWord(items[start])}
+	relations, _, _ := queryRelations(text, items, q, depths, matching)
+	qi := len(m.queries)
+	m.queries = append(m.queries, modelQuery{
+		start: start, end: end, parent: -1, kind: q.kind,
+		baseDepth: q.baseDepth, relations: relations,
+		statementIndex: statementIndexAt(m.statements, start),
+	})
+	for i := start; i < end && i < len(m.queryAt); i++ {
+		if m.queryAt[i] < 0 {
+			m.queryAt[i] = qi
+		}
+	}
+	m.queryByStart[start] = qi
+
+	details := queryRelationDetails(text, items, q, depths, matching)
+	if len(details) == len(relations) {
+		m.relationPositions[qi] = details
+		for k, ref := range relations {
+			source, end := details[k].start, details[k].end
+			if source < 0 || end > len(items) || source >= end {
+				continue
+			}
+			if items[source].Token.Kind == token.LParen {
+				if ref.Alias != nil {
+					m.relationDeclPositions[end-1] = true
+				}
+				continue
+			}
+			for p := source; p < end; p++ {
+				m.relationDeclPositions[p] = true
+			}
+		}
+	}
+
+	if q.kind == "SELECT" {
+		m.computeSelectOutput(text, qi)
 	}
 }
 
@@ -869,11 +1054,18 @@ func (m *diagnosticModel) computeProjection(text string, owner int, items []lexe
 	}
 	parts, ok := splitTopLevel(items, token.Comma)
 	if !ok {
+		// splitTopLevel fails this same way for a genuinely empty
+		// comma-separated segment (a trailing comma right before FROM, a
+		// leading comma, or two consecutive commas) as it does for
+		// unbalanced parentheses within the projection list -- either way,
+		// the projection list itself did not parse cleanly.
+		m.queries[owner].malformedProjection = true
 		return modelOutput{}
 	}
 	var columns []modelOutputColumn
 	for _, part := range parts {
 		if len(part) == 0 {
+			m.queries[owner].malformedProjection = true
 			return modelOutput{}
 		}
 		if isStarProjection(part) {

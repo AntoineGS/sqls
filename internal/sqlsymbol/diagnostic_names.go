@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
 )
 
@@ -40,56 +41,167 @@ func (m *diagnosticModel) nameFindings() []Finding {
 	}
 	var findings []Finding
 	findings = append(findings, m.unknownRelationFindings()...)
-	findings = append(findings, m.columnFindings()...)
+	findings = append(findings, m.columnFindings(planClauseExclusions(m.items))...)
 	findings = append(findings, m.triggerRowColumnFindings()...)
 	sort.SliceStable(findings, func(i, j int) bool { return findings[i].Span.Start < findings[j].Span.Start })
 	return findings
 }
 
-// --- unknown relation ---
+// syntaxOnlyKeywords supplements the dialect's own token.SQLWord.Kind
+// classification (isReservedWordToken's primary source) with InterBase
+// clause syntax the lexer does not yet classify as a keyword at all:
+// FIRST/SKIP (SELECT FIRST n SKIP m), NULLS/LAST (ORDER BY ... NULLS
+// FIRST/LAST), NEXT (NEXT VALUE FOR generator), and STARTING (STARTING
+// WITH ...). These are kept local to this file rather than added to the
+// dialect package's keyword tables, since those tables also drive
+// completion suggestions and rename's reserved-word validity -- concerns
+// this task does not want to affect.
+var syntaxOnlyKeywords = map[string]bool{
+	"FIRST": true, "SKIP": true, "NULLS": true, "LAST": true,
+	"NEXT": true, "STARTING": true,
+}
 
-// unknownRelationFindings checks every relation-position name (the same
-// positions markSQLPositions/classifyName mark Role Relation: FROM, JOIN,
-// an UPDATE target, an INSERT INTO target, and a DELETE FROM target)
-// against SemanticCatalog.RelationInfo. A name that resolves to a WITH/CTE
-// binding in scope is a model-level identity, never a catalog lookup, so it
-// is excluded before consulting the catalog; a name a callable procedure
-// answers for is handled by RelationInfo itself, which never reports a
-// known procedure name Missing as a relation (see diagnostic_catalog.go).
-func (m *diagnosticModel) unknownRelationFindings() []Finding {
-	a := m.analysis
-	var findings []Finding
-	for i, item := range m.items {
-		if i >= len(a.contexts) || !a.contexts[i].relation {
+// isReservedWordToken reports whether item is a token the dialect's own
+// keyword table already recognizes as some kind of SQL keyword (Kind !=
+// dialect.Unmatched), or one of syntaxOnlyKeywords above -- the generic
+// form of isWord()'s single-word check: "is this token ANY keyword the
+// lexer already knows about", not "is this token exactly one specific
+// word". This covers clause syntax (DISTINCT, BETWEEN, ROWS, TO, PLAN,
+// NATURAL, CONTAINING, COLLATE, CHARACTER, ...) and context values
+// (CURRENT_DATE, CURRENT_USER, USER, ...) without this file hand-
+// maintaining its own duplicate word list for each of them. A quoted word
+// is never treated as a keyword, matching isNameToken's own rule: quoting
+// always means "this is a genuine identifier".
+func isReservedWordToken(item lexeme) bool {
+	if item.Token == nil || item.Token.Kind != token.SQLKeyword {
+		return false
+	}
+	word, ok := item.Token.Value.(*token.SQLWord)
+	if !ok || word.QuoteStyle != 0 {
+		return false
+	}
+	return word.Kind != dialect.Unmatched || syntaxOnlyKeywords[word.Keyword]
+}
+
+// isNonColumnIdentifierPosition reports whether item i is a genuine
+// identifier used in a position that names something other than a table
+// column or relation: an InterBase generator (sequence) name -- the sole
+// argument of GEN_ID(...), or the name following NEXT VALUE FOR -- or a
+// character set or collation name following CHARACTER SET / COLLATE.
+// SemanticCatalog does not model any of these namespaces (RelationInfo/
+// ProcedureInfo/DomainInfo cover relations, procedures, and domains only),
+// so rather than guessing, every position recognized here is withheld
+// from column checking entirely.
+func isNonColumnIdentifierPosition(items []lexeme, i int) bool {
+	if i >= 2 && items[i-1].Token.Kind == token.LParen && isWord(items[i-2], "GEN_ID") {
+		return true
+	}
+	if i >= 3 && isWord(items[i-1], "FOR") && isWord(items[i-2], "VALUE") && isWord(items[i-3], "NEXT") {
+		return true
+	}
+	if i >= 2 && isWord(items[i-1], "SET") && isWord(items[i-2], "CHARACTER") {
+		return true
+	}
+	if i >= 1 && isWord(items[i-1], "COLLATE") {
+		return true
+	}
+	return false
+}
+
+// planClauseExclusions marks every item position inside a PLAN (...) or
+// PLAN JOIN (...) clause's parentheses. PLAN is InterBase's query-plan
+// optimizer hint: the identifiers inside it name relations/aliases/indexes
+// in that mini-language's own terms (for example PLAN (T NATURAL) or PLAN
+// JOIN (A NATURAL, B INDEX IX1)), not column expressions -- a relation
+// alias appearing there, such as T above, would otherwise be checked (and
+// wrongly flagged) as a bare column candidate. The whole clause is
+// excluded wholesale rather than modeled, consistent with this task's
+// "narrow to what's provable" bias.
+func planClauseExclusions(items []lexeme) map[int]bool {
+	excluded := make(map[int]bool)
+	for i := 0; i < len(items); i++ {
+		if !isWord(items[i], "PLAN") {
 			continue
 		}
-		if m.Unsupported(i) {
+		j := i + 1
+		if j < len(items) && isWord(items[j], "JOIN") {
+			j++
+		}
+		if j >= len(items) || items[j].Token.Kind != token.LParen {
 			continue
 		}
-		name, ok := nameFromLexeme(a.Text, item)
-		if !ok {
-			continue
-		}
-		if m.DDLInvalidated(i, name) {
-			// Named by an earlier CREATE/ALTER/DROP in this same script:
-			// the live catalog's answer (present or absent) predates that
-			// statement and is unsafe to trust from here on.
-			continue
-		}
-		if i < len(m.queryAt) {
-			if owner := m.queryAt[i]; owner >= 0 {
-				if _, isCTE := m.cteFor(owner, name.Key()); isCTE {
-					continue
-				}
+		depth := 0
+		for k := j; k < len(items); k++ {
+			switch items[k].Token.Kind {
+			case token.LParen:
+				depth++
+			case token.RParen:
+				depth--
+			}
+			excluded[k] = true
+			if depth == 0 {
+				break
 			}
 		}
-		if _, knowledge := m.semantic.RelationInfo(name); knowledge == Missing {
-			findings = append(findings, Finding{
-				Span:     item.Span,
-				Code:     codeUnknownRelation,
-				Message:  fmt.Sprintf("%s is not a known table, view, or procedure", name.Text),
-				Severity: 1,
-			})
+	}
+	return excluded
+}
+
+// --- unknown relation ---
+
+// unknownRelationFindings checks every relation named in a query's own
+// modeled FROM/JOIN/UPDATE-target/INSERT-target/DELETE-target list --
+// RelationCandidates(qi), the same query-boundary-aware scan RelationScope
+// itself is built from (sql.go's queryRelations/relationAt via
+// queryRelationDetails) -- against SemanticCatalog.RelationInfo. This
+// deliberately does not scan for "any name immediately after a FROM
+// keyword" the way a.contexts[i].relation (resolve.go's markSQLPositions)
+// does: that marker cannot distinguish a query's own FROM clause from FROM
+// used as function-call syntax, such as EXTRACT(YEAR FROM col) or TRIM(...
+// FROM col), and would otherwise check a function argument as if it were a
+// table name. A name that resolves to a WITH/CTE binding in scope is a
+// model-level identity, never a catalog lookup, so it is excluded before
+// consulting the catalog; an unaliased FROM-clause procedure call has no
+// RelationRef.Name of its own (relationAt's callable form deliberately
+// drops it, the same as a derived table), so its real name is recovered
+// from procedureNameFor before the catalog lookup, rather than skipped as
+// if it had nothing to check.
+func (m *diagnosticModel) unknownRelationFindings() []Finding {
+	var findings []Finding
+	for qi, q := range m.queries {
+		if q.malformedProjection {
+			continue
+		}
+		for _, detail := range m.RelationCandidates(qi) {
+			if m.Unsupported(detail.start) {
+				continue
+			}
+			name := detail.ref.Name
+			if name.Key() == "" {
+				procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, alias: aliasKeyOf(detail.ref.Alias)}]
+				if !ok {
+					continue // a derived table: nothing to check by name
+				}
+				name = procName
+			}
+			if m.DDLInvalidated(detail.start, name) {
+				// Named by an earlier CREATE/ALTER/DROP in this same
+				// script: the live catalog's answer (present or absent)
+				// predates that statement and is unsafe to trust from
+				// here on.
+				continue
+			}
+			if _, isCTE := m.cteFor(qi, name.Key()); isCTE {
+				continue
+			}
+			if _, knowledge := m.semantic.RelationInfo(name); knowledge == Missing {
+				findings = append(findings, Finding{
+					Span:     m.items[detail.start].Span,
+					Code:     codeUnknownRelation,
+					Message:  fmt.Sprintf("%s is not a known table, view, or procedure", name.Text),
+					Severity: 1,
+				})
+			}
 		}
 	}
 	return findings
@@ -112,7 +224,7 @@ func (m *diagnosticModel) unknownRelationFindings() []Finding {
 // excluded here and handled uniformly by triggerRowColumnFindings instead,
 // since NEW/OLD are per-row aliases for the trigger's FOR-relation, not a
 // FROM-clause relation RelationScope can resolve.
-func (m *diagnosticModel) columnFindings() []Finding {
+func (m *diagnosticModel) columnFindings(excludedPositions map[int]bool) []Finding {
 	a := m.analysis
 	var findings []Finding
 	for i, item := range m.items {
@@ -126,6 +238,13 @@ func (m *diagnosticModel) columnFindings() []Finding {
 		if qi < 0 {
 			continue
 		}
+		if qi < len(m.queries) && m.queries[qi].malformedProjection {
+			// This query's own projection list did not parse cleanly (a
+			// genuinely empty comma-separated segment, e.g. a trailing
+			// comma right before FROM): the whole statement must not be
+			// trusted for speculative missing-name errors.
+			continue
+		}
 		if m.Unsupported(i) {
 			continue
 		}
@@ -134,6 +253,15 @@ func (m *diagnosticModel) columnFindings() []Finding {
 		}
 		if m.relationDeclPositions[i] {
 			continue
+		}
+		if excludedPositions[i] {
+			continue // inside a PLAN (...) clause: not a column position at all
+		}
+		if isReservedWordToken(item) {
+			continue // SQL keyword/clause syntax, never a column candidate
+		}
+		if isNonColumnIdentifierPosition(m.items, i) {
+			continue // a generator, character set, or collation name
 		}
 		if i > 0 && isWord(m.items[i-1], "AS") {
 			continue // a column or relation alias declaration, never a reference
@@ -185,7 +313,8 @@ func (m *diagnosticModel) qualifiedColumnFindings(i, qi int) []Finding {
 		return nil
 	}
 	chain := m.RelationScope(i)
-	ref, found, ambiguous := resolveQualifier(chain, *qualifier)
+	qiChain := m.queryChain(i)
+	ref, found, ambiguous := m.resolveQualifier(chain, qiChain, *qualifier)
 	if ambiguous {
 		// More than one relation in the same scope level shares this
 		// alias/name (for example a duplicate alias): the qualifier cannot
@@ -267,12 +396,46 @@ func (m *diagnosticModel) unqualifiedColumnFindings(i, qi int, name Name) []Find
 			return nil // resolves via correlation to an enclosing query
 		}
 	}
+	if m.matchesDeclaredLocal(i, name) {
+		// A bare, unqualified SQL-context name that happens to share a
+		// declared local variable/parameter's spelling: withhold, per this
+		// plan's deliberate conservative bias (see matchesDeclaredLocal).
+		return nil
+	}
 	return []Finding{{
 		Span:     m.items[i].Span,
 		Code:     codeUnknownColumn,
 		Message:  fmt.Sprintf("%s is not a column of any relation in scope", name.Text),
 		Severity: 1,
 	}}
+}
+
+// matchesDeclaredLocal reports whether name matches a declared local
+// variable or parameter in the enclosing procedure or trigger scope at
+// item position i, reusing the existing local-symbol machinery (symbolFor
+// for procedures, triggerModel.symbolFor for triggers) rather than
+// reimplementing declaration lookup. Real InterBase requires a ':' prefix
+// to actually reference a local in SQL context, so this rule does not
+// attempt to prove which reading (column vs local) is intended -- only
+// that a plausible non-error reading exists, and withholds accordingly.
+func (m *diagnosticModel) matchesDeclaredLocal(i int, name Name) bool {
+	a := m.analysis
+	if i < len(a.procedureAt) {
+		if procIndex := a.procedureAt[i]; procIndex >= 0 {
+			if symbol, _ := symbolFor(a, procIndex, name); symbol != nil {
+				return true
+			}
+		}
+	}
+	for _, trg := range discoverTriggers(a.Text, m.items) {
+		if i < trg.bodyStart || i >= trg.bodyEnd {
+			continue
+		}
+		if sym, _ := trg.symbolFor(name); sym != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // columnMatchesInLevel counts how many relations in level expose a column
@@ -298,17 +461,38 @@ func (m *diagnosticModel) columnMatchesInLevel(i int, level []RelationRef, name 
 
 // resolveQualifier searches chain (innermost first) for the one relation
 // qualifier names, matching RelationRef.Alias first and RelationRef.Name
-// otherwise (relationMatchesQualifier). It stops at the first scope level
-// offering any match: ambiguous is true when that level has more than one,
-// found is true when it has exactly one.
-func resolveQualifier(chain [][]RelationRef, qualifier Name) (ref RelationRef, found, ambiguous bool) {
-	for _, level := range chain {
+// otherwise (relationMatchesQualifier), plus one InterBase-specific case
+// neither of those covers: an unaliased FROM-clause procedure call, whose
+// RelationRef has neither a Name nor an Alias of its own (relationAt's
+// callable form deliberately drops the literal name, the same as a
+// derived table, since a FROM-clause callable's RelationRef identity is
+// alias-only) but is still implicitly qualifiable by its own procedure
+// name in InterBase, the same as an unaliased table is implicitly
+// qualifiable by its own table name -- recovered here from
+// procedureNameFor. qiChain must be queryChain(i), RelationScope(i)'s own
+// query-index chain in the same order, so each level's procedureNameFor
+// lookup is keyed by the right owning query. It stops at the first scope
+// level offering any match: ambiguous is true when that level has more
+// than one, found is true when it has exactly one.
+func (m *diagnosticModel) resolveQualifier(chain [][]RelationRef, qiChain []int, qualifier Name) (ref RelationRef, found, ambiguous bool) {
+	for level, relations := range chain {
+		qi := -1
+		if level < len(qiChain) {
+			qi = qiChain[level]
+		}
 		matches := 0
 		var candidate RelationRef
-		for _, r := range level {
+		for _, r := range relations {
 			if relationMatchesQualifier(r, qualifier) {
 				matches++
 				candidate = r
+				continue
+			}
+			if r.Name.Key() == "" && r.Alias == nil && qi >= 0 {
+				if procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, alias: ""}]; ok && procName.Key() == qualifier.Key() {
+					matches++
+					candidate = r
+				}
 			}
 		}
 		if matches == 1 {
@@ -376,15 +560,36 @@ func (m *diagnosticModel) aliasSuppressesColumnCheck(qi, i int, name Name) bool 
 	if i < q.targetEnd {
 		return false // within the SELECT list itself: no forward-alias assumption
 	}
-	switch m.clauseAt(qi, i) {
+	clause := m.clauseAt(qi, i)
+	switch clause {
 	case "GROUP", "HAVING", "ORDER":
 	default:
 		return false
 	}
-	if !q.output.CountKnown {
+	output := q.output
+	if clause == "ORDER" {
+		// A trailing ORDER BY conventionally applies to a UNION's whole
+		// merged result, not just the last arm it lexically trails, so an
+		// alias declared in an earlier arm (SELECT ID AS K FROM T UNION
+		// SELECT ID FROM U ORDER BY K) must be checked against the
+		// union's own merged output (UnionOutput, using the first arm's
+		// column names per its own doc comment), not this arm's own
+		// output alone.
+		if unionOutput, ok := m.UnionOutput(i); ok {
+			output = unionOutput
+		} else if m.unionOf[qi] >= 0 {
+			// Part of a union whose merged shape isn't provable (an arm's
+			// own output is unknown, or arm column counts disagree): the
+			// trailing ORDER BY could still be referencing another arm's
+			// alias this arm's own output cannot see, so withhold rather
+			// than checking only this arm's own shape.
+			return true
+		}
+	}
+	if !output.CountKnown {
 		return true // cannot rule out a matching SELECT-list alias: withhold
 	}
-	for _, col := range q.output.Columns {
+	for _, col := range output.Columns {
 		if col.NameKnown && col.Name.Key() == name.Key() {
 			return true
 		}
@@ -465,13 +670,14 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 			if idx+2 >= trg.bodyEnd || m.items[idx+1].Token.Kind != token.Period || !isNameToken(m.items[idx+2]) {
 				continue
 			}
-			// m.Unsupported is deliberately not checked here: the shared
-			// binder (resolve.go's buildContexts) classifies a whole CREATE
-			// TRIGGER statement as contextUnsupported for its own unrelated
-			// reasons (see diagnostic_locals.go's triggerModel doc comment),
-			// so it would suppress every trigger finding. parseTrigger's own
-			// strict grammar validation is what keeps this rule from
-			// scanning a malformed trigger body instead.
+			// m.Unsupported now correctly exempts a recognized trigger
+			// body's own span (recognizedTriggerBodies, populated by
+			// buildTriggerQueries) from the shared binder's whole-
+			// statement contextUnsupported classification, the same way
+			// it already exempted a recognized WITH statement's body.
+			if m.Unsupported(idx) {
+				continue
+			}
 			if m.DDLInvalidated(idx, trg.relation) {
 				continue
 			}

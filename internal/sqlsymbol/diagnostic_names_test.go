@@ -261,3 +261,165 @@ func TestDiagnosticColumnMalformedSQL(t *testing.T) {
 	requireCodeCount(t, "SELECT NAEM FROM (((;", c, codeUnknownColumn, 0)
 	requireCodeCount(t, "SELECT FROM T WHERE;", c, codeUnknownColumn, 0)
 }
+
+// --- Fix round 1: C1(a) reserved words / clause syntax must never be
+// flagged as unknown-column or unknown-relation ---
+
+func TestDiagnosticFixRound1ReservedWordsNotFlaggedAsColumn(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	cases := []string{
+		"SELECT DISTINCT NAME FROM T;",
+		"SELECT FIRST 10 SKIP 5 NAME FROM T;",
+		"SELECT NAME FROM T ORDER BY NAME DESC;",
+		"SELECT NAME FROM T ORDER BY NAME DESCENDING NULLS LAST;",
+		"SELECT NAME FROM T WHERE ID BETWEEN 1 AND 2;",
+		"SELECT CURRENT_DATE FROM T;",
+		"SELECT CURRENT_TIMESTAMP FROM T;",
+		"SELECT CURRENT_USER FROM T;",
+		"SELECT USER FROM T;",
+		"SELECT GEN_ID(GEN_X, 1) FROM T;",
+		"SELECT NEXT VALUE FOR GEN_X FROM T;",
+		"SELECT CAST(ID AS VARCHAR(10) CHARACTER SET UTF8) FROM T;",
+		"SELECT NAME COLLATE PXW_CSY FROM T;",
+		"SELECT NAME FROM T WHERE NAME CONTAINING 'x';",
+		"SELECT NAME FROM T WHERE NAME STARTING WITH 'x';",
+		"SELECT NAME FROM T ROWS 1 TO 10;",
+		"SELECT NAME FROM T PLAN (T NATURAL);",
+	}
+	for _, sql := range cases {
+		requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+	}
+}
+
+func TestDiagnosticFixRound1ReservedWordsNotFlaggedInsideProcedure(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE PROCEDURE PR1 AS
+DECLARE VARIABLE X INTEGER;
+BEGIN
+  SELECT DISTINCT NAME FROM T INTO :X;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+func TestDiagnosticFixRound1PlanClauseRelationNameNotFlaggedAsColumn(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT NAME FROM T PLAN (T NATURAL);", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT NAME FROM T PLAN JOIN (T NATURAL);", c, codeUnknownColumn, 0)
+}
+
+// --- Fix round 1: C1(b) FROM inside function-call syntax must not be
+// mistaken for a query's own FROM clause ---
+
+func TestDiagnosticFixRound1ExtractFromIsNotAQueryFromClause(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT EXTRACT(YEAR FROM ID) FROM T;", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT EXTRACT(YEAR FROM ID) FROM T;", c, codeUnknownRelation, 0)
+}
+
+func TestDiagnosticFixRound1TrimFromIsNotAQueryFromClause(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT TRIM(BOTH ' ' FROM NAME) FROM T;", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT TRIM(BOTH ' ' FROM NAME) FROM T;", c, codeUnknownRelation, 0)
+}
+
+func TestDiagnosticFixRound1UnknownRelationStillDetectedAlongsideExtract(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT EXTRACT(YEAR FROM ID) FROM NOSUCH;", c, codeUnknownRelation, 1)
+}
+
+// --- Fix round 1: I1 trigger UPDATE/DELETE bodies must be checked, not
+// just SELECT/NEW/OLD ---
+
+func TestDiagnosticFixRound1TriggerUpdateBodyChecked(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS
+BEGIN
+  UPDATE U SET NAEM = 1 WHERE ID = 1;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 1)
+}
+
+func TestDiagnosticFixRound1TriggerDeleteBodyChecked(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE DELETE AS
+BEGIN
+  DELETE FROM NOSUCH WHERE ID = 1;
+END`
+	requireCodeCount(t, sql, c, codeUnknownRelation, 1)
+}
+
+func TestDiagnosticFixRound1TriggerUpdateBodyKnownColumnNotFlagged(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS
+BEGIN
+  UPDATE U SET V = 1 WHERE ID = 1;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+// --- Fix round 1: I2 UNION alias visibility in a trailing ORDER BY must
+// use the union's own merged output, not just the last arm's ---
+
+func TestDiagnosticFixRound1UnionOrderByAliasFromEarlierArm(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT ID AS K FROM T UNION SELECT ID FROM U ORDER BY K;", c, codeUnknownColumn, 0)
+}
+
+// --- Fix round 1: I3 an unaliased FROM-clause procedure call is
+// implicitly qualifiable by its own procedure name ---
+
+func TestDiagnosticFixRound1UnaliasedProcedureCallQualifier(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "SELECT P.OUT1 FROM P(1, 2);", c, codeUnknownQualifier, 0)
+	requireCodeCount(t, "SELECT P.OUT1 FROM P(1, 2);", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT P.NOSUCH FROM P(1, 2);", c, codeUnknownColumn, 1)
+}
+
+// --- Fix round 1: I4 a malformed statement must not produce speculative
+// missing-name errors, across all four finding types ---
+
+func TestDiagnosticFixRound1MalformedProjectionSuppressesAllFindings(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := "SELECT NAEM, FROM T WHERE;"
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+	requireCodeCount(t, sql, c, codeUnknownRelation, 0)
+	requireCodeCount(t, sql, c, codeUnknownQualifier, 0)
+	requireCodeCount(t, sql, c, codeAmbiguousColumn, 0)
+}
+
+// --- Fix round 1: I5 a bare name matching a declared local/parameter must
+// withhold the unknown-column finding ---
+
+func TestDiagnosticFixRound1BareNameMatchingLocalWithheld(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE PROCEDURE PR1 (ZZ INTEGER) AS
+BEGIN
+  SELECT ID FROM T WHERE ZZ = 1 INTO ZZ;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+// --- Fix round 1: I6 required coverage ---
+
+func TestDiagnosticFixRound1UnknownRelationSuppressesColumnCascade(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := "SELECT NOSUCH.ZZ, ZZ FROM NOSUCH;"
+	requireCodeCount(t, sql, c, codeUnknownRelation, 1)
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+func TestDiagnosticFixRound1DDLAddedColumnNotFlaggedStale(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := "ALTER TABLE T ADD NEWCOL INTEGER; SELECT NEWCOL FROM T;"
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+func TestDiagnosticFixRound1TriggerBodyBeyondNewOld(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T AFTER INSERT AS
+DECLARE VARIABLE X INTEGER;
+BEGIN
+  SELECT NAEM FROM U INTO :X;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 1)
+}
