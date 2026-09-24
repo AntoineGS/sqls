@@ -12,6 +12,16 @@ type Cache struct {
 	Schemas           map[string]string
 	SchemaTables      map[string][]string
 	ColumnsWithParent map[string][]*ColumnDesc
+	// ColumnsByID retains each relation's columns under the relation's exact
+	// catalog identity — ObjectID{Kind: ObjectKindTable, Name: <the
+	// relation's exact catalog name>}.Key() — never the shared upper-cased
+	// key ColumnsWithParent/ColumnDatabaseKey uses. Two exact-identity
+	// relations that fold to the same case (for example a quoted "Foo"
+	// alongside FOO) never merge here, unlike ColumnsWithParent, where they
+	// silently share one entry. Nil/absent means the active repository has
+	// not populated exact-identity column storage yet, not that no relation
+	// has columns.
+	ColumnsByID       map[string][]*ColumnDesc
 	ForeignKeys       map[string]map[string][]*ForeignKey
 	Metadata          map[MetadataKind]MetadataState
 	PrimaryKeyColumns map[string]map[string]struct{}
@@ -73,6 +83,20 @@ func (dc *Cache) ColumnDescs(tableName string) (cols []*ColumnDesc, ok bool) {
 
 func (dc *Cache) ColumnDatabase(dbName, tableName string) (cols []*ColumnDesc, ok bool) {
 	cols, ok = dc.ColumnsWithParent[ColumnDatabaseKey(dbName, tableName)]
+	return
+}
+
+// ColumnDescsByID resolves a relation's columns by its exact identity (see
+// Cache.ColumnsByID), never through ColumnDescs/ColumnDatabase's shared
+// upper-cased key: two exact-identity relations that fold to the same case
+// never merge here, unlike those accessors. It returns false when
+// exact-identity column storage has not been populated yet, or genuinely has
+// no such relation.
+func (dc *Cache) ColumnDescsByID(name string) (cols []*ColumnDesc, ok bool) {
+	if dc == nil {
+		return nil, false
+	}
+	cols, ok = dc.ColumnsByID[ObjectID{Kind: ObjectKindTable, Name: name}.Key()]
 	return
 }
 

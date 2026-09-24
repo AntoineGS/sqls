@@ -95,7 +95,70 @@ func (db *InterBaseDBRepository) readMetadataColumns(ctx context.Context, q sche
 	if err != nil {
 		return MetadataPatch{}, err
 	}
-	return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(columns)}, Count: len(columns)}, nil
+	// byID retains every relation's columns under its exact catalog identity
+	// (see catalog.Cache.ColumnsByID) alongside genColumnMap's shared
+	// upper-cased grouping: two exact-identity relations that fold to the
+	// same case (a quoted "Foo" alongside FOO) must not merge into one
+	// column list for a caller that has already resolved an exact identity.
+	byID := make(map[string][]*ColumnDesc)
+	for _, desc := range columns {
+		key := interBaseByIDKey(ObjectKindTable, desc.Table)
+		byID[key] = append(byID[key], desc)
+	}
+	return MetadataPatch{Cache: &DBCache{ColumnsWithParent: genColumnMap(columns), ColumnsByID: byID}, Count: len(columns)}, nil
+}
+
+// readMetadataViewsFromColumns reads only view headers via SQL; each view's
+// columns come from cache — the already-loaded MetadataColumnsCurrent
+// category, which reads every relation's columns, tables and views alike
+// (see interBaseBulkColumnsQueryForWidth's lack of a view filter) — rather
+// than issuing interBaseBulkViewColumnsQueryForWidth's second, redundant
+// query for exactly the same data. This is the MetadataViews job's actual
+// Run function; readMetadataViews above remains available standalone (used
+// directly by existing tests and any caller without a coordinated Columns
+// category to depend on) and still issues its own view-columns query.
+//
+// Column lookup goes through the exact-identity ColumnDescsByID, not the
+// shared upper-cased ColumnDescs/ColumnDatabase: two exact-identity
+// relations that fold to the same case must not merge into one view's
+// column list, the same requirement a table detail read has.
+func (db *InterBaseDBRepository) readMetadataViewsFromColumns(ctx context.Context, q schema.Queryer, width int, cache *DBCache) (MetadataPatch, error) {
+	names := make([]string, 0)
+	byName := make(map[string]*ViewDesc)
+	headerQuery := fmt.Sprintf(`
+SELECT %s, %s, r.RDB$VIEW_SOURCE, r.RDB$DESCRIPTION
+FROM RDB$RELATIONS r
+WHERE r.RDB$VIEW_BLR IS NOT NULL
+  AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
+ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME", width), interBaseMetadataIdentifier("r.RDB$OWNER_NAME", width))
+	err := interBaseBulkQuery(ctx, q, "view headers", headerQuery, func(rows *sql.Rows) error {
+		var rawName, owner, viewSource, description sql.NullString
+		if err := rows.Scan(&rawName, &owner, &viewSource, &description); err != nil {
+			return err
+		}
+		name, err := interBaseRequiredName(rawName, "view name")
+		if err != nil {
+			return err
+		}
+		if _, exists := byName[name]; exists {
+			return fmt.Errorf("duplicate view header %q", name)
+		}
+		columns, _ := cache.ColumnDescsByID(name)
+		byName[name] = &ViewDesc{Schema: "", Name: name, OwnerName: trimInterBaseCatalogName(owner), ViewSource: viewSource, Description: description, Columns: columns}
+		names = append(names, name)
+		return nil
+	})
+	if err != nil {
+		return MetadataPatch{}, err
+	}
+	byDescription := make(map[string]*ViewDesc, len(names))
+	byID := make(map[string]*ViewDesc, len(names))
+	for _, name := range names {
+		view := byName[name]
+		byDescription[catalogCacheKey(view.Name)] = view
+		byID[interBaseByIDKey(ObjectKindView, view.Name)] = view
+	}
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: byDescription, ViewsByID: byID}}, Count: len(names)}, nil
 }
 
 func (db *InterBaseDBRepository) readMetadataPrimaryKeys(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {

@@ -61,6 +61,13 @@ func TestInterBaseMetadataPlanHasIndependentBoundedJobs(t *testing.T) {
 	if len(plan.Jobs) != len(want) {
 		t.Fatalf("job count = %d, want %d", len(plan.Jobs), len(want))
 	}
+	// Views is the sole intentional exception: it depends on ColumnsCurrent
+	// so its Run function can reuse the already-loaded column data instead
+	// of issuing its own duplicate view-columns query (see
+	// readMetadataViewsFromColumns). Every other category stays independent.
+	wantDeps := map[MetadataKind][]MetadataKind{
+		MetadataViews: {MetadataColumnsCurrent},
+	}
 	for i, job := range plan.Jobs {
 		if job.Kind != want[i] {
 			t.Errorf("job[%d] = %s, want %s", i, job.Kind, want[i])
@@ -68,8 +75,8 @@ func TestInterBaseMetadataPlanHasIndependentBoundedJobs(t *testing.T) {
 		if job.Kind == MetadataColumnsAll {
 			t.Fatal("InterBase plan must omit all-columns")
 		}
-		if len(job.DependsOn) != 0 {
-			t.Errorf("%s dependencies = %v, want none", job.Kind, job.DependsOn)
+		if !reflect.DeepEqual(job.DependsOn, wantDeps[job.Kind]) {
+			t.Errorf("%s dependencies = %v, want %v", job.Kind, job.DependsOn, wantDeps[job.Kind])
 		}
 		if job.Run == nil {
 			t.Errorf("%s has nil Run", job.Kind)

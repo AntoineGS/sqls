@@ -29,6 +29,7 @@ func newMetadataCache() *catalog.Cache {
 		Schemas:           make(map[string]string),
 		SchemaTables:      make(map[string][]string),
 		ColumnsWithParent: make(map[string][]*catalog.ColumnDesc),
+		ColumnsByID:       make(map[string][]*catalog.ColumnDesc),
 		ForeignKeys:       make(map[string]map[string][]*catalog.ForeignKey),
 		Metadata:          make(map[catalog.MetadataKind]catalog.MetadataState),
 		PrimaryKeyColumns: make(map[string]map[string]struct{}),
@@ -84,13 +85,16 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 			break
 		}
 		next.ColumnsWithParent = cloneColumnSlices(fragment.ColumnsWithParent)
+		next.ColumnsByID = cloneColumnSlices(fragment.ColumnsByID)
 		if base.MetadataReady(catalog.MetadataPrimaryKeys) {
 			next.ColumnsWithParent = columnsWithPrimaryKeys(next.ColumnsWithParent, base.PrimaryKeyColumns)
+			next.ColumnsByID = columnsByIDWithPrimaryKeys(next.ColumnsByID, base.PrimaryKeyColumns)
 		}
 	case catalog.MetadataPrimaryKeys:
 		next.PrimaryKeyColumns = cloneNestedSetMap(fragment.PrimaryKeyColumns)
 		if base.ColumnsReady() {
 			next.ColumnsWithParent = columnsWithPrimaryKeys(base.ColumnsWithParent, next.PrimaryKeyColumns)
+			next.ColumnsByID = columnsByIDWithPrimaryKeys(base.ColumnsByID, next.PrimaryKeyColumns)
 		}
 	case catalog.MetadataForeignKeys:
 		next.ForeignKeys = cloneForeignKeyMap(fragment.ForeignKeys)
@@ -257,6 +261,34 @@ func columnsWithPrimaryKeys(columns map[string][]*catalog.ColumnDesc, primaryKey
 			copied[i] = &column
 		}
 		result[table] = copied
+	}
+	return result
+}
+
+// columnsByIDWithPrimaryKeys is columnsWithPrimaryKeys for the exact-identity
+// ColumnsByID map: its keys are opaque ObjectID.Key() strings rather than
+// table names, so PK membership is looked up via each descriptor's own
+// Schema/Table fields instead of the map key.
+func columnsByIDWithPrimaryKeys(columns map[string][]*catalog.ColumnDesc, primaryKeys map[string]map[string]struct{}) map[string][]*catalog.ColumnDesc {
+	result := make(map[string][]*catalog.ColumnDesc, len(columns))
+	for id, descriptors := range columns {
+		copied := make([]*catalog.ColumnDesc, len(descriptors))
+		for i, descriptor := range descriptors {
+			if descriptor == nil {
+				continue
+			}
+			column := *descriptor
+			column.Key = "NO"
+			keys := primaryKeys[catalog.ColumnDatabaseKey(descriptor.Schema, descriptor.Table)]
+			for key := range keys {
+				if strings.EqualFold(key, column.Name) {
+					column.Key = "YES"
+					break
+				}
+			}
+			copied[i] = &column
+		}
+		result[id] = copied
 	}
 	return result
 }

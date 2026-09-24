@@ -3,7 +3,9 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -66,6 +68,13 @@ func TestInterBaseMetadataProviderDetailReusesBulkFacts(t *testing.T) {
 		"description": {Object: table, Facet: "description", Dialect: 3, Consistency: metadata.Committed},
 		"source":      {Object: procedure, Facet: "source", Consistency: metadata.Committed},
 		"ddl":         {Object: ddlProcedure, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+		// procedure-category requests the SAME object as "ddl" (ddlProcedure),
+		// under the "source" facet, which Requires only MetadataProcedures —
+		// the actual procedure category, not an unrelated one. This is what
+		// "loaded procedure then ddl" below is required to exercise: the
+		// procedure category already loaded, then a DDL request against the
+		// exact same procedure, costing nothing extra.
+		"procedure-category": {Object: ddlProcedure, Facet: "source", Consistency: metadata.Committed},
 	}
 
 	cases := []struct {
@@ -76,7 +85,7 @@ func TestInterBaseMetadataProviderDetailReusesBulkFacts(t *testing.T) {
 		{"explorer then hover", "columns", "description", 0},
 		{"hover then explorer", "description", "columns", 0},
 		{"source then definition", "source", "source", 0},
-		{"loaded procedure then ddl", "columns" /* stands in for "procedure-category": already settled */, "ddl", 0},
+		{"loaded procedure then ddl", "procedure-category", "ddl", 0},
 	}
 
 	for _, c := range cases {
@@ -106,6 +115,87 @@ func TestInterBaseMetadataProviderDetailReusesBulkFacts(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad is Review Focus
+// #3's actual scenario, which TestInterBaseMetadataProviderDetailReusesBulkFacts
+// deliberately does not exercise: a detail request arriving WHILE its
+// required bulk category may still be loading must join/share that
+// in-flight load, not just avoid re-querying after everything has already
+// settled. It compares the total query count of a baseline run (full
+// settlement first, no racing) against a run that fires every request
+// concurrently immediately after Acquire, before ever waiting for
+// readiness. If joining an in-flight bulk category were broken (a bypassed
+// dependency wait, a duplicate job launch, a race in the new Views/Columns
+// DependsOn wiring), the racing run's total would diverge from the
+// deterministic baseline.
+func TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad(t *testing.T) {
+	newFixtureRepo := func(t *testing.T) *InterBaseDBRepository {
+		t.Helper()
+		db := openInterBaseSchemaFixture(t)
+		insertInterBaseDetailRegressionFixtures(t, db)
+		return &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	}
+
+	requests := []metadata.Request{
+		{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "CUSTOMER"}, Facet: "columns", Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindProcedure, Name: "ADD_CUSTOMER"}, Facet: "source", Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindDomain, Name: "EMAIL_ADDRESS"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindTrigger, Name: "CUSTOMER_BI"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindIndex, Name: "IDX_CUSTOMER_PK"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindGenerator, Name: "GEN_CUSTOMER_ID"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+		{Object: catalog.ObjectID{Kind: ObjectKindView, Name: "CUSTOMER_VIEW"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed},
+	}
+
+	// Baseline: settle the whole plan first, with no detail request racing
+	// it, then serve every one of the same requests; this is the
+	// deterministic per-fixture total the racing run below must match.
+	baselineCounter := interBaseFixtureCountPrepares(t)
+	_, baselineLease := acquireInterBaseTestLease(t, newFixtureRepo(t))
+	for _, req := range requests {
+		if _, err := baselineLease.Detail(context.Background(), req); err != nil {
+			t.Fatalf("baseline Detail(%s) error = %v", req.Facet, err)
+		}
+	}
+	baselineQueries := baselineCounter()
+
+	// Concurrent: acquire WITHOUT waiting for readiness, then fire every
+	// request concurrently -- racing the still-scheduling/still-running
+	// bulk plan -- before ever settling, then finish settling and compare.
+	concurrentCounter := interBaseFixtureCountPrepares(t)
+	ctx := context.Background()
+	registry := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3, MaxDetailBytes: 64 << 20})
+	t.Cleanup(func() { _ = registry.Close(ctx) })
+	provider := &interBaseTestProvider{db: newFixtureRepo(t)}
+	factory := func(context.Context) (metadata.Provider, error) { return provider, nil }
+	lease, err := registry.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "test://" + t.Name()}, metadata.Scope{Principal: "TESTER"}, factory)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	t.Cleanup(lease.Release)
+
+	var wg sync.WaitGroup
+	errs := make([]error, len(requests))
+	for i, req := range requests {
+		wg.Add(1)
+		go func(i int, req metadata.Request) {
+			defer wg.Done()
+			_, errs[i] = lease.Detail(ctx, req)
+		}(i, req)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("racing Detail(%s) error = %v", requests[i].Facet, err)
+		}
+	}
+
+	if err := metadatatest.WaitReady(ctx, lease); err != nil {
+		t.Fatalf("WaitReady() error = %v", err)
+	}
+	if got := concurrentCounter(); got != baselineQueries {
+		t.Fatalf("total queries racing detail requests against the in-flight bulk load = %d, want %d (same as the fully-settled baseline; joining an in-flight bulk category must not cause an extra query)", got, baselineQueries)
 	}
 }
 
@@ -265,10 +355,52 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		}
 
 		ambiguous := catalog.ObjectID{Kind: ObjectKindDomain, Name: "ambig_domain"}
-		if _, err := lease.Detail(ctx, metadata.Request{Object: ambiguous, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed}); err == nil {
-			t.Fatal("Detail(ambiguous unquoted domain name) error = nil, want an explicit ambiguity error")
-		} else if strings.Contains(err.Error(), "not found") {
-			t.Fatalf("Detail(ambiguous unquoted domain name) error = %v, want an ambiguity error, not not-found", err)
+		_, err = lease.Detail(ctx, metadata.Request{Object: ambiguous, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		if !errors.Is(err, catalog.ErrAmbiguous) {
+			t.Fatalf("Detail(ambiguous unquoted domain name) error = %v, want errors.Is(err, catalog.ErrAmbiguous)", err)
+		}
+		if errors.Is(err, ErrObjectNotFound) {
+			t.Fatalf("Detail(ambiguous unquoted domain name) error = %v, want ErrAmbiguous, not ErrObjectNotFound", err)
+		}
+	})
+
+	t.Run("long identifier round-trips through exact identity", func(t *testing.T) {
+		longName := "LONG_IDENTIFIER_EXCEEDING_31_BYTES_OK"
+		procedure := catalog.ObjectID{Kind: ObjectKindProcedure, Name: longName}
+		got, err := lease.Detail(ctx, metadata.Request{Object: procedure, Facet: "source", Consistency: metadata.Committed})
+		if err != nil {
+			t.Fatalf("Detail(long-identifier procedure source) error = %v", err)
+		}
+		if !strings.Contains(got.Text, "SELECT 1 FROM RDB$DATABASE") {
+			t.Fatalf("source = %q, want the seeded body", got.Text)
+		}
+	})
+
+	t.Run("CP1252 source text retained verbatim", func(t *testing.T) {
+		procedure := catalog.ObjectID{Kind: ObjectKindProcedure, Name: "CP1252_SOURCE_PROC"}
+		got, err := lease.Detail(ctx, metadata.Request{Object: procedure, Facet: "source", Consistency: metadata.Committed})
+		if err != nil {
+			t.Fatalf("Detail(CP1252 procedure source) error = %v", err)
+		}
+		want := "BEGIN\n  --\xe9\xe8\xe0 M\xfcller caf\xe9\n  SELECT 1 FROM RDB$DATABASE;\nEND"
+		if got.Text != want {
+			t.Fatalf("source = %q, want %q (non-ASCII bytes preserved verbatim)", got.Text, want)
+		}
+	})
+
+	t.Run("ordered composite key preserved in index ddl", func(t *testing.T) {
+		// PARENT's primary key is a composite (PARENT_B, PARENT_A), seeded
+		// deliberately out of position order (see openInterBaseSchemaFixture)
+		// so a loader trusting insertion order instead of segment position
+		// would fail this. Segment order in the rendered DDL must match
+		// RDB$FIELD_POSITION exactly: (PARENT_B, PARENT_A), not reversed.
+		index := catalog.ObjectID{Kind: ObjectKindIndex, Name: "IDX_PARENT_PK"}
+		got, err := lease.Detail(ctx, metadata.Request{Object: index, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		if err != nil {
+			t.Fatalf("Detail(composite index ddl) error = %v", err)
+		}
+		if !strings.Contains(got.Text, `("PARENT_B", "PARENT_A")`) {
+			t.Fatalf("index ddl = %q, want ordered composite key (PARENT_B, PARENT_A)", got.Text)
 		}
 	})
 
@@ -293,6 +425,102 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 			t.Fatalf("queries for unsupported ddl facets = %d, want 0 (no full-catalog refetch)", got)
 		}
 	})
+}
+
+// TestInterBaseMetadataProviderDetailColumnsDoNotMergeAcrossExactIdentities
+// is the required Critical-bug regression: interBaseResolveRelationName
+// correctly resolves an exact table name, but reading columns via the
+// shared upper-cased ColumnDescs/ColumnDatabaseKey path would silently
+// merge two exact-identity tables ("Foo" and FOO) that fold to the same
+// case into one answer. A columns/description request for exact "Foo" must
+// return only Foo's columns, a request for exact FOO must return only
+// FOO's columns (disjoint from Foo's), and an unquoted request for "foo"
+// must report the ambiguity explicitly rather than silently merging or
+// picking one.
+func TestInterBaseMetadataProviderDetailColumnsDoNotMergeAcrossExactIdentities(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	insertInterBaseDetailRegressionFixtures(t, db)
+	insertInterBaseMixedCaseTableFixtures(t, db)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	_, lease := acquireInterBaseTestLease(t, repo)
+	ctx := context.Background()
+
+	mixed := catalog.ObjectID{Kind: ObjectKindTable, Name: "Foo"}
+	upper := catalog.ObjectID{Kind: ObjectKindTable, Name: "FOO"}
+
+	mixedDetail, err := lease.Detail(ctx, metadata.Request{Object: mixed, Facet: "columns", Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(exact mixed-case table columns) error = %v", err)
+	}
+	mixedNames := columnNames(mixedDetail.Columns)
+	if len(mixedNames) != 1 || mixedNames[0] != "FOO_ONLY_COLUMN" {
+		t.Fatalf("Foo columns = %v, want exactly [FOO_ONLY_COLUMN]", mixedNames)
+	}
+
+	upperDetail, err := lease.Detail(ctx, metadata.Request{Object: upper, Facet: "columns", Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(exact upper-case table columns) error = %v", err)
+	}
+	upperNames := columnNames(upperDetail.Columns)
+	if len(upperNames) != 1 || upperNames[0] != "UPPER_FOO_ONLY_COLUMN" {
+		t.Fatalf("FOO columns = %v, want exactly [UPPER_FOO_ONLY_COLUMN]", upperNames)
+	}
+
+	// description must not describe a merged Frankenstein table either.
+	mixedDesc, err := lease.Detail(ctx, metadata.Request{Object: mixed, Facet: "description", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(exact mixed-case table description) error = %v", err)
+	}
+	if !strings.Contains(mixedDesc.Description.Body, "FOO_ONLY_COLUMN") || strings.Contains(mixedDesc.Description.Body, "UPPER_FOO_ONLY_COLUMN") {
+		t.Fatalf("Foo description = %q, want only FOO_ONLY_COLUMN, not UPPER_FOO_ONLY_COLUMN", mixedDesc.Description.Body)
+	}
+
+	// An unquoted lookup that matches both "Foo" and FOO exactly-differently
+	// must report the ambiguity, not silently merge or pick one.
+	ambiguous := catalog.ObjectID{Kind: ObjectKindTable, Name: "foo"}
+	_, err = lease.Detail(ctx, metadata.Request{Object: ambiguous, Facet: "columns", Consistency: metadata.Committed})
+	if !errors.Is(err, catalog.ErrAmbiguous) {
+		t.Fatalf("Detail(ambiguous unquoted table name) error = %v, want errors.Is(err, catalog.ErrAmbiguous)", err)
+	}
+}
+
+func columnNames(columns []*ColumnDesc) []string {
+	names := make([]string, 0, len(columns))
+	for _, column := range columns {
+		names = append(names, column.Name)
+	}
+	return names
+}
+
+// insertInterBaseMixedCaseTableFixtures seeds two exact-identity tables,
+// "Foo" and FOO, whose names fold to the same upper-cased value but whose
+// columns are deliberately disjoint (FOO_ONLY_COLUMN vs
+// UPPER_FOO_ONLY_COLUMN) so a silent column-merge across the two exact
+// identities is directly observable.
+func insertInterBaseMixedCaseTableFixtures(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_TYPE","RDB$FIELD_LENGTH","RDB$SYSTEM_FLAG") VALUES (?,?,?,?)`,
+		"D_FOO_COLUMN", 8, 4, 0); err != nil {
+		t.Fatal(err)
+	}
+	relation := func(name string, id int) {
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATIONS" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			name, id, nil, nil, nil, interBaseFixed("SYSDBA"), nil, 8, 1, nil, 0,
+			interBaseFixed("PERSISTENT"), 0, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	field := func(relationName, name string, position int) {
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATION_FIELDS" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			interBaseFixed(name), relationName, "D_FOO_COLUMN", position, nil, position, nil, 0, nil,
+			nil, nil, nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	relation("Foo", 90001)
+	field("Foo", "FOO_ONLY_COLUMN", 0)
+	relation("FOO", 90002)
+	field("FOO", "UPPER_FOO_ONLY_COLUMN", 0)
 }
 
 // insertInterBaseDetailRegressionFixtures seeds a mixed-case procedure whose
@@ -322,6 +550,28 @@ func insertInterBaseDetailRegressionFixtures(t *testing.T, db *sql.DB) {
 	}
 	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURE_PARAMETERS" VALUES (?,?,?,?,?,?,?)`,
 		interBaseFixed("TS_PARAM"), "TS_PROC", 0, 0, "TS_DOMAIN", nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	// A long identifier (>31 bytes), InterBase's classic identifier-length
+	// edge case: pre-Firebird-4 InterBase limits identifiers to 31 bytes,
+	// but this driver's bulk queries cast through
+	// interBaseBulkIdentifierCastWidth (67 bytes), so a name in the 32-67
+	// range must round-trip through the exact-identity path exactly, not
+	// get silently truncated or misresolved.
+	longName := "LONG_IDENTIFIER_EXCEEDING_31_BYTES_OK"
+	if len(longName) <= 31 {
+		t.Fatalf("fixture bug: longName %q is only %d bytes, want >31", longName, len(longName))
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURES" VALUES (?,?,?,?,?,?,?,?,?)`,
+		longName, 70002, 0, 0, nil, "BEGIN\n  SELECT 1 FROM RDB$DATABASE;\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
+		t.Fatal(err)
+	}
+	// CP1252/non-ASCII source text: the NONE-charset/CP1252 decoding path
+	// this whole effort cares about must preserve non-ASCII bytes in
+	// retained source verbatim, never mangling them on the retained-fact
+	// path this task builds.
+	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURES" VALUES (?,?,?,?,?,?,?,?,?)`,
+		"CP1252_SOURCE_PROC", 70003, 0, 0, nil, "BEGIN\n  --\xe9\xe8\xe0 M\xfcller caf\xe9\n  SELECT 1 FROM RDB$DATABASE;\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
 		t.Fatal(err)
 	}
 	// Two exact-identity domains whose names fold to the same case-insensitive

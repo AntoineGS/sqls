@@ -1,5 +1,13 @@
 package catalog
 
+import "errors"
+
+// ErrAmbiguous reports that an unquoted (dialect-folded) name matched more
+// than one exact object identity of the same Kind, and no exact-identity
+// match resolved it unconditionally. Callers use errors.Is(err, ErrAmbiguous)
+// rather than parsing an error message to detect this case.
+var ErrAmbiguous = errors.New("catalog: object name is ambiguous")
+
 // ObjectIndex resolves catalog objects both by their exact ObjectID and by an
 // unquoted (dialect-folded) name. It is a lookup structure only: it never
 // stores descriptor data, and inserting the same ObjectID twice is a no-op.

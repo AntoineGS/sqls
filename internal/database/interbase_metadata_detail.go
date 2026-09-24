@@ -79,7 +79,7 @@ func interBaseResolveObjectName(kind ObjectKind, names []string, want string) (s
 	case 1:
 		return matches[0].Name, nil
 	default:
-		return "", fmt.Errorf("interbase: object name %q is ambiguous among %d matches", want, len(matches))
+		return "", fmt.Errorf("interbase: object name %q is ambiguous among %d matches: %w", want, len(matches), catalog.ErrAmbiguous)
 	}
 }
 
@@ -103,7 +103,7 @@ func interBaseResolveCatalogName(cache *DBCache, kind ObjectKind, want string) (
 	}
 	name, found, ambiguous := cache.ResolveObjectName(kind, want)
 	if len(ambiguous) > 0 {
-		return "", fmt.Errorf("interbase: object name %q is ambiguous among %d matches", want, len(ambiguous))
+		return "", fmt.Errorf("interbase: object name %q is ambiguous among %d matches: %w", want, len(ambiguous), catalog.ErrAmbiguous)
 	}
 	if !found {
 		return "", ErrObjectNotFound
@@ -194,7 +194,13 @@ func (db *InterBaseDBRepository) detailPlanColumns(req metadata.Request) (metada
 			if err != nil {
 				return metadata.Detail{}, err
 			}
-			columns, _ := cache.ColumnDescs(name)
+			// ColumnDescsByID, not ColumnDescs: the latter is keyed by
+			// ColumnDatabaseKey's shared upper-cased name, so two
+			// exact-identity relations that fold to the same case (a
+			// quoted "Foo" alongside FOO) would otherwise silently merge
+			// their columns here, even though name was already resolved
+			// to one exact identity above.
+			columns, _ := cache.ColumnDescsByID(name)
 			return metadata.Detail{Object: req.Object, Columns: columns}, nil
 		},
 	}, nil
@@ -219,7 +225,9 @@ func (db *InterBaseDBRepository) detailPlanDescription(req metadata.Request) (me
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				columns, _ := cache.ColumnDescs(name)
+				// See detailPlanColumns: exact-identity lookup, not the
+				// shared upper-cased ColumnDescs.
+				columns, _ := cache.ColumnDescsByID(name)
 				relation := interBaseSchemaRelationTable(name, columns)
 				described, err := relation.DescribeCatalogWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
 				if err != nil {

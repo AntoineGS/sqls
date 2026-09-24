@@ -122,8 +122,13 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 		{Kind: MetadataPrimaryKeys, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataPrimaryKeys)
 		}},
-		{Kind: MetadataViews, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
-			return db.runMetadataRead(ctx, db.readMetadataViews)
+		// Views depends on ColumnsCurrent so its Run function can reuse the
+		// already-loaded column data instead of issuing its own duplicate
+		// view-columns query; see readMetadataViewsFromColumns.
+		{Kind: MetadataViews, DependsOn: []MetadataKind{MetadataColumnsCurrent}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
+			return db.runMetadataRead(ctx, func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+				return db.readMetadataViewsFromColumns(ctx, q, width, cache)
+			})
 		}},
 		{Kind: MetadataIndexes, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataIndexes)

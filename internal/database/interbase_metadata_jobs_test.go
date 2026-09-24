@@ -543,8 +543,18 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 				t.Fatalf("failed %s category published %d fragment entries", tc.kind, count)
 			}
 			for _, job := range (&InterBaseDBRepository{}).MetadataPlan().Jobs {
-				if job.Kind != tc.kind && snapshot.Status[job.Kind].State != MetadataReady {
-					t.Errorf("independent sibling %s state = %s, want ready", job.Kind, snapshot.Status[job.Kind].State)
+				if job.Kind == tc.kind {
+					continue
+				}
+				// Views intentionally depends on ColumnsCurrent (see
+				// readMetadataViewsFromColumns): a ColumnsCurrent failure
+				// legitimately blocks it instead of leaving it independent.
+				wantState := MetadataReady
+				if job.Kind == MetadataViews && tc.kind == MetadataColumnsCurrent {
+					wantState = MetadataBlocked
+				}
+				if snapshot.Status[job.Kind].State != wantState {
+					t.Errorf("sibling %s state = %s, want %s", job.Kind, snapshot.Status[job.Kind].State, wantState)
 				}
 			}
 		})
