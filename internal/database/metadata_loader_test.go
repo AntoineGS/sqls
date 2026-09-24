@@ -529,3 +529,86 @@ func TestMetadataLoaderRejectedOldGenerationSlotWakesWaitingGeneration(t *testin
 		t.Fatal("rejected admission did not release its global slot")
 	}
 }
+
+func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+	loader.Reset(1)
+	oldLoad, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{
+		Kind: MetadataColumnsAll,
+		Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+			close(oldStarted)
+			<-releaseOld
+			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: map[string][]*ColumnDesc{"T": {{ColumnBase: ColumnBase{Table: "T", Name: "OLD"}}}}}}, nil
+		},
+	}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-oldStarted:
+	case <-time.After(2 * time.Second):
+		close(releaseOld)
+		t.Fatal("old-generation column job did not start")
+	}
+	loader.Reset(2)
+	newLoad, err := loader.Start(context.Background(), 2, metadataRepo(MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{
+		Kind: MetadataColumnsAll,
+		Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+			return MetadataPatch{Cache: &DBCache{ColumnsWithParent: map[string][]*ColumnDesc{"T": {{ColumnBase: ColumnBase{Table: "T", Name: "NEW"}}}}}}, nil
+		},
+	}}}))
+	if err != nil {
+		close(releaseOld)
+		t.Fatal(err)
+	}
+	waitLoad(t, newLoad)
+	close(releaseOld)
+	waitLoad(t, oldLoad)
+	if err := loader.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	columns := loader.Cache().ColumnsWithParent["T"]
+	if len(columns) != 1 || columns[0].Name != "NEW" {
+		t.Fatalf("published columns = %#v, want only NEW", columns)
+	}
+}
+
+func TestMetadataLoaderCatalogJobSurvivesColumnFailure(t *testing.T) {
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	columnErr := errors.New("columns unavailable")
+	load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 2, Jobs: []MetadataJob{
+		{Kind: MetadataColumnsAll, Run: func(context.Context, *DBCache) (MetadataPatch, error) { return MetadataPatch{}, columnErr }},
+		{Kind: MetadataViews, Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+			return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: map[string]*ViewDesc{"CUSTOMER_VIEW": {Name: "customer_view"}}}}}, nil
+		}},
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitLoad(t, load)
+	snapshot := loader.Snapshot()
+	if snapshot.Status[MetadataColumnsAll].State != MetadataFailed {
+		t.Fatalf("columns state = %s, want failed", snapshot.Status[MetadataColumnsAll].State)
+	}
+	if _, ok := snapshot.Cache.View("customer_view"); !ok {
+		t.Fatalf("independent catalog job did not publish after column failure: state=%s err=%v cache=%+v", snapshot.Status[MetadataViews].State, snapshot.Status[MetadataViews].Err, snapshot.Cache.Catalog)
+	}
+	if snapshot.Status[MetadataViews].State != MetadataReady {
+		t.Fatalf("views state = %s, want ready", snapshot.Status[MetadataViews].State)
+	}
+}
+
+func TestMetadataLoaderStopIsIdempotent(t *testing.T) {
+	loader := NewMetadataLoader()
+	loader.Reset(1)
+	loader.Stop()
+	loader.Stop()
+	loader.Stop()
+	if _, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 1})); !errors.Is(err, ErrMetadataStopped) {
+		t.Fatalf("Start after repeated Stop = %v, want stopped", err)
+	}
+}

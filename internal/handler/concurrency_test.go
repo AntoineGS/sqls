@@ -255,7 +255,7 @@ func (b *stubBackend) opened() []*sql.DB {
 }
 
 // setProcedures makes the stub repository a database.CatalogRepository, so the
-// worker's catalog pass builds DBCache.Catalog from it. Call it before
+// metadata catalog jobs build DBCache.Catalog from it. Call it before
 // tx.addWorkspaceConfig, which is what triggers the connection and the cache
 // build.
 func (b *stubBackend) setProcedures(procs []*database.ProcedureDesc) {

@@ -42,6 +42,32 @@ func TestDiagnosticsCoalescesDirtyDocumentsAndAllOpenBit(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsWakeDoesNotBlockWhenChannelIsFull(t *testing.T) {
+	s := &Server{
+		lifecycleCtx:        context.Background(),
+		diagnosticsWake:     make(chan struct{}, 1),
+		diagnosticDocuments: make(map[string]struct{}),
+	}
+	s.diagnosticsWake <- struct{}{}
+	done := make(chan struct{})
+	go func() {
+		s.queueAllDiagnostics()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("metadata refresh signal blocked on a full diagnostics wake channel")
+	}
+	if len(s.diagnosticsWake) != 1 {
+		t.Fatalf("wake channel has %d signals, want the single coalesced signal", len(s.diagnosticsWake))
+	}
+	_, all := s.takeDiagnosticWork()
+	if !all {
+		t.Fatal("full wake channel caused pending all-open diagnostics work to be lost")
+	}
+}
+
 func TestDiagnosticsLatestRevisionAndSingleAnalyzerAcrossBurst(t *testing.T) {
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverMySQL)
 	s := tx.server

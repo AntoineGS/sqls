@@ -338,7 +338,7 @@ func TestSignatureHelpUnknownCalleeReturnsNil(t *testing.T) {
 }
 
 func TestSignatureHelpWithoutCatalogReturnsNil(t *testing.T) {
-	// The window before the worker's catalog pass lands, and every other
+	// The window before the metadata catalog categories land, and every other
 	// driver: today's behaviour, unchanged.
 	const input = "execute procedure myproc("
 	got, err := SignatureHelpWithDriver(input, lsp.SignatureHelpParams{

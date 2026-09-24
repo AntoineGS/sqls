@@ -162,7 +162,7 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 	return nil
 }
 
-// Stop closes the database connection, always stops the worker, and always
+// Stop cancels lifecycle work, closes the database connection, and always
 // removes this process's snapshots — including when closing the connection
 // fails. A half-dead InterBase attachment is exactly the shutdown that fails,
 // and it must not be the one that leaves database source on disk.

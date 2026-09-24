@@ -66,7 +66,7 @@ func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) 
 
 // snapshotDiagnosticCatalog copies the cache metadata used by analysis. The
 // DBCache is copy-on-write, but copying names, types, and their available order
-// keeps this analysis independent of subsequent worker refreshes.
+// keeps this analysis independent of subsequent metadata publications.
 func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
 	if cache == nil {
 		return nil

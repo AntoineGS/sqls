@@ -39,7 +39,7 @@ func newParameterFixture(t *testing.T, text string, prepare func(*parameterBacke
 	}
 	tx.addWorkspaceConfig(t, stubQueryParametersConnections("primary", "secondary"))
 
-	// The catalog lands on the worker's asynchronous pass, so a routing
+	// The catalog lands on the metadata loader's asynchronous jobs, so a routing
 	// assertion issued straight afterwards would race it and fall to the
 	// unknown-procedure branch.
 	if len(backend.describedProcedures()) > 0 {

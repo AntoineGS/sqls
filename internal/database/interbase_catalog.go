@@ -661,8 +661,8 @@ var _ CatalogSnapshotRepository = (*InterBaseDBRepository)(nil)
 // size, instead of a query per relation and several per constraint.
 //
 // The returned repository is new. The receiver is never mutated, because
-// ReCache runs on a handler goroutine while the worker's secondary pass runs
-// on its own; a shared mutable snapshot field would race.
+// independently scheduled metadata jobs may use separate snapshots
+// concurrently; a shared mutable snapshot field would race.
 func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBRepository, func() error, error) {
 	if db == nil || db.Conn == nil {
 		return nil, nil, errors.New("interbase: database connection is nil")

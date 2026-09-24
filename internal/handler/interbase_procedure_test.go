@@ -200,7 +200,7 @@ func TestExecuteProcedureUnknownProcedureUsesExecAndExplainsCacheRefresh(t *test
 }
 
 func TestExecuteProcedureWithoutCatalogUsesExecPath(t *testing.T) {
-	// The window before the worker's catalog pass lands: HasCatalog() is false
+	// The window before a catalog category lands: HasCatalog() is false
 	// and routing falls back to today's unconditional Exec, which is not a
 	// regression.
 	got, backend := runProcedureCommand(t, "EXECUTE PROCEDURE MYPROC(1);", nil)

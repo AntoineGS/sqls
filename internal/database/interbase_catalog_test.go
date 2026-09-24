@@ -1798,9 +1798,8 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 		t.Fatal("CatalogSnapshot() returned a nil closer")
 	}
 
-	// A new repository, not the receiver: ReCache runs on a handler goroutine
-	// while the worker's secondary pass runs on its own, so a shared mutable
-	// snapshot field would race.
+	// A new repository, not the receiver: independently scheduled metadata jobs
+	// can use snapshots concurrently, so a shared mutable snapshot field would race.
 	if snapshot == DBRepository(source) {
 		t.Fatal("CatalogSnapshot() returned the source repository; it must return a new one")
 	}

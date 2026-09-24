@@ -488,10 +488,13 @@ selection — the submission is rejected with a message telling you to run the
 command again. Nothing is executed. Editing outside the selection is rejected
 deliberately: it is still a version of the document you did not review.
 
-The slow one-time catalog load after connecting to a large database remains a
-**separate, pre-existing** limitation of the InterBase integration. It is not
-caused by this feature and is not fixed by it: the first command after
-connecting still waits for that load, parameter prompts included.
+Metadata loads progressively after attachment. Cache-only editor features can
+use successfully published categories without waiting for the entire catalog;
+when the required metadata is still loading, failed, or incomplete, features
+avoid treating an absent object as proof that it does not exist. A slow category
+does not prevent independent categories from becoming available. See
+[Progressive metadata lifecycle](doc/develop.md#progressive-metadata-lifecycle)
+for readiness milestones, cancellation limits and diagnostics.
 
 ### `EXECUTE PROCEDURE` limitation
 
@@ -831,12 +834,26 @@ as driver parameters — see
 
 Completion and hover use tables, views, columns, and primary and foreign
 keys. The cache also holds procedures with their parameters, triggers,
-generators, domains, indexes, and external-function declarations, refreshed
-by the background worker after the first connection rather than on demand.
+generators, domains, indexes, and external-function declarations. One
+generation-scoped metadata loader fetches independent categories progressively
+after the connection is established; the LSP server does not use the legacy
+synchronous cache generator for this work.
 sqls can also reproduce object DDL from the catalog; it is unavailable for
 external functions, database files, shadows, tables with computed columns,
 and procedures whose parameter nullability the catalog does not record, and
 no editor-facing feature surfaces it yet.
+
+Use the `sqls.showMetadataStatus` execute command to inspect connection state,
+metadata generation/revision, settlement and degradation, and each category's
+state, count, duration and stable error code. This is a pull-only status API:
+sqls does not push metadata progress notifications, because a blocked protocol
+write could stall unrelated editor responses. Metadata failures do not retry
+automatically. Selecting the same connection again through the explicit
+connection-switch command starts a fresh generation; InterBase's
+`switchDatabase` remains its existing no-op and is not a refresh operation.
+Cancellation is best effort, and a native call already in flight may continue
+until the driver returns. Successful categories remain usable if a sibling
+fails, while readiness checks protect negative answers from incomplete data.
 
 An InterBase connection holds a single attachment: `showDatabases` lists that
 attachment string, and `switchDatabase` accepts only that same name. Configure

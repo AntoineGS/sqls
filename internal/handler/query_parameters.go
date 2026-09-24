@@ -232,7 +232,7 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 // boundStatement is one preflighted statement of a parameterized batch: the
 // exact SQL that will be sent, its ordered arguments, and the route resolved
 // once, before anything ran. The routing decision travels with the statement
-// so execution never asks a possibly-replaced worker cache a second time and
+// so execution never asks a possibly-replaced metadata cache a second time and
 // gets a different answer for a statement already under way.
 type boundStatement struct {
 	sql     string
