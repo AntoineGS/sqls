@@ -41,7 +41,8 @@ shared edits. No multi-agent execution is required just to use these plans.
 - Primary keys are independent of columns and enrich copies when they arrive.
 - Bulk query reduction accompanies concurrency; no per-object goroutine fan-out.
 - No automatic retry or persistent metadata cache in this iteration.
-- Standard client-capability-gated progress plus `sqls.showMetadataStatus`.
+- Pull-based `sqls.showMetadataStatus` only; defer push progress because the
+  pinned JSON-RPC writer cannot bound blocked writes.
 - Query execution serialization against connection replacement is preserved.
 - Performance targets are acceptance goals, not measurements already obtained.
 

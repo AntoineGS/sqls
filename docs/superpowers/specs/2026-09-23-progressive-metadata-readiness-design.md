@@ -228,11 +228,12 @@ goroutine-per-cache-update fan-out or permanent pointer-keyed map of old caches.
 
 ## 8. Status and measurements
 
-Use standard LSP window work-done progress only when the client advertises it.
-Begin/end once per generation; send throttled/coalesced updates (at most one per
-100 ms, always flush the terminal state). If progress creation fails, loading
-continues. Clients without progress get one log summary per generation and one
-warning on degraded completion, not one popup per failed job.
+Expose loading and degraded state through the pull-based metadata-status command
+only in this iteration. The pinned JSON-RPC transport ignores context deadlines
+while writing; even optional work-done progress or window/logMessage can block
+all replies when the client stops reading. Do not emit metadata push notifications
+or create progress tokens until transport writes can be bounded safely. Ordinary
+server-local logs may report generation summaries without client payloads.
 
 Add `sqls.showMetadataStatus` to workspace/executeCommand; return a JSON-compatible
 object with generation, connection state, revision, settled/degraded flags, and

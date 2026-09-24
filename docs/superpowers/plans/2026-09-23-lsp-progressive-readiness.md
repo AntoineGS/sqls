@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the LSP handshake independent of database work, integrate progressive metadata, and report loading/degraded state without blocking editing.
+**Goal:** Make the LSP handshake independent of database work, integrate progressive metadata, and expose loading/degraded state through a non-pushing status command without blocking editing.
 
-**Architecture:** A single connection coordinator processes captured connection intent off the JSON-RPC read loop. Server uses MetadataLoader snapshots instead of Worker. Coherent editor snapshots and coalesced diagnostics preserve correctness while categories arrive independently; a separate status reporter consumes bounded signals.
+**Architecture:** A single connection coordinator processes captured connection intent off the JSON-RPC read loop. Server uses MetadataLoader snapshots instead of Worker. Coherent editor snapshots and coalesced diagnostics preserve correctness while categories arrive independently; the status command reads current snapshots without sending optional progress notifications.
 
 **Tech Stack:** Go 1.25.7, sourcegraph/jsonrpc2 v0.2.1, existing LSP types, context/sync, MetadataLoader from Plan 1 and InterBase MetadataPlan from Plan 2.
 
@@ -29,7 +29,7 @@
 2. A superseded or late post-shutdown attach must close locally instead of installing (Task 2).
 3. A switch queued behind a running query must not change that query's connection/config (Task 2).
 4. Partial cache/variant transitions must not leak old names, DDL, or false diagnostics (Tasks 3–4).
-5. Clients without progress support, stalled progress creation, or notification failure must still load (Task 5).
+5. Status command reads never schedule optional progress notifications; loading continues regardless of client progress capabilities (Task 5).
 
 ## Dependencies and file map
 
@@ -43,7 +43,7 @@ consumer work touches shared files; execute tasks in order.
 | `internal/handler/handler.go`, `execute_command.go` | bootstrap, lifecycle ownership, command integration |
 | `internal/handler/editor_snapshot.go` (new) | coherent document/connection/cache capture |
 | `internal/handler/diagnostics_scheduler.go` (new), `diagnostics.go` | coalesced analysis and derived catalog reuse |
-| `internal/handler/metadata_status.go` (new), `internal/lsp/metadata_status.go` (new), `internal/lsp/lsp.go` | progress/status contract |
+| `internal/handler/metadata_status.go` (new), `internal/lsp/metadata_status.go` (new), `internal/lsp/lsp.go` | pull-based status contract |
 | `internal/database/worker.go`, `worker_test.go` | remove after migration; retain equivalent regressions in loader tests |
 | `doc/develop.md`, `README.md` | lifecycle invariants and user behavior |
 
@@ -309,12 +309,12 @@ can mutate. Do not cache every historic revision in a growing map.
 - [ ] **Step 4: Run** `go test -race ./internal/handler ./internal/sqlsymbol -count=1`; assert old-generation results and closed-document results remain suppressed.
 - [ ] **Step 5: Commit** `perf(lsp): coalesce diagnostics and reuse catalog analysis inputs`.
 
-### Task 5: Expose loading progress and a machine-readable status command
+### Task 5: Expose machine-readable loading status without push traffic
 
 **Files:** Create `internal/lsp/metadata_status.go`, `internal/handler/metadata_status.go`, `metadata_status_test.go`; modify `internal/lsp/lsp.go`, `handler.go`, `execute_command.go`, and capability tests.
 
-**Interfaces:** Extend ClientCapabilities with `Window.WorkDoneProgress bool` using
-the standard `window`/`workDoneProgress` JSON keys. Add command constant
+**Interfaces:** Clients may advertise `Window.WorkDoneProgress`, but sqls does not
+initiate metadata progress in this iteration. Add command constant
 `CommandShowMetadataStatus = "sqls.showMetadataStatus"`. Define payload types:
 
 ```go
@@ -351,12 +351,12 @@ For a ready attachment whose metadata scheduling failed before any job started,
 report Settled/Degraded true and MetadataErrorCode `metadata_load_failed`; do
 not claim any individual category failed or serialize the raw error.
 
-- [ ] **Step 1: Add capability/failure tests over JSON-RPC.** Capture notifications
-with existing test clients. Cases: advertised progress, no capability, create
-request refused, create never answered, error containing a fake password, reset
-during reporting, all jobs failed, and cancelled old generation. Assert one
-terminal summary, no misleading fully-loaded text, and no fake password in
-serialized output.
+- [ ] **Step 1: Add status/absence-of-push tests over JSON-RPC.** Cases: advertised
+progress, no capability, fake password in driver error, reset during loading,
+all jobs failed, and cancelled old generation. Assert no metadata work-done
+create/notification or metadata logMessage is emitted, loading does not wait for
+client notifications, status is current/nonblocking, and no fake password enters
+serialized status output.
 
 ```go
 body, err := json.Marshal(status)
@@ -365,20 +365,15 @@ if bytes.Contains(body, []byte("secret-from-driver")) { t.Fatal("raw error leake
 ```
 
 - [ ] **Step 2: Run** `go test ./internal/handler -run TestMetadataStatus -count=1`; expect command/capability handling absent.
-- [ ] **Step 3: Implement one reporter goroutine with a capacity-one wake channel.**
-After initialized, use `window/workDoneProgress/create` with a generation-specific
-string token and a 500 ms child-context budget; failure disables progress for
-that generation only. Send `$/progress` begin/report/end values using that token.
-Throttle reports to 100 ms, flush end immediately, and end an obsolete token as
-cancelled before starting a new one. Reporter/client I/O never executes from a
-loader callback or while holding stateMu/connMu/loader locks. Bound notification
-sends by reporter context; broken client transport must not stall loading.
-Fallback emits one window/logMessage summary and one warning on degraded
-completion. User cancellation of work-done progress is not advertised in this
-iteration; omit `cancellable` or set false. Add the command to advertised
-execute-command capabilities and dispatch.
-- [ ] **Step 4: Run** `go test -race ./internal/handler ./internal/lsp -count=1`; verify progress failures never change load outcomes.
-- [ ] **Step 5: Commit** `feat(lsp): report progressive metadata readiness and failures`.
+- [ ] **Step 3: Keep status entirely pull-based.** Remove the optional metadata
+reporter, wake channel, work-done create/`$/progress` sends, and fallback
+window/logMessage metadata notifications. The pinned jsonrpc2 send path ignores
+context while writing and holds its shared send mutex; a stalled client would
+otherwise block normal replies. Keep the status command advertised and dispatched;
+format statuses under short internal locks and do not acquire connMu. This does
+not promise replies when the client stops reading stdout entirely.
+- [ ] **Step 4: Run** `go test -race ./internal/handler ./internal/lsp -count=1`; verify advertised progress/no-capability cases do not generate optional metadata traffic or change load outcomes.
+- [ ] **Step 5: Commit** `feat(lsp): expose pull-based metadata readiness and failures`.
 
 ### Task 6: Complete cutover and document the new lifecycle
 
