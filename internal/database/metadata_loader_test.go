@@ -523,32 +523,31 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 	}
 	waitDone := make(chan error, 1)
 	waitObserving := make(chan struct{})
-	waitCtx := &observedWaitContext{Context: context.Background(), observed: waitObserving}
+	waitContext, cancelWait := context.WithCancel(context.Background())
+	waitCtx := &observedWaitContext{Context: waitContext, observed: waitObserving}
 	go func() {
 		waitDone <- loader.Wait(waitCtx)
 	}()
 	select {
-	case <-waitObserving: // Wait evaluated its cancellation channel and is in its blocking select.
+	case <-waitObserving: // Wait has entered the context's Done method.
 	case <-time.After(2 * time.Second):
-		t.Fatal("Wait did not reach its blocking select")
+		t.Fatal("Wait did not enter its context's Done method")
 	}
+	// Cancellation proves this particular Wait is still in flight even if it
+	// has not yet been scheduled into its select after calling Done.
+	cancelWait()
 	select {
 	case err := <-waitDone:
-		t.Fatalf("Wait returned before gated generation drained: %v", err)
-	default:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("in-flight Wait error = %v, want context.Canceled while generation remains gated", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight Wait did not return after its context was canceled")
 	}
 	releaseLatestGate()
 	releaseLatestGate = nil
 	if err := loader.Wait(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-	select {
-	case err := <-waitDone:
-		if err != nil {
-			t.Fatalf("Wait started while gated returned: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("Wait did not return after gated generation drained")
 	}
 	if snapshot := loader.Snapshot(); snapshot.Generation != 100 {
 		t.Fatalf("current generation = %d, want 100", snapshot.Generation)
