@@ -1,10 +1,14 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
@@ -46,6 +50,29 @@ END`
 	}
 	if len(got) != 4 {
 		t.Fatalf("got %d references with declaration, want 4", len(got))
+	}
+}
+
+func TestReferencesUseConfiguredEditorSnapshotBeforeAttachment(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverInterBase, Dialect: 1}}}
+	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE v INTEGER;\nBEGIN\nv=0;\nv=:v+1;\nEND"
+	if err := s.openFileAtVersion("file:///configured.sql", "sql", text, 1); err != nil {
+		t.Fatal(err)
+	}
+	params := lsp.ReferenceParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: "file:///configured.sql"},
+		Position:     lsp.Position{Line: 4, Character: 3},
+	}}
+	data, _ := json.Marshal(params)
+	result, err := s.handleReferences(context.Background(), nil, &jsonrpc2.Request{Params: (*json.RawMessage)(&data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations, ok := result.([]lsp.Location)
+	if !ok || len(locations) != 3 {
+		t.Fatalf("configured InterBase references = %#v, want three local references", result)
 	}
 }
 

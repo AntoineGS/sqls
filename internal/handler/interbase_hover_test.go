@@ -210,6 +210,31 @@ func TestResolveInterBaseHoverTargetUsesKnownViewWhileViewsLoading(t *testing.T)
 	}
 }
 
+func TestHoverDoesNotUseColumnTableFallbackUntilViewsReady(t *testing.T) {
+	cache := interBaseHoverCache(t)
+	text := "SELECT * FROM MYVIEW"
+	params := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Character: strings.Index(text, "MYVIEW")},
+	}}
+	cache.Metadata[database.MetadataViews] = database.MetadataLoading
+	got, err := hoverWithDriverVariant(text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil && !errors.Is(err, ErrNoHover) {
+		t.Fatal("hover while views are loading:", err)
+	}
+	if got != nil {
+		t.Fatalf("unresolved view was reported as a table: %+v", got)
+	}
+
+	cache.Metadata[database.MetadataViews] = database.MetadataReady
+	got, err = hoverWithDriverVariant(text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatal("hover after views are ready:", err)
+	}
+	if got == nil || !strings.Contains(got.Contents.Value, "MYVIEW") {
+		t.Fatalf("ready view should retain positive column-backed hover, got %+v", got)
+	}
+}
+
 func TestResolveInterBaseHoverTargetIsCaseInsensitiveWithoutUpperCasingAtTheCallSite(t *testing.T) {
 	params := lsp.HoverParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{

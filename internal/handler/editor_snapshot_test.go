@@ -73,6 +73,26 @@ func TestEditorSnapshotCopiesDocumentAndConfiguredDialect(t *testing.T) {
 	}
 }
 
+func TestDiagnosticsSnapshotCurrentAcceptsConfiguredVariantWithoutConnection(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverInterBase, Dialect: 1}}}
+	s.stateMu.Lock()
+	s.connGeneration = 1
+	s.stateMu.Unlock()
+	s.metadata.Reset(1)
+	if err := s.openFileAtVersion("file:///configured.sql", "sql", "SELECT 1", 1); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok := s.diagnosticsSnapshot("file:///configured.sql")
+	if !ok {
+		t.Fatal("configured document snapshot missing")
+	}
+	if !s.diagnosticsSnapshotCurrent(snapshot) {
+		t.Fatalf("snapshot with configured variant %#v is not current before attachment", snapshot.variant)
+	}
+}
+
 func TestEditorSnapshotRejectsMismatchedMetadataGeneration(t *testing.T) {
 	s := NewServer()
 	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })

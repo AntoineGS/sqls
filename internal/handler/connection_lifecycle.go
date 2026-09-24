@@ -111,7 +111,10 @@ func (c *connectionCoordinator) request(ctx context.Context, cfg *database.DBCon
 		replaced = c.pending.Reply
 		c.pending = nil
 	}
-	if c.activeCancel != nil && c.activeKey != key {
+	// Passive notifications with the same key returned above as coalesced
+	// requests. An explicit reselect is different: it requests a fresh
+	// generation even when it selects the currently attaching connection.
+	if c.activeCancel != nil && (explicit || c.activeKey != key) {
 		c.activeCancel()
 	}
 	c.nextID++

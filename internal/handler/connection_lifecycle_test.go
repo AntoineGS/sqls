@@ -135,6 +135,45 @@ func TestIdenticalNotificationDoesNotQueueDuplicateDuringActiveAttach(t *testing
 	}
 }
 
+func TestExplicitReselectCancelsSameKeyActiveAttach(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	entered := make(chan struct{})
+	canceled := make(chan struct{})
+	var opens atomic.Int32
+	s.openConnection = func(ctx context.Context, _ *database.DBConfig) (*database.DBConnection, error) {
+		if opens.Add(1) == 1 {
+			close(entered)
+			<-ctx.Done()
+			close(canceled)
+			return nil, ctx.Err()
+		}
+		return nil, errors.New("second attach reached opener")
+	}
+	cfg := &database.DBConfig{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: ":memory:"}
+	first := s.coordinator.Request(s.lifecycleCtx, cfg, 0, "")
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("first attach did not enter opener")
+	}
+	second := s.coordinator.RequestExplicit(s.lifecycleCtx, cfg, 0, "")
+	select {
+	case <-canceled:
+	case <-time.After(time.Second):
+		t.Fatal("same-key explicit reselect did not cancel active attach")
+	}
+	if err := <-first; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first attach result = %v, want canceled", err)
+	}
+	if err := <-second; err == nil || err.Error() != "second attach reached opener" {
+		t.Fatalf("explicit reselect result = %v, want second opener result", err)
+	}
+	if got := opens.Load(); got != 2 {
+		t.Fatalf("opener called %d times, want 2", got)
+	}
+}
+
 func TestConnectionIntentWaitReturnsOnCancellationWhileWriteLockQueued(t *testing.T) {
 	s := NewServer()
 	defer s.Stop()

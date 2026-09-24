@@ -178,7 +178,12 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	current := open && file.Version == snapshot.version && file.Revision == snapshot.revision &&
 		s.connGeneration == snapshot.generation
 	if s.dbConn == nil {
-		current = current && snapshot.variant == (dialect.DriverVariant{})
+		cfg := cloneConnectionConfig(s.curDBCfg)
+		if cfg == nil {
+			cfg = selectedConfig(s.effectiveConfigLocked(), s.initOptionDBConfig, s.curConnectionIndex)
+		}
+		configured := configuredDriverVariant(cfg)
+		current = current && configured == snapshot.variant
 	} else {
 		current = current && s.dbConn.DriverVariant() == snapshot.variant
 	}
@@ -188,6 +193,28 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	}
 	meta := s.metadata.Snapshot()
 	return meta != nil && meta.Generation == uint64(snapshot.generation) && meta.Cache == snapshot.cache
+}
+
+// configuredDriverVariant mirrors the pre-attachment parser selection used by
+// captureEditorSnapshot. It is deliberately local-only so the diagnostics
+// publication fence can compare identity without I/O or recursively acquiring
+// stateMu.
+func configuredDriverVariant(cfg *database.DBConfig) dialect.DriverVariant {
+	if cfg == nil {
+		return dialect.DriverVariant{}
+	}
+	variant := dialect.DriverVariant{Driver: cfg.Driver}
+	if cfg.Driver == dialect.DatabaseDriverInterBase {
+		switch cfg.Dialect {
+		case 1:
+			variant.Variant = dialect.SQLVariantInterBase1
+		case 3:
+			variant.Variant = dialect.SQLVariantInterBase3
+		default:
+			variant.Variant = dialect.SQLVariantInterBase3
+		}
+	}
+	return variant
 }
 
 func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.Conn, uri string) {

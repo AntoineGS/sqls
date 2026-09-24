@@ -267,6 +267,13 @@ func hoverContentFromIdent(ctx *hoverContext, identName string, dbCache *databas
 		// find table
 		cols, ok := dbCache.ColumnDescs(tableName)
 		if ok {
+			// InterBase can publish relation columns before its view category
+			// settles. In that interval a view is also present in the relation
+			// column map, so columns alone cannot prove this is a table. Legacy
+			// caches without explicit view status retain their prior behavior.
+			if _, tracked := dbCache.Metadata[database.MetadataViews]; tracked && !dbCache.MetadataReady(database.MetadataViews) {
+				return nil
+			}
 			return tableHoverInfo(tableName, cols)
 		}
 	}
