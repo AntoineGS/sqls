@@ -25,15 +25,17 @@ func isServerNotification(method string) bool {
 }
 
 type documentDiagnosticsSnapshot struct {
-	uri             string
-	text            string
-	version         int
-	revision        uint64
-	variant         dialect.DriverVariant
-	generation      int
-	cache           *database.DBCache
-	cacheSnapshot   sqlsymbol.SemanticCatalog
-	dialectResolved bool
+	uri               string
+	text              string
+	version           int
+	revision          uint64
+	variant           dialect.DriverVariant
+	generation        int
+	cache             *database.DBCache
+	cacheSnapshot     sqlsymbol.SemanticCatalog
+	dialectResolved   bool
+	diagnosticOptions sqlsymbol.DiagnosticOptions
+	policyRevision    uint64
 }
 
 type diagnosticCatalog struct {
@@ -169,14 +171,16 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		return documentDiagnosticsSnapshot{}, false
 	}
 	snapshot := documentDiagnosticsSnapshot{
-		uri:             editor.URI,
-		text:            editor.Text,
-		version:         editor.Version,
-		revision:        editor.Revision,
-		generation:      editor.Generation,
-		variant:         editor.Variant,
-		cache:           editor.Cache,
-		dialectResolved: editor.DialectResolved,
+		uri:               editor.URI,
+		text:              editor.Text,
+		version:           editor.Version,
+		revision:          editor.Revision,
+		generation:        editor.Generation,
+		variant:           editor.Variant,
+		cache:             editor.Cache,
+		dialectResolved:   editor.DialectResolved,
+		diagnosticOptions: editor.DiagnosticOptions,
+		policyRevision:    editor.PolicyRevision,
 	}
 	if snapshot.CacheReadyForDiagnostics() {
 		snapshot.cacheSnapshot = s.diagnosticCatalogFor(snapshot.cache)
@@ -196,7 +200,7 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	s.stateMu.RLock()
 	file, open := s.files[snapshot.uri]
 	current := open && file.Version == snapshot.version && file.Revision == snapshot.revision &&
-		s.connGeneration == snapshot.generation
+		s.connGeneration == snapshot.generation && s.policyRevision == snapshot.policyRevision
 	if s.dbConn == nil {
 		cfg := cloneConnectionConfig(s.curDBCfg)
 		if cfg == nil {
@@ -266,7 +270,7 @@ func diagnosticsForSnapshot(snapshot documentDiagnosticsSnapshot) []lsp.Diagnost
 		return diagnostics
 	}
 
-	found := analysis.Diagnostics(snapshot.cacheSnapshot)
+	found := analysis.DiagnosticsWithOptions(snapshot.cacheSnapshot, snapshot.diagnosticOptions)
 	sort.SliceStable(found, func(i, j int) bool {
 		left, right := found[i], found[j]
 		if left.Span.Start != right.Span.Start {

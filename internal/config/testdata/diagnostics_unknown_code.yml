@@ -1,0 +1,3 @@
+diagnostics:
+  rules:
+    interbase-not-a-real-code: error

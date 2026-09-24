@@ -24,6 +24,26 @@ func requireCodeCount(t *testing.T, text string, c Catalog, code string, want in
 	}
 }
 
+// requireCodeCountWithOptions fails the test unless text produces exactly
+// want findings with code under c, computed via DiagnosticsWithOptions under
+// options rather than the default-policy Diagnostics.
+func requireCodeCountWithOptions(t *testing.T, text string, c Catalog, options DiagnosticOptions, code string, want int) {
+	t.Helper()
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, f := range a.DiagnosticsWithOptions(c, options) {
+		if f.Code == code {
+			count++
+		}
+	}
+	if count != want {
+		t.Fatalf("%s: got %d, want %d", code, count, want)
+	}
+}
+
 // isDiagnosticFixtureSystemName mirrors the production adapter's rule: sqls
 // never claims completeness over system catalog objects, regardless of how
 // complete its user-object fixtures are.

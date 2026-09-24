@@ -31,6 +31,12 @@ type singletonQuery struct {
 	equalities []singletonEquality
 }
 
+// codeSingletonSelect marks a singleton SELECT (SELECT ... INTO, or a
+// SELECT expected to return at most one row) whose predicates do not
+// provably constrain a complete primary key or unique index for every
+// relation it reads.
+const codeSingletonSelect = "interbase-singleton-select"
+
 func (a *Analysis) singletonDiagnostics(c Catalog) []Finding {
 	keys, ok := c.(UniqueKeyCatalog)
 	if !ok || a == nil {
@@ -54,7 +60,7 @@ func (a *Analysis) singletonDiagnostics(c Catalog) []Finding {
 		query := singletonQuery{analysis: a}
 		if safe, supported := query.analyze(items[i:end], keys); supported && !safe {
 			findings = append(findings, Finding{
-				Span: items[i].Span, Code: "interbase-singleton-select", Severity: 2,
+				Span: items[i].Span, Code: codeSingletonSelect, Severity: 2,
 				Message: "Possible multiple rows in singleton SELECT: predicates do not constrain a complete primary key or unique index for every relation",
 			})
 		}

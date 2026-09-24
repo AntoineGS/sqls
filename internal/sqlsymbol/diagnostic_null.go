@@ -4,6 +4,10 @@ import "github.com/sqls-server/sqls/token"
 
 const nullComparisonMessage = "comparison with NULL yields UNKNOWN; use IS NULL/IS NOT NULL if testing nullness"
 
+// codeNullComparison marks a direct `= NULL`/`<> NULL`/`!= NULL` comparison,
+// which InterBase always evaluates to UNKNOWN rather than true/false.
+const codeNullComparison = "interbase-null-comparison"
+
 // nullComparisonFindings warns about a direct `= NULL` / `<> NULL` / `!= NULL`
 // comparison, which InterBase always evaluates to UNKNOWN rather than
 // true/false. This is pure lexical pattern matching over the boolean
@@ -163,7 +167,7 @@ func scanClauseForNullComparisons(items []lexeme) []Finding {
 		}
 		return []Finding{{
 			Span:     Span{Start: items[0].Span.Start, End: items[len(items)-1].Span.End},
-			Code:     "interbase-null-comparison",
+			Code:     codeNullComparison,
 			Message:  nullComparisonMessage,
 			Severity: 2,
 		}}

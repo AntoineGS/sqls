@@ -69,7 +69,14 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration   int
+	connGeneration int
+
+	// policyRevision advances on every workspace configuration change. It
+	// fences diagnostic publication the same way connGeneration does: a
+	// computation started under an old policy revision must never overwrite
+	// a publication made under a newer one, even when connection/metadata
+	// identity is otherwise unchanged. Guarded by stateMu.
+	policyRevision   uint64
 	lifecycleCtx     context.Context
 	lifecycleCancel  context.CancelFunc
 	coordinator      *connectionCoordinator
@@ -495,9 +502,16 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	}
 	s.stateMu.Lock()
 	s.WSCfg = params.Settings.SQLS
+	s.policyRevision++
 	initialized := s.initialized
 	connected := s.dbConn != nil
 	s.stateMu.Unlock()
+	// Every configuration change advances the policy-revision fence, even
+	// one that does not touch diagnostics settings: a stale computation
+	// started under the previous revision must never overwrite a
+	// publication made after this change. Requeue every open document so
+	// they are re-evaluated under the new revision.
+	s.queueAllDiagnostics()
 	if initialized && !connected {
 		cfg, index, dbName := s.desiredConnection()
 		s.coordinator.Request(s.lifecycleCtx, cfg, index, dbName)

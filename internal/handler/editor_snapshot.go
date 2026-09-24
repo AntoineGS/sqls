@@ -6,6 +6,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
 // editorSnapshot is the immutable set of editor, connection, and metadata
@@ -22,6 +23,8 @@ type editorSnapshot struct {
 	Metadata          *database.MetadataSnapshot
 	Repository        database.DBRepository
 	LowercaseKeywords bool
+	DiagnosticOptions sqlsymbol.DiagnosticOptions
+	PolicyRevision    uint64
 	Attaching         bool
 	ConnectionReady   bool
 	SourceContext     snapshotContext
@@ -46,6 +49,8 @@ func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
 		Generation: s.connGeneration, Cache: &database.DBCache{},
 		LowercaseKeywords: configSnapshot.LowercaseKeywords,
+		DiagnosticOptions: configSnapshot.Diagnostics.Options(),
+		PolicyRevision:    s.policyRevision,
 		Attaching:         s.connectionState == connectionConnecting,
 		ConnectionReady:   s.connectionState == connectionReady,
 	}

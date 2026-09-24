@@ -9,6 +9,7 @@ import (
 	"runtime"
 
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"gopkg.in/yaml.v2"
 )
 
@@ -23,13 +24,45 @@ var (
 type Config struct {
 	LowercaseKeywords bool                 `json:"lowercaseKeywords" yaml:"lowercaseKeywords"`
 	Connections       []*database.DBConfig `json:"connections" yaml:"connections"`
+	Diagnostics       DiagnosticsConfig    `json:"diagnostics" yaml:"diagnostics"`
+}
+
+// DiagnosticsConfig configures InterBase diagnostic rule policy. Rules maps
+// a finding code (for example "interbase-null-comparison") to a level:
+// "default", "off", "error", "warning", "information", or "hint". The set of
+// valid codes and levels is owned by sqlsymbol, not duplicated here.
+type DiagnosticsConfig struct {
+	Rules map[string]string `json:"rules" yaml:"rules"`
+}
+
+func (d DiagnosticsConfig) Validate() error {
+	if len(d.Rules) == 0 {
+		return nil
+	}
+	return sqlsymbol.DiagnosticOptions{Rules: d.Rules}.Validate()
+}
+
+// Options converts this config section into the sqlsymbol type diagnostics
+// computation consumes, deep-copying Rules so callers cannot mutate this
+// Config's map through the returned options.
+func (d DiagnosticsConfig) Options() sqlsymbol.DiagnosticOptions {
+	if len(d.Rules) == 0 {
+		return sqlsymbol.DiagnosticOptions{}
+	}
+	rules := make(map[string]string, len(d.Rules))
+	for code, level := range d.Rules {
+		rules[code] = level
+	}
+	return sqlsymbol.DiagnosticOptions{Rules: rules}
 }
 
 func (c *Config) Validate() error {
 	if len(c.Connections) > 0 {
-		return c.Connections[0].Validate()
+		if err := c.Connections[0].Validate(); err != nil {
+			return err
+		}
 	}
-	return nil
+	return c.Diagnostics.Validate()
 }
 
 func NewConfig() *Config {

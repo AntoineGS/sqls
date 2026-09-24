@@ -367,11 +367,15 @@ func (a *Analysis) findingForDestination(source []lexeme, destination widthDesti
 	return []Finding{a.widthFinding(source, destination.span, destination.label, sourceWidth, destinationWidth)}
 }
 
+// codeStringTruncation marks a provable width mismatch assigning a wider
+// source expression to a narrower destination column or variable.
+const codeStringTruncation = "interbase-string-truncation"
+
 func (a *Analysis) widthFinding(source []lexeme, destination Span, destinationName string, sourceWidth, destinationWidth int) Finding {
 	sourceText := strings.TrimSpace(a.Text[source[0].Span.Start:source[len(source)-1].Span.End])
 	return Finding{
 		Span:     destination,
-		Code:     "interbase-string-truncation",
+		Code:     codeStringTruncation,
 		Message:  fmt.Sprintf("Possible string truncation assigning %s (width %d) to %s (width %d)", sourceText, sourceWidth, destinationName, destinationWidth),
 		Severity: 2,
 	}

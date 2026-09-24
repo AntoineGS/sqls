@@ -28,27 +28,31 @@ type Finding struct {
 	Severity int
 }
 
-// Diagnostics reports InterBase findings, including advisory warnings about
-// possible truncation and singleton selections lacking a uniqueness guarantee.
-// Catalog supplies read-only metadata; unused-symbol analysis does not need it.
-func (a *Analysis) Diagnostics(c Catalog) []Finding {
-	findings := make([]Finding, 0)
+// codeUnused marks a declared local variable or parameter that is never read.
+const codeUnused = "interbase-unused"
+
+// unusedFindings reports every declared symbol never read: an assigned-only
+// local, or an unread input parameter. Output parameters and symbols whose
+// declaration binding itself is ambiguous (RenameBlocked) are excluded.
+func (a *Analysis) unusedFindings() []Finding {
+	var findings []Finding
 	for _, symbol := range a.Symbols {
 		if symbol.Kind == OutputParameter || len(symbol.Reads) != 0 || symbol.RenameBlocked != "" {
 			continue
 		}
 		findings = append(findings, Finding{
 			Span:     symbol.Declaration,
-			Code:     "interbase-unused",
+			Code:     codeUnused,
 			Message:  "Unused declaration",
 			Severity: 4,
 		})
 	}
-	findings = append(findings, a.widthDiagnostics(c)...)
-	findings = append(findings, a.singletonDiagnostics(c)...)
-	findings = append(findings, a.nullComparisonFindings()...)
-	m := a.diagnosticModel(c)
-	findings = append(findings, m.localFindings()...)
-	findings = append(findings, m.nameFindings()...)
-	return append(findings, m.shapeFindings()...)
+	return findings
+}
+
+// Diagnostics reports InterBase findings, including advisory warnings about
+// possible truncation and singleton selections lacking a uniqueness guarantee.
+// Catalog supplies read-only metadata; unused-symbol analysis does not need it.
+func (a *Analysis) Diagnostics(c Catalog) []Finding {
+	return a.DiagnosticsWithOptions(c, DiagnosticOptions{})
 }
