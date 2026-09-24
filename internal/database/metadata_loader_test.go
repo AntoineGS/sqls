@@ -285,6 +285,114 @@ func TestMetadataLoaderCancellationSettlesBeforeRunDrains(t *testing.T) {
 	loader.Stop()
 }
 
+func TestMetadataLoaderFailureIsIsolatedForEveryJobKind(t *testing.T) {
+	kinds := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataColumnsAll, MetadataPrimaryKeys, MetadataForeignKeys, MetadataViews, MetadataProcedures, MetadataGenerators, MetadataDomains, MetadataFunctions, MetadataIndexes, MetadataTriggers}
+	for _, failedKind := range kinds {
+		t.Run(string(failedKind), func(t *testing.T) {
+			loader := NewMetadataLoader()
+			t.Cleanup(loader.Stop)
+			loader.Reset(1)
+			jobs := make([]MetadataJob, 0, len(kinds))
+			for _, kind := range kinds {
+				kind := kind
+				jobs = append(jobs, MetadataJob{Kind: kind, Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+					if kind == failedKind {
+						return MetadataPatch{}, errors.New("injected job failure")
+					}
+					return MetadataPatch{Cache: emptyMetadataFragment(kind)}, nil
+				}})
+			}
+			load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 3, Jobs: jobs}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			waitLoad(t, load)
+			status := loader.Snapshot().Status
+			if status[failedKind].State != MetadataFailed {
+				t.Fatalf("failed job status = %+v", status[failedKind])
+			}
+			for _, kind := range kinds {
+				if kind != failedKind && status[kind].State != MetadataReady {
+					t.Fatalf("independent %s status = %+v", kind, status[kind])
+				}
+			}
+		})
+	}
+}
+
+func emptyMetadataFragment(kind MetadataKind) *DBCache {
+	fragment := &DBCache{}
+	switch kind {
+	case MetadataSchemas:
+		fragment.Schemas = map[string]string{}
+	case MetadataRelations:
+		fragment.SchemaTables = map[string][]string{}
+	case MetadataColumnsCurrent, MetadataColumnsAll:
+		fragment.ColumnsWithParent = map[string][]*ColumnDesc{}
+	case MetadataPrimaryKeys:
+		fragment.PrimaryKeyColumns = map[string]map[string]struct{}{}
+	case MetadataForeignKeys:
+		fragment.ForeignKeys = map[string]map[string][]*ForeignKey{}
+	case MetadataViews:
+		fragment.Catalog = &CatalogCache{Views: map[string]*ViewDesc{}}
+	case MetadataProcedures:
+		fragment.Catalog = &CatalogCache{Procedures: map[string]*ProcedureDesc{}}
+	case MetadataGenerators:
+		fragment.Catalog = &CatalogCache{Generators: map[string]*GeneratorDesc{}}
+	case MetadataDomains:
+		fragment.Catalog = &CatalogCache{Domains: map[string]*DomainDesc{}}
+	case MetadataFunctions:
+		fragment.Catalog = &CatalogCache{Functions: map[string]*FunctionDesc{}}
+	case MetadataIndexes:
+		fragment.Catalog = &CatalogCache{Indexes: map[string]*IndexDesc{}}
+	case MetadataTriggers:
+		fragment.Catalog = &CatalogCache{Triggers: map[string]*TriggerDesc{}}
+	}
+	return fragment
+}
+
+func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.T) {
+	loader := NewMetadataLoader()
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	loader.Reset(1)
+	var last *MetadataLoad
+	for generation := uint64(1); generation <= 100; generation++ {
+		loader.Reset(generation)
+		gen := generation
+		plan := MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{Kind: MetadataViews, Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+			enteredOnce.Do(func() { close(entered) })
+			<-gate
+			return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: map[string]*ViewDesc{"CURRENT": {Name: "CURRENT"}}}}, Count: int(gen)}, nil
+		}}}}
+		load, err := loader.Start(context.Background(), generation, metadataRepo(plan))
+		if err != nil {
+			t.Fatalf("generation %d: %v", generation, err)
+		}
+		last = load
+		if generation == 1 {
+			select {
+			case <-entered:
+			case <-time.After(2 * time.Second):
+				t.Fatal("first generation did not enter gated query")
+			}
+		}
+	}
+	loader.Stop()
+	waitLoad(t, last)
+	close(gate)
+	if err := loader.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loader.Cache().View("CURRENT"); ok {
+		t.Fatal("stopped pending generation published metadata")
+	}
+	if snapshot := loader.Snapshot(); snapshot.Generation != 100 {
+		t.Fatalf("current generation = %d, want 100", snapshot.Generation)
+	}
+}
+
 func TestMetadataLoaderStatusOnlyChangesRetainCachePointer(t *testing.T) {
 	loader := NewMetadataLoader()
 	t.Cleanup(loader.Stop)
