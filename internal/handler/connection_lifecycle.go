@@ -37,6 +37,8 @@ type connectionCoordinator struct {
 	pending      *connectionIntent
 	activeCancel context.CancelFunc
 	activeKey    string
+	activeID     uint64
+	afterClaim   func() // deterministic lifecycle test seam; called outside mu
 	stopped      bool
 	nextID       uint64
 	lastKey      string
@@ -177,47 +179,65 @@ func (c *connectionCoordinator) run() {
 			return
 		case <-c.wake:
 		}
+		ctx, cancel := context.WithCancel(c.server.lifecycleCtx)
 		c.mu.Lock()
 		if c.stopped {
 			c.mu.Unlock()
+			cancel()
 			return
 		}
 		intent := c.pending
 		c.pending = nil
 		if intent != nil {
 			c.activeKey = intentKey(intent)
+			c.activeID = intent.ID
+			c.activeCancel = cancel
 		}
+		afterClaim := c.afterClaim
 		c.mu.Unlock()
 		if intent == nil {
+			cancel()
 			continue
+		}
+		if afterClaim != nil {
+			afterClaim()
 		}
 		if err := intent.Context.Err(); err != nil {
 			c.mu.Lock()
-			if c.activeKey == intentKey(intent) {
+			if c.activeID == intent.ID {
 				c.activeKey = ""
+				c.activeID = 0
+				c.activeCancel = nil
 			}
 			c.mu.Unlock()
+			cancel()
 			intent.Reply <- err
 			continue
 		}
-		ctx, cancel := context.WithCancel(c.server.lifecycleCtx)
 		stopCancel := context.AfterFunc(intent.Context, cancel)
 		c.mu.Lock()
 		if c.stopped {
+			if c.activeID == intent.ID {
+				c.activeCancel = nil
+				c.activeKey = ""
+				c.activeID = 0
+			}
 			c.mu.Unlock()
 			stopCancel()
 			cancel()
 			intent.Reply <- context.Canceled
 			return
 		}
-		c.activeCancel = cancel
 		c.mu.Unlock()
 		err := c.server.attachIntent(ctx, intent)
 		stopCancel()
 		cancel()
 		c.mu.Lock()
-		c.activeCancel = nil
-		c.activeKey = ""
+		if c.activeID == intent.ID {
+			c.activeCancel = nil
+			c.activeKey = ""
+			c.activeID = 0
+		}
 		if !errors.Is(err, context.Canceled) {
 			c.lastKey = intentKey(intent)
 		}
@@ -233,6 +253,16 @@ func intentKey(i *connectionIntent) string {
 		D string
 	}{i.Config, i.ConnectionIndex, i.DatabaseName})
 	return string(b)
+}
+
+// isCurrent fences coordinator work at lifecycle boundaries. Request mutates
+// activeID/pending under the same mutex and cancels the active context before
+// releasing it, so an older attachment cannot commit after a newer request is
+// visible here.
+func (c *connectionCoordinator) isCurrent(intent *connectionIntent) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.stopped && c.activeID == intent.ID && (c.pending == nil || c.pending.ID < intent.ID)
 }
 
 var errCoordinatorStopped = errors.New("connection coordinator stopped")

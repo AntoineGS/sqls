@@ -75,6 +75,7 @@ type Server struct {
 	cleanupDone      chan struct{}
 	cleanupQueue     chan *database.DBConnection
 	cleanupFinal     chan *database.DBConnection
+	diagnosticsWake  chan struct{}
 	stopOnce         sync.Once
 	fileRevision     uint64
 	notificationConn *jsonrpc2.Conn
@@ -116,16 +117,14 @@ func NewServer() *Server {
 		cleanupDone:     make(chan struct{}),
 		cleanupQueue:    make(chan *database.DBConnection, 2),
 		cleanupFinal:    make(chan *database.DBConnection, 1),
+		diagnosticsWake: make(chan struct{}, 1),
 	}
 	server.metadata.SetChangedCallback(func() {
-		select {
-		case <-server.lifecycleCtx.Done():
-		default:
-			go server.republishOpenDiagnostics(server.lifecycleCtx)
-		}
+		server.signalDiagnostics()
 	})
 	server.coordinator = newConnectionCoordinator(server)
 	go server.cleanupConnections()
+	go server.runDiagnosticSignals()
 	// Deliberately no filesystem access here: NewServer runs in every test in
 	// this package, and touching the real cache directory from a unit test is
 	// the hazard the injected root exists to remove. The root is only resolved,
@@ -570,6 +569,9 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	if err := intent.Context.Err(); err != nil {
 		return err
 	}
+	if !s.coordinator.isCurrent(intent) {
+		return context.Canceled
+	}
 	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
 	if s.connectionState == connectionStopped {
@@ -591,7 +593,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
 	_ = s.enqueueDetachedConnection(old)
-	s.republishOpenDiagnostics(s.lifecycleCtx)
+	s.signalDiagnostics()
 	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))
 	if err != nil {
 		s.stateMu.Lock()
@@ -616,7 +618,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	}
 	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
-	if s.connGeneration != generation || s.connectionState == connectionStopped || ctx.Err() != nil || intent.Context.Err() != nil {
+	if s.connGeneration != generation || s.connectionState == connectionStopped || ctx.Err() != nil || intent.Context.Err() != nil || !s.coordinator.isCurrent(intent) {
 		if s.connGeneration == generation && s.connectionState != connectionStopped {
 			s.connectionState = connectionIdle
 		}
@@ -635,6 +637,9 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 		_, err = s.metadata.Start(s.lifecycleCtx, uint64(generation), repo)
 	}
 	if err != nil {
+		if markErr := s.metadata.MarkStartFailed(uint64(generation)); markErr != nil {
+			log.Printf("sqls: marking metadata generation %d start failure: %v", generation, markErr)
+		}
 		s.stateMu.Lock()
 		if s.connGeneration == generation && s.connectionState == connectionReady {
 			s.metadataStartErr = err
@@ -642,7 +647,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 		s.stateMu.Unlock()
 		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
 	}
-	s.republishOpenDiagnostics(s.lifecycleCtx)
+	s.signalDiagnostics()
 	return nil
 }
 
@@ -693,38 +698,6 @@ func (s *Server) showConnectionWarnings(ctx context.Context, messenger lsp.Messa
 			log.Println("send warning", err.Error())
 		}
 	}
-}
-
-func (s *Server) newDBConnection(ctx context.Context) (*database.DBConnection, error) {
-	// Get the most preferred DB connection settings
-	connCfg := s.topConnection()
-	if connCfg == nil {
-		return nil, ErrNoConnection
-	}
-	s.stateMu.RLock()
-	index := s.curConnectionIndex
-	dbName := s.curDBName
-	s.stateMu.RUnlock()
-
-	if index != 0 {
-		connCfg = s.getConnection(index)
-	}
-	if connCfg == nil {
-		return nil, fmt.Errorf("not found database connection config, index %d", index+1)
-	}
-	if dbName != "" {
-		connCfg.DBName = dbName
-	}
-	s.stateMu.Lock()
-	s.curDBCfg = connCfg
-	s.stateMu.Unlock()
-
-	// Connect database
-	conn, err := database.Open(connCfg)
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
 }
 
 func (s *Server) newDBRepository(ctx context.Context) (database.DBRepository, error) {

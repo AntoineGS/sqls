@@ -51,11 +51,12 @@ type MetadataStatus struct {
 
 // MetadataSnapshot is an immutable view of one metadata generation.
 type MetadataSnapshot struct {
-	Generation uint64
-	Revision   uint64
-	Started    bool
-	Cache      *DBCache
-	Status     map[MetadataKind]MetadataStatus
+	Generation  uint64
+	Revision    uint64
+	Started     bool
+	StartFailed bool
+	Cache       *DBCache
+	Status      map[MetadataKind]MetadataStatus
 }
 
 // MetadataPatch is one job's cache fragment and accounting information.
@@ -86,7 +87,7 @@ type MetadataPlanRepository interface {
 
 // Settled reports whether a started snapshot has terminal status for every category.
 func (s *MetadataSnapshot) Settled() bool {
-	if s == nil || !s.Started || len(s.Status) == 0 {
+	if s == nil || (!s.Started && !s.StartFailed) || len(s.Status) == 0 {
 		return false
 	}
 	for _, status := range s.Status {
@@ -103,6 +104,9 @@ func (s *MetadataSnapshot) Settled() bool {
 func (s *MetadataSnapshot) Degraded() bool {
 	if s == nil || len(s.Status) == 0 {
 		return false
+	}
+	if s.StartFailed {
+		return true
 	}
 	for _, status := range s.Status {
 		if status.State == MetadataFailed || status.State == MetadataBlocked {

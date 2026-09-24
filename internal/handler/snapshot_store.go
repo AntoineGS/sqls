@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -68,7 +69,7 @@ type sourceSnapshotStore struct {
 	// created is every directory this store made, so shutdown can remove
 	// exactly those and nothing a concurrent sqls process owns.
 	created      map[string]struct{}
-	shuttingDown bool
+	shuttingDown atomic.Bool
 }
 
 func newSourceSnapshotStore(root string) *sourceSnapshotStore {
@@ -105,9 +106,12 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 		return "", errors.New("snapshot store is disabled")
 	}
 
+	if s.shuttingDown.Load() {
+		return "", errors.New("snapshot store is shutting down")
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.shuttingDown {
+	if s.shuttingDown.Load() {
 		return "", errors.New("snapshot store is shutting down")
 	}
 
@@ -201,8 +205,8 @@ func (s *sourceSnapshotStore) pruneLocked() {
 //
 // It removes only its own directories, never the root: the root is shared with
 // any other sqls process, whose live snapshots must survive this one's exit.
-// The lock is released before the filesystem work, so a shutdown never waits on
-// an in-flight write beyond the bookkeeping.
+// The lock is released before the filesystem work. Shutdown fences writes
+// atomically and cleanup runs on the lifecycle cleanup worker.
 func (s *sourceSnapshotStore) RemoveAll() {
 	if s == nil {
 		return
@@ -230,9 +234,7 @@ func (s *sourceSnapshotStore) BeginShutdown() {
 	if s == nil {
 		return
 	}
-	s.mu.Lock()
-	s.shuttingDown = true
-	s.mu.Unlock()
+	s.shuttingDown.Store(true)
 }
 
 func (s *sourceSnapshotStore) connectionDirLocked(sc snapshotContext) (string, error) {

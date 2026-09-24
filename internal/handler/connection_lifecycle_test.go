@@ -64,6 +64,10 @@ func TestMetadataStartRejectionKeepsAttachmentReadyAndRecordsDegradedError(t *te
 	if !errors.Is(startErr, database.ErrInvalidMetadataPlan) {
 		t.Fatalf("metadata start status = %v, want invalid plan error", startErr)
 	}
+	meta := s.metadata.Snapshot()
+	if meta.Started || !meta.StartFailed || !meta.Settled() || !meta.Degraded() {
+		t.Fatalf("rejected metadata generation snapshot = %+v (settled=%v degraded=%v)", meta, meta.Settled(), meta.Degraded())
+	}
 }
 
 func TestConnectionLifecycleRequestCopiesConfig(t *testing.T) {
@@ -670,6 +674,91 @@ func TestChangedConfigurationSupersedesActiveAttachAndClosesStaleCandidate(t *te
 	s.stateMu.RUnlock()
 	if got != installed || state != connectionReady {
 		t.Fatalf("installed connection=%p state=%q, want B=%p ready", got, state, installed)
+	}
+}
+
+func TestSwitchConnectionsRejectsOutOfRangeBeforeSubmittingIntent(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	active := &database.DBConnection{Driver: dialect.DatabaseDriverSQLite3}
+	s.SpecificFileCfg = &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: ":memory:"}}}
+	s.stateMu.Lock()
+	s.dbConn = active
+	s.curDBCfg = cloneConnectionConfig(s.SpecificFileCfg.Connections[0])
+	s.connectionState = connectionReady
+	s.stateMu.Unlock()
+	called := atomic.Bool{}
+	s.openConnection = func(context.Context, *database.DBConfig) (*database.DBConnection, error) {
+		called.Store(true)
+		return nil, errors.New("unexpected opener call")
+	}
+	_, err := s.switchConnections(context.Background(), lsp.ExecuteCommandParams{Arguments: []interface{}{"2"}})
+	if err == nil {
+		t.Fatal("out-of-range connection index was accepted")
+	}
+	s.stateMu.RLock()
+	gotConn, gotState := s.dbConn, s.connectionState
+	s.stateMu.RUnlock()
+	if gotConn != active || gotState != connectionReady {
+		t.Fatalf("after rejected switch: conn=%p state=%q, want preserved active %p ready", gotConn, gotState, active)
+	}
+	if called.Load() {
+		t.Fatal("out-of-range switch reached connection opener")
+	}
+}
+
+func TestRequestDuringCoordinatorClaimCancelsClaimedIntent(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	claimed, continueClaim := make(chan struct{}), make(chan struct{})
+	var hookOnce atomic.Bool
+	s.coordinator.mu.Lock()
+	s.coordinator.afterClaim = func() {
+		if hookOnce.CompareAndSwap(false, true) {
+			close(claimed)
+			<-continueClaim
+		}
+	}
+	s.coordinator.mu.Unlock()
+	var opens atomic.Int32
+	s.openConnection = func(ctx context.Context, cfg *database.DBConfig) (*database.DBConnection, error) {
+		opens.Add(1)
+		return &database.DBConnection{Driver: dialect.DatabaseDriverSQLite3}, nil
+	}
+	cfgA := &database.DBConfig{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: "claim-A"}
+	cfgB := &database.DBConfig{Driver: dialect.DatabaseDriverSQLite3, DataSourceName: "claim-B"}
+	a := s.coordinator.Request(context.Background(), cfgA, 0, "")
+	select {
+	case <-claimed:
+	case <-time.After(time.Second):
+		t.Fatal("coordinator did not claim A")
+	}
+	b := s.coordinator.Request(context.Background(), cfgB, 0, "")
+	close(continueClaim)
+	select {
+	case err := <-a:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("A result = %v, want canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("claimed A did not settle")
+	}
+	select {
+	case err := <-b:
+		if err != nil {
+			t.Fatalf("B result = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("latest B intent did not settle")
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("openConnection calls = %d, want only latest intent", got)
+	}
+	s.stateMu.RLock()
+	installed := s.curDBCfg
+	s.stateMu.RUnlock()
+	if installed == nil || installed.DataSourceName != "claim-B" {
+		t.Fatalf("installed config = %+v, want B", installed)
 	}
 }
 

@@ -835,9 +835,9 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 
 	var index int
 
-	cfg := s.getConfig()
-	if cfg != nil {
-		for i, conn := range cfg.Connections {
+	connections := s.connectionConfigsSnapshot()
+	if len(connections) != 0 {
+		for i, conn := range connections {
 			if conn.Alias == indexStr {
 				index = i + 1
 				break
@@ -856,7 +856,10 @@ func (s *Server) switchConnections(ctx context.Context, params lsp.ExecuteComman
 	}
 	index = index - 1
 
-	connectionCfg := s.getConnection(index)
+	if index >= len(connections) || connections[index] == nil {
+		return nil, fmt.Errorf("connection index %d is out of range", index+1)
+	}
+	connectionCfg := connections[index]
 	s.stateMu.RLock()
 	dbName := s.curDBName
 	s.stateMu.RUnlock()

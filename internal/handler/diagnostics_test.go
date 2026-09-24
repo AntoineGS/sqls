@@ -19,6 +19,30 @@ import (
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
+func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T) {
+	s := NewServer()
+	defer s.Stop()
+	s.stateMu.Lock()
+	s.connGeneration = 1
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	s.files["file:///catalog.sql"] = &File{Text: "SELECT * FROM T"}
+	s.stateMu.Unlock()
+	s.metadata.Reset(1)
+	before, ok := s.diagnosticsSnapshot("file:///catalog.sql")
+	if !ok {
+		t.Fatal("snapshot missing for open document")
+	}
+	if before.cacheSnapshot != nil {
+		t.Fatalf("catalog built before columns ready: %#v", before.cacheSnapshot)
+	}
+	cache := s.metadata.Cache()
+	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
+	after, ok := s.diagnosticsSnapshot("file:///catalog.sql")
+	if !ok || after.cacheSnapshot == nil {
+		t.Fatal("catalog was not captured after ColumnsReady became true")
+	}
+}
+
 type diagnosticsNotification struct {
 	URI         string           `json:"uri"`
 	Version     *int             `json:"version"`

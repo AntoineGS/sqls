@@ -63,6 +63,38 @@ func TestMetadataLoaderSiblingSurvivesFailure(t *testing.T) {
 	}
 }
 
+func TestMetadataLoaderMarkStartFailedIsTerminalAndGenerationFenced(t *testing.T) {
+	loader := NewMetadataLoader()
+	t.Cleanup(loader.Stop)
+	loader.Reset(3)
+	before := loader.Snapshot()
+	if err := loader.MarkStartFailed(2); !errors.Is(err, ErrMetadataStaleGeneration) {
+		t.Fatalf("stale MarkStartFailed error = %v, want stale generation", err)
+	}
+	if err := loader.MarkStartFailed(3); err != nil {
+		t.Fatal(err)
+	}
+	failed := loader.Snapshot()
+	if failed.Generation != 3 || failed.Started || !failed.StartFailed || !failed.Settled() || !failed.Degraded() {
+		t.Fatalf("start-failed snapshot = %+v (settled=%v degraded=%v)", failed, failed.Settled(), failed.Degraded())
+	}
+	if failed.Cache != before.Cache {
+		t.Fatal("start failure replaced the generation cache")
+	}
+	for kind, status := range before.Status {
+		if failed.Status[kind] != status {
+			t.Fatalf("start failure changed status %s: before=%+v after=%+v", kind, status, failed.Status[kind])
+		}
+	}
+	if _, err := loader.Start(context.Background(), 3, metadataRepo(MetadataPlan{Parallelism: 1})); !errors.Is(err, ErrMetadataAlreadyStarted) {
+		t.Fatalf("Start after terminal start failure = %v, want already-started rejection", err)
+	}
+	loader.Reset(4)
+	if next := loader.Snapshot(); next.StartFailed || next.Settled() || next.Degraded() {
+		t.Fatalf("new generation inherited start failure: %+v", next)
+	}
+}
+
 func TestMetadataLoaderContainsPanicsAndBlocksDependents(t *testing.T) {
 	loader := NewMetadataLoader()
 	t.Cleanup(loader.Stop)

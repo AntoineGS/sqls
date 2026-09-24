@@ -168,7 +168,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 	meta := s.metadata.Snapshot()
 	if meta != nil && meta.Generation == uint64(snapshot.generation) {
 		snapshot.cache = meta.Cache
-		if snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
+		if snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase && snapshot.cache.ColumnsReady() {
 			snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
 		}
 	}
@@ -302,5 +302,31 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 	sort.Strings(uris)
 	for _, uri := range uris {
 		s.publishDocumentDiagnostics(ctx, conn, uri)
+	}
+}
+
+// signalDiagnostics coalesces refresh requests into one bounded wake. The
+// single worker below performs client notifications without a connection
+// lifecycle lock held and prevents metadata bursts from spawning goroutines.
+func (s *Server) signalDiagnostics() {
+	select {
+	case <-s.lifecycleCtx.Done():
+		return
+	default:
+	}
+	select {
+	case s.diagnosticsWake <- struct{}{}:
+	default:
+	}
+}
+
+func (s *Server) runDiagnosticSignals() {
+	for {
+		select {
+		case <-s.lifecycleCtx.Done():
+			return
+		case <-s.diagnosticsWake:
+			s.republishOpenDiagnostics(s.lifecycleCtx)
+		}
 	}
 }

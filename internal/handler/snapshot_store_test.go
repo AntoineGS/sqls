@@ -534,6 +534,23 @@ func TestSnapshotStoreRemoveAllIsSafeOnANilStore(t *testing.T) {
 	store.RemoveAll()
 }
 
+func TestSnapshotStoreBeginShutdownDoesNotWaitForWriteMutex(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	store.mu.Lock() // models a write/prune blocked in filesystem I/O.
+	done := make(chan struct{})
+	go func() { store.BeginShutdown(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		store.mu.Unlock()
+		t.Fatal("BeginShutdown blocked behind the snapshot write mutex")
+	}
+	store.mu.Unlock()
+	if _, err := store.write(snapshotContext{generation: 1, identity: "after-shutdown"}, "procedure", "P", "source"); err == nil {
+		t.Fatal("write succeeded after the shutdown fence was set")
+	}
+}
+
 func TestSnapshotsRemovedOnShutdown(t *testing.T) {
 	server := NewServer()
 	store := newTestSnapshotStore(t)

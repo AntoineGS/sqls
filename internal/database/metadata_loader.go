@@ -22,16 +22,17 @@ var (
 type MetadataLoad struct{ Done <-chan struct{} }
 
 type MetadataLoader struct {
-	mu         sync.Mutex
-	snapshot   *MetadataSnapshot
-	generation uint64
-	started    bool
-	stopped    bool
-	ctx        context.Context
-	cancel     context.CancelFunc
-	done       chan struct{}
-	doneClosed bool
-	callback   func()
+	mu          sync.Mutex
+	snapshot    *MetadataSnapshot
+	generation  uint64
+	started     bool
+	startFailed bool
+	stopped     bool
+	ctx         context.Context
+	cancel      context.CancelFunc
+	done        chan struct{}
+	doneClosed  bool
+	callback    func()
 
 	// The semaphore belongs to the loader, not a generation. A cancelled native
 	// call keeps its slot until the Run function actually returns.
@@ -80,16 +81,51 @@ func (l *MetadataLoader) Reset(generation uint64) {
 				status[kind] = value
 			}
 		}
-		l.snapshot = &MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: status}
+		l.snapshot = &MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, StartFailed: l.snapshot.StartFailed, Cache: l.snapshot.Cache, Status: status}
 		l.closeDoneLocked()
 	}
-	l.generation, l.started = generation, false
+	l.generation, l.started, l.startFailed = generation, false, false
 	l.ctx, l.cancel = nil, nil
 	l.done, l.doneClosed = nil, false
 	l.snapshot = &MetadataSnapshot{Generation: generation, Revision: 1, Cache: newMetadataCache(), Status: emptyMetadataStatus()}
 	callback := l.callback
 	l.mu.Unlock()
 	callMetadataCallback(callback)
+}
+
+// MarkStartFailed records that repository planning or metadata scheduling could
+// not begin for this generation. It preserves the empty cache and unsupported
+// category statuses because no job outcome is known, while making the snapshot
+// terminal and degraded. The generation check prevents stale attachment work
+// from overwriting a newer generation.
+func (l *MetadataLoader) MarkStartFailed(generation uint64) error {
+	l.mu.Lock()
+	if l.stopped {
+		l.mu.Unlock()
+		return ErrMetadataStopped
+	}
+	if generation != l.generation || l.snapshot == nil {
+		l.mu.Unlock()
+		return ErrMetadataStaleGeneration
+	}
+	if l.started || l.startFailed {
+		l.mu.Unlock()
+		return ErrMetadataAlreadyStarted
+	}
+	l.startFailed = true
+	current := l.snapshot
+	l.publishLocked(&MetadataSnapshot{
+		Generation:  generation,
+		Revision:    current.Revision + 1,
+		Started:     false,
+		StartFailed: true,
+		Cache:       current.Cache,
+		Status:      cloneMap(current.Status),
+	})
+	callback := l.callback
+	l.mu.Unlock()
+	callMetadataCallback(callback)
+	return nil
 }
 
 func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRepository) (*MetadataLoad, error) {
@@ -102,7 +138,7 @@ func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRe
 		l.mu.Unlock()
 		return nil, ErrMetadataStaleGeneration
 	}
-	if l.started {
+	if l.started || l.startFailed {
 		l.mu.Unlock()
 		return nil, ErrMetadataAlreadyStarted
 	}
@@ -124,7 +160,7 @@ func (l *MetadataLoader) Start(ctx context.Context, generation uint64, repo DBRe
 		l.mu.Unlock()
 		return nil, ErrMetadataStaleGeneration
 	}
-	if l.started {
+	if l.started || l.startFailed {
 		l.mu.Unlock()
 		return nil, ErrMetadataAlreadyStarted
 	}
