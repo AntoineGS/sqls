@@ -7,11 +7,29 @@ import (
 	"github.com/google/go-cmp/cmp"
 )
 
+// nthIndex returns the byte offset of the (0-based) nth occurrence of marker
+// in text, or -1 if there are fewer than n+1 occurrences.
+func nthIndex(text, marker string, n int) int {
+	from := 0
+	for i := 0; ; i++ {
+		relative := strings.Index(text[from:], marker)
+		if relative < 0 {
+			return -1
+		}
+		start := from + relative
+		if i == n {
+			return start
+		}
+		from = start + len(marker)
+	}
+}
+
 func TestDiagnosticUnused(t *testing.T) {
 	tests := []struct {
 		name         string
 		text         string
 		declarations []string
+		occurrences  []int // 0-based occurrence index per declarations entry; defaults to 0 (first occurrence)
 		wantFindings []Finding
 	}{
 		{
@@ -37,9 +55,16 @@ func TestDiagnosticUnused(t *testing.T) {
 			declarations: []string{"OUT_NAME"},
 		},
 		{
+			// The unused-declaration rule still correctly suppresses itself
+			// for both DUP symbols (RenameBlocked != ""); the new
+			// duplicate-declaration rule (Task 3) now reports the second,
+			// conflicting declaration, so the two rules coexist here rather
+			// than the previous total silence.
 			name:         "ambiguous same-name declarations",
 			text:         "CREATE PROCEDURE P AS DECLARE VARIABLE DUP VARCHAR(20); DECLARE VARIABLE DUP VARCHAR(30); BEGIN END",
-			declarations: []string{"DUP", "DUP"},
+			declarations: []string{"DUP"},
+			occurrences:  []int{1},
+			wantFindings: []Finding{{Code: "interbase-duplicate-declaration", Message: "DUP is already declared in this procedure", Severity: 1}},
 		},
 		{
 			name:         "SQL occurrence is not proven local",
@@ -58,9 +83,13 @@ func TestDiagnosticUnused(t *testing.T) {
 			want := make([]Finding, len(tt.wantFindings))
 			copy(want, tt.wantFindings)
 			for i := range want {
-				start := strings.Index(tt.text, tt.declarations[i])
+				occurrence := 0
+				if i < len(tt.occurrences) {
+					occurrence = tt.occurrences[i]
+				}
+				start := nthIndex(tt.text, tt.declarations[i], occurrence)
 				if start < 0 {
-					t.Fatalf("declaration %q not found", tt.declarations[i])
+					t.Fatalf("declaration %q occurrence %d not found", tt.declarations[i], occurrence)
 				}
 				want[i].Span = Span{Start: start, End: start + len(tt.declarations[i])}
 			}

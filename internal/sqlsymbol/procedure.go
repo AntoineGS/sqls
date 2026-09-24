@@ -50,6 +50,13 @@ type Analysis struct {
 	contexts    []tokenContext
 	procedureAt []int
 	sqlScopes   [][][]RelationRef
+
+	// malformedDeclarations records the byte-span recoverLocalDeclaration
+	// skipped over for a malformed DECLARE VARIABLE, so diagnostics-only
+	// rules (e.g. unknown-variable) can suppress findings inside a region
+	// whose declared-name shape could not be parsed, consistent with
+	// Unsupported-style suppression elsewhere.
+	malformedDeclarations []Span
 }
 
 type procedureHeader struct {
@@ -212,13 +219,19 @@ func declarationTypeStart(item lexeme) bool {
 // remains, the current procedure's diagnostics are suppressed because its
 // reads cannot be bound reliably.
 func recoverLocalDeclaration(analysis *Analysis, current *int, frames *[]bodyFrame, bodyStarted *bool, items []lexeme, start int) int {
+	recordMalformed := func(end int) {
+		analysis.malformedDeclarations = append(analysis.malformedDeclarations, Span{Start: items[start].Span.Start, End: end})
+	}
 	for i := start + 1; i < len(items); i++ {
 		switch {
 		case items[i].Token.Kind == token.Semicolon:
+			recordMalformed(items[i].Span.End)
 			return i
 		case isWord(items[i], "BEGIN"):
+			recordMalformed(items[i].Span.Start)
 			return i - 1
 		case isProcedureHeaderStart(items, i):
+			recordMalformed(items[i].Span.Start)
 			suppressProcedureDiagnostics(analysis, *current)
 			closeProcedure(analysis, *current, items[i].Span.Start)
 			*current = -1
@@ -227,6 +240,7 @@ func recoverLocalDeclaration(analysis *Analysis, current *int, frames *[]bodyFra
 			return i - 1
 		}
 	}
+	recordMalformed(len(analysis.Text))
 	suppressProcedureDiagnostics(analysis, *current)
 	closeProcedure(analysis, *current, len(analysis.Text))
 	*current = -1
