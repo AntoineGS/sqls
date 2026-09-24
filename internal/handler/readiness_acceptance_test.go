@@ -3,9 +3,13 @@ package handler
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -25,6 +29,43 @@ const (
 )
 
 var readinessRepositories sync.Map
+
+type readinessQueryConnector struct {
+	entered chan<- struct{}
+	release <-chan struct{}
+	once    *sync.Once
+}
+type readinessSQLQueryDriver struct{ connector readinessQueryConnector }
+type readinessQueryConn struct{ connector readinessQueryConnector }
+type readinessQueryRows struct{ sent bool }
+
+func (c readinessQueryConnector) Connect(context.Context) (driver.Conn, error) {
+	return &readinessQueryConn{connector: c}, nil
+}
+func (c readinessQueryConnector) Driver() driver.Driver { return readinessSQLQueryDriver{connector: c} }
+func (d readinessSQLQueryDriver) Open(string) (driver.Conn, error) {
+	return &readinessQueryConn{connector: d.connector}, nil
+}
+func (*readinessQueryConn) Prepare(string) (driver.Stmt, error) {
+	return nil, errors.New("unexpected Prepare")
+}
+func (*readinessQueryConn) Close() error              { return nil }
+func (*readinessQueryConn) Begin() (driver.Tx, error) { return nil, errors.New("unexpected Begin") }
+func (c *readinessQueryConn) QueryContext(context.Context, string, []driver.NamedValue) (driver.Rows, error) {
+	c.connector.once.Do(func() { close(c.connector.entered) })
+	<-c.connector.release
+	return &readinessQueryRows{}, nil
+}
+func (*readinessQueryRows) Columns() []string { return []string{"value"} }
+func (*readinessQueryRows) Close() error      { return nil }
+func (r *readinessQueryRows) Next(dest []driver.Value) error {
+	if r.sent {
+		return io.EOF
+	}
+	r.sent = true
+	dest[0] = "query-result"
+	return nil
+}
 
 func init() {
 	for _, driver := range []dialect.DatabaseDriver{readinessOldDriver, readinessNewDriver, readinessQueryDriver} {
@@ -46,16 +87,57 @@ type readinessPlanRepository struct {
 
 func (r readinessPlanRepository) MetadataPlan() database.MetadataPlan { return r.plan }
 
+type readinessDynamicPlanRepository struct {
+	*database.MockDBRepository
+	plan func() database.MetadataPlan
+}
+
+func (r readinessDynamicPlanRepository) MetadataPlan() database.MetadataPlan { return r.plan() }
+
 func readinessRPC(t *testing.T, s *Server) *jsonrpc2.Conn {
+	client, _ := readinessRPCWithEvents(t, s)
+	return client
+}
+
+func readinessRPCWithEvents(t *testing.T, s *Server) (*jsonrpc2.Conn, <-chan string) {
 	t.Helper()
 	clientSide, serverSide := net.Pipe()
-	client := jsonrpc2.NewConn(context.Background(), jsonrpc2.NewBufferedStream(clientSide, jsonrpc2.VSCodeObjectCodec{}), jsonrpc2.HandlerWithError(func(context.Context, *jsonrpc2.Conn, *jsonrpc2.Request) (interface{}, error) { return nil, nil }))
+	events := make(chan string, 64)
+	client := jsonrpc2.NewConn(context.Background(), jsonrpc2.NewBufferedStream(clientSide, jsonrpc2.VSCodeObjectCodec{}), jsonrpc2.HandlerWithError(func(_ context.Context, _ *jsonrpc2.Conn, req *jsonrpc2.Request) (interface{}, error) {
+		select {
+		case events <- req.Method:
+		default:
+		}
+		return nil, nil
+	}))
 	server := jsonrpc2.NewConn(context.Background(), jsonrpc2.NewBufferedStream(serverSide, jsonrpc2.VSCodeObjectCodec{}), NewDispatcher(jsonrpc2.HandlerWithError(s.Handle)))
 	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
 	if err := client.Call(context.Background(), "initialize", lsp.InitializeParams{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	return client
+	return client, events
+}
+
+func waitForDiagnosticMemo(t *testing.T, s *Server, events <-chan string, want *database.DBCache) {
+	t.Helper()
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case method := <-events:
+			if method != publishDiagnosticsMethod {
+				continue
+			}
+			s.diagnosticCatalogMu.Lock()
+			current := s.diagnosticCache
+			s.diagnosticCatalogMu.Unlock()
+			if current == want {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("no diagnostics publication observed for cache pointer %p", want)
+		}
+	}
 }
 
 func readinessSeed(t testing.TB) *database.DBCache {
@@ -318,14 +400,15 @@ func TestReadinessAcceptanceCompletionsWhileColumnsAreGated(t *testing.T) {
 
 func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 	s := NewServer()
-	client := readinessRPC(t, s)
+	client, events := readinessRPCWithEvents(t, s)
 	t.Cleanup(func() { _ = s.Stop() })
+	uri := "file:///diagnostic-memo-switch.sql"
 	oldGate, oldEntered := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
 	releaseOld := func() { releaseOnce.Do(func() { close(oldGate) }) }
 	t.Cleanup(releaseOld)
 	var active, peak atomic.Int32
-	job := func(name string, entered chan struct{}, gate <-chan struct{}) database.MetadataJob {
+	procedureJob := func(name string, entered chan struct{}, gate <-chan struct{}) database.MetadataJob {
 		return database.MetadataJob{Kind: database.MetadataProcedures, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
 			n := active.Add(1)
 			for {
@@ -344,15 +427,26 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 			return database.MetadataPatch{Cache: &database.DBCache{Catalog: &database.CatalogCache{Procedures: map[string]*database.ProcedureDesc{name: {Name: name}}}}}, nil
 		}}
 	}
-	readinessRepositories.Store(readinessOldDriver, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1, Jobs: []database.MetadataJob{job("OLDPROC", oldEntered, oldGate)}}})
-	readinessRepositories.Store(readinessNewDriver, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1, Jobs: []database.MetadataJob{job("NEWPROC", nil, nil)}}})
+	columnsJob := func() database.MetadataJob {
+		return database.MetadataJob{Kind: database.MetadataColumnsCurrent, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+			return database.MetadataPatch{Cache: &database.DBCache{ColumnsWithParent: map[string][]*database.ColumnDesc{"PUBLIC\tT": {{ColumnBase: database.ColumnBase{Schema: "PUBLIC", Table: "T", Name: "ID"}, Type: "INTEGER"}}}}}, nil
+		}}
+	}
+	readinessRepositories.Store(readinessOldDriver, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 2, Jobs: []database.MetadataJob{procedureJob("OLDPROC", oldEntered, oldGate), columnsJob()}}})
+	readinessRepositories.Store(readinessNewDriver, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 2, Jobs: []database.MetadataJob{procedureJob("NEWPROC", nil, nil), columnsJob()}}})
 	t.Cleanup(func() {
 		readinessRepositories.Delete(readinessOldDriver)
 		readinessRepositories.Delete(readinessNewDriver)
 	})
 	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: readinessOldDriver}, {Driver: readinessNewDriver}}}
 	s.openConnection = func(_ context.Context, cfg *database.DBConfig) (*database.DBConnection, error) {
-		return &database.DBConnection{Driver: cfg.Driver}, nil
+		// Repository selection uses cfg.Driver, while the connection's resolved
+		// InterBase variant makes the ordinary diagnostics worker derive its
+		// catalog memo from the published columns cache.
+		return &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}, nil
+	}
+	if err := client.Notify(context.Background(), "textDocument/didOpen", lsp.DidOpenTextDocumentParams{TextDocument: lsp.TextDocumentItem{URI: uri, LanguageID: "sql", Text: "select * from city", Version: 1}}); err != nil {
+		t.Fatal(err)
 	}
 	switchCall := func(index string) error {
 		return client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandSwitchConnection, Arguments: []interface{}{index}}, nil)
@@ -365,13 +459,22 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("old generation did not enter gated procedure query")
 	}
+	oldReadyDeadline := time.After(2 * time.Second)
+	for s.metadata.Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
+		select {
+		case <-oldReadyDeadline:
+			t.Fatal("old generation columns did not publish for diagnostics")
+		default:
+			runtime.Gosched()
+		}
+	}
 	oldCache := s.metadata.Cache()
-	s.diagnosticCatalogFor(oldCache)
+	waitForDiagnosticMemo(t, s, events, oldCache)
 	if err := switchCall("2"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.After(2 * time.Second)
-	for s.metadata.Snapshot().Status[database.MetadataProcedures].State != database.MetadataReady {
+	for s.metadata.Snapshot().Status[database.MetadataProcedures].State != database.MetadataReady || s.metadata.Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
 		select {
 		case <-deadline:
 			t.Fatal("replacement metadata did not publish while old call remained gated")
@@ -402,7 +505,7 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 		t.Fatal("stale old-generation procedure leaked into replacement cache")
 	}
 	currentCache := s.metadata.Cache()
-	s.diagnosticCatalogFor(currentCache)
+	waitForDiagnosticMemo(t, s, events, currentCache)
 	s.diagnosticCatalogMu.Lock()
 	if s.diagnosticCache != currentCache || s.diagnosticCache == oldCache || s.derivedCatalog == nil {
 		s.diagnosticCatalogMu.Unlock()
@@ -418,6 +521,56 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 	}
 }
 
+func TestReadinessAcceptanceDiagnosticMemoTracksOneHundredRPCRefreshes(t *testing.T) {
+	s := NewServer()
+	client, events := readinessRPCWithEvents(t, s)
+	t.Cleanup(func() { _ = s.Stop() })
+	var planGeneration atomic.Int32
+	readinessRepositories.Store(readinessOldDriver, readinessDynamicPlanRepository{MockDBRepository: &database.MockDBRepository{}, plan: func() database.MetadataPlan {
+		generation := planGeneration.Add(1)
+		return database.MetadataPlan{Parallelism: 1, Jobs: []database.MetadataJob{{Kind: database.MetadataColumnsCurrent, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+			column := &database.ColumnDesc{ColumnBase: database.ColumnBase{Schema: "PUBLIC", Table: "T", Name: fmt.Sprintf("ID_%d", generation)}, Type: "INTEGER"}
+			return database.MetadataPatch{Cache: &database.DBCache{ColumnsWithParent: map[string][]*database.ColumnDesc{"PUBLIC\tT": {column}}}}, nil
+		}}}}
+	}})
+	t.Cleanup(func() { readinessRepositories.Delete(readinessOldDriver) })
+	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: readinessOldDriver}}}
+	s.openConnection = func(context.Context, *database.DBConfig) (*database.DBConnection, error) {
+		return &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}, nil
+	}
+	uri := "file:///diagnostic-memo-refresh.sql"
+	if err := client.Notify(context.Background(), "textDocument/didOpen", lsp.DidOpenTextDocumentParams{TextDocument: lsp.TextDocumentItem{URI: uri, LanguageID: "sql", Text: "select * from T", Version: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	var previous *database.DBCache
+	for generation := 1; generation <= 100; generation++ {
+		if err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandSwitchConnection, Arguments: []interface{}{"1"}}, nil); err != nil {
+			t.Fatalf("refresh %d: %v", generation, err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := s.metadata.Wait(ctx); err != nil {
+			cancel()
+			t.Fatalf("refresh %d loader wait: %v", generation, err)
+		}
+		cancel()
+		cache := s.metadata.Cache()
+		if !cache.MetadataReady(database.MetadataColumnsCurrent) {
+			t.Fatalf("refresh %d did not publish columns", generation)
+		}
+		waitForDiagnosticMemo(t, s, events, cache)
+		s.diagnosticCatalogMu.Lock()
+		memoCache, memoCatalog := s.diagnosticCache, s.derivedCatalog
+		s.diagnosticCatalogMu.Unlock()
+		if memoCache != cache || memoCatalog == nil {
+			t.Fatalf("refresh %d diagnostic memo = cache:%p catalog:%v, want cache:%p nonnil", generation, memoCache, memoCatalog != nil, cache)
+		}
+		if previous != nil && previous == memoCache {
+			t.Fatalf("refresh %d retained prior generation cache pointer", generation)
+		}
+		previous = memoCache
+	}
+}
+
 func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T) {
 	s := NewServer()
 	client := readinessRPC(t, s)
@@ -426,12 +579,10 @@ func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T)
 	var releaseOnce sync.Once
 	deferRelease := func() { releaseOnce.Do(func() { close(releaseQuery) }) }
 	t.Cleanup(deferRelease)
+	queryDB := sql.OpenDB(readinessQueryConnector{entered: queryEntered, release: releaseQuery, once: &sync.Once{}})
+	t.Cleanup(func() { _ = queryDB.Close() })
 	repo := database.NewMockDBRepository(nil).(*database.MockDBRepository)
-	repo.MockQuery = func(context.Context, string) (*sql.Rows, error) {
-		close(queryEntered)
-		<-releaseQuery
-		return &sql.Rows{}, nil
-	}
+	repo.MockQuery = func(ctx context.Context, query string) (*sql.Rows, error) { return queryDB.QueryContext(ctx, query) }
 	readinessRepositories.Store(readinessQueryDriver, repo)
 	t.Cleanup(func() { readinessRepositories.Delete(readinessQueryDriver) })
 	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: readinessQueryDriver}}}
@@ -448,9 +599,15 @@ func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T)
 	if err := client.Notify(context.Background(), "textDocument/didOpen", lsp.DidOpenTextDocumentParams{TextDocument: lsp.TextDocumentItem{URI: uri, LanguageID: "sql", Text: "select 1", Version: 1}}); err != nil {
 		t.Fatal(err)
 	}
-	queryDone := make(chan error, 1)
+	type queryOutcome struct {
+		result interface{}
+		err    error
+	}
+	queryDone := make(chan queryOutcome, 1)
 	go func() {
-		queryDone <- client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandExecuteQuery, Arguments: []interface{}{uri}}, nil)
+		var result interface{}
+		err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandExecuteQuery, Arguments: []interface{}{uri}}, &result)
+		queryDone <- queryOutcome{result: result, err: err}
 	}()
 	select {
 	case <-queryEntered:
@@ -459,6 +616,19 @@ func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T)
 	}
 	if err := client.Notify(context.Background(), "textDocument/didChange", lsp.DidChangeTextDocumentParams{TextDocument: lsp.VersionedTextDocumentIdentifier{URI: uri, Version: 2}, ContentChanges: []lsp.TextDocumentContentChangeEvent{{Text: "select 2"}}}); err != nil {
 		t.Fatalf("didChange notification while query blocked: %v", err)
+	}
+	changeDeadline := time.NewTimer(2 * time.Second)
+	defer changeDeadline.Stop()
+	for {
+		if text, ok := s.fileText(uri); ok && text == "select 2" {
+			break
+		}
+		select {
+		case <-changeDeadline.C:
+			t.Fatal("didChange notification returned but document state was not updated")
+		default:
+			runtime.Gosched()
+		}
 	}
 	stopDone := make(chan error, 1)
 	go func() { stopDone <- s.Stop() }()
@@ -479,7 +649,14 @@ func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T)
 	}
 	deferRelease()
 	select {
-	case <-queryDone:
+	case outcome := <-queryDone:
+		if outcome.err != nil {
+			t.Fatalf("query already in flight at Stop returned an unexpected error: %v", outcome.err)
+		}
+		result, ok := outcome.result.(string)
+		if !ok || !strings.Contains(result, "query-result") {
+			t.Fatalf("completed query returned no expected driver result: %#v", outcome.result)
+		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("pending RPC query did not finish after driver release")
 	}

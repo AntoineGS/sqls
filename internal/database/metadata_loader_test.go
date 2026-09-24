@@ -415,77 +415,107 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 	db := sql.OpenDB(drainConnector{driver: drainDriver{counts: resources}})
 	db.SetMaxOpenConns(3)
 	t.Cleanup(func() { _ = db.Close() })
-	gate := make(chan struct{})
-	var gateOnce sync.Once
-	releaseGate := func() { gateOnce.Do(func() { close(gate) }) }
-	t.Cleanup(func() { releaseGate(); loader.Stop(); _ = loader.Wait(context.Background()) })
-	entered := make(chan struct{})
-	var enteredOnce sync.Once
+	var latestGate chan struct{}
+	t.Cleanup(func() {
+		if latestGate != nil {
+			close(latestGate)
+		}
+		loader.Stop()
+		_ = loader.Wait(context.Background())
+	})
 	var active, peak atomic.Int32
-	loader.Reset(1)
 	var last *MetadataLoad
+	var previousGate chan struct{}
+	kinds := []MetadataKind{MetadataViews, MetadataProcedures, MetadataDomains}
 	for generation := uint64(1); generation <= 100; generation++ {
 		loader.Reset(generation)
+		if previousGate != nil {
+			close(previousGate) // drain the superseded generation only after its work entered
+			if err := loader.Wait(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		gate := make(chan struct{})
+		latestGate = gate
+		entered := make(chan struct{}, len(kinds))
 		gen := generation
-		plan := MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{Kind: MetadataViews, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
-			tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
-			if err != nil {
-				return MetadataPatch{}, err
-			}
-			rows, err := tx.QueryContext(ctx, "select metadata")
-			if err != nil {
-				_ = tx.Rollback()
-				return MetadataPatch{}, err
-			}
-			n := active.Add(1)
-			for {
-				p := peak.Load()
-				if n <= p || peak.CompareAndSwap(p, n) {
-					break
+		plan := MetadataPlan{Parallelism: len(kinds)}
+		for _, kind := range kinds {
+			kind := kind
+			plan.Jobs = append(plan.Jobs, MetadataJob{Kind: kind, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
+				tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+				if err != nil {
+					return MetadataPatch{}, err
 				}
-			}
-			defer active.Add(-1)
-			enteredOnce.Do(func() { close(entered) })
-			<-gate
-			if err := rows.Close(); err != nil {
-				_ = tx.Rollback()
-				return MetadataPatch{}, err
-			}
-			if err := tx.Rollback(); err != nil {
-				return MetadataPatch{}, err
-			}
-			name := fmt.Sprintf("GEN_%d", gen)
-			return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: map[string]*ViewDesc{name: {Name: name}}}}, Count: int(gen)}, nil
-		}}}}
+				rows, err := tx.QueryContext(ctx, "select metadata")
+				if err != nil {
+					_ = tx.Rollback()
+					return MetadataPatch{}, err
+				}
+				n := active.Add(1)
+				for {
+					p := peak.Load()
+					if n <= p || peak.CompareAndSwap(p, n) {
+						break
+					}
+				}
+				defer active.Add(-1)
+				entered <- struct{}{}
+				<-gate
+				if err := rows.Close(); err != nil {
+					_ = tx.Rollback()
+					return MetadataPatch{}, err
+				}
+				if err := tx.Rollback(); err != nil {
+					return MetadataPatch{}, err
+				}
+				name := fmt.Sprintf("GEN_%d", gen)
+				fragment := &DBCache{}
+				switch kind {
+				case MetadataViews:
+					fragment.Catalog = &CatalogCache{Views: map[string]*ViewDesc{name: {Name: name}}}
+				case MetadataProcedures:
+					fragment.Catalog = &CatalogCache{Procedures: map[string]*ProcedureDesc{name: {Name: name}}}
+				case MetadataDomains:
+					fragment.Catalog = &CatalogCache{Domains: map[string]*DomainDesc{name: {Name: name}}}
+				}
+				return MetadataPatch{Cache: fragment, Count: int(gen)}, nil
+			}})
+		}
 		load, err := loader.Start(context.Background(), generation, metadataRepo(plan))
 		if err != nil {
 			t.Fatalf("generation %d: %v", generation, err)
 		}
 		last = load
-		if generation == 1 {
+		for range kinds {
 			select {
 			case <-entered:
 			case <-time.After(2 * time.Second):
-				t.Fatal("first generation did not enter gated query")
+				t.Fatalf("generation %d did not enter all gated queries (active=%d)", generation, active.Load())
 			}
 		}
+		if got := active.Load(); got != int32(len(kinds)) {
+			t.Fatalf("generation %d active queries = %d, want %d", generation, got, len(kinds))
+		}
+		previousGate = gate
 	}
-	releaseGate()
+	loader.Stop() // generation 100's three real transactions/rows remain gated
 	waitLoad(t, last)
-	loader.Stop()
+	if got := active.Load(); got != int32(len(kinds)) {
+		t.Fatalf("active calls during Stop = %d, want %d", got, len(kinds))
+	}
+	if cache := loader.Cache(); cache.HasCatalog() && (len(cache.Catalog.Views) != 0 || len(cache.Catalog.Procedures) != 0 || len(cache.Catalog.Domains) != 0) {
+		t.Fatalf("stopped current generation retained stale catalog: %+v", cache.Catalog)
+	}
+	close(latestGate)
+	latestGate = nil
 	if err := loader.Wait(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if view, ok := loader.Cache().View("GEN_100"); !ok || view.Name != "GEN_100" {
-		t.Fatal("current generation metadata was not retained after Stop")
-	}
-	if _, ok := loader.Cache().View("GEN_1"); ok {
-		t.Fatal("retired generation metadata remains in current cache")
-	}
 	if snapshot := loader.Snapshot(); snapshot.Generation != 100 {
 		t.Fatalf("current generation = %d, want 100", snapshot.Generation)
-	} else if snapshot.Status[MetadataViews].Count != 100 || snapshot.Status[MetadataViews].State != MetadataReady {
-		t.Fatalf("current generation status = %+v", snapshot.Status[MetadataViews])
+	} else if snapshot.Status[MetadataViews].State != MetadataCancelled || snapshot.Status[MetadataProcedures].State != MetadataCancelled || snapshot.Status[MetadataDomains].State != MetadataCancelled {
+		t.Fatalf("stopped generation statuses = %+v", snapshot.Status)
 	}
 	if active.Load() != 0 {
 		t.Fatalf("active calls after Wait = %d", active.Load())
@@ -497,12 +527,12 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 	if resources.txBegins != resources.txRollbacks || resources.rowsOpened != resources.rowsClosed {
 		t.Fatalf("drained driver resources: tx begin/rollback=%d/%d rows open/close=%d/%d", resources.txBegins, resources.txRollbacks, resources.rowsOpened, resources.rowsClosed)
 	}
-	if resources.txBegins < 2 {
-		t.Fatalf("only %d driver transactions exercised old/current generations", resources.txBegins)
+	if resources.txBegins != 3*100 {
+		t.Fatalf("driver transactions = %d, want 300 (three jobs in each of 100 generations)", resources.txBegins)
 	}
 	resources.mu.Unlock()
-	if got := peak.Load(); got > 3 {
-		t.Fatalf("peak active calls = %d, want <=3", got)
+	if got := peak.Load(); got != 3 {
+		t.Fatalf("peak active calls = %d, want worker bound 3", got)
 	}
 }
 
