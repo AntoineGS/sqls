@@ -132,9 +132,10 @@ not overwrite it.
 - Candidate: built with `CGO_ENABLED=1 go build -tags interbase` at
   `/tmp/opencode/sqls-performance-candidate`; SHA-256
   `fab09cd9da0cc91ab2c37c9ef13ac35498e55ef3abcd72a8ae9fb2a7c7ed1bf6`.
-- Runner: built from `./script/metadata-benchmark` at
+- Runner: rebuilt from `./script/metadata-benchmark` at source revision
+  `c445415` after the loading-probe correction, at
   `/tmp/opencode/sqls-metadata-benchmark`; SHA-256
-  `fab6e66adb95ed18046953ace1ca8f4fb1cd5675465c4b079c85d0a736cdc3fb`.
+  `da1389815b3d08af381e5b6acb9d8e93dad5990433973e9eed4ccf68083c6837`.
 - Preserved baseline binary at `/tmp/opencode/sqls-performance-baseline`,
   SHA-256 `86ec5c0cd3a7ca3380eff7fc9a19ad63cf65beab0eb0ce35795b13f130a5f027`;
   its recorded build provenance is sqls `e8bf840` / driver archive `1fdfc620`
