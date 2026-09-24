@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -70,17 +71,27 @@ func (l *Lease) Detail(ctx context.Context, req Request) (Detail, error) {
 		return Detail{}, ErrUnsupported
 	}
 
-	if err := l.waitForCategories(ctx, loader, plan.Requires); err != nil {
+	// waitForCategories returns the EXACT snapshot whose Status it confirmed
+	// terminal for plan.Requires: its Generation and Cache are captured from
+	// that SAME read, not a later, separate Snapshot() call. A concurrent
+	// Refresh between "categories confirmed terminal" and "generation/cache
+	// captured" would otherwise let a Load run against a newer, incomplete
+	// generation's cache while still being fenced/cached under that newer
+	// generation's number -- silently caching a wrong-generation result
+	// instead of failing safe. Passing snapshot.Cache explicitly into the
+	// Load closure (rather than letting it call loader.Cache() lazily at
+	// run time) closes that window: whatever cache the categories were
+	// checked against is exactly the cache Load receives.
+	snapshot, err := l.waitForCategories(ctx, loader, plan.Requires)
+	if err != nil {
+		return Detail{}, err
+	}
+	if err := requireCategoriesReady(plan.Requires, snapshot); err != nil {
 		return Detail{}, err
 	}
 
-	snapshot := loader.Snapshot()
-	if snapshot.Stale {
-		return Detail{}, ErrStale
-	}
-
 	acquired, err := l.track.details.acquire(ctx, snapshot.Generation, plan.Coverage, func(jobCtx context.Context) (Detail, error) {
-		return plan.Load(jobCtx, loader.Cache())
+		return plan.Load(jobCtx, snapshot.Cache)
 	})
 	if err != nil {
 		return Detail{}, err
@@ -92,19 +103,21 @@ func (l *Lease) Detail(ctx context.Context, req Request) (Detail, error) {
 }
 
 // waitForCategories blocks until every one of kinds reaches a terminal
-// status in loader's current generation, or ctx/the store ends first. It
-// reuses the same coalesced-event subscription Lease.Subscribe exposes, so
-// it never polls.
-func (l *Lease) waitForCategories(ctx context.Context, loader *Loader, kinds []catalog.MetadataKind) error {
+// status in loader's current generation, or ctx/the store ends first, then
+// returns that exact snapshot (see the comment in Detail for why the caller
+// must use THIS snapshot's Generation/Cache rather than reading a fresh one
+// afterward). It reuses the same coalesced-event subscription Lease.Subscribe
+// exposes, so it never polls.
+func (l *Lease) waitForCategories(ctx context.Context, loader *Loader, kinds []catalog.MetadataKind) (*catalog.MetadataSnapshot, error) {
 	if len(kinds) == 0 {
-		return nil
+		return loader.Snapshot(), nil
 	}
 	sub := l.Subscribe()
 	defer sub.Close()
 	for {
 		snapshot := loader.Snapshot()
 		if snapshot.Stale {
-			return ErrStale
+			return nil, ErrStale
 		}
 		allTerminal := true
 		for _, kind := range kinds {
@@ -115,17 +128,35 @@ func (l *Lease) waitForCategories(ctx context.Context, loader *Loader, kinds []c
 			}
 		}
 		if allTerminal {
-			return nil
+			return snapshot, nil
 		}
 		select {
 		case _, ok := <-sub.C:
 			if !ok {
-				return ErrClosed
+				return nil, ErrClosed
 			}
 		case <-ctx.Done():
-			return ctx.Err()
+			return nil, ctx.Err()
 		}
 	}
+}
+
+// requireCategoriesReady rejects a snapshot whose required categories
+// reached a terminal state other than Ready (Failed, Blocked or Cancelled):
+// proceeding to Load against such a category's cache would silently compute
+// a Detail against incomplete/wrong data instead of failing.
+func requireCategoriesReady(kinds []catalog.MetadataKind, snapshot *catalog.MetadataSnapshot) error {
+	for _, kind := range kinds {
+		status := snapshot.Status[kind]
+		if status.State == catalog.MetadataReady {
+			continue
+		}
+		if status.Err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrCategoryFailed, kind, status.Err)
+		}
+		return fmt.Errorf("%w: %s is %s", ErrCategoryFailed, kind, status.State)
+	}
+	return nil
 }
 
 // Invalidate marks this store's current data stale: detail reads return

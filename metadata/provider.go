@@ -10,12 +10,13 @@ import (
 // Public errors returned by the registry, lease and detail APIs. Callers
 // should use errors.Is against these values rather than parsing messages.
 var (
-	ErrClosed        = errors.New("metadata: registry or lease is closed")
-	ErrStale         = errors.New("metadata: snapshot or detail is stale")
-	ErrUnsupported   = errors.New("metadata: operation is not supported by this provider")
-	ErrScopeRequired = errors.New("metadata: an authenticated scope is required")
-	ErrInvalidTarget = errors.New("metadata: invalid database target")
-	ErrDetailLimit   = errors.New("metadata: detail exceeds the retained size budget")
+	ErrClosed         = errors.New("metadata: registry or lease is closed")
+	ErrStale          = errors.New("metadata: snapshot or detail is stale")
+	ErrUnsupported    = errors.New("metadata: operation is not supported by this provider")
+	ErrScopeRequired  = errors.New("metadata: an authenticated scope is required")
+	ErrInvalidTarget  = errors.New("metadata: invalid database target")
+	ErrDetailLimit    = errors.New("metadata: detail exceeds the retained size budget")
+	ErrCategoryFailed = errors.New("metadata: a required category did not become ready")
 )
 
 // Key identifies one shared metadata store. Two connections that normalize to

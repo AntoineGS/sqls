@@ -3,6 +3,7 @@ package metadata_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -129,6 +130,60 @@ func TestInvalidateBlocksDetailUntilRefresh(t *testing.T) {
 	}
 }
 
+// TestInvalidateStaleSurvivesInFlightJobSettling covers two parts of the
+// same requirement: Invalidate must actually cancel in-flight category jobs
+// (not just document that it does), and Stale must survive every later
+// snapshot publish -- including the canceled job's own Run finishing and
+// recordMetadataJobMetrics publishing its metrics -- until an explicit
+// Refresh clears it.
+func TestInvalidateStaleSurvivesInFlightJobSettling(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+	p := metadatatest.New()
+	gate := make(chan struct{})
+	p.Gate = gate
+	key := metadata.Key{Engine: "interbase", URL: "ib://host/invalidate-inflight"}
+	scope := metadata.Scope{Principal: "U"}
+	lease, err := r.Acquire(ctx, key, scope, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+
+	select {
+	case <-p.Entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relations job never entered")
+	}
+
+	if err := lease.Invalidate(); err != nil {
+		t.Fatal(err)
+	}
+	if !lease.Snapshot().Stale {
+		t.Fatal("Invalidate did not mark the snapshot stale")
+	}
+	if status := lease.Snapshot().Status[catalog.MetadataRelations]; status.State != catalog.MetadataCancelled {
+		t.Fatalf("relations state after Invalidate = %s, want cancelled (Invalidate must cancel in-flight category jobs)", status.State)
+	}
+
+	close(gate) // let the already-cancelled job's Run actually return
+
+	// The (now-cancelled) job's Run still finishes and publishes metrics via
+	// recordMetadataJobMetrics (Count becomes non-zero once that runs) --
+	// this is the exact scenario that must not silently clear Stale. Wait
+	// for that publish to have genuinely happened, then check Stale;
+	// checking immediately after Invalidate would not exercise this path,
+	// since recordMetadataJobMetrics races the test goroutine for the lock
+	// and may already have run by then.
+	waitFor(t, 2*time.Second, func() bool {
+		return lease.Snapshot().Status[catalog.MetadataRelations].Count != 0
+	})
+	if !lease.Snapshot().Stale {
+		t.Fatal("Stale flipped back to false when the in-flight category job's Run settled after Invalidate")
+	}
+}
+
 // TestCategoryFailureRequiresExplicitRefreshToRetry: a failed bulk category
 // must not silently auto-retry; only an explicit Refresh retries it.
 func TestCategoryFailureRequiresExplicitRefreshToRetry(t *testing.T) {
@@ -172,6 +227,45 @@ func TestCategoryFailureRequiresExplicitRefreshToRetry(t *testing.T) {
 	status = lease.Snapshot().Status[catalog.MetadataRelations]
 	if status.State != catalog.MetadataReady {
 		t.Fatalf("relations state after refresh = %s, want ready", status.State)
+	}
+}
+
+// TestDetailFailedRequiredCategoryBlocksLoad: when a required category
+// failed rather than merely not-yet-settling, Detail must return an error
+// referencing the underlying cause, not proceed to Load against an
+// incomplete/wrong cache.
+func TestDetailFailedRequiredCategoryBlocksLoad(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+	p := metadatatest.New()
+	p.Failure = errors.New("relations boom")
+	key := metadata.Key{Engine: "interbase", URL: "ib://host/detail-category-failed"}
+	scope := metadata.Scope{Principal: "U"}
+	lease, err := r.Acquire(ctx, key, scope, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	waitReadyOrFatal(t, lease)
+
+	if status := lease.Snapshot().Status[catalog.MetadataRelations]; status.State != catalog.MetadataFailed {
+		t.Fatalf("relations state = %s, want failed", status.State)
+	}
+
+	request := metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Facet: "source", Consistency: metadata.Committed}
+	_, err = lease.Detail(ctx, request)
+	if err == nil {
+		t.Fatal("Detail succeeded despite a failed required category")
+	}
+	if !errors.Is(err, metadata.ErrCategoryFailed) {
+		t.Fatalf("err = %v, want it to wrap ErrCategoryFailed", err)
+	}
+	if !strings.Contains(err.Error(), "relations boom") {
+		t.Fatalf("err = %v, want it to reference the underlying cause", err)
+	}
+	if p.DetailCalls.Load() != 0 {
+		t.Fatal("Load must not run against a failed required category's cache")
 	}
 }
 

@@ -698,7 +698,7 @@ func TestMetadataLoaderRejectedOldGenerationSlotWakesWaitingGeneration(t *testin
 
 	// Model the new generation parked on the loader's current wake epoch while
 	// all three permits remain held by superseded-generation runners.
-	wake := loader.slotWakeChannel()
+	wake := loader.storeWake.wait()
 	waiting := make(chan struct{})
 	go func() {
 		close(waiting)

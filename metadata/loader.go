@@ -47,9 +47,18 @@ type Loader struct {
 	// incarnation) uses, so store- and host-wide concurrency are genuinely
 	// shared. A cancelled native call keeps its slots until the Run function
 	// actually returns.
+	//
+	// storeWake/hostWake are the SAME broadcast wakers the owning StoreBudget
+	// hands to every other loader and detail load sharing these semaphores
+	// (see budget.go's waker). schedule's poll-and-park loop below selects on
+	// both, so a release from ANY of them — a sibling scope's loader, a
+	// retiring incarnation's loader, a detail load, or a loader for a
+	// completely different Key releasing the shared host semaphore — wakes
+	// this loader, not just its own releases.
 	semaphore     chan struct{}
 	hostSemaphore chan struct{}
-	slotWake      chan struct{}
+	storeWake     *waker
+	hostWake      *waker
 	active        int
 	drained       chan struct{}
 }
@@ -64,7 +73,11 @@ func NewLoader(budget *StoreBudget) *Loader {
 	}
 	drained := make(chan struct{})
 	close(drained)
-	return &Loader{semaphore: budget.sem, hostSemaphore: budget.host, slotWake: make(chan struct{}), drained: drained}
+	return &Loader{
+		semaphore: budget.sem, hostSemaphore: budget.host,
+		storeWake: budget.storeWake, hostWake: budget.hostWake,
+		drained: drained,
+	}
 }
 
 var metadataKinds = []catalog.MetadataKind{
@@ -103,7 +116,7 @@ func (l *Loader) Reset(generation uint64) {
 				changed = true
 			}
 		}
-		l.snapshot = &catalog.MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, StartFailed: l.snapshot.StartFailed, Cache: l.snapshot.Cache, Status: status}
+		l.snapshot = &catalog.MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, StartFailed: l.snapshot.StartFailed, Stale: l.snapshot.Stale, Cache: l.snapshot.Cache, Status: status}
 		if changed {
 			retired = l.snapshot
 		}
@@ -112,7 +125,11 @@ func (l *Loader) Reset(generation uint64) {
 	l.generation, l.started, l.startFailed = generation, false, false
 	l.ctx, l.cancel = nil, nil
 	l.done, l.doneClosed = nil, false
-	l.snapshot = &catalog.MetadataSnapshot{Generation: generation, Revision: 1, Cache: newMetadataCache(), Status: emptyMetadataStatus()}
+	// Stale is explicitly reset to false here: this is the one path
+	// (Refresh, via Lease.Refresh -> beginGeneration then Reset) that
+	// intentionally clears it for the new generation. Every other publish
+	// site in this file must instead carry the current value forward.
+	l.snapshot = &catalog.MetadataSnapshot{Generation: generation, Revision: 1, Stale: false, Cache: newMetadataCache(), Status: emptyMetadataStatus()}
 	callback := l.callback
 	l.mu.Unlock()
 	if retired != nil {
@@ -150,6 +167,7 @@ func (l *Loader) MarkStartFailed(generation uint64) error {
 		Revision:    current.Revision + 1,
 		Started:     false,
 		StartFailed: true,
+		Stale:       current.Stale,
 		Cache:       current.Cache,
 		Status:      cloneMap(current.Status),
 	})
@@ -209,7 +227,7 @@ func (l *Loader) Start(ctx context.Context, generation uint64, plan catalog.Meta
 	for _, job := range plan.Jobs {
 		status[job.Kind] = catalog.MetadataStatus{State: catalog.MetadataPending, QueuedAt: now}
 	}
-	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: true, Cache: l.snapshot.Cache, Status: status})
+	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: true, Stale: l.snapshot.Stale, Cache: l.snapshot.Cache, Status: status})
 	done := l.done
 	callback := l.callback
 	if l.active == 0 {
@@ -301,9 +319,13 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 			l.settleCancelled(generation)
 			return
 		}
-		// Take the wake generation before attempting acquisitions. A release
-		// after this point broadcasts to every scheduler waiting on this epoch.
-		wake := l.slotWakeChannel()
+		// Take the wake epochs before attempting acquisitions. A release
+		// after this point — from this loader, a sibling loader sharing the
+		// same store permits, a detail load, or any loader anywhere sharing
+		// the host permit — broadcasts to every scheduler waiting on either
+		// epoch, so neither is a private signal only this loader can fire.
+		storeWakeCh := l.storeWake.wait()
+		hostWakeCh := l.hostWake.wait()
 		// A failed prerequisite blocks only its transitive dependents.
 		changed := true
 		for changed {
@@ -382,7 +404,9 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 			case <-ctx.Done():
 				l.settleCancelled(generation)
 				return
-			case <-wake:
+			case <-storeWakeCh:
+				continue
+			case <-hostWakeCh:
 				continue
 			}
 		}
@@ -390,7 +414,9 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 		case <-ctx.Done():
 			l.settleCancelled(generation)
 			return
-		case <-wake:
+		case <-storeWakeCh:
+			continue
+		case <-hostWakeCh:
 			continue
 		case result := <-results:
 			running--
@@ -439,7 +465,7 @@ func (l *Loader) admitJob(generation uint64, ctx context.Context, kind catalog.M
 	}
 	status.State = catalog.MetadataLoading
 	statuses[kind] = status
-	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
+	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Stale: current.Stale, Cache: current.Cache, Status: statuses})
 	if l.active == 0 {
 		l.drained = make(chan struct{})
 	}
@@ -465,7 +491,7 @@ func (l *Loader) markMetadataJobStarted(generation uint64, ctx context.Context, 
 	}
 	status.StartedAt = time.Now()
 	statuses[kind] = status
-	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
+	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Stale: current.Stale, Cache: current.Cache, Status: statuses})
 	l.mu.Unlock()
 	return true
 }
@@ -489,30 +515,17 @@ func (l *Loader) recordMetadataJobMetrics(generation uint64, kind catalog.Metada
 	status.Count = patch.Count
 	status.Queries, status.QueriesKnown = patch.Queries, patch.QueriesKnown
 	statuses[kind] = status
-	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
+	l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Stale: current.Stale, Cache: current.Cache, Status: statuses})
 	callback := l.callback
 	l.mu.Unlock()
 	callMetadataCallback(callback)
 }
 
-func (l *Loader) slotWakeChannel() <-chan struct{} {
-	l.mu.Lock()
-	wake := l.slotWake
-	l.mu.Unlock()
-	return wake
-}
-
-func (l *Loader) signalSlotAvailable() {
-	l.mu.Lock()
-	previous := l.slotWake
-	l.slotWake = make(chan struct{})
-	close(previous)
-	l.mu.Unlock()
-}
-
 // tryAcquireSlot makes one non-blocking attempt to admit a runner: it needs
 // both a store-level and a host-level permit, acquired in that order, and
-// rolls back the store permit if the host is momentarily full.
+// rolls back the store permit if the host is momentarily full. A rollback
+// broadcasts storeWake: releasing a permit this loader itself briefly held
+// must wake any OTHER waiter for it exactly like any other release would.
 func (l *Loader) tryAcquireSlot() bool {
 	select {
 	case l.semaphore <- struct{}{}:
@@ -524,16 +537,19 @@ func (l *Loader) tryAcquireSlot() bool {
 		return true
 	default:
 		<-l.semaphore
+		l.storeWake.broadcast()
 		return false
 	}
 }
 
 // releaseMetadataSlot releases one loader-wide runner permit (host and
-// store) and wakes every generation that may be waiting to acquire one.
+// store) and broadcasts both wakers so every loader or detail load anywhere
+// sharing either permit — not just this one — wakes to retry.
 func (l *Loader) releaseMetadataSlot() {
 	<-l.hostSemaphore
+	l.hostWake.broadcast()
 	<-l.semaphore
-	l.signalSlotAvailable()
+	l.storeWake.broadcast()
 }
 
 func dependenciesReady(job catalog.MetadataJob, states map[catalog.MetadataKind]catalog.MetadataState) bool {
@@ -576,7 +592,7 @@ func (l *Loader) setStatus(generation uint64, kind catalog.MetadataKind, status 
 	if cache == nil {
 		cache = current.Cache
 	}
-	next := &catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: cache, Status: statuses}
+	next := &catalog.MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Stale: current.Stale, Cache: cache, Status: statuses}
 	statuses[kind] = status
 	l.publishLocked(next)
 	callback := l.callback
@@ -608,7 +624,7 @@ func (l *Loader) settleCancelled(generation uint64) {
 		}
 	}
 	if changed {
-		l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
+		l.publishLocked(&catalog.MetadataSnapshot{Generation: generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Stale: l.snapshot.Stale, Cache: l.snapshot.Cache, Status: statuses})
 	}
 	l.closeDoneLocked()
 	snapshot := l.snapshot
@@ -644,24 +660,52 @@ func (l *Loader) closeDoneLocked() {
 }
 func (l *Loader) publishLocked(snapshot *catalog.MetadataSnapshot) { l.snapshot = snapshot }
 
-// MarkStale flags the current snapshot Stale without canceling or starting
-// any job. It is idempotent; it never changes Generation or Cache/Status,
-// only adds the Stale flag with a new Revision. Reset/Start (via Refresh)
-// publishes the next non-stale snapshot.
+// MarkStale flags the current snapshot Stale and cancels this generation's
+// in-flight category jobs (transitioning any Pending/Loading status to
+// Cancelled), without starting anything new: no new generation, no new job.
+// It is idempotent. It never changes Generation. Reset/Start (via Refresh)
+// is the only path that clears Stale back to false, for the next generation.
+//
+// The Cache itself is deliberately left intact (not emptied): "make the
+// authoritative cache empty" is scoped, by this task's rulings, to
+// detail-read purposes — Lease.Invalidate separately empties the detail
+// store (see detailStore.markStale) and detail reads already return
+// ErrStale via that path. Leaving the bulk Cache/Status here lets a reader
+// of Snapshot still see the last known category data (just flagged Stale)
+// during the window before Refresh completes, rather than presenting a
+// blank tree. See the task report for the full reasoning.
 func (l *Loader) MarkStale() {
 	l.mu.Lock()
-	if l.snapshot == nil || l.snapshot.Stale {
+	if l.stopped || l.snapshot == nil || l.snapshot.Stale {
 		l.mu.Unlock()
 		return
 	}
+	if l.cancel != nil {
+		l.cancel()
+	}
 	current := l.snapshot
-	l.snapshot = &catalog.MetadataSnapshot{
+	statuses := cloneMap(current.Status)
+	changed := false
+	for kind, status := range statuses {
+		if status.State == catalog.MetadataPending || status.State == catalog.MetadataLoading {
+			status.State, status.FinishedAt = catalog.MetadataCancelled, time.Now()
+			statuses[kind] = status
+			changed = true
+		}
+	}
+	next := &catalog.MetadataSnapshot{
 		Generation: current.Generation, Revision: current.Revision + 1,
 		Started: current.Started, StartFailed: current.StartFailed, Stale: true,
-		Cache: current.Cache, Status: current.Status,
+		Cache: current.Cache, Status: statuses,
 	}
+	l.snapshot = next
+	l.closeDoneLocked()
 	callback := l.callback
 	l.mu.Unlock()
+	if changed {
+		logCancelledMetadataStatuses(next)
+		logMetadataGeneration(next)
+	}
 	callMetadataCallback(callback)
 }
 
@@ -713,7 +757,7 @@ func (l *Loader) Stop() {
 			}
 		}
 		if changed {
-			l.publishLocked(&catalog.MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Cache: l.snapshot.Cache, Status: statuses})
+			l.publishLocked(&catalog.MetadataSnapshot{Generation: l.generation, Revision: l.snapshot.Revision + 1, Started: l.snapshot.Started, Stale: l.snapshot.Stale, Cache: l.snapshot.Cache, Status: statuses})
 			cancelled = l.snapshot
 		}
 	}

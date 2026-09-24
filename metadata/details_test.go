@@ -3,8 +3,10 @@ package metadata_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -261,6 +263,112 @@ func TestDetailDialectOnlyDifferenceDoesNotReload(t *testing.T) {
 		t.Fatalf("Render called %d times, want 2", renderCalls)
 	}
 }
+
+// TestDetailCacheMatchesCategoryCheckUnderConcurrentRefresh races Detail
+// calls against concurrent Refreshes and proves the cache handed to Load
+// always corresponds to the exact snapshot whose Status was confirmed
+// terminal for the required categories -- never a newer, incomplete
+// generation's cache paired with an older check. Before the fix, Detail
+// read the category-terminal snapshot once (for the check) and then read
+// loader.Snapshot()/loader.Cache() again, separately, to capture the
+// generation and the cache handed to Load; a Refresh landing in that gap
+// could pair a "relations is Ready" check with a brand new, empty cache.
+func TestDetailCacheMatchesCategoryCheckUnderConcurrentRefresh(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+
+	var violations atomic.Int64
+	p := &consistencyProvider{}
+	key := metadata.Key{Engine: "interbase", URL: "ib://host/detail-consistency"}
+	scope := metadata.Scope{Principal: "U"}
+	lease, err := r.Acquire(ctx, key, scope, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	waitReadyOrFatal(t, lease)
+
+	// Both loops are independently bounded (rather than one spinning
+	// unbounded until the other finishes): an unthrottled tight Refresh
+	// loop can otherwise pile up schedule() goroutines faster than they
+	// drain (each Refresh cancels the previous generation but does not wait
+	// for it), which is a self-inflicted resource-exhaustion problem in the
+	// test's own stress pattern, not something the production fix controls
+	// or needs to.
+	const refreshIterations, detailIterations = 60, 60
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < refreshIterations; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = lease.Refresh(context.Background())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		defer close(stop)
+		for i := 0; i < detailIterations; i++ {
+			req := metadata.Request{
+				Object:      catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: fmt.Sprintf("T%d", i)},
+				Facet:       "source",
+				Consistency: metadata.Committed,
+			}
+			_, err := lease.Detail(context.Background(), req)
+			if err != nil && !errors.Is(err, metadata.ErrStale) && !errors.Is(err, metadata.ErrCategoryFailed) {
+				violations.Add(1)
+			}
+		}
+	}()
+	wg.Wait()
+
+	if v := violations.Load(); v != 0 {
+		t.Fatalf("%d Detail Load calls observed a cache inconsistent with the category check that gated them (or an unexpected error)", v)
+	}
+	if v := p.violations.Load(); v != 0 {
+		t.Fatalf("%d Load calls ran against a cache where the checked-terminal category was not actually merged in", v)
+	}
+}
+
+// consistencyProvider's relations job always succeeds immediately; its
+// DetailPlan.Load asserts the cache it receives genuinely has relations
+// merged in (Metadata[MetadataRelations] == MetadataReady and SchemaTables
+// populated) every time it runs, recording a violation otherwise.
+type consistencyProvider struct {
+	violations atomic.Int64
+}
+
+func (p *consistencyProvider) Plan() catalog.MetadataPlan {
+	return catalog.MetadataPlan{Parallelism: 1, Jobs: []catalog.MetadataJob{{
+		Kind: catalog.MetadataRelations,
+		Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			return catalog.MetadataPatch{Cache: &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}}, Count: 1}, nil
+		},
+	}}}
+}
+
+func (p *consistencyProvider) DetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
+	return metadata.DetailPlan{
+		Requires: []catalog.MetadataKind{catalog.MetadataRelations},
+		Coverage: req.Object.Key() + "\x00" + req.Facet,
+		Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
+			if cache == nil || cache.Metadata[catalog.MetadataRelations] != catalog.MetadataReady || len(cache.SchemaTables[""]) == 0 {
+				p.violations.Add(1)
+			}
+			return metadata.Detail{Text: "ok"}, nil
+		},
+	}, nil
+}
+
+func (p *consistencyProvider) Close() error { return nil }
+
+func (p *consistencyProvider) Factory(context.Context) (metadata.Provider, error) { return p, nil }
 
 // renderingProvider is a minimal metadata.Provider with a configurable Load
 // and Render, for tests needing a real (non-nil) Render function.
