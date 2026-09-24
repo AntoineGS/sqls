@@ -15,6 +15,7 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
 var (
@@ -44,6 +45,13 @@ type Server struct {
 	// publication from the previous attachment cannot follow the switch's
 	// clearing/recompute notification.
 	diagnosticsPublishMu sync.Mutex
+	diagnosticCatalogMu  sync.Mutex
+	diagnosticCache      *database.DBCache
+	derivedCatalog       sqlsymbol.Catalog
+	diagnosticWorkMu     sync.Mutex
+	diagnosticDocuments  map[string]struct{}
+	diagnosticAllOpen    bool
+	diagnosticAnalyzer   func(documentDiagnosticsSnapshot) []lsp.Diagnostic
 
 	dbConn *database.DBConnection
 
@@ -106,21 +114,22 @@ func NewServer() *Server {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 
 	server := &Server{
-		files:           make(map[string]*File),
-		ddlMemo:         make(map[ddlKey]string),
-		cancels:         newCancelRegistry(),
-		lifecycleCtx:    lifecycleCtx,
-		lifecycleCancel: lifecycleCancel,
-		metadata:        database.NewMetadataLoader(),
-		connectionState: connectionIdle,
-		openConnection:  database.OpenContext,
-		cleanupDone:     make(chan struct{}),
-		cleanupQueue:    make(chan *database.DBConnection, 2),
-		cleanupFinal:    make(chan *database.DBConnection, 1),
-		diagnosticsWake: make(chan struct{}, 1),
+		files:               make(map[string]*File),
+		ddlMemo:             make(map[ddlKey]string),
+		cancels:             newCancelRegistry(),
+		lifecycleCtx:        lifecycleCtx,
+		lifecycleCancel:     lifecycleCancel,
+		metadata:            database.NewMetadataLoader(),
+		connectionState:     connectionIdle,
+		openConnection:      database.OpenContext,
+		cleanupDone:         make(chan struct{}),
+		cleanupQueue:        make(chan *database.DBConnection, 2),
+		cleanupFinal:        make(chan *database.DBConnection, 1),
+		diagnosticsWake:     make(chan struct{}, 1),
+		diagnosticDocuments: make(map[string]struct{}),
 	}
 	server.metadata.SetChangedCallback(func() {
-		server.signalDiagnostics()
+		server.queueAllDiagnostics()
 	})
 	server.coordinator = newConnectionCoordinator(server)
 	go server.cleanupConnections()
@@ -314,7 +323,7 @@ func (s *Server) handleTextDocumentDidOpen(ctx context.Context, conn *jsonrpc2.C
 	if err := s.openFileAtVersion(params.TextDocument.URI, params.TextDocument.LanguageID, params.TextDocument.Text, params.TextDocument.Version); err != nil {
 		return nil, err
 	}
-	s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
+	s.queueDiagnosticDocument(params.TextDocument.URI)
 	return nil, nil
 }
 
@@ -336,7 +345,7 @@ func (s *Server) handleTextDocumentDidChange(ctx context.Context, conn *jsonrpc2
 		return nil, err
 	}
 	if changed {
-		s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
+		s.queueDiagnosticDocument(params.TextDocument.URI)
 	}
 	return nil, nil
 }
@@ -362,7 +371,7 @@ func (s *Server) handleTextDocumentDidSave(ctx context.Context, conn *jsonrpc2.C
 		var applied bool
 		applied, err = s.updateFileAtRevision(params.TextDocument.URI, *params.Text, revision)
 		if err == nil && applied {
-			s.publishDocumentDiagnostics(ctx, conn, params.TextDocument.URI)
+			s.queueDiagnosticDocument(params.TextDocument.URI)
 		}
 	} else {
 		err = s.saveFile(params.TextDocument.URI)
@@ -593,7 +602,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
 	_ = s.enqueueDetachedConnection(old)
-	s.signalDiagnostics()
+	s.queueAllDiagnostics()
 	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))
 	if err != nil {
 		s.stateMu.Lock()
@@ -647,7 +656,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 		s.stateMu.Unlock()
 		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
 	}
-	s.signalDiagnostics()
+	s.queueAllDiagnostics()
 	return nil
 }
 

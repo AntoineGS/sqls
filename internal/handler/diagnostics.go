@@ -163,7 +163,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		dialectResolved: editor.DialectResolved,
 	}
 	if snapshot.CacheReadyForDiagnostics() {
-		snapshot.cacheSnapshot = snapshotDiagnosticCatalog(snapshot.cache)
+		snapshot.cacheSnapshot = s.diagnosticCatalogFor(snapshot.cache)
 	}
 	return snapshot, true
 }
@@ -197,7 +197,11 @@ func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.
 	}
 	var diagnostics []lsp.Diagnostic
 	if snapshot.dialectResolved || snapshot.variant.Driver != dialect.DatabaseDriverInterBase {
-		diagnostics = diagnosticsForSnapshot(snapshot)
+		if s.diagnosticAnalyzer != nil {
+			diagnostics = s.diagnosticAnalyzer(snapshot)
+		} else {
+			diagnostics = diagnosticsForSnapshot(snapshot)
+		}
 	}
 	s.publishDiagnosticsSnapshot(ctx, conn, snapshot, diagnostics)
 }
@@ -305,9 +309,26 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 	}
 }
 
-// signalDiagnostics coalesces refresh requests into one bounded wake. The
-// single worker below performs client notifications without a connection
-// lifecycle lock held and prevents metadata bursts from spawning goroutines.
+// diagnosticCatalogFor memoizes the immutable diagnostic projection for the
+// current copy-on-write cache. Metadata status-only revisions retain the same
+// cache pointer; data changes publish a new one and replace this single entry.
+func (s *Server) diagnosticCatalogFor(cache *database.DBCache) sqlsymbol.Catalog {
+	s.diagnosticCatalogMu.Lock()
+	defer s.diagnosticCatalogMu.Unlock()
+	if cache == nil {
+		s.diagnosticCache = nil
+		s.derivedCatalog = nil
+		return nil
+	}
+	if s.diagnosticCache != cache {
+		s.derivedCatalog = snapshotDiagnosticCatalog(cache)
+		s.diagnosticCache = cache
+	}
+	return s.derivedCatalog
+}
+
+// signalDiagnostics coalesces refresh requests into one bounded wake. Dirty
+// state must be marked before this method is called.
 func (s *Server) signalDiagnostics() {
 	select {
 	case <-s.lifecycleCtx.Done():
@@ -317,16 +338,5 @@ func (s *Server) signalDiagnostics() {
 	select {
 	case s.diagnosticsWake <- struct{}{}:
 	default:
-	}
-}
-
-func (s *Server) runDiagnosticSignals() {
-	for {
-		select {
-		case <-s.lifecycleCtx.Done():
-			return
-		case <-s.diagnosticsWake:
-			s.republishOpenDiagnostics(s.lifecycleCtx)
-		}
 	}
 }
