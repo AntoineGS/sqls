@@ -46,6 +46,7 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			case <-ctx.Done():
 				t.Fatalf("metadata plan did not settle: %v", ctx.Err())
 			}
+			after := connection.Conn.Stats()
 			snapshot := loader.Snapshot()
 			if snapshot.Degraded() {
 				t.Fatalf("metadata plan degraded: %+v", snapshot.Status)
@@ -197,7 +198,6 @@ func TestInterBaseMetadataLive(t *testing.T) {
 				t.Errorf("foreign-key descriptors differ: got %d, legacy %d", len(gotForeignKeys), len(wantForeignKeys))
 			}
 
-			after := connection.Conn.Stats()
 			t.Logf("dialect=%d categories=%d db.Stats pool-wide WaitCount delta=%d pool-wide WaitDuration delta=%s", dialect, len(snapshot.Status), after.WaitCount-before.WaitCount, after.WaitDuration-before.WaitDuration)
 			for kind, status := range snapshot.Status {
 				t.Logf("category=%s state=%s count=%d queries=%d queries-known=%t queue=%s run=%s", kind, status.State, status.Count, status.Queries, status.QueriesKnown, metadataJobMetrics(status).Queue, metadataJobMetrics(status).Run)

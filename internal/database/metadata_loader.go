@@ -97,6 +97,8 @@ func (l *MetadataLoader) Reset(generation uint64) {
 	callback := l.callback
 	l.mu.Unlock()
 	if retired != nil {
+		// Emit after unlocking so logging cannot block lifecycle transitions. A
+		// concurrent new generation may therefore log before this retired one.
 		logCancelledMetadataStatuses(retired)
 		logMetadataGeneration(retired)
 	}
@@ -334,6 +336,9 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 				if ctx.Err() != nil {
 					return
 				}
+				if !l.markMetadataJobStarted(generation, ctx, job.Kind) {
+					return
+				}
 				result := metadataResult{kind: job.Kind}
 				func() {
 					defer func() {
@@ -344,6 +349,7 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 					}()
 					result.patch, result.err = job.Run(ctx, cache)
 				}()
+				l.recordMetadataJobMetrics(generation, job.Kind, result.patch)
 				results <- result
 			}(job, cache)
 		}
@@ -397,6 +403,7 @@ func (l *MetadataLoader) schedule(ctx context.Context, generation uint64, plan M
 // admitJob is the launch linearization point. The generation, cancellation
 // state, status transition, and cache input are checked/captured together so a
 // reset cannot make an old scheduler hand a new generation's cache to a job.
+// StartedAt is recorded by the runner immediately before invoking Run.
 func (l *MetadataLoader) admitJob(generation uint64, ctx context.Context, kind MetadataKind) (*DBCache, bool) {
 	l.mu.Lock()
 	if l.stopped || !l.started || l.generation != generation || l.snapshot == nil || l.ctx == nil || l.ctx.Err() != nil || ctx == nil || ctx.Err() != nil {
@@ -410,7 +417,7 @@ func (l *MetadataLoader) admitJob(generation uint64, ctx context.Context, kind M
 		l.mu.Unlock()
 		return nil, false
 	}
-	status.State, status.StartedAt = MetadataLoading, time.Now()
+	status.State = MetadataLoading
 	statuses[kind] = status
 	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
 	if l.active == 0 {
@@ -421,6 +428,51 @@ func (l *MetadataLoader) admitJob(generation uint64, ctx context.Context, kind M
 	l.mu.Unlock()
 	callMetadataCallback(callback)
 	return cache, true
+}
+
+func (l *MetadataLoader) markMetadataJobStarted(generation uint64, ctx context.Context, kind MetadataKind) bool {
+	l.mu.Lock()
+	if l.stopped || generation != l.generation || l.snapshot == nil || ctx == nil || ctx.Err() != nil {
+		l.mu.Unlock()
+		return false
+	}
+	current := l.snapshot
+	statuses := cloneMap(current.Status)
+	status := statuses[kind]
+	if status.State != MetadataLoading || !status.StartedAt.IsZero() {
+		l.mu.Unlock()
+		return false
+	}
+	status.StartedAt = time.Now()
+	statuses[kind] = status
+	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
+	l.mu.Unlock()
+	return true
+}
+
+// recordMetadataJobMetrics stores the runner's outcome before it hands the
+// result to the scheduler. Cancellation may settle the generation first; in
+// that case retain only metrics in the same generation and never publish cache.
+func (l *MetadataLoader) recordMetadataJobMetrics(generation uint64, kind MetadataKind, patch MetadataPatch) {
+	l.mu.Lock()
+	if generation != l.generation || l.snapshot == nil {
+		l.mu.Unlock()
+		return
+	}
+	current := l.snapshot
+	statuses := cloneMap(current.Status)
+	status, ok := statuses[kind]
+	if !ok || (status.State != MetadataLoading && status.State != MetadataCancelled) {
+		l.mu.Unlock()
+		return
+	}
+	status.Count = patch.Count
+	status.Queries, status.QueriesKnown = patch.Queries, patch.QueriesKnown
+	statuses[kind] = status
+	l.publishLocked(&MetadataSnapshot{Generation: generation, Revision: current.Revision + 1, Started: current.Started, Cache: current.Cache, Status: statuses})
+	callback := l.callback
+	l.mu.Unlock()
+	callMetadataCallback(callback)
 }
 
 func (l *MetadataLoader) slotWakeChannel() <-chan struct{} {

@@ -79,6 +79,76 @@ func TestMetadataMetrics(t *testing.T) {
 		loader.Stop()
 	})
 
+	t.Run("cancelled running job retains metrics after native call drains", func(t *testing.T) {
+		loader := NewMetadataLoader()
+		t.Cleanup(loader.Stop)
+		gate := make(chan struct{})
+		started := make(chan struct{})
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		loader.Reset(1)
+		load, err := loader.Start(ctx, 1, metadataRepo(MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{
+			Kind: MetadataViews,
+			Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+				close(started)
+				<-gate
+				return MetadataPatch{
+					Cache: &DBCache{Catalog: &CatalogCache{Views: map[string]*ViewDesc{"cancelled-result": {Name: "cancelled-result"}}}},
+					Count: 6, Queries: 2, QueriesKnown: true,
+				}, context.Canceled
+			},
+		}}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-started
+		cancel()
+		waitLoad(t, load)
+		if got := loader.Snapshot().Status[MetadataViews].State; got != MetadataCancelled {
+			t.Fatalf("logical state = %s, want cancelled", got)
+		}
+		close(gate)
+		if err := loader.Wait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		status := loader.Snapshot().Status[MetadataViews]
+		if status.State != MetadataCancelled || status.Count != 6 || !status.QueriesKnown || status.Queries != 2 {
+			t.Fatalf("drained cancelled job lost metrics: %+v", status)
+		}
+		if _, ok := loader.Cache().View("cancelled-result"); ok {
+			t.Fatal("cancelled job published its fragment")
+		}
+	})
+
+	t.Run("admitted but never invoked job has no start timestamp", func(t *testing.T) {
+		loader := NewMetadataLoader()
+		t.Cleanup(loader.Stop)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		loader.Reset(1)
+		loader.SetChangedCallback(func() {
+			status := loader.Snapshot().Status[MetadataViews]
+			if status.State == MetadataLoading {
+				cancel()
+			}
+		})
+		load, err := loader.Start(ctx, 1, metadataRepo(MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{
+			Kind: MetadataViews,
+			Run: func(context.Context, *DBCache) (MetadataPatch, error) {
+				t.Fatal("cancelled-before-invocation job ran")
+				return MetadataPatch{}, nil
+			},
+		}}}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitLoad(t, load)
+		status := loader.Snapshot().Status[MetadataViews]
+		if status.State != MetadataCancelled || !status.StartedAt.IsZero() || metadataJobMetrics(status).Run != 0 {
+			t.Fatalf("never-invoked job has false run timing: %+v", status)
+		}
+	})
+
 	t.Run("superseded generation does not contribute to current summary", func(t *testing.T) {
 		loader := NewMetadataLoader()
 		t.Cleanup(loader.Stop)
