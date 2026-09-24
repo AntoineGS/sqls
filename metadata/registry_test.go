@@ -156,14 +156,17 @@ func TestAcquireSimultaneousSharesOneCreation(t *testing.T) {
 	}
 }
 
-// TestAcquireCancelDuringWaitDoesNotAffectSurvivor proves the invariant
-// directly instead of racing on timing: the survivor's Acquire call is
-// confirmed (via the factory's Entered signal, which can only fire after
-// Acquire's own ref-increment already ran) to hold a live reference before a
-// second, cancelable joiner is even started, so the joiner's cancellation —
-// whenever it lands relative to the joiner's own ref bookkeeping — can never
-// remove the survivor's reference.
-func TestAcquireCancelDuringWaitDoesNotAffectSurvivor(t *testing.T) {
+// TestAcquireJoinerCanceledCreatorSurvives proves the invariant directly
+// instead of racing on timing: the survivor (the creator, whose Acquire call
+// triggers factory creation) is confirmed (via the factory's Entered signal,
+// which can only fire after Acquire's own ref-increment already ran) to hold
+// a live reference before a second, cancelable joiner is even started, so
+// the joiner's cancellation — whenever it lands relative to the joiner's own
+// ref bookkeeping — can never remove the creator's reference. This is the
+// mirror image of TestAcquireCreatorCanceledJoinerSurvives below, which
+// covers the plan's actual named scenario (the FIRST/creator caller gets
+// canceled, not a later joiner).
+func TestAcquireJoinerCanceledCreatorSurvives(t *testing.T) {
 	ctx := context.Background()
 	r := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3})
 	defer r.Close(ctx)
@@ -221,6 +224,97 @@ func TestAcquireCancelDuringWaitDoesNotAffectSurvivor(t *testing.T) {
 	}
 	defer survivor.lease.Release()
 	waitReadyOrFatal(t, survivor.lease)
+}
+
+// TestAcquireCreatorCanceledJoinerSurvives covers the plan's Review Focus #2
+// scenario directly: "A canceled first acquirer must not close a provider
+// another acquirer still needs." Here A's own Acquire call is the one that
+// triggers factory creation (A is the creator), and A's context is the one
+// that gets canceled while A is still waiting on its own Acquire call. B,
+// using an independent, uncancelled context, joins the same still-live
+// track before A's cancellation lands (proven deterministically the same
+// way TestAcquireSimultaneousSharesOneCreation proves it: B signals "about
+// to call Acquire" via a WaitGroup, and that signal is waited on before
+// anything time-dependent happens) and must still receive a lease for the
+// SAME live store — same Incarnation, one factory call total — regardless
+// of A's own outcome. This is what the production code should guarantee
+// because the factory always runs on the registry-owned track context, not
+// on any individual caller's own Acquire context.
+func TestAcquireCreatorCanceledJoinerSurvives(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3})
+	defer r.Close(ctx)
+
+	var factoryCalls atomic.Int64
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
+	gate := make(chan struct{})
+	factory := func(fctx context.Context) (metadata.Provider, error) {
+		factoryCalls.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		select {
+		case <-gate:
+		case <-fctx.Done():
+			return nil, fctx.Err()
+		}
+		return metadatatest.New(), nil
+	}
+
+	key := metadata.Key{Engine: "interbase", URL: "ib://host/creator-cancel"}
+	scope := metadata.Scope{Principal: "U"}
+
+	// A is the creator: the first Acquire call for this (Key, Scope), so its
+	// factory call is the one that ends up gated.
+	creatorCtx, cancelCreator := context.WithCancel(context.Background())
+	creatorDone := make(chan error, 1)
+	go func() {
+		_, err := r.Acquire(creatorCtx, key, scope, factory)
+		creatorDone <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("factory never entered")
+	}
+	// A's own Acquire call has already incremented its reference: refs++
+	// always happens before the factory call that signals Entered.
+
+	// B joins the same still-live track before A's cancellation lands.
+	type result struct {
+		lease *metadata.Lease
+		err   error
+	}
+	joinerDone := make(chan result, 1)
+	var launched sync.WaitGroup
+	launched.Add(1)
+	go func() {
+		launched.Done()
+		l, err := r.Acquire(context.Background(), key, scope, factory)
+		joinerDone <- result{l, err}
+	}()
+	launched.Wait() // B's Acquire call has been invoked and has attached
+
+	cancelCreator()
+
+	// A's own context died mid-wait (gate is still closed at this point, so
+	// A cannot have raced ahead to <-t.ready): its Acquire call must fail
+	// with context.Canceled. The point of the test is that B is unaffected.
+	if creatorErr := <-creatorDone; !errors.Is(creatorErr, context.Canceled) {
+		t.Fatalf("creator error = %v, want context.Canceled", creatorErr)
+	}
+
+	close(gate)
+	joiner := <-joinerDone
+	if joiner.err != nil {
+		t.Fatalf("joiner Acquire failed after creator (first acquirer) canceled: %v", joiner.err)
+	}
+	defer joiner.lease.Release()
+	waitReadyOrFatal(t, joiner.lease)
+
+	if got := factoryCalls.Load(); got != 1 {
+		t.Fatalf("factory called %d times, want exactly 1 (a canceled first acquirer must not close a provider another acquirer still needs)", got)
+	}
 }
 
 func TestReleaseOneRetainsOther(t *testing.T) {
