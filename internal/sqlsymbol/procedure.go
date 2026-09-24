@@ -57,6 +57,15 @@ type Analysis struct {
 	// whose declared-name shape could not be parsed, consistent with
 	// Unsupported-style suppression elsewhere.
 	malformedDeclarations []Span
+
+	// malformedDeclarationNames records, per procedure index, the Key() of
+	// any name a malformed DECLARE VARIABLE attempted (but failed) to
+	// declare -- e.g. a missing type or missing terminator. Diagnostics-only
+	// rules must not flag a later use of that same name as unknown: the
+	// declaration's failure is the reportable problem, not the name's
+	// later "unresolved" appearance, which would otherwise double-report
+	// the same root cause under a confusing code.
+	malformedDeclarationNames map[int]map[string]bool
 }
 
 type procedureHeader struct {
@@ -135,14 +144,14 @@ func analyze(text string, dv dialect.DriverVariant, tolerant bool) (*Analysis, e
 					if !tolerant {
 						return nil, fmt.Errorf("local variable declaration has an invalid name")
 					}
-					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i, "")
 					continue
 				}
 				if i+3 >= len(items) || !declarationTypeStart(items[i+3]) {
 					if !tolerant {
 						return nil, fmt.Errorf("local variable %s is missing a type", name.Key())
 					}
-					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i, name.Key())
 					continue
 				}
 				declarationEnd := i + 3
@@ -163,7 +172,7 @@ func analyze(text string, dv dialect.DriverVariant, tolerant bool) (*Analysis, e
 						}
 						return nil, fmt.Errorf("local variable %s declaration is missing a terminator", name.Key())
 					}
-					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i)
+					i = recoverLocalDeclaration(analysis, &current, &frames, &bodyStarted, items, i, name.Key())
 					continue
 				}
 				addSymbol(analysis, current, &Symbol{
@@ -217,8 +226,22 @@ func declarationTypeStart(item lexeme) bool {
 // recoverLocalDeclaration skips a malformed declaration to the next safe
 // declaration terminator or procedure body. If only another procedure or EOF
 // remains, the current procedure's diagnostics are suppressed because its
-// reads cannot be bound reliably.
-func recoverLocalDeclaration(analysis *Analysis, current *int, frames *[]bodyFrame, bodyStarted *bool, items []lexeme, start int) int {
+// reads cannot be bound reliably. attemptedName is the Key() of the name the
+// failed declaration was trying to declare, or "" when even the name itself
+// could not be parsed; when non-empty, it is recorded so unknown-variable
+// detection excludes every later use of that same name in this procedure,
+// not only positions inside the malformed declaration's own span.
+func recoverLocalDeclaration(analysis *Analysis, current *int, frames *[]bodyFrame, bodyStarted *bool, items []lexeme, start int, attemptedName string) int {
+	procIndex := *current
+	if procIndex >= 0 && attemptedName != "" {
+		if analysis.malformedDeclarationNames == nil {
+			analysis.malformedDeclarationNames = make(map[int]map[string]bool)
+		}
+		if analysis.malformedDeclarationNames[procIndex] == nil {
+			analysis.malformedDeclarationNames[procIndex] = make(map[string]bool)
+		}
+		analysis.malformedDeclarationNames[procIndex][attemptedName] = true
+	}
 	recordMalformed := func(end int) {
 		analysis.malformedDeclarations = append(analysis.malformedDeclarations, Span{Start: items[start].Span.Start, End: end})
 	}

@@ -8,9 +8,17 @@ import (
 	"github.com/sqls-server/sqls/token"
 )
 
-// codeUnknownVariable marks a bare procedural identifier, or an INTO/
-// RETURNING_VALUES target, whose role provably must be a local variable or
-// parameter but that does not match any declaration in scope.
+// codeUnknownVariable marks a position whose procedural-variable role is
+// syntactically proven -- a genuine assignment lvalue, or an INTO/
+// RETURNING_VALUES target -- but that does not match any declaration in
+// scope. General expression-position reads (an arbitrary IF/WHILE
+// condition, the right-hand side of an assignment, a function argument) are
+// deliberately never scanned: unlike an assignment target or an INTO list,
+// nothing about those positions proves a bare name there is a variable
+// reference rather than a keyword, a context value, a type name, a
+// generator/domain/exception name, or some other legal non-variable
+// identifier. See the "Fix round 1" section of task-3-report.md for the
+// false positives that motivated this narrower scope.
 const codeUnknownVariable = "interbase-unknown-variable"
 
 // codeDuplicateDeclaration marks a local variable or parameter declaration
@@ -81,14 +89,16 @@ func duplicateFindingsFor(group []*Symbol, scopeWord string) []Finding {
 
 // --- CREATE PROCEDURE: unknown variable references ---
 
-// procedureUnknownVariableFindings scans every name token owned by a
-// procedure (a.procedureAt >= 0) and flags two provable variable-role
-// positions the existing binder (resolve.go) does not already resolve to a
-// declared Symbol: a bare identifier in procedural (non-SQL) context --
-// reached only through an assignment lvalue ("name =") or a read already
-// inside an IF/WHILE/FOR/CASE condition, per buildContexts' own state
-// machine -- and a SELECT ... INTO / EXECUTE ... RETURNING_VALUES target,
-// which is always a local/parameter by InterBase's own grammar.
+// procedureUnknownVariableFindings flags exactly two provable variable-role
+// positions: a genuine assignment lvalue, and a SELECT ... INTO / EXECUTE
+// ... RETURNING_VALUES target. Both are recognized by isWriteOccurrence
+// (resolve.go), the same helper the existing binder already uses to
+// classify a bound symbol's occurrence as a Read or a Write -- reused here
+// rather than reimplemented, so this rule's notion of "provably a variable
+// position" never drifts from the binder's own. Every other bare
+// identifier in procedural context (an IF/WHILE condition, a function
+// argument, the right-hand side of an assignment) is left unscanned: see
+// the codeUnknownVariable doc comment for why.
 func (a *Analysis) procedureUnknownVariableFindings(m *diagnosticModel) []Finding {
 	items := significantLexemes(a.lexemes)
 	var findings []Finding
@@ -107,14 +117,22 @@ func (a *Analysis) procedureUnknownVariableFindings(m *diagnosticModel) []Findin
 			continue
 		}
 		ctx := a.contexts[i]
+		if !isWriteOccurrence(items, i, ctx) {
+			continue
+		}
 		resolution := a.Resolve(item.Span.Start)
-		unknown := (ctx.kind == contextProcedure && resolution.Role == Other) ||
-			(ctx.outputTarget && resolution.Role == Column)
-		if !unknown {
+		if resolution.Role != Other && resolution.Role != Column {
 			continue
 		}
 		name, ok := nameFromLexeme(a.Text, item)
 		if !ok {
+			continue
+		}
+		if a.malformedDeclarationNames[procIndex][name.Key()] {
+			// This exact name already has its own, more specific
+			// malformed-declaration problem; reporting it as an unknown
+			// variable too would just be a confusing duplicate finding
+			// for the same root cause.
 			continue
 		}
 		findings = append(findings, unknownVariableFinding(item.Span, name, procedureCandidateNames(a, procIndex)))
@@ -165,7 +183,12 @@ type triggerSymbol struct {
 // triggerModel is one recognized CREATE TRIGGER statement: a supported
 // subset of InterBase's trigger grammar (see parseTrigger). Triggers whose
 // header or body do not match this subset are never added to the discovered
-// list, so their content never produces a finding.
+// list, so their content never produces a finding. A trigger whose own
+// DECLARE VARIABLE section is malformed is entirely excluded this same way
+// (parseTrigger returns ok=false), which also satisfies "withhold dependent
+// errors after a malformed declaration" for triggers without needing
+// procedure.go's per-name suppression map: there is no partial trigger body
+// to selectively report on.
 type triggerModel struct {
 	name      Name
 	relation  Name
@@ -195,7 +218,7 @@ func discoverTriggers(text string, items []lexeme) []triggerModel {
 //	  [POSITION number]
 //	AS
 //	  (DECLARE VARIABLE name type;)*
-//	  BEGIN ... END
+//	BEGIN ... END
 //
 // Any deviation -- a schema-qualified relation, INSTEAD OF, a malformed
 // declaration, an unbalanced body -- reports ok=false and the whole trigger
@@ -340,13 +363,99 @@ func (trg *triggerModel) candidateNames() []string {
 	return names
 }
 
-// unknownVariableFindings conservatively scans the trigger body for the same
-// two provable variable-role shapes as procedureUnknownVariableFindings: a
-// bare assignment lvalue ("name ="), and a bare read inside an IF/WHILE
-// condition's parentheses. NEW/OLD and any name qualified by "." (including
-// the column half of NEW.col/OLD.col) are always skipped: this file does not
-// enforce column existence or event-appropriateness for NEW/OLD, only that
-// they are never mistaken for an unbound local.
+// triggerBodyContext classifies every item position within [bodyStart,
+// bodyEnd) as SQL or procedural, and marks SQL-region INTO/RETURNING_VALUES
+// target positions, mirroring buildContexts' own contextSQL/outputTarget
+// tracking in resolve.go (scoped down to the single concern this file
+// needs: never treating a SQL column name or predicate as a candidate
+// variable, and correctly finding INTO targets). A SELECT/UPDATE/INSERT/
+// DELETE keyword opens a SQL region that closes at the next top-level ";"
+// or, for a FOR SELECT ... DO cursor loop, at "DO" -- matching resolve.go's
+// own "kind, active = contextProcedure, false" transition at FOR's DO.
+// MERGE/WITH open an unsupported region (also excluded, never scanned)
+// closing at the next ";". This is intentionally simpler than
+// buildContexts: it does not need Local/Column/Alias role classification,
+// only the SQL/procedural split.
+type triggerBodyContext struct {
+	inSQL        []bool
+	outputTarget []bool
+}
+
+func newTriggerBodyContext(items []lexeme, bodyStart, bodyEnd int) triggerBodyContext {
+	n := bodyEnd - bodyStart
+	ctx := triggerBodyContext{inSQL: make([]bool, n), outputTarget: make([]bool, n)}
+	kind := "procedural"
+	head := ""
+	depth := 0
+	outputDepth := -1
+	outputActive := false
+	outputExpect := false
+	for idx := bodyStart; idx < bodyEnd; idx++ {
+		item := items[idx]
+		i := idx - bodyStart
+		if item.Token.Kind == token.Semicolon {
+			kind, head = "procedural", ""
+			outputDepth, outputActive, outputExpect = -1, false, false
+		}
+		switch kind {
+		case "procedural":
+			switch {
+			case isWord(item, "SELECT"), isWord(item, "UPDATE"), isWord(item, "INSERT"), isWord(item, "DELETE"):
+				kind = "sql"
+				if word, ok := item.Token.Value.(*token.SQLWord); ok {
+					head = strings.ToUpper(word.Keyword)
+				}
+			case isWord(item, "MERGE"), isWord(item, "WITH"):
+				kind = "unsupported"
+			}
+		case "sql":
+			if isWord(item, "DO") {
+				kind, head = "procedural", ""
+				outputDepth, outputActive, outputExpect = -1, false, false
+			}
+			if isWord(item, "INTO") && head != "INSERT" {
+				outputDepth, outputActive, outputExpect = depth, true, true
+			}
+			if outputActive && depth <= outputDepth && (isWord(item, "FROM") || isWord(item, "WHERE") || isWord(item, "RETURNING")) {
+				outputActive, outputExpect = false, false
+			}
+			if outputActive && item.Token.Kind == token.Comma && depth == outputDepth {
+				outputExpect = true
+			}
+			if outputActive && isNameToken(item) && depth == outputDepth && outputExpect {
+				ctx.outputTarget[i] = true
+				outputExpect = false
+			}
+		case "unsupported":
+			// closed only by the top-level ";" handled above
+		}
+		ctx.inSQL[i] = kind == "sql" || kind == "unsupported"
+		switch item.Token.Kind {
+		case token.LParen:
+			depth++
+		case token.RParen:
+			depth--
+		}
+	}
+	return ctx
+}
+
+func isTriggerAssignmentBoundary(prev lexeme) bool {
+	if prev.Token.Kind == token.Semicolon {
+		return true
+	}
+	return isWord(prev, "BEGIN") || isWord(prev, "THEN") || isWord(prev, "ELSE") || isWord(prev, "DO")
+}
+
+// unknownVariableFindings flags the same two provable variable-role shapes
+// as the procedure-side rule -- a genuine assignment lvalue, and an INTO/
+// RETURNING_VALUES target -- scoped to the trigger body's own procedural
+// regions via triggerBodyContext. Positions inside an embedded SQL
+// statement (a column name, a WHERE predicate, an UPDATE ... SET target)
+// are never scanned: those are Task 4's concern, not an unbound local.
+// NEW/OLD, any name qualified by ".", and any name immediately followed by
+// "(" are always skipped, so NEW.col/OLD.col and a function/procedure call
+// name are never mistaken for a local.
 func (trg *triggerModel) unknownVariableFindings(text string, items []lexeme) []Finding {
 	var findings []Finding
 	report := func(idx int) {
@@ -377,33 +486,18 @@ func (trg *triggerModel) unknownVariableFindings(text string, items []lexeme) []
 		findings = append(findings, unknownVariableFinding(item.Span, name, trg.candidateNames()))
 	}
 
-	i := trg.bodyStart + 1
-	for i < trg.bodyEnd {
-		item := items[i]
+	ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
+	for idx := trg.bodyStart + 1; idx < trg.bodyEnd; idx++ {
+		i := idx - trg.bodyStart
+		item := items[idx]
 		switch {
-		case isNameToken(item) && i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.Eq:
-			report(i)
-			i++
-		case (isWord(item, "IF") || isWord(item, "WHILE")) && i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.LParen:
-			depth := 0
-			j := i + 1
-			for ; j < trg.bodyEnd; j++ {
-				switch items[j].Token.Kind {
-				case token.LParen:
-					depth++
-				case token.RParen:
-					depth--
-				}
-				if depth == 0 {
-					break
-				}
-			}
-			for k := i + 2; k < j; k++ {
-				report(k)
-			}
-			i = j + 1
-		default:
-			i++
+		case ctx.outputTarget[i]:
+			report(idx)
+		case ctx.inSQL[i]:
+			// SQL column names and predicates: never a variable candidate.
+		case isNameToken(item) && idx+1 < trg.bodyEnd && items[idx+1].Token.Kind == token.Eq &&
+			isTriggerAssignmentBoundary(items[idx-1]):
+			report(idx)
 		}
 	}
 	return findings
