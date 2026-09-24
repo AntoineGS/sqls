@@ -83,12 +83,16 @@ func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.SemanticCatalo
 	if cache == nil {
 		return nil
 	}
+	proceduresKnown := cache.HasCatalog() && cache.MetadataReady(database.MetadataProcedures)
 	catalog := &diagnosticCatalog{
-		keys:            make(map[string][][]string),
-		relations:       buildDiagnosticRelations(cache),
-		relationsKnown:  relationsNamespaceReady(cache),
+		keys:      make(map[string][][]string),
+		relations: buildDiagnosticRelations(cache),
+		// A relation lookup can only prove Missing once procedures are also
+		// known: an absent table/view name might still be a selectable
+		// procedure (a callable relation form).
+		relationsKnown:  relationsNamespaceReady(cache) && proceduresKnown,
 		procedures:      buildDiagnosticProcedures(cache),
-		proceduresKnown: cache.HasCatalog() && cache.MetadataReady(database.MetadataProcedures),
+		proceduresKnown: proceduresKnown,
 		domains:         buildDiagnosticDomains(cache),
 		domainsKnown:    cache.HasCatalog() && cache.MetadataReady(database.MetadataDomains),
 	}

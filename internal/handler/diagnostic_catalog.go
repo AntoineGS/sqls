@@ -52,6 +52,12 @@ func (c *diagnosticCatalog) RelationInfo(table sqlsymbol.Name) (sqlsymbol.Relati
 			ColumnsKnown: fact.ColumnsKnown,
 		}, sqlsymbol.Present
 	}
+	// A name absent from tables/views might still be a selectable procedure
+	// (a callable relation form). Building that RelationFact shape is a later
+	// task's job; here it is enough to not misreport it as a Missing relation.
+	if _, ok := c.procedures[key]; ok {
+		return sqlsymbol.RelationFact{}, sqlsymbol.Unknown
+	}
 	if c.relationsKnown {
 		return sqlsymbol.RelationFact{}, sqlsymbol.Missing
 	}

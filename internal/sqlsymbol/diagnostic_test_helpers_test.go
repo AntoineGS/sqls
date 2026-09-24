@@ -97,6 +97,19 @@ func newDiagnosticFixtureCatalog() *diagnosticFixtureCatalog {
 	}
 }
 
+// A known procedure name must never be reported as a Missing relation, even
+// with an otherwise complete fixture: it is a callable relation form, not
+// proven absent.
+func TestDiagnosticFixtureCatalogKnownProcedureNameIsNotMissingAsRelation(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	if fact, knowledge := c.RelationInfo(Name{Text: "P"}); knowledge != Unknown {
+		t.Fatalf("RelationInfo(P) = (%+v, %v), want Unknown, not Missing, for a known procedure name", fact, knowledge)
+	}
+	if _, knowledge := c.RelationInfo(Name{Text: "MISSING_NAME"}); knowledge != Missing {
+		t.Fatalf("knowledge = %v, want Missing for a name absent from a fully complete fixture", knowledge)
+	}
+}
+
 func (c *diagnosticFixtureCatalog) Columns(table Name) ([]ColumnType, bool) {
 	fact, knowledge := c.RelationInfo(table)
 	if knowledge != Present || !fact.ColumnsKnown {
@@ -129,7 +142,13 @@ func (c *diagnosticFixtureCatalog) RelationInfo(table Name) (RelationFact, Knowl
 	if fact, ok := c.relations[key]; ok {
 		return fact, Present
 	}
-	if c.relationsKnown {
+	// A name absent from tables/views might still be a selectable procedure
+	// (a callable relation form): building that RelationFact shape is a later
+	// task's job, but it must never be reported as a Missing relation here.
+	if _, ok := c.procedures[key]; ok {
+		return RelationFact{}, Unknown
+	}
+	if c.relationsKnown && c.proceduresKnown {
 		return RelationFact{}, Missing
 	}
 	return RelationFact{}, Unknown

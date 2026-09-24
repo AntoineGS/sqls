@@ -51,15 +51,68 @@ func TestDiagnosticCatalogRelationsReadyViewsIncompleteReportsUnknown(t *testing
 func TestDiagnosticCatalogCompleteRelationNamespaceReportsMissing(t *testing.T) {
 	cache := &database.DBCache{
 		SchemaTables: map[string][]string{"": {"T"}},
-		Catalog:      &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Catalog:      &database.CatalogCache{Views: map[string]*database.ViewDesc{}, Procedures: map[string]*database.ProcedureDesc{}},
 		Metadata: map[database.MetadataKind]database.MetadataState{
-			database.MetadataRelations: database.MetadataReady,
-			database.MetadataViews:     database.MetadataReady,
+			database.MetadataRelations:  database.MetadataReady,
+			database.MetadataViews:      database.MetadataReady,
+			database.MetadataProcedures: database.MetadataReady,
 		},
 	}
 	catalog := snapshotDiagnosticCatalog(cache)
 	if _, knowledge := catalog.RelationInfo(diagnosticName("MISSING_NAME")); knowledge != sqlsymbol.Missing {
 		t.Fatalf("knowledge = %v, want Missing for a complete namespace", knowledge)
+	}
+}
+
+// A relation lookup cannot claim completeness until procedures are also
+// known: a name absent from tables/views might still resolve to a selectable
+// procedure. This must stay Unknown, not Missing, for an ordinary missing
+// table name too, once procedures are added to the completeness gate.
+func TestDiagnosticCatalogRelationsReadyProceduresLoadingReportsUnknown(t *testing.T) {
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {"T"}},
+		Catalog:      &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataRelations:  database.MetadataReady,
+			database.MetadataViews:      database.MetadataReady,
+			database.MetadataProcedures: database.MetadataLoading,
+		},
+	}
+	catalog := snapshotDiagnosticCatalog(cache)
+	if _, knowledge := catalog.RelationInfo(diagnosticName("MISSING_NAME")); knowledge != sqlsymbol.Unknown {
+		t.Fatalf("knowledge = %v, want Unknown while procedures are still loading, even for an ordinary missing table name", knowledge)
+	}
+	// The already-known table itself is unaffected: its own existence does
+	// not depend on procedure readiness.
+	if _, knowledge := catalog.RelationInfo(diagnosticName("T")); knowledge != sqlsymbol.Present {
+		t.Fatalf("knowledge = %v, want Present for an already-known relation", knowledge)
+	}
+}
+
+// A name that resolves to a known, selectable procedure must never be
+// reported as a Missing relation, even with an otherwise complete relation
+// namespace: it is a callable relation form, not proven absent.
+func TestDiagnosticCatalogKnownProcedureNameIsNotMissingAsRelation(t *testing.T) {
+	cache := &database.DBCache{
+		SchemaTables: map[string][]string{"": {"T"}},
+		Catalog: &database.CatalogCache{
+			Views:      map[string]*database.ViewDesc{},
+			Procedures: map[string]*database.ProcedureDesc{"SEL_PROC": {Name: "SEL_PROC"}},
+		},
+		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataRelations:  database.MetadataReady,
+			database.MetadataViews:      database.MetadataReady,
+			database.MetadataProcedures: database.MetadataReady,
+		},
+	}
+	catalog := snapshotDiagnosticCatalog(cache)
+	if fact, knowledge := catalog.RelationInfo(diagnosticName("SEL_PROC")); knowledge != sqlsymbol.Unknown {
+		t.Fatalf("RelationInfo(SEL_PROC) = (%+v, %v), want Unknown, not Missing, for a known procedure name", fact, knowledge)
+	}
+	// An ordinary absent name is still provably Missing once relations,
+	// views, and procedures are all complete.
+	if _, knowledge := catalog.RelationInfo(diagnosticName("MISSING_NAME")); knowledge != sqlsymbol.Missing {
+		t.Fatalf("knowledge = %v, want Missing for a name absent from a fully complete namespace", knowledge)
 	}
 }
 
@@ -181,10 +234,11 @@ func TestDiagnosticCatalogFailedDomainsReportsUnknown(t *testing.T) {
 func TestDiagnosticCatalogExactQuotedNames(t *testing.T) {
 	cache := &database.DBCache{
 		SchemaTables: map[string][]string{"": {"MixedCase"}},
-		Catalog:      &database.CatalogCache{Views: map[string]*database.ViewDesc{}},
+		Catalog:      &database.CatalogCache{Views: map[string]*database.ViewDesc{}, Procedures: map[string]*database.ProcedureDesc{}},
 		Metadata: map[database.MetadataKind]database.MetadataState{
-			database.MetadataRelations: database.MetadataReady,
-			database.MetadataViews:     database.MetadataReady,
+			database.MetadataRelations:  database.MetadataReady,
+			database.MetadataViews:      database.MetadataReady,
+			database.MetadataProcedures: database.MetadataReady,
 		},
 	}
 	catalog := snapshotDiagnosticCatalog(cache)
