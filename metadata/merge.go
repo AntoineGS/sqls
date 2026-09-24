@@ -101,21 +101,33 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 		switch kind {
 		case catalog.MetadataViews:
 			catalogHeader.Views = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.ViewDesc { return c.Views }))
+			catalogHeader.ViewsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.ViewDesc { return c.ViewsByID }))
 		case catalog.MetadataProcedures:
 			catalogHeader.Procedures = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.ProcedureDesc { return c.Procedures }))
+			catalogHeader.ProceduresByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.ProcedureDesc { return c.ProceduresByID }))
 		case catalog.MetadataGenerators:
 			catalogHeader.Generators = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.GeneratorDesc { return c.Generators }))
+			catalogHeader.GeneratorsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.GeneratorDesc { return c.GeneratorsByID }))
 		case catalog.MetadataDomains:
 			catalogHeader.Domains = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.DomainDesc { return c.Domains }))
+			catalogHeader.DomainsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.DomainDesc { return c.DomainsByID }))
 		case catalog.MetadataFunctions:
 			catalogHeader.Functions = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.FunctionDesc { return c.Functions }))
+			catalogHeader.FunctionsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.FunctionDesc { return c.FunctionsByID }))
 		case catalog.MetadataIndexes:
 			catalogHeader.Indexes = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.IndexDesc { return c.Indexes }))
 			catalogHeader.IndexesByTable = indexGroups(catalogHeader.Indexes)
+			catalogHeader.IndexesByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.IndexDesc { return c.IndexesByID }))
 		case catalog.MetadataTriggers:
 			catalogHeader.Triggers = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.Triggers }))
 			catalogHeader.TriggersByTable = triggerGroups(catalogHeader.Triggers)
+			catalogHeader.TriggersByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.TriggersByID }))
 		}
+		// Objects accumulates exact identities across every category loaded
+		// so far (see CatalogCache.RebuildObjects), so it is rebuilt from
+		// the union of all *ByID maps after each category's own map is
+		// updated above, not just this category's fragment.
+		catalogHeader.RebuildObjects(nil)
 		next.Catalog = catalogHeader
 	}
 	return &next, nil

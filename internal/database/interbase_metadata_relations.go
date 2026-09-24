@@ -54,10 +54,12 @@ ORDER BY r.RDB$RELATION_NAME`, interBaseMetadataIdentifier("r.RDB$RELATION_NAME"
 	}
 	descriptions := db.viewDescriptions(views)
 	byDescription := make(map[string]*ViewDesc, len(descriptions))
+	byID := make(map[string]*ViewDesc, len(descriptions))
 	for _, description := range descriptions {
-		byDescription[description.Name] = description
+		byDescription[catalogCacheKey(description.Name)] = description
+		byID[interBaseByIDKey(ObjectKindView, description.Name)] = description
 	}
-	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: byDescription}}, Count: len(descriptions)}, nil
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: byDescription, ViewsByID: byID}}, Count: len(descriptions)}, nil
 }
 
 func trimInterBaseCatalogName(value sql.NullString) sql.NullString {

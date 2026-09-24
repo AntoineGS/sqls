@@ -11,6 +11,7 @@ import (
 type (
 	ColumnBase             = catalog.ColumnBase
 	ColumnDesc             = catalog.ColumnDesc
+	ColumnTypeFacts        = catalog.ColumnTypeFacts
 	ForeignKey             = catalog.ForeignKey
 	DBCache                = catalog.Cache
 	CatalogCache           = catalog.CatalogCache

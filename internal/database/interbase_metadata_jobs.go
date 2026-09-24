@@ -141,11 +141,13 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 					return MetadataPatch{}, err
 				}
 				items := make(map[string]*GeneratorDesc, len(values))
+				byID := make(map[string]*GeneratorDesc, len(values))
 				for _, value := range values {
 					copy := *value
 					items[catalogCacheKey(value.Name)] = &copy
+					byID[interBaseByIDKey(ObjectKindGenerator, value.Name)] = &copy
 				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Generators: items}}, Count: len(items)}, nil
+				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Generators: items, GeneratorsByID: byID}}, Count: len(items)}, nil
 			})
 		}},
 		{Kind: MetadataDomains, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
@@ -155,11 +157,13 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 					return MetadataPatch{}, err
 				}
 				items := make(map[string]*DomainDesc, len(values))
+				byID := make(map[string]*DomainDesc, len(values))
 				for _, value := range values {
 					copy := *value
 					items[catalogCacheKey(value.Name)] = &copy
+					byID[interBaseByIDKey(ObjectKindDomain, value.Name)] = &copy
 				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Domains: items}}, Count: len(items)}, nil
+				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Domains: items, DomainsByID: byID}}, Count: len(items)}, nil
 			})
 		}},
 		{Kind: MetadataTriggers, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
@@ -169,11 +173,13 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 					return MetadataPatch{}, err
 				}
 				items := make(map[string]*TriggerDesc, len(values))
+				byID := make(map[string]*TriggerDesc, len(values))
 				for _, value := range values {
 					copy := *value
 					items[catalogCacheKey(value.Name)] = &copy
+					byID[interBaseByIDKey(ObjectKindTrigger, value.Name)] = &copy
 				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Triggers: items}}, Count: len(items)}, nil
+				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Triggers: items, TriggersByID: byID}}, Count: len(items)}, nil
 			})
 		}},
 	}}

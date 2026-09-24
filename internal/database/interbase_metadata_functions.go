@@ -86,8 +86,10 @@ ORDER BY a.RDB$FUNCTION_NAME, a.RDB$ARGUMENT_POSITION`, functionName)
 		return MetadataPatch{}, err
 	}
 	byDescription := make(map[string]*FunctionDesc, len(descriptions))
+	byID := make(map[string]*FunctionDesc, len(descriptions))
 	for _, description := range descriptions {
 		byDescription[catalogCacheKey(description.Name)] = description
+		byID[interBaseByIDKey(ObjectKindFunction, description.Name)] = description
 	}
-	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Functions: byDescription}}, Count: len(descriptions)}, nil
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Functions: byDescription, FunctionsByID: byID}}, Count: len(descriptions)}, nil
 }

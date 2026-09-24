@@ -118,6 +118,62 @@ func interBaseColumnType(domain *schema.Domain) string {
 	}
 }
 
+// interBaseColumnFacts retains the raw scalar facts behind a column's
+// rendered Type, keyed off the column's own field source and collation
+// override plus its resolved domain, so a caller can reconstruct a
+// dialect-correct schema.Domain/schema.Column later without a second catalog
+// read. It returns nil when the column resolved to no domain at all, exactly
+// like ColumnDesc.Type does.
+func interBaseColumnFacts(column schema.Column) *ColumnTypeFacts {
+	if column.Domain == nil {
+		return nil
+	}
+	facts := interBaseDomainFacts(column.Domain)
+	facts.UserDomain = interBaseUserDomainName(column.FieldSource, column.Domain) != ""
+	facts.ColumnCollationID = column.CollationID
+	facts.ColumnCollationName = column.CollationName
+	return facts
+}
+
+// interBaseParameterFacts is interBaseColumnFacts for a procedure parameter,
+// whose user-domain test uses the parameter's own field source.
+func interBaseParameterFacts(fieldSource sql.NullString, domain *schema.Domain) *ColumnTypeFacts {
+	if domain == nil {
+		return nil
+	}
+	facts := interBaseDomainFacts(domain)
+	facts.UserDomain = interBaseUserDomainName(fieldSource, domain) != ""
+	return facts
+}
+
+// interBaseDomainFacts retains the raw scalar facts of domain itself, for a
+// standalone CREATE DOMAIN reconstruction. UserDomain is left false: it does
+// not apply to the domain declaration itself, only to a column/parameter's
+// reference to one.
+func interBaseDomainFacts(domain *schema.Domain) *ColumnTypeFacts {
+	if domain == nil {
+		return nil
+	}
+	return &ColumnTypeFacts{
+		FieldType:        domain.FieldType,
+		FieldSubType:     domain.FieldSubType,
+		FieldScale:       domain.FieldScale,
+		FieldPrecision:   domain.FieldPrecision,
+		FieldLength:      domain.FieldLength,
+		CharacterLength:  domain.CharacterLength,
+		CharacterSetID:   domain.CharacterSetID,
+		CharacterSetName: domain.CharacterSetName,
+		CollationID:      domain.CollationID,
+		CollationName:    domain.CollationName,
+		Dimensions:       domain.Dimensions,
+		DomainName:       sql.NullString{String: domain.Name, Valid: domain.Name != ""},
+		SystemDomain:     domain.SystemFlag.Valid && domain.SystemFlag.Int64 != 0,
+		ComputedSource:   domain.ComputedSource,
+		ValidationSource: domain.ValidationSource,
+		DomainDefault:    domain.DefaultSource,
+	}
+}
+
 func interBaseCharacterLength(domain *schema.Domain) int64 {
 	if domain == nil {
 		return 0
@@ -310,6 +366,7 @@ func (db *InterBaseDBRepository) columnDescription(relationName string, column s
 		Key:     key,
 		Default: interBaseEffectiveDefault(column.DefaultSource, domainDefault),
 		Extra:   extra,
+		Facts:   interBaseColumnFacts(column),
 	}
 }
 
@@ -431,6 +488,7 @@ func (db *InterBaseDBRepository) DescribeDomains(ctx context.Context) ([]*Domain
 			CharacterSetName: domain.CharacterSetName,
 			CollationName:    domain.CollationName,
 			Description:      domain.Description,
+			Facts:            interBaseDomainFacts(domain),
 		})
 	}
 	return result, nil
@@ -465,6 +523,7 @@ func (db *InterBaseDBRepository) indexDescriptions(indexes []schema.Index) []*In
 			Active:         interBaseFlagIsClear(index.Inactive),
 			ConstraintName: index.ConstraintName,
 			Description:    index.Description,
+			Direction:      index.IndexType,
 		})
 	}
 	return result
@@ -520,6 +579,7 @@ func (db *InterBaseDBRepository) parameterDescriptions(parameters []schema.Proce
 			Domain:      interBaseUserDomainName(parameter.FieldSource, parameter.Domain),
 			Nullable:    parameter.Nullable,
 			Description: parameter.Description,
+			Facts:       interBaseParameterFacts(parameter.FieldSource, parameter.Domain),
 		})
 	}
 	return result
@@ -598,6 +658,7 @@ func (db *InterBaseDBRepository) DescribeTriggers(ctx context.Context) ([]*Trigg
 			Active:      interBaseFlagIsClear(trigger.Inactive),
 			Source:      trigger.Source,
 			Description: trigger.Description,
+			TypeCode:    trigger.TriggerType,
 		})
 	}
 	return result, nil

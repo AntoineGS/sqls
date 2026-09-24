@@ -14,7 +14,7 @@ func (db *InterBaseDBRepository) readMetadataIndexes(ctx context.Context, q sche
 	headerQuery := fmt.Sprintf(`
 SELECT %s, %s, i.RDB$UNIQUE_FLAG, i.RDB$DESCRIPTION,
        i.RDB$INDEX_INACTIVE, i.RDB$EXPRESSION_SOURCE, %s,
-       i.RDB$SEGMENT_COUNT
+       i.RDB$SEGMENT_COUNT, i.RDB$INDEX_TYPE
 FROM RDB$INDICES i
 LEFT JOIN RDB$RELATION_CONSTRAINTS rc ON rc.RDB$INDEX_NAME = i.RDB$INDEX_NAME
 WHERE COALESCE(i.RDB$SYSTEM_FLAG, 0) = 0
@@ -25,7 +25,7 @@ ORDER BY i.RDB$INDEX_NAME`,
 	err := interBaseBulkQuery(ctx, q, "index headers", headerQuery, func(rows *sql.Rows) error {
 		var nameValue, relationValue, constraintName sql.NullString
 		var index schema.Index
-		if err := rows.Scan(&nameValue, &relationValue, &index.UniqueFlag, &index.Description, &index.Inactive, &index.Expression, &constraintName, &index.SegmentCount); err != nil {
+		if err := rows.Scan(&nameValue, &relationValue, &index.UniqueFlag, &index.Description, &index.Inactive, &index.Expression, &constraintName, &index.SegmentCount, &index.IndexType); err != nil {
 			return err
 		}
 		name, err := interBaseRequiredName(nameValue, "index name")
@@ -102,8 +102,10 @@ ORDER BY s.RDB$INDEX_NAME, s.RDB$FIELD_POSITION`,
 	}
 	descriptions := db.indexDescriptions(indexes)
 	byDescription := make(map[string]*IndexDesc, len(descriptions))
+	byID := make(map[string]*IndexDesc, len(descriptions))
 	for _, description := range descriptions {
-		byDescription[description.Name] = description
+		byDescription[catalogCacheKey(description.Name)] = description
+		byID[interBaseByIDKey(ObjectKindIndex, description.Name)] = description
 	}
-	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Indexes: byDescription}}, Count: len(descriptions)}, nil
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Indexes: byDescription, IndexesByID: byID}}, Count: len(descriptions)}, nil
 }

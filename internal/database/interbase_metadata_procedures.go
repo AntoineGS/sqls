@@ -110,10 +110,12 @@ ORDER BY pp.RDB$PROCEDURE_NAME, pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`,
 	}
 	descriptions := db.procedureDescriptions(procedures)
 	byDescription := make(map[string]*ProcedureDesc, len(descriptions))
+	byID := make(map[string]*ProcedureDesc, len(descriptions))
 	for _, description := range descriptions {
-		byDescription[description.Name] = description
+		byDescription[catalogCacheKey(description.Name)] = description
+		byID[interBaseByIDKey(ObjectKindProcedure, description.Name)] = description
 	}
-	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Procedures: byDescription}}, Count: len(descriptions)}, nil
+	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Procedures: byDescription, ProceduresByID: byID}}, Count: len(descriptions)}, nil
 }
 
 func scanInterBaseProcedureParameter(rows *sql.Rows) (schema.ProcedureParameter, *schema.Domain, error) {

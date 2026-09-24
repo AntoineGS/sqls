@@ -95,6 +95,134 @@ func (dc *Cache) HasCatalog() bool {
 	return dc != nil && dc.Catalog != nil
 }
 
+// RebuildObjects rebuilds Objects from every entry currently in the *ByID
+// maps, using fold to normalize an unquoted name (see NewObjectIndex; a nil
+// fold uses the default upper-case convention). Call it after replacing any
+// one category's *ByID map so Objects reflects every kind loaded so far,
+// not just the category that just changed.
+func (cc *CatalogCache) RebuildObjects(fold func(string) string) {
+	if cc == nil {
+		return
+	}
+	idx := NewObjectIndex(fold)
+	for _, v := range cc.ViewsByID {
+		idx.Insert(ObjectID{Kind: ObjectKindView, Name: v.Name})
+	}
+	for _, v := range cc.ProceduresByID {
+		idx.Insert(ObjectID{Kind: ObjectKindProcedure, Name: v.Name})
+	}
+	for _, v := range cc.GeneratorsByID {
+		idx.Insert(ObjectID{Kind: ObjectKindGenerator, Name: v.Name})
+	}
+	for _, v := range cc.DomainsByID {
+		idx.Insert(ObjectID{Kind: ObjectKindDomain, Name: v.Name})
+	}
+	for _, v := range cc.FunctionsByID {
+		idx.Insert(ObjectID{Kind: ObjectKindFunction, Name: v.Name})
+	}
+	for _, v := range cc.IndexesByID {
+		idx.Insert(ObjectID{Kind: ObjectKindIndex, Name: v.Name})
+	}
+	for _, v := range cc.TriggersByID {
+		idx.Insert(ObjectID{Kind: ObjectKindTrigger, Name: v.Name})
+	}
+	cc.Objects = idx
+}
+
+// objectIDKeyFor builds the exact ObjectID.Key() a *ByID map entry for name
+// under kind is stored at. It exists so insertion (in engine adapters) and
+// lookup (here and in consumers) always derive the same key from the same
+// inputs.
+func objectIDKeyFor(kind ObjectKind, name string) string {
+	return ObjectID{Kind: kind, Name: name}.Key()
+}
+
+// ViewByID, ProcedureByID, GeneratorByID, DomainByID, FunctionByID,
+// IndexByID and TriggerByID resolve a catalog object by its exact name,
+// never subject to the upper-casing collision the corresponding legacy
+// accessor (View, Procedure, ...) has. They return false when the category
+// has not published yet, or genuinely has no such exact object.
+func (dc *Cache) ViewByID(name string) (*ViewDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.ViewsByID[objectIDKeyFor(ObjectKindView, name)]
+	return v, ok
+}
+
+func (dc *Cache) ProcedureByID(name string) (*ProcedureDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.ProceduresByID[objectIDKeyFor(ObjectKindProcedure, name)]
+	return v, ok
+}
+
+func (dc *Cache) GeneratorByID(name string) (*GeneratorDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.GeneratorsByID[objectIDKeyFor(ObjectKindGenerator, name)]
+	return v, ok
+}
+
+func (dc *Cache) DomainByID(name string) (*DomainDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.DomainsByID[objectIDKeyFor(ObjectKindDomain, name)]
+	return v, ok
+}
+
+func (dc *Cache) FunctionByID(name string) (*FunctionDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.FunctionsByID[objectIDKeyFor(ObjectKindFunction, name)]
+	return v, ok
+}
+
+func (dc *Cache) IndexByID(name string) (*IndexDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.IndexesByID[objectIDKeyFor(ObjectKindIndex, name)]
+	return v, ok
+}
+
+func (dc *Cache) TriggerByID(name string) (*TriggerDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.TriggersByID[objectIDKeyFor(ObjectKindTrigger, name)]
+	return v, ok
+}
+
+// ResolveObjectName resolves want (an exact or unquoted name) against
+// Objects for kind. An exact identity match (Kind, want) is returned
+// unconditionally, even if it also happens to fold-collide with another
+// object: exact identity is never weaker than the unquoted fallback.
+// Otherwise a unique folded match resolves; zero matches reports !found,
+// and more than one match is returned so the caller can report the
+// ambiguity explicitly instead of picking one arbitrarily.
+func (dc *Cache) ResolveObjectName(kind ObjectKind, want string) (name string, found bool, ambiguous []ObjectID) {
+	if !dc.HasCatalog() || dc.Catalog.Objects == nil {
+		return "", false, nil
+	}
+	if id, ok := dc.Catalog.Objects.Lookup(ObjectID{Kind: kind, Name: want}); ok {
+		return id.Name, true, nil
+	}
+	matches := dc.Catalog.Objects.LookupUnquoted(kind, want)
+	switch len(matches) {
+	case 0:
+		return "", false, nil
+	case 1:
+		return matches[0].Name, true, nil
+	default:
+		return "", false, matches
+	}
+}
+
 func (dc *Cache) View(name string) (*ViewDesc, bool) {
 	if !dc.HasCatalog() {
 		return nil, false

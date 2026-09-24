@@ -22,6 +22,51 @@ type ColumnDesc struct {
 	Key     string
 	Default sql.NullString
 	Extra   string
+	// Facts retains the native scalar facts behind Type so a caller can
+	// re-render it for a different SQL dialect without a second catalog
+	// read. Nil when the source engine has no dialect-sensitive rendering
+	// (or has not been updated to populate it).
+	Facts *ColumnTypeFacts
+}
+
+// ColumnTypeFacts is the raw, engine-native projection a dialect-aware
+// renderer needs to reproduce Type (or a domain/parameter's type) for a
+// specific SQL dialect without re-querying the database. Its fields follow
+// InterBase's RDB$FIELDS projection; other engines leave it nil. Display
+// labels are derived from these facts, never the reverse: a rendered string
+// is never parsed back into one of these fields.
+type ColumnTypeFacts struct {
+	FieldType        sql.NullInt64
+	FieldSubType     sql.NullInt64
+	FieldScale       sql.NullInt64
+	FieldPrecision   sql.NullInt64
+	FieldLength      sql.NullInt64
+	CharacterLength  sql.NullInt64
+	CharacterSetID   sql.NullInt64
+	CharacterSetName sql.NullString
+	CollationID      sql.NullInt64
+	CollationName    sql.NullString
+	Dimensions       sql.NullInt64
+	// DomainName is the resolved field-source/domain identifier, valid
+	// whenever the column or parameter resolved to an RDB$FIELDS row.
+	DomainName sql.NullString
+	// UserDomain reports whether Type refers to a shared, user-declared
+	// domain (rendered as a bare domain-name reference) rather than an
+	// inline type declaration.
+	UserDomain bool
+	// SystemDomain reports whether the resolved domain is system-generated
+	// (RDB$FIELDS.RDB$SYSTEM_FLAG <> 0), which excludes it from DDL that
+	// regenerates user domains.
+	SystemDomain bool
+	// ComputedSource, ValidationSource and DomainDefault are the domain's
+	// own COMPUTED BY, CHECK and DEFAULT sources, verbatim.
+	ComputedSource   sql.NullString
+	ValidationSource sql.NullString
+	DomainDefault    sql.NullString
+	// ColumnCollationID/ColumnCollationName are the column's own collation
+	// override, distinct from the domain's collation.
+	ColumnCollationID   sql.NullInt64
+	ColumnCollationName sql.NullString
 }
 
 func (cd *ColumnDesc) OnelineDesc() string {
@@ -125,6 +170,8 @@ type ProcedureParameterDesc struct {
 	Domain      string       // user domain name; "" for an inline type
 	Nullable    sql.NullBool // invalid when the catalog cannot determine it
 	Description sql.NullString
+	// Facts retains the native facts behind Type; see ColumnDesc.Facts.
+	Facts *ColumnTypeFacts
 }
 
 // TriggerDesc describes a DML or database trigger.
@@ -137,6 +184,11 @@ type TriggerDesc struct {
 	Active       sql.NullBool
 	Source       sql.NullString
 	Description  sql.NullString
+	// TypeCode is the raw RDB$TRIGGER_TYPE code Event was decoded from. DDL
+	// regeneration needs the code itself, not the decoded label: multi-event
+	// triggers are valid catalog metadata but invalid CREATE TRIGGER DDL,
+	// and only the raw code lets a renderer detect that case.
+	TypeCode sql.NullInt64
 }
 
 // DomainDesc describes a user domain.
@@ -150,6 +202,8 @@ type DomainDesc struct {
 	CharacterSetName sql.NullString
 	CollationName    sql.NullString
 	Description      sql.NullString
+	// Facts retains the native facts behind Type; see ColumnDesc.Facts.
+	Facts *ColumnTypeFacts
 }
 
 // IndexDesc describes an index and its ordered segments.
@@ -163,6 +217,9 @@ type IndexDesc struct {
 	Active         sql.NullBool
 	ConstraintName sql.NullString // owning constraint; invalid when standalone
 	Description    sql.NullString
+	// Direction is the raw RDB$INDEX_TYPE code (0 ascending, 1 descending).
+	// DDL regeneration needs the code, not just Unique/Active.
+	Direction sql.NullInt64
 }
 
 // FunctionDesc describes an external function (UDF) declaration.
@@ -185,8 +242,23 @@ type FunctionArgumentDesc struct {
 }
 
 // CatalogCache holds extended catalog objects. A nil *CatalogCache means the
-// active repository does not implement CatalogRepository. All maps are keyed by
-// the upper-cased object name.
+// active repository does not implement CatalogRepository. The Views,
+// Procedures, Generators, Domains, Functions, Indexes and Triggers maps are
+// keyed by the upper-cased object name: two exact-identity objects of the
+// same kind that fold to the same upper-cased name (for example a
+// quoted-mixed-case name alongside its all-upper-case counterpart) silently
+// collapse to one entry in these legacy maps. Existing consumers rely on
+// that shape and are unaffected by the fields below.
+//
+// The *ByID maps and Objects preserve every object's exact identity
+// alongside those legacy maps, keyed by catalog.ObjectID.Key() instead of an
+// upper-cased name, so a caller that already has (or resolves) an exact
+// ObjectID never risks that collision. Objects additionally exposes
+// dialect-aware unquoted lookup across all kinds, reporting an ambiguous
+// unquoted name explicitly rather than picking one object arbitrarily. A nil
+// Objects/*ByID map (an old caller's CatalogCache literal, or a category
+// that has not published yet) means no exact-identity data is available yet,
+// not that no objects exist.
 type CatalogCache struct {
 	Views           map[string]*ViewDesc
 	Procedures      map[string]*ProcedureDesc
@@ -197,6 +269,15 @@ type CatalogCache struct {
 	IndexesByTable  map[string][]*IndexDesc
 	Triggers        map[string]*TriggerDesc
 	TriggersByTable map[string][]*TriggerDesc
+
+	Objects        *ObjectIndex
+	ViewsByID      map[string]*ViewDesc
+	ProceduresByID map[string]*ProcedureDesc
+	GeneratorsByID map[string]*GeneratorDesc
+	DomainsByID    map[string]*DomainDesc
+	FunctionsByID  map[string]*FunctionDesc
+	IndexesByID    map[string]*IndexDesc
+	TriggersByID   map[string]*TriggerDesc
 }
 
 // ColumnDatabaseKey normalises a schema/table pair for column cache lookup.
