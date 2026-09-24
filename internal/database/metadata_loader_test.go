@@ -409,34 +409,48 @@ func emptyMetadataFragment(kind MetadataKind) *DBCache {
 	return fragment
 }
 
+type observedWaitContext struct {
+	context.Context
+	observed chan struct{}
+	once     sync.Once
+}
+
+func (c *observedWaitContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.observed) })
+	return c.Context.Done()
+}
+
 func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.T) {
 	loader := NewMetadataLoader()
 	resources := &drainResourceCounts{}
 	db := sql.OpenDB(drainConnector{driver: drainDriver{counts: resources}})
 	db.SetMaxOpenConns(3)
 	t.Cleanup(func() { _ = db.Close() })
-	var latestGate chan struct{}
+	var releaseLatestGate func()
 	t.Cleanup(func() {
-		if latestGate != nil {
-			close(latestGate)
+		if releaseLatestGate != nil {
+			releaseLatestGate()
 		}
 		loader.Stop()
 		_ = loader.Wait(context.Background())
 	})
 	var active, peak atomic.Int32
 	var last *MetadataLoad
-	var previousGate chan struct{}
+	var releasePreviousGate func()
 	kinds := []MetadataKind{MetadataViews, MetadataProcedures, MetadataDomains}
 	for generation := uint64(1); generation <= 100; generation++ {
 		loader.Reset(generation)
-		if previousGate != nil {
-			close(previousGate) // drain the superseded generation only after its work entered
+		if releasePreviousGate != nil {
+			releasePreviousGate() // drain the superseded generation only after its work entered
+			releasePreviousGate = nil
 			if err := loader.Wait(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 		}
 		gate := make(chan struct{})
-		latestGate = gate
+		var releaseOnce sync.Once
+		releaseGate := func() { releaseOnce.Do(func() { close(gate) }) }
+		releaseLatestGate = releaseGate
 		entered := make(chan struct{}, len(kinds))
 		gen := generation
 		plan := MetadataPlan{Parallelism: len(kinds)}
@@ -497,7 +511,7 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 		if got := active.Load(); got != int32(len(kinds)) {
 			t.Fatalf("generation %d active queries = %d, want %d", generation, got, len(kinds))
 		}
-		previousGate = gate
+		releasePreviousGate = releaseGate
 	}
 	loader.Stop() // generation 100's three real transactions/rows remain gated
 	waitLoad(t, last)
@@ -507,10 +521,34 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 	if cache := loader.Cache(); cache.HasCatalog() && (len(cache.Catalog.Views) != 0 || len(cache.Catalog.Procedures) != 0 || len(cache.Catalog.Domains) != 0) {
 		t.Fatalf("stopped current generation retained stale catalog: %+v", cache.Catalog)
 	}
-	close(latestGate)
-	latestGate = nil
+	waitDone := make(chan error, 1)
+	waitObserving := make(chan struct{})
+	waitCtx := &observedWaitContext{Context: context.Background(), observed: waitObserving}
+	go func() {
+		waitDone <- loader.Wait(waitCtx)
+	}()
+	select {
+	case <-waitObserving: // Wait evaluated its cancellation channel and is in its blocking select.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not reach its blocking select")
+	}
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned before gated generation drained: %v", err)
+	default:
+	}
+	releaseLatestGate()
+	releaseLatestGate = nil
 	if err := loader.Wait(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("Wait started while gated returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after gated generation drained")
 	}
 	if snapshot := loader.Snapshot(); snapshot.Generation != 100 {
 		t.Fatalf("current generation = %d, want 100", snapshot.Generation)
