@@ -32,24 +32,34 @@ type documentDiagnosticsSnapshot struct {
 	variant         dialect.DriverVariant
 	generation      int
 	cache           *database.DBCache
-	cacheSnapshot   sqlsymbol.Catalog
+	cacheSnapshot   sqlsymbol.SemanticCatalog
 	dialectResolved bool
 }
 
 type diagnosticCatalog struct {
-	columns map[string][]sqlsymbol.ColumnType
-	keys    map[string][][]string
+	keys map[string][][]string
+
+	relations       map[string]sqlsymbol.RelationFact
+	relationsKnown  bool
+	procedures      map[string]sqlsymbol.ProcedureFact
+	proceduresKnown bool
+	domains         map[string]sqlsymbol.DomainFact
+	domainsKnown    bool
 }
 
+// Columns preserves its pre-SemanticCatalog contract: a table is reported
+// only once its relation existence and its complete column list are both
+// known, which RelationInfo's Present+ColumnsKnown combination captures.
 func (c *diagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnType, bool) {
-	if c == nil {
+	fact, knowledge := c.RelationInfo(table)
+	if knowledge != sqlsymbol.Present || !fact.ColumnsKnown {
 		return nil, false
 	}
-	columns, ok := c.columns[table.Key()]
-	if !ok {
-		return nil, false
+	columns := make([]sqlsymbol.ColumnType, len(fact.Columns))
+	for i, column := range fact.Columns {
+		columns[i] = sqlsymbol.ColumnType{Name: column.Name, Type: column.Type}
 	}
-	return append([]sqlsymbol.ColumnType(nil), columns...), true
+	return columns, true
 }
 
 func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) {
@@ -66,31 +76,33 @@ func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) 
 
 // snapshotDiagnosticCatalog copies the cache metadata used by analysis. The
 // DBCache is copy-on-write, but copying names, types, and their available order
-// keeps this analysis independent of subsequent metadata publications.
-func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
+// keeps this analysis independent of subsequent metadata publications. Each
+// fact category is copied as soon as its own metadata is ready; the whole
+// cache no longer needs to be columns-ready before a snapshot exists.
+func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.SemanticCatalog {
 	if cache == nil {
 		return nil
 	}
 	catalog := &diagnosticCatalog{
-		columns: make(map[string][]sqlsymbol.ColumnType),
-		keys:    make(map[string][][]string),
+		keys:            make(map[string][][]string),
+		relations:       buildDiagnosticRelations(cache),
+		relationsKnown:  relationsNamespaceReady(cache),
+		procedures:      buildDiagnosticProcedures(cache),
+		proceduresKnown: cache.HasCatalog() && cache.MetadataReady(database.MetadataProcedures),
+		domains:         buildDiagnosticDomains(cache),
+		domainsKnown:    cache.HasCatalog() && cache.MetadataReady(database.MetadataDomains),
 	}
-	for _, table := range cache.SortedTables() {
-		descriptions, ok := cache.ColumnDescs(table)
-		if !ok {
+	// Catalog metadata preserves the database's actual spelling. Quoted
+	// names therefore match exactly; unquoted InterBase names naturally
+	// match the upper-case names returned by its catalog.
+	for table, fact := range catalog.relations {
+		if !fact.ColumnsKnown {
 			continue
 		}
-		columns := make([]sqlsymbol.ColumnType, 0, len(descriptions))
-		for _, description := range descriptions {
-			if description == nil {
-				continue
-			}
-			columns = append(columns, sqlsymbol.ColumnType{Name: description.Name, Type: description.Type})
+		columns := make([]sqlsymbol.ColumnType, len(fact.Columns))
+		for i, column := range fact.Columns {
+			columns[i] = sqlsymbol.ColumnType{Name: column.Name, Type: column.Type}
 		}
-		// Catalog metadata preserves the database's actual spelling. Quoted
-		// names therefore match exactly; unquoted InterBase names naturally
-		// match the upper-case names returned by its catalog.
-		catalog.columns[table] = columns
 		if keys, known := diagnosticUniqueKeys(cache, table, columns); known {
 			catalog.keys[table] = keys
 		}
@@ -168,8 +180,12 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 	return snapshot, true
 }
 
+// CacheReadyForDiagnostics gates catalog construction on the connection's
+// dialect alone. Each fact category's own readiness (see snapshotDiagnosticCatalog)
+// decides what a particular lookup can prove; the whole cache no longer needs
+// to be columns-ready before the adapter exists.
 func (snapshot documentDiagnosticsSnapshot) CacheReadyForDiagnostics() bool {
-	return snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase && snapshot.cache.ColumnsReady()
+	return snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase
 }
 
 func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot) bool {
@@ -347,7 +363,7 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 // diagnosticCatalogFor memoizes the immutable diagnostic projection for the
 // current copy-on-write cache. Metadata status-only revisions retain the same
 // cache pointer; data changes publish a new one and replace this single entry.
-func (s *Server) diagnosticCatalogFor(cache *database.DBCache) sqlsymbol.Catalog {
+func (s *Server) diagnosticCatalogFor(cache *database.DBCache) sqlsymbol.SemanticCatalog {
 	s.diagnosticCatalogMu.Lock()
 	defer s.diagnosticCatalogMu.Unlock()
 	if cache == nil {

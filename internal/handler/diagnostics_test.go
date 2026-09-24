@@ -19,7 +19,7 @@ import (
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
-func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T) {
+func TestDiagnosticsSnapshotBuildsCatalogBeforeColumnsReady(t *testing.T) {
 	s := NewServer()
 	defer s.Stop()
 	s.stateMu.Lock()
@@ -28,18 +28,26 @@ func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T)
 	s.files["file:///catalog.sql"] = &File{Text: "SELECT * FROM T"}
 	s.stateMu.Unlock()
 	s.metadata.Reset(1)
-	before, ok := s.diagnosticsSnapshot("file:///catalog.sql")
+	cache := s.metadata.Cache()
+	cache.SchemaTables = map[string][]string{"": {"T"}}
+	cache.Metadata[database.MetadataRelations] = database.MetadataReady
+
+	// The relation adapter is available immediately, without waiting for the
+	// whole cache to become columns-ready: the all-or-nothing gate applied to
+	// construction only, not to per-relation column knowledge.
+	snapshot, ok := s.diagnosticsSnapshot("file:///catalog.sql")
 	if !ok {
 		t.Fatal("snapshot missing for open document")
 	}
-	if before.cacheSnapshot != nil {
-		t.Fatalf("catalog built before columns ready: %#v", before.cacheSnapshot)
+	if snapshot.cacheSnapshot == nil {
+		t.Fatal("catalog was not built before columns became ready")
 	}
-	cache := s.metadata.Cache()
-	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
-	after, ok := s.diagnosticsSnapshot("file:///catalog.sql")
-	if !ok || after.cacheSnapshot == nil {
-		t.Fatal("catalog was not captured after ColumnsReady became true")
+	fact, knowledge := snapshot.cacheSnapshot.RelationInfo(sqlsymbol.Name{Text: "T"})
+	if knowledge != sqlsymbol.Present {
+		t.Fatalf("knowledge = %v, want Present for a relation known before columns are ready", knowledge)
+	}
+	if fact.ColumnsKnown {
+		t.Fatal("fact.ColumnsKnown = true, want false before columns are ready")
 	}
 }
 

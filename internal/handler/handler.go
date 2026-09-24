@@ -47,7 +47,7 @@ type Server struct {
 	diagnosticsPublishMu sync.Mutex
 	diagnosticCatalogMu  sync.Mutex
 	diagnosticCache      *database.DBCache
-	derivedCatalog       sqlsymbol.Catalog
+	derivedCatalog       sqlsymbol.SemanticCatalog
 	diagnosticWorkMu     sync.Mutex
 	diagnosticDocuments  map[string]struct{}
 	diagnosticAllOpen    bool
