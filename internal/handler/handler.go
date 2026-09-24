@@ -69,25 +69,28 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration   int
-	lifecycleCtx     context.Context
-	lifecycleCancel  context.CancelFunc
-	coordinator      *connectionCoordinator
-	metadata         *database.MetadataLoader
-	initialized      bool
-	connectionState  connectionState
-	metadataStartErr error
-	openConnection   database.ContextOpener
-	activeConfigKey  string
-	cleanupOnce      sync.Once
-	cleanupDone      chan struct{}
-	cleanupQueue     chan *database.DBConnection
-	cleanupFinal     chan *database.DBConnection
-	diagnosticsWake  chan struct{}
-	diagnosticsDone  chan struct{}
-	stopOnce         sync.Once
-	fileRevision     uint64
-	notificationConn *jsonrpc2.Conn
+	connGeneration       int
+	lifecycleCtx         context.Context
+	lifecycleCancel      context.CancelFunc
+	coordinator          *connectionCoordinator
+	metadata             *database.MetadataLoader
+	initialized          bool
+	connectionState      connectionState
+	metadataStartErr     error
+	workDoneProgress     bool
+	metadataWake         chan struct{}
+	metadataReporterDone chan struct{}
+	openConnection       database.ContextOpener
+	activeConfigKey      string
+	cleanupOnce          sync.Once
+	cleanupDone          chan struct{}
+	cleanupQueue         chan *database.DBConnection
+	cleanupFinal         chan *database.DBConnection
+	diagnosticsWake      chan struct{}
+	diagnosticsDone      chan struct{}
+	stopOnce             sync.Once
+	fileRevision         uint64
+	notificationConn     *jsonrpc2.Conn
 
 	// ddlMemo caches the rendered DDL appendix per connection generation.
 	// Hover fires on every cursor rest over the same token; without this,
@@ -115,27 +118,31 @@ func NewServer() *Server {
 	lifecycleCtx, lifecycleCancel := context.WithCancel(context.Background())
 
 	server := &Server{
-		files:               make(map[string]*File),
-		ddlMemo:             make(map[ddlKey]string),
-		cancels:             newCancelRegistry(),
-		lifecycleCtx:        lifecycleCtx,
-		lifecycleCancel:     lifecycleCancel,
-		metadata:            database.NewMetadataLoader(),
-		connectionState:     connectionIdle,
-		openConnection:      database.OpenContext,
-		cleanupDone:         make(chan struct{}),
-		cleanupQueue:        make(chan *database.DBConnection, 2),
-		cleanupFinal:        make(chan *database.DBConnection, 1),
-		diagnosticsWake:     make(chan struct{}, 1),
-		diagnosticsDone:     make(chan struct{}),
-		diagnosticDocuments: make(map[string]struct{}),
+		files:                make(map[string]*File),
+		ddlMemo:              make(map[ddlKey]string),
+		cancels:              newCancelRegistry(),
+		lifecycleCtx:         lifecycleCtx,
+		lifecycleCancel:      lifecycleCancel,
+		metadata:             database.NewMetadataLoader(),
+		connectionState:      connectionIdle,
+		openConnection:       database.OpenContext,
+		cleanupDone:          make(chan struct{}),
+		cleanupQueue:         make(chan *database.DBConnection, 2),
+		cleanupFinal:         make(chan *database.DBConnection, 1),
+		diagnosticsWake:      make(chan struct{}, 1),
+		diagnosticsDone:      make(chan struct{}),
+		metadataWake:         make(chan struct{}, 1),
+		metadataReporterDone: make(chan struct{}),
+		diagnosticDocuments:  make(map[string]struct{}),
 	}
 	server.metadata.SetChangedCallback(func() {
+		server.signalMetadata()
 		server.queueAllDiagnostics()
 	})
 	server.coordinator = newConnectionCoordinator(server)
 	go server.cleanupConnections()
 	go server.runDiagnosticSignals()
+	go server.runMetadataReporter()
 	// Deliberately no filesystem access here: NewServer runs in every test in
 	// this package, and touching the real cache directory from a unit test is
 	// the hazard the injected root exists to remove. The root is only resolved,
@@ -181,6 +188,7 @@ func (s *Server) Stop() error {
 		dbConn := s.dbConn
 		s.dbConn = nil
 		s.stateMu.Unlock()
+		s.signalMetadata()
 		s.cleanupFinal <- dbConn
 		go func() { <-s.coordinator.done; close(s.cleanupQueue) }()
 	})
@@ -289,13 +297,14 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 			ExecuteCommandProvider: &lsp.ExecuteCommandOptions{Commands: []string{
 				CommandExecuteQuery, CommandExplainQuery, CommandGetQueryParameters,
 				CommandShowDatabases, CommandShowSchemas, CommandShowConnections,
-				CommandSwitchDatabase, CommandSwitchConnection, CommandShowTables,
+				CommandSwitchDatabase, CommandSwitchConnection, CommandShowTables, CommandShowMetadataStatus,
 			}},
 		},
 	}
 
 	s.stateMu.Lock()
 	s.initOptionDBConfig = params.InitializationOptions.ConnectionConfig
+	s.workDoneProgress = params.Capabilities.Window.WorkDoneProgress
 	s.stateMu.Unlock()
 
 	// No attachment, metadata, or client messaging is permitted on initialize's
@@ -498,6 +507,8 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	initialized := s.initialized
 	connected := s.dbConn != nil
 	s.stateMu.Unlock()
+	s.signalMetadata()
+	s.signalMetadata()
 	if initialized && !connected {
 		cfg, index, dbName := s.desiredConnection()
 		s.coordinator.Request(s.lifecycleCtx, cfg, index, dbName)
@@ -568,6 +579,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 		s.stateMu.Lock()
 		s.connectionState = connectionIdle
 		s.stateMu.Unlock()
+		s.signalMetadata()
 		return ErrNoConnection
 	}
 	// A queued intent cannot alter the active generation until it owns the
@@ -603,6 +615,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.metadata.Reset(uint64(generation))
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
+	s.signalMetadata()
 	_ = s.enqueueDetachedConnection(old)
 	s.queueAllDiagnostics()
 	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))
@@ -616,6 +629,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 			}
 		}
 		s.stateMu.Unlock()
+		s.signalMetadata()
 		return err
 	}
 	if ctx.Err() != nil || intent.Context.Err() != nil || s.lifecycleCtx.Err() != nil {
@@ -625,6 +639,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 			s.connectionState = connectionIdle
 		}
 		s.stateMu.Unlock()
+		s.signalMetadata()
 		return context.Canceled
 	}
 	s.diagnosticsPublishMu.Lock()
@@ -643,6 +658,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.activeConfigKey = intentKey(intent)
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
+	s.signalMetadata()
 	repo, err := database.CreateRepositoryFromConnection(intent.Config.Driver, candidate)
 	if err == nil {
 		_, err = s.metadata.Start(s.lifecycleCtx, uint64(generation), repo)
@@ -656,6 +672,7 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 			s.metadataStartErr = err
 		}
 		s.stateMu.Unlock()
+		s.signalMetadata()
 		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
 	}
 	s.queueAllDiagnostics()

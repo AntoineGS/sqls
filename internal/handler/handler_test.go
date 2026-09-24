@@ -183,7 +183,7 @@ func TestInitialized(t *testing.T) {
 			ExecuteCommandProvider: &lsp.ExecuteCommandOptions{Commands: []string{
 				CommandExecuteQuery, CommandExplainQuery, CommandGetQueryParameters,
 				CommandShowDatabases, CommandShowSchemas, CommandShowConnections,
-				CommandSwitchDatabase, CommandSwitchConnection, CommandShowTables,
+				CommandSwitchDatabase, CommandSwitchConnection, CommandShowTables, CommandShowMetadataStatus,
 			}},
 		},
 	}

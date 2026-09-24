@@ -24,6 +24,11 @@ type InitializeOptions struct {
 }
 
 type ClientCapabilities struct {
+	Window WindowClientCapabilities `json:"window,omitempty"`
+}
+
+type WindowClientCapabilities struct {
+	WorkDoneProgress bool `json:"workDoneProgress,omitempty"`
 }
 
 type InitializeResult struct {

@@ -24,14 +24,15 @@ import (
 )
 
 const (
-	CommandExecuteQuery     = "executeQuery"
-	CommandShowDatabases    = "showDatabases"
-	CommandShowSchemas      = "showSchemas"
-	CommandShowConnections  = "showConnections"
-	CommandSwitchDatabase   = "switchDatabase"
-	CommandSwitchConnection = "switchConnections"
-	CommandShowTables       = "showTables"
-	CommandExplainQuery     = "explainQuery"
+	CommandExecuteQuery       = "executeQuery"
+	CommandShowDatabases      = "showDatabases"
+	CommandShowSchemas        = "showSchemas"
+	CommandShowConnections    = "showConnections"
+	CommandSwitchDatabase     = "switchDatabase"
+	CommandSwitchConnection   = "switchConnections"
+	CommandShowTables         = "showTables"
+	CommandExplainQuery       = "explainQuery"
+	CommandShowMetadataStatus = "sqls.showMetadataStatus"
 )
 
 const lateCancellationNote = "Note: the cancellation request arrived after the statement completed; the result\nbelow is the real result.\n\n"
@@ -157,6 +158,8 @@ func (s *Server) dispatchCommand(ctx context.Context, params lsp.ExecuteCommandP
 	switch params.Command {
 	case CommandExecuteQuery:
 		return s.executeQuery(ctx, params)
+	case CommandShowMetadataStatus:
+		return s.showMetadataStatus(ctx, params)
 	case CommandShowDatabases:
 		return s.showDatabases(ctx, params)
 	case CommandShowSchemas:
