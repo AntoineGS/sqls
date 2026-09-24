@@ -49,12 +49,16 @@ type MetadataStatus struct {
 	Err          error // internal only
 }
 
-// MetadataSnapshot is an immutable view of one metadata generation.
+// MetadataSnapshot is an immutable view of one metadata generation. Stale
+// reports that the store was explicitly Invalidate()d: Cache and Status still
+// reflect the last known generation, but detail reads must not trust them
+// until a Refresh publishes a new generation with Stale false again.
 type MetadataSnapshot struct {
 	Generation  uint64
 	Revision    uint64
 	Started     bool
 	StartFailed bool
+	Stale       bool
 	Cache       *Cache
 	Status      map[MetadataKind]MetadataStatus
 }

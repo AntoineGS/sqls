@@ -15,6 +15,12 @@ import (
 // Provider is a deterministic metadata.Provider fixture. Its relations job
 // increments Calls exactly once per execution, signals Entered once, then
 // waits on Gate (if non-nil) before returning Cache or Failure.
+//
+// Its DetailPlan requires the relations category and uses the requested
+// object's exact key plus facet as Coverage. Its Load increments DetailCalls
+// exactly once per real execution (never for a Render or a cache hit),
+// signals DetailEntered once, then waits on DetailGate (if non-nil) before
+// returning DetailValue or DetailFailure.
 type Provider struct {
 	Calls   atomic.Int64
 	Closes  atomic.Int64
@@ -23,15 +29,23 @@ type Provider struct {
 	Cache   *catalog.Cache
 	Failure error
 
-	enteredOnce sync.Once
+	DetailCalls   atomic.Int64
+	DetailEntered chan struct{}
+	DetailGate    <-chan struct{}
+	DetailValue   metadata.Detail
+	DetailFailure error
+
+	enteredOnce       sync.Once
+	detailEnteredOnce sync.Once
 }
 
-// New returns a Provider seeded with one "T" relation and an open Entered
-// channel.
+// New returns a Provider seeded with one "T" relation and open Entered/
+// DetailEntered channels.
 func New() *Provider {
 	return &Provider{
-		Entered: make(chan struct{}),
-		Cache:   &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}},
+		Entered:       make(chan struct{}),
+		DetailEntered: make(chan struct{}),
+		Cache:         &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}},
 	}
 }
 
@@ -60,10 +74,31 @@ func (p *Provider) runRelations(ctx context.Context, _ *catalog.Cache) (catalog.
 	return catalog.MetadataPatch{Cache: p.Cache, Count: len(p.Cache.SchemaTables[""])}, nil
 }
 
-// DetailPlan always reports metadata.ErrUnsupported; task A4 extends this
-// fixture with configurable detail behavior.
-func (p *Provider) DetailPlan(metadata.Request) (metadata.DetailPlan, error) {
-	return metadata.DetailPlan{}, metadata.ErrUnsupported
+// DetailPlan requires the relations category and uses the object's exact key
+// plus facet as Coverage, so two requests for the same object/facet always
+// join the same load regardless of Dialect or Consistency.
+func (p *Provider) DetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
+	coverage := req.Object.Key() + "\x00" + req.Facet
+	return metadata.DetailPlan{
+		Requires: []catalog.MetadataKind{catalog.MetadataRelations},
+		Coverage: coverage,
+		Load:     p.loadDetail,
+	}, nil
+}
+
+func (p *Provider) loadDetail(ctx context.Context, _ *catalog.Cache) (metadata.Detail, error) {
+	p.DetailCalls.Add(1)
+	p.detailEnteredOnce.Do(func() { close(p.DetailEntered) })
+	if p.DetailGate != nil {
+		select {
+		case <-p.DetailGate:
+		case <-ctx.Done():
+		}
+	}
+	if p.DetailFailure != nil {
+		return metadata.Detail{}, p.DetailFailure
+	}
+	return p.DetailValue, nil
 }
 
 // Close increments Closes and always succeeds.

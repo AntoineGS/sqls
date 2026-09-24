@@ -99,7 +99,7 @@ func waitLoad(t *testing.T, load *Load) {
 }
 
 func TestMetadataLoaderSiblingSurvivesFailure(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	repo := metadataRepo(catalog.MetadataPlan{Parallelism: 2, Jobs: []catalog.MetadataJob{
@@ -127,7 +127,7 @@ func TestMetadataLoaderSiblingSurvivesFailure(t *testing.T) {
 }
 
 func TestMetadataLoaderMarkStartFailedIsTerminalAndGenerationFenced(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(3)
 	before := loader.Snapshot()
@@ -159,7 +159,7 @@ func TestMetadataLoaderMarkStartFailedIsTerminalAndGenerationFenced(t *testing.T
 }
 
 func TestMetadataLoaderContainsPanicsAndBlocksDependents(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	repo := metadataRepo(catalog.MetadataPlan{Parallelism: 3, Jobs: []catalog.MetadataJob{
@@ -215,7 +215,7 @@ func TestMetadataLoaderRejectsInvalidPlansBeforeRunning(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			loader := NewLoader()
+			loader := NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
 			var runs atomic.Int32
@@ -240,7 +240,7 @@ func TestMetadataLoaderRejectsInvalidPlansBeforeRunning(t *testing.T) {
 }
 
 func TestMetadataLoaderResetKeepsGlobalNativeLimit(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	gate := make(chan struct{})
 	var release sync.Once
@@ -306,7 +306,7 @@ func TestMetadataLoaderResetKeepsGlobalNativeLimit(t *testing.T) {
 }
 
 func TestMetadataLoaderWaitTracksDrainAndContext(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	gate := make(chan struct{})
 	started := make(chan struct{})
 	loader.Reset(1)
@@ -333,7 +333,7 @@ func TestMetadataLoaderWaitTracksDrainAndContext(t *testing.T) {
 }
 
 func TestMetadataLoaderCancellationSettlesBeforeRunDrains(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	gate := make(chan struct{})
 	started := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
@@ -371,7 +371,7 @@ func TestMetadataLoaderFailureIsIsolatedForEveryJobKind(t *testing.T) {
 	kinds := []catalog.MetadataKind{catalog.MetadataSchemas, catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataColumnsAll, catalog.MetadataPrimaryKeys, catalog.MetadataForeignKeys, catalog.MetadataViews, catalog.MetadataProcedures, catalog.MetadataGenerators, catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers}
 	for _, failedKind := range kinds {
 		t.Run(string(failedKind), func(t *testing.T) {
-			loader := NewLoader()
+			loader := NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
 			jobs := make([]catalog.MetadataJob, 0, len(kinds))
@@ -445,7 +445,7 @@ func (c *observedWaitContext) Done() <-chan struct{} {
 }
 
 func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	resources := &drainResourceCounts{}
 	db := sql.OpenDB(drainConnector{driver: drainDriver{counts: resources}})
 	db.SetMaxOpenConns(3)
@@ -598,7 +598,7 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 }
 
 func TestMetadataLoaderStatusOnlyChangesRetainCachePointer(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	changed := make(chan struct{}, 8)
@@ -636,7 +636,7 @@ func TestMetadataLoaderStatusOnlyChangesRetainCachePointer(t *testing.T) {
 }
 
 func TestMetadataLoaderGenerationAndStartErrors(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	if _, err := loader.Start(context.Background(), 0, metadataRepo(catalog.MetadataPlan{})); !errors.Is(err, ErrMetadataStaleGeneration) {
 		t.Fatalf("initial Start error = %v", err)
@@ -658,7 +658,7 @@ func TestMetadataLoaderGenerationAndStartErrors(t *testing.T) {
 }
 
 func TestMetadataLoaderAdmissionRejectsResetGeneration(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	loader.Reset(1)
 	oldCache := loader.Cache()
 	loader.mu.Lock()
@@ -687,11 +687,12 @@ func TestMetadataLoaderAdmissionRejectsResetGeneration(t *testing.T) {
 }
 
 func TestMetadataLoaderRejectedOldGenerationSlotWakesWaitingGeneration(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	for i := 0; i < cap(loader.semaphore); i++ {
 		loader.semaphore <- struct{}{}
+		loader.hostSemaphore <- struct{}{}
 	}
 	loader.Reset(2)
 
@@ -722,7 +723,7 @@ func TestMetadataLoaderRejectedOldGenerationSlotWakesWaitingGeneration(t *testin
 }
 
 func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
 	var releaseOnce sync.Once
@@ -768,7 +769,7 @@ func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
 }
 
 func TestMetadataLoaderStopIsIdempotent(t *testing.T) {
-	loader := NewLoader()
+	loader := NewLoader(nil)
 	loader.Reset(1)
 	loader.Stop()
 	loader.Stop()

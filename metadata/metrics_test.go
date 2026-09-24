@@ -27,7 +27,7 @@ func TestMetadataMetrics(t *testing.T) {
 	})
 
 	t.Run("failed jobs retain query counts", func(t *testing.T) {
-		loader := NewLoader()
+		loader := NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		loader.Reset(1)
 		load, err := loader.Start(context.Background(), 1, catalog.MetadataPlan{
@@ -53,7 +53,7 @@ func TestMetadataMetrics(t *testing.T) {
 	})
 
 	t.Run("cancellation while queued has zero run duration", func(t *testing.T) {
-		loader := NewLoader()
+		loader := NewLoader(nil)
 		loader.Reset(1)
 		for i := 0; i < cap(loader.semaphore); i++ {
 			loader.semaphore <- struct{}{}
@@ -82,7 +82,7 @@ func TestMetadataMetrics(t *testing.T) {
 	})
 
 	t.Run("cancelled running job retains metrics after native call drains", func(t *testing.T) {
-		loader := NewLoader()
+		loader := NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		gate := make(chan struct{})
 		started := make(chan struct{})
@@ -123,7 +123,7 @@ func TestMetadataMetrics(t *testing.T) {
 	})
 
 	t.Run("admitted but never invoked job has no start timestamp", func(t *testing.T) {
-		loader := NewLoader()
+		loader := NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -152,7 +152,7 @@ func TestMetadataMetrics(t *testing.T) {
 	})
 
 	t.Run("superseded generation does not contribute to current summary", func(t *testing.T) {
-		loader := NewLoader()
+		loader := NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		gate := make(chan struct{})
 		loader.Reset(1)

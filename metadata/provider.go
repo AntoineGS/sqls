@@ -15,6 +15,7 @@ var (
 	ErrUnsupported   = errors.New("metadata: operation is not supported by this provider")
 	ErrScopeRequired = errors.New("metadata: an authenticated scope is required")
 	ErrInvalidTarget = errors.New("metadata: invalid database target")
+	ErrDetailLimit   = errors.New("metadata: detail exceeds the retained size budget")
 )
 
 // Key identifies one shared metadata store. Two connections that normalize to

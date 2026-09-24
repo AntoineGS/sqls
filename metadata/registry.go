@@ -51,6 +51,11 @@ type track struct {
 
 	refs int
 
+	// storeBudget and details are set once, at track creation, and never
+	// reassigned afterward, so they can be read without t.mu.
+	storeBudget *StoreBudget
+	details     *detailStore
+
 	mu       sync.Mutex
 	provider Provider
 	err      error
@@ -80,7 +85,8 @@ func (t *track) isClosed() bool {
 // Acquire can attach a new track to an entry that is simultaneously being
 // removed, producing two live stores for one (Key, Scope).
 type Registry struct {
-	opts Options
+	opts   Options
+	budget *Budget
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -93,14 +99,26 @@ type Registry struct {
 
 // NewRegistry creates a registry. ctx bounds the lifetime of every factory
 // call and background metadata load the registry ever starts; canceling it
-// is equivalent to calling Close.
+// is equivalent to calling Close. A non-positive Options field falls back to
+// the registry default (never silently unbounded): six host jobs, three per
+// store, 64 MiB retained detail bytes per store.
 func NewRegistry(ctx context.Context, opts Options) *Registry {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if opts.MaxHostJobs <= 0 {
+		opts.MaxHostJobs = defaultHostJobs
+	}
+	if opts.MaxStoreJobs <= 0 {
+		opts.MaxStoreJobs = defaultStoreJobs
+	}
+	if opts.MaxDetailBytes <= 0 {
+		opts.MaxDetailBytes = defaultMaxDetailBytes
+	}
 	rootCtx, cancel := context.WithCancel(ctx)
 	return &Registry{
 		opts:    opts,
+		budget:  NewBudget(opts.MaxHostJobs, opts.MaxStoreJobs),
 		ctx:     rootCtx,
 		cancel:  cancel,
 		entries: make(map[Key]*registryEntry),
@@ -173,7 +191,12 @@ func (r *Registry) attach(key Key, sk scopeKey, scope Scope) (entry *registryEnt
 	t, exists := entry.tracks[sk]
 	if !exists {
 		tctx, cancel := context.WithCancel(r.ctx)
-		t = &track{entry: entry, scope: scope, ctx: tctx, cancel: cancel, ready: make(chan struct{}), hub: newEventHub()}
+		storeBudget := r.budget.ForStore(key)
+		t = &track{
+			entry: entry, scope: scope, ctx: tctx, cancel: cancel, ready: make(chan struct{}), hub: newEventHub(),
+			storeBudget: storeBudget,
+			details:     newDetailStore(tctx, storeBudget, r.opts.MaxDetailBytes),
+		}
 		entry.tracks[sk] = t
 		creator = true
 	}
@@ -193,7 +216,7 @@ func (r *Registry) createTrack(t *track, factory Factory) {
 		return
 	}
 
-	loader := NewLoader()
+	loader := NewLoader(t.storeBudget)
 	loader.SetChangedCallback(func() { r.publishTrackEvent(t) })
 
 	t.mu.Lock()
@@ -270,6 +293,8 @@ func (r *Registry) finalizeTrack(t *track) {
 			loader.Stop()
 			loader.Wait(context.Background())
 		}
+		t.details.markStale()
+		t.details.wait(context.Background())
 		if provider != nil {
 			t.closeOnce.Do(func() { _ = provider.Close() })
 		}
@@ -277,6 +302,7 @@ func (r *Registry) finalizeTrack(t *track) {
 		t.closed = true
 		t.mu.Unlock()
 		t.hub.closeAll()
+		r.budget.release(t.entry.key)
 	}()
 }
 
@@ -331,6 +357,10 @@ func (r *Registry) Close(ctx context.Context) error {
 				return err
 			}
 		}
+		t.details.markStale()
+		if err := t.details.wait(ctx); err != nil {
+			return err
+		}
 		if provider != nil {
 			t.closeOnce.Do(func() { _ = provider.Close() })
 		}
@@ -338,6 +368,7 @@ func (r *Registry) Close(ctx context.Context) error {
 		t.closed = true
 		t.mu.Unlock()
 		t.hub.closeAll()
+		r.budget.release(t.entry.key)
 	}
 	return ctx.Err()
 }

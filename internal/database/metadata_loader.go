@@ -23,7 +23,7 @@ type MetadataLoader struct {
 }
 
 func NewMetadataLoader() *MetadataLoader {
-	return &MetadataLoader{Loader: metadata.NewLoader()}
+	return &MetadataLoader{Loader: metadata.NewLoader(nil)}
 }
 
 // Start derives repo's metadata plan and starts generation with it. Plan

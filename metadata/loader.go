@@ -41,18 +41,30 @@ type Loader struct {
 	doneClosed  bool
 	callback    func()
 
-	// The semaphore belongs to the loader, not a generation. A cancelled native
-	// call keeps its slot until the Run function actually returns.
-	semaphore chan struct{}
-	slotWake  chan struct{}
-	active    int
-	drained   chan struct{}
+	// semaphore and hostSemaphore belong to the supplied StoreBudget, not a
+	// generation or this Loader alone: they are the SAME channels a sibling
+	// loader for another scope of this Key (or a retiring/replacement
+	// incarnation) uses, so store- and host-wide concurrency are genuinely
+	// shared. A cancelled native call keeps its slots until the Run function
+	// actually returns.
+	semaphore     chan struct{}
+	hostSemaphore chan struct{}
+	slotWake      chan struct{}
+	active        int
+	drained       chan struct{}
 }
 
-func NewLoader() *Loader {
+// NewLoader creates a Loader whose job admission draws from budget's shared
+// store- and host-level permits. A nil budget gets a private, unshared
+// default budget (matching this package's original, registry-independent
+// behavior) rather than failing.
+func NewLoader(budget *StoreBudget) *Loader {
+	if budget == nil {
+		budget = NewBudget(0, 0).ForStore(Key{})
+	}
 	drained := make(chan struct{})
 	close(drained)
-	return &Loader{semaphore: make(chan struct{}, 3), slotWake: make(chan struct{}), drained: drained}
+	return &Loader{semaphore: budget.sem, hostSemaphore: budget.host, slotWake: make(chan struct{}), drained: drained}
 }
 
 var metadataKinds = []catalog.MetadataKind{
@@ -319,9 +331,7 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 			if states[job.Kind] != catalog.MetadataPending || !dependenciesReady(job, states) {
 				continue
 			}
-			select {
-			case l.semaphore <- struct{}{}:
-			default:
+			if !l.tryAcquireSlot() {
 				continue
 			}
 			if ctx.Err() != nil {
@@ -500,9 +510,28 @@ func (l *Loader) signalSlotAvailable() {
 	l.mu.Unlock()
 }
 
-// releaseMetadataSlot releases one loader-wide runner permit and wakes every
-// generation that may be waiting to acquire it.
+// tryAcquireSlot makes one non-blocking attempt to admit a runner: it needs
+// both a store-level and a host-level permit, acquired in that order, and
+// rolls back the store permit if the host is momentarily full.
+func (l *Loader) tryAcquireSlot() bool {
+	select {
+	case l.semaphore <- struct{}{}:
+	default:
+		return false
+	}
+	select {
+	case l.hostSemaphore <- struct{}{}:
+		return true
+	default:
+		<-l.semaphore
+		return false
+	}
+}
+
+// releaseMetadataSlot releases one loader-wide runner permit (host and
+// store) and wakes every generation that may be waiting to acquire one.
 func (l *Loader) releaseMetadataSlot() {
+	<-l.hostSemaphore
 	<-l.semaphore
 	l.signalSlotAvailable()
 }
@@ -614,6 +643,27 @@ func (l *Loader) closeDoneLocked() {
 	}
 }
 func (l *Loader) publishLocked(snapshot *catalog.MetadataSnapshot) { l.snapshot = snapshot }
+
+// MarkStale flags the current snapshot Stale without canceling or starting
+// any job. It is idempotent; it never changes Generation or Cache/Status,
+// only adds the Stale flag with a new Revision. Reset/Start (via Refresh)
+// publishes the next non-stale snapshot.
+func (l *Loader) MarkStale() {
+	l.mu.Lock()
+	if l.snapshot == nil || l.snapshot.Stale {
+		l.mu.Unlock()
+		return
+	}
+	current := l.snapshot
+	l.snapshot = &catalog.MetadataSnapshot{
+		Generation: current.Generation, Revision: current.Revision + 1,
+		Started: current.Started, StartFailed: current.StartFailed, Stale: true,
+		Cache: current.Cache, Status: current.Status,
+	}
+	callback := l.callback
+	l.mu.Unlock()
+	callMetadataCallback(callback)
+}
 
 func (l *Loader) Snapshot() *catalog.MetadataSnapshot {
 	l.mu.Lock()
