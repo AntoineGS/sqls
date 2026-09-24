@@ -9,6 +9,7 @@ import (
 	"log"
 	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -61,6 +62,14 @@ type Loader struct {
 	hostWake      *waker
 	active        int
 	drained       chan struct{}
+
+	// acquireAttempts counts every tryAcquireSlot call regardless of
+	// outcome. It exists purely so a whitebox test can distinguish a
+	// genuinely parked scheduler loop from a busy-spinning one (a parked
+	// loop attempts acquisition a handful of times at most per wake; a
+	// spinning one attempts thousands of times per second); it is never
+	// read by production code.
+	acquireAttempts atomic.Int64
 }
 
 // NewLoader creates a Loader whose job admission draws from budget's shared
@@ -346,6 +355,8 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 			}
 		}
 		launched := false
+		sawStoreFull := false
+		sawHostFull := false
 		for _, job := range plan.Jobs {
 			if running >= plan.Parallelism {
 				break
@@ -353,7 +364,12 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 			if states[job.Kind] != catalog.MetadataPending || !dependenciesReady(job, states) {
 				continue
 			}
-			if !l.tryAcquireSlot() {
+			switch l.tryAcquireSlot() {
+			case slotStoreFull:
+				sawStoreFull = true
+				continue
+			case slotHostFull:
+				sawHostFull = true
 				continue
 			}
 			if ctx.Err() != nil {
@@ -398,13 +414,26 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 		if terminal == len(plan.Jobs) {
 			break
 		}
+		// If every failed attempt this iteration was a host-triggered
+		// rollback (no plain store-full attempt also occurred), our own
+		// rollback already closed the top-captured storeWakeCh epoch: park
+		// only on hostWakeCh (a nil channel case never becomes ready, so
+		// this disables the storeWakeCh case below without complicating its
+		// structure) rather than immediately re-waking on a signal we just
+		// fired ourselves, for a permit-set change that could not admit a
+		// runner anyway while the host stays full. hostWakeCh itself is
+		// never touched by this rollback, so it is always safe to keep.
+		parkStoreWakeCh := storeWakeCh
+		if sawHostFull && !sawStoreFull {
+			parkStoreWakeCh = nil
+		}
 		if running == 0 && !launched {
 			// Pending work is waiting for a global slot held by another generation.
 			select {
 			case <-ctx.Done():
 				l.settleCancelled(generation)
 				return
-			case <-storeWakeCh:
+			case <-parkStoreWakeCh:
 				continue
 			case <-hostWakeCh:
 				continue
@@ -414,7 +443,7 @@ func (l *Loader) schedule(ctx context.Context, generation uint64, plan catalog.M
 		case <-ctx.Done():
 			l.settleCancelled(generation)
 			return
-		case <-storeWakeCh:
+		case <-parkStoreWakeCh:
 			continue
 		case <-hostWakeCh:
 			continue
@@ -521,24 +550,41 @@ func (l *Loader) recordMetadataJobMetrics(generation uint64, kind catalog.Metada
 	callMetadataCallback(callback)
 }
 
+// slotOutcome reports which permit set, if any, blocked one tryAcquireSlot
+// attempt. schedule uses this to decide what it actually still needs to wait
+// for: waiting on a signal that can never unblock it (see slotHostFull's use
+// in schedule) is what caused the busy-spin this type exists to prevent.
+type slotOutcome int
+
+const (
+	slotAcquired  slotOutcome = iota // both permits held; caller must release later
+	slotStoreFull                    // never reached the host check; a store-level release could help
+	slotHostFull                     // store permit was taken then rolled back; only a host-level release can help
+)
+
 // tryAcquireSlot makes one non-blocking attempt to admit a runner: it needs
 // both a store-level and a host-level permit, acquired in that order, and
 // rolls back the store permit if the host is momentarily full. A rollback
 // broadcasts storeWake: releasing a permit this loader itself briefly held
 // must wake any OTHER waiter for it exactly like any other release would.
-func (l *Loader) tryAcquireSlot() bool {
+// The caller (schedule) must NOT itself re-arm on that same storeWake epoch
+// for a slotHostFull outcome: this rollback already consumed it, and a
+// plain store-level change can never admit a runner while the host stays
+// full (admission needs both), so waiting on it here would just spin.
+func (l *Loader) tryAcquireSlot() slotOutcome {
+	l.acquireAttempts.Add(1)
 	select {
 	case l.semaphore <- struct{}{}:
 	default:
-		return false
+		return slotStoreFull
 	}
 	select {
 	case l.hostSemaphore <- struct{}{}:
-		return true
+		return slotAcquired
 	default:
 		<-l.semaphore
 		l.storeWake.broadcast()
-		return false
+		return slotHostFull
 	}
 }
 
