@@ -1,0 +1,305 @@
+package metadata
+
+import (
+	"context"
+	"sync"
+)
+
+// scopeKey is the comparable projection of Scope used to key per-scope
+// tracks. It never leaves this package.
+type scopeKey struct {
+	principal  string
+	role       string
+	textPolicy string
+}
+
+func newScopeKey(s Scope) scopeKey {
+	return scopeKey{principal: s.Principal, role: s.Role, textPolicy: s.TextPolicy}
+}
+
+// registryEntry is one Key's shared state: a monotonically allocated
+// incarnation and the independently tracked stores for each distinct Scope
+// currently in use under that Key. Once every track drains, the entry itself
+// is retired; a later Acquire for the same Key allocates a fresh entry and a
+// new incarnation rather than resurrecting torn-down state.
+type registryEntry struct {
+	key         Key
+	incarnation uint64
+
+	mu     sync.Mutex
+	tracks map[scopeKey]*track
+}
+
+// track is one (Key, Scope) store: its provider, its metadata loader and its
+// reference count. A track is created by the first Acquire for its
+// (Key, Scope) and torn down by the Acquire/Release that drops the last
+// reference.
+type track struct {
+	entry *registryEntry
+	scope Scope
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	ready chan struct{} // closed once the factory call has returned (success or failure)
+
+	mu       sync.Mutex
+	refs     int
+	provider Provider
+	err      error
+	loader   *Loader
+	closed   bool // set once the provider has been finalized (Closed)
+
+	closeOnce sync.Once
+	hub       *eventHub
+}
+
+func (t *track) isClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
+}
+
+// Registry shares metadata stores across consumers keyed by (engine,
+// normalized database URL). Acquire returns a Lease onto the shared store for
+// a given authenticated Scope; the store is created on first use and torn
+// down once its last lease releases.
+type Registry struct {
+	opts Options
+
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu             sync.Mutex
+	entries        map[Key]*registryEntry
+	incarnationSeq uint64
+	closed         bool
+}
+
+// NewRegistry creates a registry. ctx bounds the lifetime of every factory
+// call and background metadata load the registry ever starts; canceling it
+// is equivalent to calling Close.
+func NewRegistry(ctx context.Context, opts Options) *Registry {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rootCtx, cancel := context.WithCancel(ctx)
+	return &Registry{
+		opts:    opts,
+		ctx:     rootCtx,
+		cancel:  cancel,
+		entries: make(map[Key]*registryEntry),
+	}
+}
+
+// Acquire returns a Lease onto the shared store for (key, scope), creating it
+// via factory if no live store exists yet. Concurrent Acquire calls for the
+// same (Key, Scope) share one factory call and one provider. Canceling ctx
+// while waiting only withdraws this caller's interest; it never cancels
+// creation still needed by another consumer.
+func (r *Registry) Acquire(ctx context.Context, key Key, scope Scope, factory Factory) (*Lease, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if scope == (Scope{}) {
+		return nil, ErrScopeRequired
+	}
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, ErrClosed
+	}
+	entry, ok := r.entries[key]
+	if !ok {
+		r.incarnationSeq++
+		entry = &registryEntry{key: key, incarnation: r.incarnationSeq, tracks: make(map[scopeKey]*track)}
+		r.entries[key] = entry
+	}
+	r.mu.Unlock()
+
+	sk := newScopeKey(scope)
+	entry.mu.Lock()
+	t, exists := entry.tracks[sk]
+	creator := false
+	if !exists {
+		tctx, cancel := context.WithCancel(r.ctx)
+		t = &track{entry: entry, scope: scope, ctx: tctx, cancel: cancel, ready: make(chan struct{}), hub: newEventHub()}
+		entry.tracks[sk] = t
+		creator = true
+	}
+	t.refs++
+	entry.mu.Unlock()
+
+	if creator {
+		go r.createTrack(t, factory)
+	}
+
+	select {
+	case <-t.ready:
+		t.mu.Lock()
+		err := t.err
+		t.mu.Unlock()
+		if err != nil {
+			r.releaseTrackRef(entry, sk, t)
+			return nil, err
+		}
+		return &Lease{registry: r, entry: entry, scopeKey: sk, track: t, key: key, incarnation: entry.incarnation}, nil
+	case <-ctx.Done():
+		r.releaseTrackRef(entry, sk, t)
+		return nil, ctx.Err()
+	}
+}
+
+// createTrack runs factory outside any registry/entry mutex, then starts the
+// track's metadata loader on success. It always closes t.ready exactly once.
+func (r *Registry) createTrack(t *track, factory Factory) {
+	provider, err := factory(t.ctx)
+	if err != nil {
+		t.mu.Lock()
+		t.err = err
+		t.mu.Unlock()
+		close(t.ready)
+		return
+	}
+
+	loader := NewLoader()
+	loader.SetChangedCallback(func() { r.publishTrackEvent(t) })
+
+	t.mu.Lock()
+	t.provider = provider
+	t.loader = loader
+	t.mu.Unlock()
+	close(t.ready)
+
+	if t.ctx.Err() != nil {
+		// Every interested caller already withdrew while we were creating the
+		// provider; the ref-count-zero path will drain and close it.
+		return
+	}
+	loader.Reset(1)
+	if _, err := loader.Start(t.ctx, 1, provider.Plan()); err != nil {
+		_ = loader.MarkStartFailed(1)
+	}
+}
+
+// releaseTrackRef drops one reference to t. The last reference to drop
+// retires t from its entry (and the entry from the registry once it holds no
+// more live tracks) and finalizes t's provider/loader asynchronously.
+func (r *Registry) releaseTrackRef(entry *registryEntry, sk scopeKey, t *track) {
+	entry.mu.Lock()
+	t.mu.Lock()
+	t.refs--
+	remaining := t.refs
+	t.mu.Unlock()
+	entryEmpty := false
+	if remaining <= 0 {
+		delete(entry.tracks, sk)
+		entryEmpty = len(entry.tracks) == 0
+	}
+	entry.mu.Unlock()
+
+	if entryEmpty {
+		r.mu.Lock()
+		if current, ok := r.entries[entry.key]; ok && current == entry {
+			delete(r.entries, entry.key)
+		}
+		r.mu.Unlock()
+	}
+
+	if remaining <= 0 {
+		r.finalizeTrack(t)
+	}
+}
+
+// finalizeTrack cancels t's registry-owned context and, once its factory call
+// and metadata loader have both settled, closes its provider exactly once.
+// It never blocks its caller.
+func (r *Registry) finalizeTrack(t *track) {
+	t.cancel()
+	go func() {
+		<-t.ready
+		t.mu.Lock()
+		provider, loader := t.provider, t.loader
+		t.mu.Unlock()
+		if loader != nil {
+			loader.Stop()
+			loader.Wait(context.Background())
+		}
+		if provider != nil {
+			t.closeOnce.Do(func() { _ = provider.Close() })
+		}
+		t.mu.Lock()
+		t.closed = true
+		t.mu.Unlock()
+		t.hub.closeAll()
+	}()
+}
+
+func (r *Registry) publishTrackEvent(t *track) {
+	t.mu.Lock()
+	loader := t.loader
+	t.mu.Unlock()
+	if loader == nil {
+		return
+	}
+	snapshot := loader.Snapshot()
+	t.hub.publish(Event{Key: t.entry.key, Incarnation: t.entry.incarnation, Generation: snapshot.Generation, Revision: snapshot.Revision})
+}
+
+// Close cancels every store this registry owns and waits for their
+// factories, metadata loads and providers to settle before returning.
+func (r *Registry) Close(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	entries := make([]*registryEntry, 0, len(r.entries))
+	for _, entry := range r.entries {
+		entries = append(entries, entry)
+	}
+	r.entries = make(map[Key]*registryEntry)
+	r.mu.Unlock()
+
+	r.cancel()
+
+	var tracks []*track
+	for _, entry := range entries {
+		entry.mu.Lock()
+		for _, t := range entry.tracks {
+			tracks = append(tracks, t)
+		}
+		entry.tracks = make(map[scopeKey]*track)
+		entry.mu.Unlock()
+	}
+
+	for _, t := range tracks {
+		select {
+		case <-t.ready:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		t.mu.Lock()
+		provider, loader := t.provider, t.loader
+		t.mu.Unlock()
+		if loader != nil {
+			loader.Stop()
+			if err := loader.Wait(ctx); err != nil {
+				return err
+			}
+		}
+		if provider != nil {
+			t.closeOnce.Do(func() { _ = provider.Close() })
+		}
+		t.mu.Lock()
+		t.closed = true
+		t.mu.Unlock()
+		t.hub.closeAll()
+	}
+	return ctx.Err()
+}
