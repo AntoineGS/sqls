@@ -46,6 +46,7 @@ func (a *Analysis) Diagnostics(c Catalog) []Finding {
 	}
 	findings = append(findings, a.widthDiagnostics(c)...)
 	findings = append(findings, a.singletonDiagnostics(c)...)
+	findings = append(findings, a.nullComparisonFindings()...)
 	m := a.diagnosticModel(c)
 	findings = append(findings, m.localFindings()...)
 	findings = append(findings, m.nameFindings()...)
