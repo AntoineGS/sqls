@@ -375,15 +375,31 @@ func (trg *triggerModel) candidateNames() []string {
 // MERGE/WITH open an unsupported region (also excluded, never scanned)
 // closing at the next ";". This is intentionally simpler than
 // buildContexts: it does not need Local/Column/Alias role classification,
-// only the SQL/procedural split.
+// only the SQL/procedural split (inSQL) plus, separately, which of those
+// SQL-or-unsupported positions are specifically unsupported (the
+// unsupported field) -- a distinction this file's own rule does not need
+// but a caller modeling trigger-embedded queries elsewhere does, to avoid
+// misreading a bare SELECT/UPDATE/INSERT/DELETE keyword inside a MERGE's
+// WHEN clause or a WITH's CTE body as an independent query start.
 type triggerBodyContext struct {
 	inSQL        []bool
 	outputTarget []bool
+
+	// unsupported marks a position whose kind is specifically
+	// "unsupported" (a MERGE/WITH region), a strict subset of inSQL (which
+	// is true for both "sql" and "unsupported" kinds, since this file's own
+	// unknownVariableFindings never needs to tell them apart -- both are
+	// equally "never a variable candidate" to that rule). A caller that
+	// does need the distinction (for example, one deciding whether a bare
+	// keyword genuinely starts a new top-level SQL statement, which must
+	// never be true inside MERGE/WITH content) should check inSQL &&
+	// !unsupported for "genuinely sql", not inSQL alone.
+	unsupported []bool
 }
 
 func newTriggerBodyContext(items []lexeme, bodyStart, bodyEnd int) triggerBodyContext {
 	n := bodyEnd - bodyStart
-	ctx := triggerBodyContext{inSQL: make([]bool, n), outputTarget: make([]bool, n)}
+	ctx := triggerBodyContext{inSQL: make([]bool, n), outputTarget: make([]bool, n), unsupported: make([]bool, n)}
 	kind := "procedural"
 	head := ""
 	depth := 0
@@ -430,6 +446,7 @@ func newTriggerBodyContext(items []lexeme, bodyStart, bodyEnd int) triggerBodyCo
 			// closed only by the top-level ";" handled above
 		}
 		ctx.inSQL[i] = kind == "sql" || kind == "unsupported"
+		ctx.unsupported[i] = kind == "unsupported"
 		switch item.Token.Kind {
 		case token.LParen:
 			depth++

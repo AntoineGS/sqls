@@ -919,6 +919,21 @@ func (m *diagnosticModel) queryChain(i int) []int {
 // statement's own [start, end) span here -- over a trigger body already
 // known to have a syntactically valid, supported shape (parseTrigger only
 // ever returns ok=true for that recognized subset).
+//
+// Query-start detection requires ctx.inSQL[i] && !ctx.unsupported[i], not
+// ctx.inSQL[i] alone: inSQL is true for both the "sql" and "unsupported"
+// (MERGE/WITH) region kinds, since newTriggerBodyContext's own rule
+// (unknownVariableFindings) treats both identically -- "never a variable
+// candidate". A bare query-start keyword can appear inside MERGE/WITH
+// content without starting a genuine top-level query at all (a MERGE's own
+// "WHEN MATCHED THEN UPDATE ..." clause contains an UPDATE keyword; a
+// WITH's CTE body starts with its own nested SELECT), and MERGE/WITH must
+// stay wholly unmodeled here, matching the "MERGE is silent" invariant
+// this model already upholds for a top-level MERGE/WITH (Unsupported).
+// Once a genuine sql-kind query has started, ctx.unsupported cannot become
+// true again before the query's own end (kind only ever transitions
+// unsupported<-procedural<-sql, never sql->unsupported directly), so the
+// end-of-query check below does not need the same guard.
 func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depths []int, matching map[int]int) {
 	for _, trg := range discoverTriggers(text, items) {
 		m.recognizedTriggerBodies = append(m.recognizedTriggerBodies, itemRange{trg.bodyStart, trg.bodyEnd})
@@ -926,7 +941,7 @@ func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depth
 		start := -1
 		for idx := trg.bodyStart + 1; idx < trg.bodyEnd; idx++ {
 			i := idx - trg.bodyStart
-			if start < 0 && ctx.inSQL[i] && isQueryStart(items[idx]) {
+			if start < 0 && ctx.inSQL[i] && !ctx.unsupported[i] && isQueryStart(items[idx]) {
 				start = idx
 			}
 			if start >= 0 && !ctx.inSQL[i] {

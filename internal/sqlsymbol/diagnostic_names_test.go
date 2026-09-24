@@ -423,3 +423,37 @@ BEGIN
 END`
 	requireCodeCount(t, sql, c, codeUnknownColumn, 1)
 }
+
+// --- Fix round 2: MERGE/WITH content inside a trigger body must stay
+// wholly unmodeled, matching the "MERGE is silent" invariant elsewhere --
+// buildTriggerQueries must not misread a bare SELECT/UPDATE/INSERT/DELETE
+// keyword occurring inside a MERGE's WHEN clause or a WITH's CTE body as
+// an independent top-level query start.
+
+func TestDiagnosticFixRound2MergeInsideTriggerBodyStaysSilent(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS
+BEGIN
+  MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = 1;
+END`
+	requireCodeCount(t, sql, c, codeUnknownRelation, 0)
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+func TestDiagnosticFixRound2WithInsideTriggerBodyResolvesCTEOutput(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS
+DECLARE VARIABLE X INTEGER;
+BEGIN
+  WITH W AS (SELECT ID AS RENAMED FROM U) SELECT RENAMED FROM W INTO :X;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+// A top-level (non-trigger) MERGE/WITH must remain unaffected by this fix.
+func TestDiagnosticFixRound2TopLevelMergeAndWithStillSilentAndCorrect(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	requireCodeCount(t, "MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = 1;", c, codeUnknownRelation, 0)
+	requireCodeCount(t, "MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = 1;", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "WITH W AS (SELECT ID AS RENAMED FROM U) SELECT RENAMED FROM W;", c, codeUnknownColumn, 0)
+}
