@@ -275,12 +275,12 @@ func (s *Server) interBaseDefinitionWithSnapshot(ctx context.Context, repo datab
 	}
 
 	content, bannerLines := renderSnapshot(target, sc, s.snapshots.now(), body, note)
-	if !s.snapshotGenerationCurrent(sc.generation) {
+	path, published, err := s.writeDefinitionSnapshot(sc, string(target.kind), target.name, content)
+	if err != nil {
+		log.Printf("sqls: write %s snapshot candidate for %q: %v", target.kind, target.name, err)
 		return nil, nil
 	}
-	path, err := s.snapshots.write(sc, string(target.kind), target.name, content)
-	if err != nil {
-		log.Printf("sqls: write %s snapshot for %q: %v", target.kind, target.name, err)
+	if !published {
 		return nil, nil
 	}
 

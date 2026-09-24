@@ -240,11 +240,11 @@ func (s *Server) interBaseRelationDefinitionWithSnapshot(ctx context.Context, re
 		return nil, nil
 	}
 	content, bannerLines := renderSnapshot(target, sc, s.snapshots.now(), body, note)
-	if !s.snapshotGenerationCurrent(sc.generation) {
+	path, published, err := s.writeDefinitionSnapshot(sc, string(target.kind), target.name, content)
+	if err != nil {
 		return nil, nil
 	}
-	path, err := s.snapshots.write(sc, string(target.kind), target.name, content)
-	if err != nil {
+	if !published {
 		return nil, nil
 	}
 	rangeValue, ok := symbolRange(content, sqlsymbol.Span{Start: span.Start + snapshotBodyOffset(content, bannerLines), End: span.End + snapshotBodyOffset(content, bannerLines)})

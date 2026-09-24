@@ -38,6 +38,31 @@ func testSnapshotContext() snapshotContext {
 	}
 }
 
+func TestSnapshotCandidatesHaveUniqueDirectoriesAndIsolatedCleanup(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	first, err := store.writeCandidate(testSnapshotContext(), "procedure", "MYPROC", "A source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.writeCandidate(testSnapshotContext(), "procedure", "MYPROC", "B source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.path == second.path {
+		t.Fatalf("candidate paths collide: %q", first.path)
+	}
+	if filepath.Base(first.path) != "MYPROC.sql" || filepath.Base(second.path) != "MYPROC.sql" {
+		t.Fatalf("candidate basenames = %q and %q", filepath.Base(first.path), filepath.Base(second.path))
+	}
+	first.remove()
+	if _, err := os.Stat(first.path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("discarded candidate stat error = %v, want not-exist", err)
+	}
+	if got, err := os.ReadFile(second.path); err != nil || string(got) != "B source" {
+		t.Fatalf("other candidate after cleanup = %q, %v", got, err)
+	}
+}
+
 func TestSnapshotStoreWritesUnderConnectionAndKindDirectories(t *testing.T) {
 	store := newTestSnapshotStore(t)
 	sc := testSnapshotContext()

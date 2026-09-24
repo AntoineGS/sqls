@@ -22,7 +22,7 @@ func (partialCatalogRepository) MetadataPlan() database.MetadataPlan {
 		}},
 		{Kind: database.MetadataProcedures, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
 			return database.MetadataPatch{Cache: &database.DBCache{Catalog: &database.CatalogCache{Procedures: map[string]*database.ProcedureDesc{
-				"READYPROC": {Name: "READYPROC"},
+				"READYPROC": {Name: "READYPROC", InputParameters: []*database.ProcedureParameterDesc{{Name: "P_IN", Type: "INTEGER"}}},
 			}}}}, nil
 		}},
 	}}
@@ -115,6 +115,137 @@ func TestEditorSnapshotAutoDialectUsesDefaultUntilResolved(t *testing.T) {
 	}
 }
 
+func TestEditorSnapshotPreservesConfiguredDriverWhenConnectionOmitsIt(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	if err := s.openFileAtVersion("file:///postgres.sql", "sql", `select "col" from t`, 1); err != nil {
+		t.Fatal(err)
+	}
+	s.stateMu.Lock()
+	s.WSCfg = &config.Config{Connections: []*database.DBConfig{{Driver: dialect.DatabaseDriverPostgreSQL}}}
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverPostgreSQL}
+	s.dbConn = &database.DBConnection{Variant: dialect.SQLVariantDefault}
+	s.connectionState = connectionReady
+	s.stateMu.Unlock()
+
+	snapshot, err := s.captureEditorSnapshot("file:///postgres.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Variant.Driver != dialect.DatabaseDriverPostgreSQL {
+		t.Fatalf("attached driver = %q, want configured PostgreSQL", snapshot.Variant.Driver)
+	}
+	if snapshot.Repository == nil {
+		t.Fatal("ready PostgreSQL connection should produce a repository")
+	}
+	c := completer.NewCompleter(snapshot.Cache)
+	c.Driver, c.Variant = snapshot.Variant.Driver, snapshot.Variant.Variant
+	items, err := c.Complete("ILI", lsp.CompletionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		Position: lsp.Position{Line: 0, Character: 3},
+	}}, false)
+	if err != nil {
+		t.Fatalf("PostgreSQL completion parse: %v", err)
+	}
+	for _, item := range items {
+		if item.Label == "ILIKE" {
+			return
+		}
+	}
+	t.Fatal("configured PostgreSQL keyword ILIKE missing after attached driver omitted its name")
+}
+
+func TestEditorSnapshotUsesAttachedInterBaseDialectAfterAutoDetection(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	if err := s.openFileAtVersion("file:///interbase.sql", "sql", `select "text" from t`, 1); err != nil {
+		t.Fatal(err)
+	}
+	s.stateMu.Lock()
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Dialect: 0}
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase1}
+	s.connectionState = connectionReady
+	s.stateMu.Unlock()
+	snapshot, err := s.captureEditorSnapshot("file:///interbase.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.Variant != (dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase1}) || !snapshot.DialectResolved {
+		t.Fatalf("resolved attached variant = %#v, resolved=%v", snapshot.Variant, snapshot.DialectResolved)
+	}
+}
+
+func TestCompletionRemainsIncompleteBeforeMetadataStart(t *testing.T) {
+	snapshot := editorSnapshot{
+		ConnectionReady: true,
+		Metadata: &database.MetadataSnapshot{
+			Started: false,
+			Status: map[database.MetadataKind]database.MetadataStatus{
+				database.MetadataProcedures: {State: database.MetadataUnsupported},
+			},
+		},
+	}
+	if !completionMetadataIncomplete(snapshot) {
+		t.Fatal("ready attachment before MetadataLoader.Start must remain incomplete")
+	}
+	snapshot.Metadata.StartFailed = true
+	if completionMetadataIncomplete(snapshot) {
+		t.Fatal("terminal metadata start failure must not remain incomplete")
+	}
+}
+
+func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	const uri = "file:///ready-before-metadata.sql"
+	if err := s.openFileAtVersion(uri, "sql", "execute procedure ", 1); err != nil {
+		t.Fatal(err)
+	}
+	s.stateMu.Lock()
+	s.connGeneration = 1
+	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Dialect: 3}
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
+	s.connectionState = connectionReady
+	s.metadata.Reset(1)
+	s.stateMu.Unlock()
+	ready, start := make(chan struct{}), make(chan struct{})
+	started := make(chan error, 1)
+	go func() {
+		close(ready) // attachment is visible; the coordinator has not called Start yet
+		<-start
+		load, err := s.metadata.Start(context.Background(), 1, partialCatalogRepository{&database.MockDBRepository{}})
+		if err == nil {
+			select {
+			case <-load.Done:
+			case <-time.After(time.Second):
+				err = errors.New("metadata jobs did not settle")
+			}
+		}
+		started <- err
+	}()
+	<-ready
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snapshot.ConnectionReady || snapshot.Metadata == nil || snapshot.Metadata.Started {
+		t.Fatalf("gated pre-start snapshot = ready:%v metadata:%#v", snapshot.ConnectionReady, snapshot.Metadata)
+	}
+	if !completionMetadataIncomplete(snapshot) {
+		t.Fatal("completion incorrectly settled in attachment-to-Start interval")
+	}
+	close(start)
+	if err := <-started; err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = s.captureEditorSnapshot(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completionMetadataIncomplete(snapshot) {
+		t.Fatal("terminal failed/ready categories should settle completion")
+	}
+}
+
 func TestProgressiveEditorSnapshotKeepsReadyProcedureWhenViewsFail(t *testing.T) {
 	s := NewServer()
 	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
@@ -167,6 +298,16 @@ func TestProgressiveEditorSnapshotKeepsReadyProcedureWhenViewsFail(t *testing.T)
 	}
 	if completionMetadataIncomplete(snapshot) {
 		t.Fatal("terminal failed category must not keep completion incomplete")
+	}
+	signatureText := "execute procedure readyproc("
+	signature, err := SignatureHelpWithDriverVariant(signatureText, lsp.SignatureHelpParams{
+		TextDocumentPositionParams: lsp.TextDocumentPositionParams{Position: lsp.Position{Line: 0, Character: len(signatureText)}},
+	}, snapshot.Cache, snapshot.Variant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if signature == nil || len(signature.Signatures) != 1 || len(signature.Signatures[0].Parameters) != 1 || signature.Signatures[0].Parameters[0].Label != "P_IN" {
+		t.Fatalf("partial-ready procedure signature = %#v", signature)
 	}
 }
 

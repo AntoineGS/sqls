@@ -37,6 +37,9 @@ func completionMetadataIncomplete(snapshot editorSnapshot) bool {
 	if snapshot.Attaching {
 		return true
 	}
+	if snapshot.ConnectionReady && (snapshot.Metadata == nil || (!snapshot.Metadata.Started && !snapshot.Metadata.StartFailed)) {
+		return true
+	}
 	if snapshot.Metadata == nil {
 		return false
 	}

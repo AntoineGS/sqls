@@ -23,6 +23,7 @@ type editorSnapshot struct {
 	Repository        database.DBRepository
 	LowercaseKeywords bool
 	Attaching         bool
+	ConnectionReady   bool
 	SourceContext     snapshotContext
 }
 
@@ -46,6 +47,7 @@ func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 		Generation: s.connGeneration, Cache: &database.DBCache{},
 		LowercaseKeywords: configSnapshot.LowercaseKeywords,
 		Attaching:         s.connectionState == connectionConnecting,
+		ConnectionReady:   s.connectionState == connectionReady,
 	}
 	if cfg != nil {
 		snapshot.SourceContext = snapshotContextForConfig(snapshot.Generation, cfg)
@@ -76,7 +78,11 @@ func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 	}
 
 	if s.dbConn != nil {
-		snapshot.Variant = s.dbConn.DriverVariant()
+		resolved := s.dbConn.DriverVariant()
+		if resolved.Driver != "" {
+			snapshot.Variant.Driver = resolved.Driver
+		}
+		snapshot.Variant.Variant = resolved.Variant
 		snapshot.DialectResolved = true
 		if s.connectionState == connectionReady && cfg != nil {
 			// Both inputs were captured above while stateMu was held.
@@ -91,6 +97,25 @@ func (s *Server) snapshotGenerationCurrent(generation int) bool {
 	current := s.connGeneration == generation && s.connectionState != connectionStopped
 	s.stateMu.RUnlock()
 	return current
+}
+
+// writeDefinitionSnapshot writes to an attempt-private path without holding
+// stateMu, then uses a short read lock as the location-publication
+// linearization point. Stale candidates are removed only from their own
+// directory, outside the lifecycle lock.
+func (s *Server) writeDefinitionSnapshot(sc snapshotContext, kind, name, content string) (string, bool, error) {
+	candidate, err := s.snapshots.writeCandidate(sc, kind, name, content)
+	if err != nil {
+		return "", false, err
+	}
+	s.stateMu.RLock()
+	current := s.connGeneration == sc.generation && s.connectionState != connectionStopped
+	s.stateMu.RUnlock()
+	if !current {
+		candidate.remove()
+		return "", false, nil
+	}
+	return candidate.path, true, nil
 }
 
 func snapshotContextForConfig(generation int, cfg *database.DBConfig) snapshotContext {

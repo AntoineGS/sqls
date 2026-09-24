@@ -70,6 +70,22 @@ type sourceSnapshotStore struct {
 	// exactly those and nothing a concurrent sqls process owns.
 	created      map[string]struct{}
 	shuttingDown atomic.Bool
+	writeFile    func(string, []byte, os.FileMode) error
+}
+
+// snapshotCandidate is a uniquely named, unpublished filesystem result. Its
+// directory is isolated from every other definition attempt, even when the
+// connection identity and object basename are the same.
+type snapshotCandidate struct {
+	store *sourceSnapshotStore
+	dir   string
+	path  string
+}
+
+func (c snapshotCandidate) remove() {
+	if c.store != nil && c.dir != "" {
+		c.store.removeCandidate(c.dir)
+	}
 }
 
 func newSourceSnapshotStore(root string) *sourceSnapshotStore {
@@ -131,7 +147,11 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 	}
 
 	path := filepath.Join(kindDir, escapeSnapshotName(name)+".sql")
-	if err := os.WriteFile(path, []byte(content), snapshotFileMode); err != nil {
+	writeFile := s.writeFile
+	if writeFile == nil {
+		writeFile = os.WriteFile
+	}
+	if err := writeFile(path, []byte(content), snapshotFileMode); err != nil {
 		return "", fmt.Errorf("write snapshot: %w", err)
 	}
 	// WriteFile applies its mode only when it creates the file, and a snapshot
@@ -154,6 +174,71 @@ func (s *sourceSnapshotStore) write(sc snapshotContext, kind, name, content stri
 	}
 
 	return path, nil
+}
+
+// writeCandidate writes a result below a unique attempt directory. The caller
+// publishes its path to the client only after its connection generation is
+// revalidated. The store lock is independent of lifecycle locks and never
+// protects a shared object filename from another candidate.
+func (s *sourceSnapshotStore) writeCandidate(sc snapshotContext, kind, name, content string) (snapshotCandidate, error) {
+	if s == nil {
+		return snapshotCandidate{}, errors.New("snapshot store is disabled")
+	}
+	if s.shuttingDown.Load() {
+		return snapshotCandidate{}, errors.New("snapshot store is shutting down")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.shuttingDown.Load() {
+		return snapshotCandidate{}, errors.New("snapshot store is shutting down")
+	}
+	s.pruneLocked()
+	base, err := s.connectionDirLocked(sc)
+	if err != nil {
+		return snapshotCandidate{}, err
+	}
+	attemptDir, err := os.MkdirTemp(base, ".candidate-")
+	if err != nil {
+		return snapshotCandidate{}, fmt.Errorf("create snapshot candidate directory: %w", err)
+	}
+	cleanupOnError := true
+	defer func() {
+		if cleanupOnError {
+			_ = os.RemoveAll(attemptDir)
+		}
+	}()
+
+	kindDir := filepath.Join(attemptDir, escapeSnapshotName(kind))
+	if err := os.MkdirAll(kindDir, snapshotDirMode); err != nil {
+		return snapshotCandidate{}, fmt.Errorf("create snapshot candidate kind directory: %w", err)
+	}
+	path := filepath.Join(kindDir, escapeSnapshotName(name)+".sql")
+	writeFile := s.writeFile
+	if writeFile == nil {
+		writeFile = os.WriteFile
+	}
+	if err := writeFile(path, []byte(content), snapshotFileMode); err != nil {
+		return snapshotCandidate{}, fmt.Errorf("write snapshot candidate: %w", err)
+	}
+	if err := os.Chmod(path, snapshotFileMode); err != nil {
+		return snapshotCandidate{}, fmt.Errorf("set snapshot candidate permissions: %w", err)
+	}
+	now := time.Now()
+	if err := os.Chtimes(base, now, now); err != nil {
+		log.Printf("sqls: touch snapshot connection directory %q: %v", base, err)
+	}
+	cleanupOnError = false
+	return snapshotCandidate{store: s, dir: attemptDir, path: path}, nil
+}
+
+func (s *sourceSnapshotStore) removeCandidate(dir string) {
+	// Serialize with RemoveAll and candidate writes; the path is unique to this
+	// attempt, so this can never remove a later result for the same object.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := os.RemoveAll(dir); err != nil {
+		log.Printf("sqls: remove unpublished snapshot candidate %q: %v", dir, err)
+	}
 }
 
 // pruneLocked removes sibling snapshot directories older than snapshotMaxAge.
