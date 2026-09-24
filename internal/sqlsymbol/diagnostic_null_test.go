@@ -160,6 +160,20 @@ func TestDiagnosticNullComparisonForUpdateEndsWhereClause(t *testing.T) {
 	requireCodeCount(t, "SELECT ID FROM T WHERE V = NULL FOR UPDATE;", nil, "interbase-null-comparison", 1)
 }
 
+// --- LEFT/RIGHT function calls must not be confused with join qualifiers ---
+
+func TestDiagnosticNullComparisonLeftFunctionNotBoundary(t *testing.T) {
+	requireCodeCount(t,
+		"SELECT ID FROM T JOIN U ON T.NAME = LEFT(U.NAME, 3);",
+		nil, "interbase-null-comparison", 0)
+}
+
+func TestDiagnosticNullComparisonRightFunctionNotBoundary(t *testing.T) {
+	requireCodeCount(t,
+		"SELECT ID FROM T JOIN U ON T.NAME = RIGHT(U.NAME, 3);",
+		nil, "interbase-null-comparison", 0)
+}
+
 // --- span covers the whole comparison expression ---
 
 func TestDiagnosticNullComparisonSpan(t *testing.T) {
