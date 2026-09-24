@@ -264,7 +264,7 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 					result.columnLatencyMS = append(result.columnLatencyMS, response.latency)
 				}
 			}
-			if containsLabel(response.items, func() string {
+			if response.valid && containsLabel(response.items, func() string {
 				if response.table {
 					return p.ExpectedTable
 				}
@@ -410,7 +410,11 @@ func dispatchCompletion(ctx context.Context, conn *jsonrpc2.Conn, pos lsp.Positi
 		var raw json.RawMessage
 		err := waiter.Wait(ctx, &raw)
 		items, decodeErr := decodeCompletion(raw)
-		response := completionResponse{table: table, items: items, valid: err == nil && decodeErr == nil, sampled: loading}
+		valid := err == nil && decodeErr == nil
+		if !valid {
+			items = nil
+		}
+		response := completionResponse{table: table, items: items, valid: valid, sampled: loading}
 		if loading && response.valid {
 			response.latency = float64(time.Since(started)) / float64(time.Millisecond)
 		}
@@ -479,10 +483,10 @@ func warmupRefresh(ctx context.Context, conn *jsonrpc2.Conn, p probe, logs <-cha
 		case response := <-responses:
 			if response.table {
 				tableInFlight = false
-				tableReady = tableReady || containsLabel(response.items, p.ExpectedTable)
+				tableReady = tableReady || (response.valid && containsLabel(response.items, p.ExpectedTable))
 			} else {
 				colInFlight = false
-				colReady = colReady || containsLabel(response.items, p.ExpectedColumn)
+				colReady = colReady || (response.valid && containsLabel(response.items, p.ExpectedColumn))
 			}
 		case <-ticker.C:
 			if observer == "status" {

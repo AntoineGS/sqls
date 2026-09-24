@@ -137,6 +137,24 @@ func TestKnownDegradedSettlementWithoutSentinelTerminatesDegraded(t *testing.T) 
 	}
 }
 
+func TestMalformedCompletionDetailCannotEstablishMeasuredReadiness(t *testing.T) {
+	result := runOne(context.Background(), helperServer(t, "malformed-completion"), "unused", testProbe(), "cold-process", 2*time.Second)
+	if result.Outcome != "degraded" || result.BasicReadyMS != nil {
+		t.Fatalf("malformed completion details established measured readiness: %+v", result)
+	}
+}
+
+func TestMalformedCompletionDetailCannotSatisfyRefreshWarmup(t *testing.T) {
+	server, pidFile := helperServerWithPID(t, "malformed-completion")
+	result := runOne(context.Background(), server, "unused", testProbe(), "refresh", 600*time.Millisecond)
+	if result.Outcome == "success" {
+		t.Fatalf("malformed completion details satisfied refresh warm-up: %+v", result)
+	}
+	if _, err := os.Stat(pidFile + ".switch"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refresh switch was invoked before valid warm-up sentinels: stat error=%v", err)
+	}
+}
+
 func TestStdioRunnerStallKillsAndReapsChildWithUnsetMetrics(t *testing.T) {
 	server, pidFile := helperServerWithPID(t, "stall")
 	started := time.Now()
@@ -235,7 +253,7 @@ func helperServerWithPID(t *testing.T, mode string) (string, string) {
 	dir := t.TempDir()
 	script := dir + "/server"
 	pidFile := filepath.Join(dir, "child.pid")
-	content := "#!/bin/sh\nSQLS_BENCH_HELPER=1 SQLS_BENCH_MODE=" + mode + " SQLS_BENCH_PIDFILE=" + shellQuote(pidFile) + " exec " + shellQuote(path) + " -test.run=^TestHelperProcess$\n"
+	content := "#!/bin/sh\nSQLS_BENCH_HELPER=1 SQLS_BENCH_MODE=" + mode + " SQLS_BENCH_PIDFILE=" + shellQuote(pidFile) + " SQLS_BENCH_SWITCHFILE=" + shellQuote(pidFile+".switch") + " exec " + shellQuote(path) + " -test.run=^TestHelperProcess$\n"
 	if err := os.WriteFile(script, []byte(content), 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -291,13 +309,21 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 		readyAt := h.readyAt
 		h.mu.Unlock()
 		if params.Position.Character == 8 {
-			time.Sleep(120 * time.Millisecond)
+			tableDelay := 120 * time.Millisecond
+			if mode == "malformed-completion" {
+				tableDelay = 10 * time.Millisecond
+			}
+			time.Sleep(tableDelay)
 			if (mode == "candidate-log-contamination" || mode == "failed-catalog") && time.Now().Before(readyAt) {
 				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": "OTHER"}})
 				return
 			}
 			if mode == "missing-table" || mode == "degraded-missing-table" {
 				_ = c.Reply(ctx, req.ID, []map[string]string{{"label": "OTHER"}})
+				return
+			}
+			if mode == "malformed-completion" {
+				_ = c.Reply(ctx, req.ID, json.RawMessage(`{"isIncomplete":"invalid","items":[{"label":"TABLE_SENTINEL"}]}`))
 				return
 			}
 			if mode == "no-status" {
@@ -329,6 +355,9 @@ func (h *fixtureHandler) Handle(ctx context.Context, c *jsonrpc2.Conn, req *json
 			_ = json.Unmarshal(*req.Params, &params)
 		}
 		if params.Command == "switchConnections" {
+			if path := os.Getenv("SQLS_BENCH_SWITCHFILE"); path != "" {
+				_ = os.WriteFile(path, []byte("switch invoked"), 0600)
+			}
 			var args struct {
 				Arguments []interface{} `json:"arguments"`
 			}
