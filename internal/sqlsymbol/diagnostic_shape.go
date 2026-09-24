@@ -34,7 +34,7 @@ func (m *diagnosticModel) shapeFindings() []Finding {
 	findings = append(findings, m.insertTargetCountFindings(depths, matching)...)
 	findings = append(findings, m.selectIntoTargetCountFindings()...)
 	findings = append(findings, m.unionTargetCountFindings()...)
-	findings = append(findings, m.executeProcedureFindings()...)
+	findings = append(findings, m.executeProcedureFindings(matching)...)
 	findings = append(findings, m.fromCallableArityFindings(depths, matching)...)
 	sort.SliceStable(findings, func(i, j int) bool { return findings[i].Span.Start < findings[j].Span.Start })
 	return findings
@@ -88,27 +88,25 @@ func (m *diagnosticModel) insertTargetCountFindingAt(items []lexeme, start, limi
 	if !ok || target.Name.Key() == "" {
 		return nil
 	}
-	var columnCount, afterColumns int
-	if next < limit && items[next].Token.Kind == token.LParen {
-		columnItems, after, ok := enclosedList(items, next, limit)
-		if !ok {
-			return nil
-		}
-		columnParts, ok := splitTopLevel(columnItems, token.Comma)
-		if !ok {
-			return nil
-		}
-		columnCount, afterColumns = len(columnParts), after
-	} else {
-		// No explicit column list: only usable when the target's full,
-		// known column order proves the count (RelationOutput), per the
-		// task brief -- otherwise withhold rather than guess an order.
-		cols, ok := m.RelationOutput(next, target)
-		if !ok {
-			return nil
-		}
-		columnCount, afterColumns = len(cols), next
+	// Ruling I2: an omitted INSERT column list is never checked, even when
+	// the target's full column order is known. Proving the insertable
+	// column order requires knowing whether computed columns
+	// (RDB$COMPUTED_SOURCE) are excluded from an implicit INSERT's target
+	// list, and the catalog adapter has no such signal -- this is
+	// genuinely unverified InterBase engine semantics, not something to
+	// guess at.
+	if next >= limit || items[next].Token.Kind != token.LParen {
+		return nil
 	}
+	columnItems, afterColumns, ok := enclosedList(items, next, limit)
+	if !ok {
+		return nil
+	}
+	columnParts, ok := splitTopLevel(columnItems, token.Comma)
+	if !ok {
+		return nil
+	}
+	columnCount := len(columnParts)
 	if afterColumns >= limit {
 		return nil
 	}
@@ -350,11 +348,51 @@ func (m *diagnosticModel) procedureOutputCountFinding(name Name, at, count int, 
 	}, true
 }
 
-// executeProcedureFindings scans every "EXECUTE PROCEDURE name(...)"
-// call directly from the token stream: unlike SELECT/UPDATE/INSERT/DELETE,
+// parseExecuteCallArgs parses an EXECUTE PROCEDURE call's own argument
+// list, spanning items[start:limit] (limit is the top-level RETURNING_VALUES
+// keyword's position, or the statement end when absent). InterBase's
+// documented grammar is "EXECUTE PROCEDURE name [param [, param ...]]
+// [RETURNING_VALUES ...]": the parenthesized form (name(1, 2)) is an
+// ALTERNATIVE syntax, not the only one -- a bare, unparenthesized
+// comma-separated list (name 1, 2) is equally legal and, in practice, more
+// common. This recognizes all three legal shapes:
+//
+//  1. Nothing (start == limit): zero arguments.
+//  2. items[start] is "(" and its match is exactly at limit-1 (the whole
+//     span is one single enclosing group, matching-paren classic form):
+//     count via splitTopLevel on the enclosed list ("()" itself is zero
+//     arguments).
+//  3. Anything else: a bare, unparenthesized comma-separated list spanning
+//     the whole remaining span, counted via splitTopLevel directly. This
+//     also correctly handles a leading parenthesized subexpression that is
+//     only part of a larger bare argument, such as "(1) + 1, 2" -- since
+//     that opening paren's own match does not land at limit-1, it falls
+//     through to this bare-list case, where splitTopLevel's own depth
+//     tracking still finds the right top-level commas.
+//
+// Any span that does not cleanly parse as one of these three shapes (an
+// unbalanced paren, a genuinely empty comma-separated element) reports
+// ok=false so the caller withholds rather than guesses.
+func parseExecuteCallArgs(items []lexeme, start, limit int, matching map[int]int) (args [][]lexeme, ok bool) {
+	if start >= limit {
+		return nil, true
+	}
+	if items[start].Token.Kind == token.LParen {
+		if close, isMatch := matching[start]; isMatch && close == limit-1 {
+			if close == start+1 {
+				return nil, true // "()": explicit zero arguments
+			}
+			return splitTopLevel(items[start+1:close], token.Comma)
+		}
+	}
+	return splitTopLevel(items[start:limit], token.Comma)
+}
+
+// executeProcedureFindings scans every "EXECUTE PROCEDURE name ..." call
+// directly from the token stream: unlike SELECT/UPDATE/INSERT/DELETE,
 // EXECUTE is never a modelQuery kind (isQueryStart in sql.go does not
 // recognize it), so there is no existing per-query shape to walk here.
-func (m *diagnosticModel) executeProcedureFindings() []Finding {
+func (m *diagnosticModel) executeProcedureFindings(matching map[int]int) []Finding {
 	a := m.analysis
 	items := m.items
 	var findings []Finding
@@ -375,21 +413,49 @@ func (m *diagnosticModel) executeProcedureFindings() []Finding {
 			continue
 		}
 		limit := m.statements[si].End
-		args, next, ok := parseCallArgs(items, nameIdx+1, limit)
+		argsEnd := limit
+		if relative := topLevelWordIndex(items[nameIdx+1:limit], "RETURNING_VALUES"); relative >= 0 {
+			argsEnd = nameIdx + 1 + relative
+		}
+		args, ok := parseExecuteCallArgs(items, nameIdx+1, argsEnd, matching)
 		if !ok {
 			continue
 		}
 		findings = append(findings, m.procedureInputArityFindings(name, len(args), nameIdx)...)
-		if next < limit && isWord(items[next], "RETURNING_VALUES") && next+1 < limit {
-			if targets, ok := splitTopLevel(items[next+1:limit], token.Comma); ok {
-				span := Span{Start: items[next+1].Span.Start, End: items[limit-1].Span.End}
-				if f, has := m.procedureOutputCountFinding(name, nameIdx, len(targets), span); has {
-					findings = append(findings, f)
-				}
-			}
+		if argsEnd < limit && isWord(items[argsEnd], "RETURNING_VALUES") {
+			findings = append(findings, m.executeReturningValuesFindings(name, nameIdx, items, argsEnd, limit, matching)...)
 		}
 	}
 	return findings
+}
+
+// executeReturningValuesFindings counts an EXECUTE PROCEDURE call's
+// RETURNING_VALUES target list. Per ruling I4, a target list that is a
+// single parenthesized group (RETURNING_VALUES (:a, :b)) is withheld
+// entirely rather than counted as one target or unwrapped as multiple: it
+// is unverified whether InterBase (as opposed to Firebird) even accepts
+// that syntactic form, so neither its legality nor its target count should
+// be guessed at. The ordinary unparenthesized form (RETURNING_VALUES :a,
+// :b) is unaffected and counted via splitTopLevel as before.
+func (m *diagnosticModel) executeReturningValuesFindings(name Name, nameIdx int, items []lexeme, returningIdx, limit int, matching map[int]int) []Finding {
+	start := returningIdx + 1
+	if start >= limit {
+		return nil
+	}
+	if items[start].Token.Kind == token.LParen {
+		if close, ok := matching[start]; ok && close == limit-1 {
+			return nil // ruling I4: withhold for a single parenthesized target group
+		}
+	}
+	targets, ok := splitTopLevel(items[start:limit], token.Comma)
+	if !ok {
+		return nil
+	}
+	span := Span{Start: items[start].Span.Start, End: items[limit-1].Span.End}
+	if f, has := m.procedureOutputCountFinding(name, nameIdx, len(targets), span); has {
+		return []Finding{f}
+	}
+	return nil
 }
 
 // fromCallableArityFindings checks a selectable procedure's own input

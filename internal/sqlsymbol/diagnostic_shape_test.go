@@ -40,7 +40,13 @@ func TestDiagnosticTargetCountInsertValuesCommaInsideFunctionCallCountsAsOneItem
 		newDiagnosticFixtureCatalog(), "interbase-target-count", 0)
 }
 
-func TestDiagnosticTargetCountInsertOmittedColumnListWithheldWhenUnknown(t *testing.T) {
+// --- Ruling I2: an omitted INSERT column list is always withheld ---
+// Proving the insertable column order requires knowing whether computed
+// columns are excluded from an implicit INSERT's target list, which the
+// catalog adapter cannot signal; this must never be guessed at, regardless
+// of value count or relation-column-list completeness.
+
+func TestDiagnosticTargetCountInsertOmittedColumnListAlwaysWithheld(t *testing.T) {
 	c := &diagnosticFixtureCatalog{
 		relationsKnown:  false,
 		proceduresKnown: true,
@@ -51,13 +57,10 @@ func TestDiagnosticTargetCountInsertOmittedColumnListWithheldWhenUnknown(t *test
 		keys:            map[string][][]string{},
 	}
 	requireCodeCount(t, "INSERT INTO T VALUES (1, 2);", c, "interbase-target-count", 0)
-}
-
-func TestDiagnosticTargetCountInsertOmittedColumnListUsesKnownRelationOrder(t *testing.T) {
-	// T has 4 known columns (ID, V, NAME, N): a 2-value list is provably
-	// short, a 4-value list provably matches.
+	// T has 4 known columns (ID, V, NAME, N); even so, neither a
+	// clearly-short nor a matching-count implicit VALUES list is checked.
 	requireCodeCount(t, "INSERT INTO T VALUES (1, 2);",
-		newDiagnosticFixtureCatalog(), "interbase-target-count", 1)
+		newDiagnosticFixtureCatalog(), "interbase-target-count", 0)
 	requireCodeCount(t, "INSERT INTO T VALUES (1, 2, 'x', 3);",
 		newDiagnosticFixtureCatalog(), "interbase-target-count", 0)
 }
@@ -177,6 +180,71 @@ func TestDiagnosticProcedureArityMinimumUnknownTooManyIsDiagnosed(t *testing.T) 
 		InputsKnown: true,
 	})
 	requireCodeCount(t, "EXECUTE PROCEDURE P2(1, 2, 3);", c, "interbase-procedure-arity", 1)
+}
+
+// --- Fix round 1: C1 -- the InterBase-standard unparenthesized EXECUTE
+// PROCEDURE syntax ("EXECUTE PROCEDURE name [param [, param ...]]
+// [RETURNING_VALUES ...]") is an alternative to the parenthesized form,
+// not a rarer variant, and must be counted correctly, not treated as a
+// zero-argument call.
+
+func TestDiagnosticProcedureArityUnparenthesizedArgs(t *testing.T) {
+	requireCodeCount(t, "EXECUTE PROCEDURE P :a, :b;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 0)
+}
+
+func TestDiagnosticProcedureArityUnparenthesizedArgsWithReturningValues(t *testing.T) {
+	// Fixture P has exactly one known output (OUT1), so the
+	// RETURNING_VALUES list here supplies one target to match.
+	requireCodeCount(t, "EXECUTE PROCEDURE P 1, 2 RETURNING_VALUES :a;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 0)
+	requireCodeCount(t, "EXECUTE PROCEDURE P 1, 2 RETURNING_VALUES :a;",
+		newDiagnosticFixtureCatalog(), "interbase-target-count", 0)
+}
+
+func TestDiagnosticProcedureArityUnparenthesizedArgsInsideProcedureBody(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE A INTEGER; BEGIN EXECUTE PROCEDURE P :a, 2 RETURNING_VALUES :a; END;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 0)
+}
+
+func TestDiagnosticProcedureArityLeadingParenthesizedExpressionArg(t *testing.T) {
+	// "(1) + 1" is one bare argument (a parenthesized subexpression used
+	// in a larger arithmetic expression), followed by a second bare
+	// argument "2" -- this is the unparenthesized call form, not the
+	// classic single-enclosing-parens form, even though it starts with "(".
+	requireCodeCount(t, "EXECUTE PROCEDURE P (1) + 1, 2;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 0)
+}
+
+func TestDiagnosticProcedureArityUnparenthesizedTooFewArgs(t *testing.T) {
+	requireCodeCount(t, "EXECUTE PROCEDURE P :a;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 1)
+}
+
+func TestDiagnosticProcedureArityUnparenthesizedTooManyArgs(t *testing.T) {
+	requireCodeCount(t, "EXECUTE PROCEDURE P :a, :b, :c;",
+		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 1)
+}
+
+// --- Fix round 1: I1 -- a trigger's SELECT ... INTO must produce exactly
+// one target-count finding, not two, even when a DECLARE VARIABLE line
+// before BEGIN causes buildContexts' generic per-token state machine to
+// reset just before the trigger body (see diagnostic_model.go's
+// excludeQueriesWithinTriggerBodies for the root cause).
+
+func TestDiagnosticTargetCountTriggerSelectIntoNotDuplicated(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE TRIGGER TR FOR T BEFORE INSERT AS DECLARE VARIABLE X INTEGER; BEGIN SELECT ID, V FROM T INTO :a; END;",
+		newDiagnosticFixtureCatalog(), "interbase-target-count", 1)
+}
+
+// --- Fix round 1: I4 -- a parenthesized RETURNING_VALUES target group is
+// withheld entirely: it is unverified whether InterBase accepts this form.
+
+func TestDiagnosticTargetCountReturningValuesParenthesizedGroupWithheld(t *testing.T) {
+	requireCodeCount(t, "EXECUTE PROCEDURE P(1, 2) RETURNING_VALUES (:a, :b);",
+		newDiagnosticFixtureCatalog(), "interbase-target-count", 0)
 }
 
 // --- metadata-arrival transition ---

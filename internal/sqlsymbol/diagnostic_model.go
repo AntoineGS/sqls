@@ -159,7 +159,10 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text))
 	m.statements = splitStatements(items, boundaryAfter)
 
+	triggers := discoverTriggers(a.Text, items)
+
 	raw := discoverSQLQueries(items, a.contexts, depths)
+	raw = excludeQueriesWithinTriggerBodies(raw, triggers)
 	for i := range raw {
 		raw[i].relations, raw[i].target, raw[i].hasTarget = queryRelations(a.Text, items, raw[i], depths, matching)
 	}
@@ -204,7 +207,7 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 	// shadowing) depend on that state already being in place; it updates
 	// those same structures directly for its own additions rather than
 	// triggering a second top-level pass.
-	m.buildTriggerQueries(a.Text, items, depths, matching)
+	m.buildTriggerQueries(a.Text, items, depths, matching, triggers)
 	m.detectUnionGroups(items, depths)
 
 	for _, stmt := range m.statements {
@@ -485,6 +488,41 @@ func statementIndexAt(statements []modelStatement, pos int) int {
 		}
 	}
 	return -1
+}
+
+// excludeQueriesWithinTriggerBodies drops any ordinary top-level query
+// discovery result that starts inside a CREATE TRIGGER body.
+// resolve.go's buildContexts has no CREATE TRIGGER recognition at all (see
+// Unsupported's own doc comment): a top-level semicolon anywhere in the
+// trigger's own AS-clause before BEGIN (for example, ending a DECLARE
+// VARIABLE line) resets its generic per-token state machine back to the
+// same "outside any procedure" state it starts in, which can then
+// accidentally classify an embedded SQL statement inside the trigger body
+// as an ordinary contextSQL region -- duplicating what buildTriggerQueries
+// (the trigger body's own dedicated, authoritative discovery mechanism,
+// built on newTriggerBodyContext rather than the shared binder) already
+// finds independently. A trigger body is never a legitimate standalone
+// top-level SQL statement's home, so any raw discovery result starting
+// inside one is always this same accident, never a genuine second,
+// unrelated top-level query.
+func excludeQueriesWithinTriggerBodies(raw []sqlQuery, triggers []triggerModel) []sqlQuery {
+	if len(triggers) == 0 {
+		return raw
+	}
+	filtered := raw[:0]
+	for _, q := range raw {
+		inside := false
+		for _, trg := range triggers {
+			if q.start >= trg.bodyStart && q.start < trg.bodyEnd {
+				inside = true
+				break
+			}
+		}
+		if !inside {
+			filtered = append(filtered, q)
+		}
+	}
+	return filtered
 }
 
 // boundaryAfterItems marks, for each item index, whether a SET TERM custom
@@ -907,15 +945,24 @@ func (m *diagnosticModel) queryChain(i int) []int {
 // buildTriggerQueries additively models each trigger body's own embedded
 // SQL statement (SELECT/UPDATE/INSERT/DELETE) as a query, the same way
 // procedure bodies' embedded SQL is already modeled by the ordinary
-// discoverSQLQueries pass above. CREATE TRIGGER bodies get no such
+// discoverSQLQueries pass above. CREATE TRIGGER bodies mostly get no such
 // treatment from the shared binder: resolve.go's buildContexts has no
-// CREATE TRIGGER recognition at all (unlike CREATE PROCEDURE), so a whole
-// trigger statement's span is classified contextUnsupported end to end,
-// and discoverSQLQueries (which requires contextSQL/contextExecute) never
-// discovers anything inside one. This reuses Task 3's own
-// newTriggerBodyContext/discoverTriggers (diagnostic_locals.go) -- built
-// for a narrower purpose (finding procedural vs SQL regions for local-
-// variable detection) but equally able to delimit each embedded SQL
+// CREATE TRIGGER recognition at all (unlike CREATE PROCEDURE), so a
+// trigger statement's span is usually classified contextUnsupported end to
+// end, and discoverSQLQueries (which requires contextSQL/contextExecute)
+// finds nothing inside one -- except when a top-level semicolon appears
+// earlier in the trigger's own AS-clause before BEGIN (for example, ending
+// a DECLARE VARIABLE line): buildContexts' semicolon handling resets its
+// generic per-token state machine unconditionally, which can then
+// accidentally classify the trigger's first embedded statement as an
+// ordinary contextSQL region after all. diagnosticModel's caller already
+// guards against that residual overlap via excludeQueriesWithinTriggerBodies
+// (dropping any raw discoverSQLQueries result starting inside a trigger
+// body before this function runs), so triggers is this function's sole,
+// authoritative source for that content regardless. This reuses Task 3's
+// own newTriggerBodyContext/discoverTriggers (diagnostic_locals.go) --
+// built for a narrower purpose (finding procedural vs SQL regions for
+// local-variable detection) but equally able to delimit each embedded SQL
 // statement's own [start, end) span here -- over a trigger body already
 // known to have a syntactically valid, supported shape (parseTrigger only
 // ever returns ok=true for that recognized subset).
@@ -934,8 +981,8 @@ func (m *diagnosticModel) queryChain(i int) []int {
 // true again before the query's own end (kind only ever transitions
 // unsupported<-procedural<-sql, never sql->unsupported directly), so the
 // end-of-query check below does not need the same guard.
-func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depths []int, matching map[int]int) {
-	for _, trg := range discoverTriggers(text, items) {
+func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depths []int, matching map[int]int, triggers []triggerModel) {
+	for _, trg := range triggers {
 		m.recognizedTriggerBodies = append(m.recognizedTriggerBodies, itemRange{trg.bodyStart, trg.bodyEnd})
 		ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
 		start := -1
