@@ -534,6 +534,9 @@ func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
 	loader := NewMetadataLoader()
 	t.Cleanup(loader.Stop)
 	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseOld) }) }
+	t.Cleanup(release)
 	loader.Reset(1)
 	oldLoad, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 1, Jobs: []MetadataJob{{
 		Kind: MetadataColumnsAll,
@@ -549,7 +552,6 @@ func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
 	select {
 	case <-oldStarted:
 	case <-time.After(2 * time.Second):
-		close(releaseOld)
 		t.Fatal("old-generation column job did not start")
 	}
 	loader.Reset(2)
@@ -560,11 +562,10 @@ func TestMetadataLoaderRejectsOldGenerationColumns(t *testing.T) {
 		},
 	}}}))
 	if err != nil {
-		close(releaseOld)
 		t.Fatal(err)
 	}
 	waitLoad(t, newLoad)
-	close(releaseOld)
+	release()
 	waitLoad(t, oldLoad)
 	if err := loader.Wait(context.Background()); err != nil {
 		t.Fatal(err)
@@ -580,12 +581,11 @@ func TestMetadataLoaderCatalogJobSurvivesColumnFailure(t *testing.T) {
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	columnErr := errors.New("columns unavailable")
-	load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 2, Jobs: []MetadataJob{
-		{Kind: MetadataColumnsAll, Run: func(context.Context, *DBCache) (MetadataPatch, error) { return MetadataPatch{}, columnErr }},
-		{Kind: MetadataViews, Run: func(context.Context, *DBCache) (MetadataPatch, error) {
-			return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Views: map[string]*ViewDesc{"CUSTOMER_VIEW": {Name: "customer_view"}}}}}, nil
-		}},
-	}}))
+	repository := catalogTestRepository()
+	repository.MockDescribeDatabaseTable = func(context.Context) ([]*ColumnDesc, error) {
+		return nil, columnErr
+	}
+	load, err := loader.Start(context.Background(), 1, repository)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -593,6 +593,9 @@ func TestMetadataLoaderCatalogJobSurvivesColumnFailure(t *testing.T) {
 	snapshot := loader.Snapshot()
 	if snapshot.Status[MetadataColumnsAll].State != MetadataFailed {
 		t.Fatalf("columns state = %s, want failed", snapshot.Status[MetadataColumnsAll].State)
+	}
+	if !errors.Is(snapshot.Status[MetadataColumnsAll].Err, columnErr) {
+		t.Fatalf("columns error = %v, want injected failure %v", snapshot.Status[MetadataColumnsAll].Err, columnErr)
 	}
 	if _, ok := snapshot.Cache.View("customer_view"); !ok {
 		t.Fatalf("independent catalog job did not publish after column failure: state=%s err=%v cache=%+v", snapshot.Status[MetadataViews].State, snapshot.Status[MetadataViews].Err, snapshot.Cache.Catalog)

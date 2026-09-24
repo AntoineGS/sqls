@@ -70,10 +70,13 @@ The coordinator owns attachment attempts; superseded attempts cannot install a
 connection or publish metadata into the current generation.
 
 **Lock ordering: `connMu` before `stateMu`, never the reverse**, and `stateMu`
-is never held across any I/O. Connection replacement performs close/open and
-metadata generation setup while holding `connMu.Lock()`, taking `stateMu.Lock()`
-only for pointer/state assignments. Bootstrap and workspace configuration are
-not inline lock holders.
+is never held across any I/O. The coordinator's `attachIntent` holds
+`connMu.Lock()` while it advances the generation, opens the candidate
+attachment, commits it and starts the metadata generation; it takes
+`stateMu.Lock()` only for short pointer/state assignments. The replaced
+attachment is transferred to the lifecycle cleanup queue and closed later on
+the cleanup goroutine, not synchronously under `connMu`. Bootstrap and workspace
+configuration are not inline lock holders.
 
 **The accessor trap.** `getConfig`, `topConnection`, `getConnection`,
 `parserDriver`, `newDBRepository` and `fileText` take `stateMu` *internally*.
@@ -88,36 +91,40 @@ blocks behind it while the first is still held, which deadlocks. A downstream
 implementer who does not know these six functions take the lock will write an
 inverted acquisition without realising it.
 
-**Shutdown takes no `connMu`, but it does take `stateMu`.** `Server.Stop`,
-`handleShutdown` and `handleExit` must not block on a runaway query, and
-`sql.DB.Close` is documented as safe to call while queries are in flight — so
-none of them takes `connMu`. All three still read `s.dbConn`, and `handleExit`
-runs on the read loop while an async `switchDatabase` may be inside
-`reconnectionDB` reassigning that pointer, so each snapshots it under
-`stateMu.RLock()` and closes the local. "No `connMu`" is not "no lock".
+**Shutdown takes no `connMu`, but it does take `stateMu`.** `handleShutdown` and
+`handleExit` delegate to `Server.Stop`. Stop cancels lifecycle work, snapshots
+and clears `dbConn` under `stateMu`, then transfers the attachment to the
+lifecycle cleanup goroutine. It does not wait for `connMu` or close a native
+attachment inline on the request loop. "No `connMu`" is not "no lock"; database
+pointer/state access still uses `stateMu`.
 
 **The field audit.** Every field of `Server` is classified. Any new field must
 be added here and classified, or it ships a race.
 
-| Field | Written by | Read by | Treatment |
+| Field(s) | Written/owned by | Read/used by | Treatment |
 | --- | --- | --- | --- |
-| `files` | `openFile`/`updateFile`/`closeFile` (inline) | every handler; `executeQuery` (async) | `stateMu` on every access, plus the copy rule below |
-| `dbConn` | `reconnectionDB` (async-reachable) | `newDBRepository`, `parserDriver`, `Server.Stop`, `handleShutdown`, `handleExit` | `stateMu` on every access, shutdown paths included — they take no `connMu` but still snapshot the pointer under `stateMu.RLock()` |
-| `curDBCfg` | `attachIntent` (coordinator) | `newDBRepository`, `activeIntentConfig` | `stateMu`; config is cloned on capture and commit |
-| `curDBName` | connection coordinator | `newDBConnection` | `stateMu` |
-| `curConnectionIndex` | connection coordinator | `newDBConnection` | `stateMu` |
-| `connectionState`, `metadataStartErr` | connection coordinator | command readiness checks, metadata status | `stateMu` |
-| `WSCfg` | `handleWorkspaceDidChangeConfiguration` (inline) | `getConfig` ← `topConnection`/`showConnections`/`switchConnections` (async) | `stateMu` — a genuine inline-writer/async-reader race |
-| `initOptionDBConfig` | `handleInitialize` (inline, once) | `topConnection` (async-reachable) | `stateMu` — write-once, but read from the async path |
-| `SpecificFileCfg`, `DefaultFileCfg` | `main.go` before `jsonrpc2.NewConn` | `getConfig` | write-once-before-serving; an invariant, not a lock. Any future writer after serving begins must take `stateMu` |
-| `connGeneration` | `attachIntent` (coordinator) | `connectionGeneration`, `memoisedObjectDDL` (inline, hover) | `stateMu` |
-| `ddlMemo` | `attachIntent`, `memoisedObjectDDL` | `memoisedObjectDDL` (inline, hover) | `stateMu`, **never held across the `ObjectDDL` round trip** |
-| `coordinator` | `NewServer` | initialize/configuration/switch handlers, `Stop` | pointer never reassigned; its own mutex guards pending intent and lifecycle |
-| `metadata` | `NewServer` | connection coordinator, metadata status command, editor snapshots | pointer never reassigned; `MetadataLoader` guards snapshots and generations |
-| `diagnosticsWake` | `NewServer` | metadata callback, diagnostic signal consumer | capacity-one coalescing channel; nonblocking sends; single consumer |
-| `cancels` | `NewServer` | `handleWorkspaceExecuteCommand`, `handleCancelRequest` | pointer never reassigned; the registry has its own mutex |
-| `connGeneration` | `reconnectionDB` | `snapshotContext` (inline, definition) | `stateMu` |
-| `snapshots` | `NewServer` only | `interBaseDefinition` (inline), `Stop` | pointer never reassigned after construction; the store guards its own state with its own mutex, which **is** held across filesystem I/O — it is a leaf lock, unlike `stateMu` |
+| `connMu`, `stateMu` | `NewServer` | handlers, coordinator, shutdown | Server lock order is `connMu` before `stateMu`; `stateMu` never spans I/O. See the lock rules above. |
+| `diagnosticsPublishMu` | `NewServer` | diagnostic publisher and coordinator generation transition | Serializes diagnostic validation/send with generation changes; separate from `stateMu`. |
+| `diagnosticCatalogMu`; `diagnosticCache`, `derivedCatalog` | `NewServer`; diagnostics consumer | diagnostic analysis | `diagnosticCatalogMu` guards the cache identity and its immutable derived catalog. |
+| `diagnosticWorkMu`; `diagnosticDocuments`, `diagnosticAllOpen` | `NewServer`; queue/take helpers | diagnostics signal consumer | `diagnosticWorkMu` guards pending work; `diagnosticsWake` is only a coalesced wake, sent nonblocking. |
+| `diagnosticAnalyzer` | test setup only | diagnostics analysis | Test injection is set before the consumer uses it; no production writer after construction. |
+| `dbConn` | `attachIntent` and `Stop` | `newDBRepository`, `parserDriver`, `Stop` | `stateMu`; Stop detaches it and cleanup goroutine closes it asynchronously. No `reconnectionDB` writer remains. |
+| `curDBCfg`, `curDBName`, `curConnectionIndex`, `activeConfigKey` | connection coordinator (`attachIntent`) | connection/config accessors and commands | `stateMu`; connection configs are deep-cloned on capture and commit. |
+| `connectionState`, `metadataStartErr`, `connGeneration`, `ddlMemo` | connection coordinator; `Stop` for stopped state | readiness checks, status, editor snapshots, hover | `stateMu`; DDL memo is invalidated per generation and never locked across `ObjectDDL` I/O. |
+| `WSCfg` | `handleWorkspaceDidChangeConfiguration` (inline) | `getConfig`, `topConnection`, `showConnections`, connection requests | `stateMu`; configuration is snapshotted before enqueueing connection work. |
+| `initOptionDBConfig`, `initialized` | initialize handler (once) | configuration selection and lifecycle handlers | `stateMu`; write-once/transition state, read by coordinator-reachable paths. |
+| `SpecificFileCfg`, `DefaultFileCfg` | `main.go` before `jsonrpc2.NewConn` | `getConfig` | Write-once-before-serving invariant; any later writer must take `stateMu`. |
+| `lifecycleCtx`, `lifecycleCancel`, `stopOnce` | `NewServer`, `Stop` | coordinator, metadata jobs, diagnostics consumer | Context is concurrency-safe; cancellation is one-shot via `stopOnce`; no server lock is held during cancellation. |
+| `coordinator` | `NewServer` | initialize/configuration/switch handlers, `Stop` | Pointer is immutable; the coordinator's own mutex protects desired/pending/active intents. |
+| `metadata` | `NewServer` | coordinator, status command, editor snapshots | Pointer is immutable; `MetadataLoader` owns synchronization for generation snapshots/jobs. |
+| `openConnection` | `NewServer`; test setup before use | connection coordinator | Production function is immutable after construction; tests replace it before starting requests. |
+| `cleanupDone`, `cleanupQueue`, `cleanupFinal` | `NewServer`; Stop signals/queues final connection | cleanup goroutine; tests await `cleanupDone` | Queue transfers connection-close ownership to one cleanup consumer; coordinator completion triggers queue close, then final connection/snapshot cleanup. |
+| `cleanupOnce` | none | none | Currently unused; it provides no synchronization guarantee. |
+| `diagnosticsWake`, `diagnosticsDone` | `NewServer`; signal helper sends wake | diagnostics consumer; tests await completion | Capacity-one nonblocking wake; single consumer closes `diagnosticsDone` on exit. |
+| `fileRevision`, `files` | document handlers (inline) | editor snapshots and handlers; query/diagnostic paths | `stateMu` on mutable file state; read text through the copy rule below. |
+| `notificationConn` | `Server.Handle` | diagnostics signal consumer | `stateMu` for replacement and snapshot before diagnostic notification work. |
+| `snapshots` | `NewServer` | definition handler, cleanup goroutine | Pointer is immutable; the store uses its own leaf mutex, including around filesystem operations. |
+| `cancels` | `NewServer` | execute/cancel handlers | Pointer is immutable; `cancelRegistry` owns its mutex and is not nested with server locks. |
 
 **The copy rule for `files`.** `updateFile` mutates `File.Text` through the
 stored pointer, so holding `stateMu` only while looking the pointer up is not
