@@ -824,6 +824,37 @@ func TestInterBaseDefinitionProcedureWritesReadOnlySnapshot(t *testing.T) {
 	}
 }
 
+func TestInterBaseDefinitionDoesNotWriteAfterGenerationSwitch(t *testing.T) {
+	server := newDefinitionServer(t)
+	server.stateMu.Lock()
+	server.connGeneration = 1
+	server.stateMu.Unlock()
+	entered, release := make(chan struct{}), make(chan struct{})
+	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
+		close(entered)
+		<-release
+		return "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN\n  SUSPEND;\nEND", nil
+	})
+	sc := snapshotContextForConfig(1, server.curDBCfg)
+	done := make(chan lsp.Definition, 1)
+	go func() {
+		got, _ := server.interBaseDefinitionWithSnapshot(context.Background(), repo, definitionCatalog(), definitionParamsAt(20), "execute procedure myproc", dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, sc)
+		done <- got
+	}()
+	<-entered
+	server.stateMu.Lock()
+	server.connGeneration = 2
+	server.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "connection-b", DataSourceName: "localhost/3050:/db/b.ib"}
+	server.stateMu.Unlock()
+	close(release)
+	if got := <-done; len(got) != 0 {
+		t.Fatalf("definition = %v, want no location after switch", got)
+	}
+	if !snapshotRootIsEmpty(t, server.snapshots) {
+		t.Fatal("stale DDL created a snapshot after the generation switch")
+	}
+}
+
 func TestInterBaseDefinitionRangePointsAtObjectName(t *testing.T) {
 	server := newDefinitionServer(t)
 	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {

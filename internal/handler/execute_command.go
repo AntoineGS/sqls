@@ -204,6 +204,11 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 	if !ok {
 		return nil, fmt.Errorf("document not found, %q", uri)
 	}
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		return nil, err
+	}
+	text = snapshot.Text
 
 	// extract target query
 	if params.Range != nil {
@@ -215,13 +220,13 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 			params.Range.End.Character,
 		)
 	}
-	if s.parserDriver() == dialect.DatabaseDriverInterBase {
+	if snapshot.Variant.Driver == dialect.DatabaseDriverInterBase {
 		text = queryparams.ExecutableSelects(text)
 	}
-	if err := s.refuseLegacyNamedParameters(text); err != nil {
+	if err := s.refuseLegacyNamedParametersWithVariant(text, snapshot.Variant); err != nil {
 		return nil, err
 	}
-	stmts, err := getStatementsWithDriverVariant(text, s.parserDriverVariant())
+	stmts, err := getStatementsWithDriverVariant(text, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
@@ -237,7 +242,7 @@ func (s *Server) executeQuery(ctx context.Context, params lsp.ExecuteCommandPara
 
 	// execute statements
 	rendered, err := renderStatements(ctx, len(queries), func(i int) (string, error) {
-		return s.runStatement(ctx, queries[i], showVertical)
+		return s.runStatementWithSnapshot(ctx, queries[i], showVertical, snapshot)
 	})
 	if err != nil {
 		return nil, err
@@ -287,6 +292,34 @@ func (s *Server) runStatement(ctx context.Context, query string, vertical bool, 
 	return s.runRoutedStatement(ctx, query, vertical, s.statementRouting(query), args...)
 }
 
+func (s *Server) runStatementWithSnapshot(ctx context.Context, query string, vertical bool, snapshot editorSnapshot, args ...any) (string, error) {
+	if snapshot.Repository == nil {
+		return "", ErrNoConnection
+	}
+	routing := statementRoutingWithSnapshot(query, snapshot.Variant, snapshot.Cache)
+	return s.runRoutedStatementWithRepository(ctx, query, vertical, routing, snapshot.Repository, args...)
+}
+
+func (s *Server) runRoutedStatementWithRepository(ctx context.Context, query string, vertical bool, routing procedureRouting, repo database.DBRepository, args ...any) (string, error) {
+	var result string
+	var err error
+	switch {
+	case routing.isQuery:
+		result, err = s.renderQueryWithRepository(ctx, repo, query, vertical, true, nil, args...)
+	case routing.returnsRows:
+		result, err = s.renderQueryWithRepository(ctx, repo, query, vertical, false, []string{executeProcedureOneRowNote}, args...)
+	default:
+		result, err = s.execWithRepository(ctx, repo, query, args...)
+	}
+	if err != nil && routing.unknown && cancellationNotice(ctx, err) == "" {
+		return fmt.Sprintf("Exec failed: %v\n\n"+unknownProcedureHint+"\n", err, routing.name), nil
+	}
+	if err == nil && routing.unknown && routing.metadataIncomplete {
+		return result + fmt.Sprintf("\n"+unknownProcedureHint+"\n", routing.name), nil
+	}
+	return result, err
+}
+
 func (s *Server) runRoutedStatement(ctx context.Context, query string, vertical bool, routing procedureRouting, args ...any) (string, error) {
 	if routing.isQuery {
 		return s.query(ctx, query, vertical, args...)
@@ -317,6 +350,16 @@ func (s *Server) statementRouting(query string) procedureRouting {
 		return procedureRouting{isQuery: true}
 	}
 	return s.interBaseProcedureRouting(query)
+}
+
+func statementRoutingWithSnapshot(query string, variant dialect.DriverVariant, cache *database.DBCache) procedureRouting {
+	if _, isQuery := database.QueryExecType(query, ""); isQuery {
+		return procedureRouting{isQuery: true}
+	}
+	if variant.Driver == dialect.DatabaseDriverInterBase {
+		return interBaseProcedureRouting(query, cache)
+	}
+	return procedureRouting{}
 }
 
 // procedureRouting is the once-and-only-once routing decision for a
@@ -352,7 +395,14 @@ func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
 		return procedureRouting{}
 	}
 
-	cache := s.metadata.Cache()
+	return interBaseProcedureRouting(query, s.metadata.Cache())
+}
+
+func interBaseProcedureRouting(query string, cache *database.DBCache) procedureRouting {
+	name := interBaseProcedureName(query)
+	if name == "" {
+		return procedureRouting{}
+	}
 	if cache == nil || !cache.HasCatalog() {
 		return procedureRouting{name: name, unknown: true, metadataIncomplete: true}
 	}
@@ -477,6 +527,15 @@ func (s *Server) queryProcedure(ctx context.Context, query string, vertical bool
 
 func (s *Server) renderQuery(ctx context.Context, query string, vertical, allowReadOnly bool, notes []string, args ...any) (string, error) {
 	result, scanErr := s.queryResult(ctx, query, allowReadOnly, args...)
+	return renderQueryResultWithNotes(ctx, result, scanErr, vertical, notes)
+}
+
+func (s *Server) renderQueryWithRepository(ctx context.Context, repo database.DBRepository, query string, vertical, allowReadOnly bool, notes []string, args ...any) (string, error) {
+	result, scanErr := queryResultWithRepository(ctx, repo, query, allowReadOnly, args...)
+	return renderQueryResultWithNotes(ctx, result, scanErr, vertical, notes)
+}
+
+func renderQueryResultWithNotes(ctx context.Context, result *database.QueryResult, scanErr error, vertical bool, notes []string) (string, error) {
 	if result == nil {
 		return "", scanErr
 	}
@@ -557,6 +616,10 @@ func (s *Server) queryResult(ctx context.Context, query string, allowReadOnly bo
 	if err != nil {
 		return nil, err
 	}
+	return queryResultWithRepository(ctx, repo, query, allowReadOnly, args...)
+}
+
+func queryResultWithRepository(ctx context.Context, repo database.DBRepository, query string, allowReadOnly bool, args ...any) (*database.QueryResult, error) {
 	if len(args) > 0 {
 		read, err := boundReadFor(repo, allowReadOnly)
 		if err != nil {
@@ -670,7 +733,12 @@ func (s *Server) exec(ctx context.Context, query string, vertical bool, args ...
 	if err != nil {
 		return "", err
 	}
+	return s.execWithRepository(ctx, repo, query, args...)
+}
+
+func (s *Server) execWithRepository(ctx context.Context, repo database.DBRepository, query string, args ...any) (string, error) {
 	var result sql.Result
+	var err error
 	if len(args) > 0 {
 		bound, boundErr := boundExecFor(repo)
 		if boundErr != nil {

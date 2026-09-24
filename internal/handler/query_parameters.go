@@ -29,9 +29,11 @@ const parameterProtocolVersion = 1
 // the selected SQL text, its identity for stale-submission detection, and the
 // driver variant to compile it under.
 type parameterSelection struct {
-	Text    string
-	Context lsp.QueryParameterContext
-	Variant dialect.DriverVariant
+	Text       string
+	Context    lsp.QueryParameterContext
+	Variant    dialect.DriverVariant
+	Cache      *database.DBCache
+	Repository database.DBRepository
 }
 
 // parameterSelection resolves the requested document/range and the active
@@ -53,16 +55,15 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		return parameterSelection{}, fmt.Errorf("specify the file uri as a string")
 	}
 
-	s.stateMu.RLock()
-	f, ok := s.files[uri]
-	if !ok {
-		s.stateMu.RUnlock()
-		return parameterSelection{}, fmt.Errorf("document not found, %q", uri)
+	snapshot, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		return parameterSelection{}, err
 	}
-	text := f.Text
+	text := snapshot.Text
+	variant := snapshot.Variant
+	s.stateMu.RLock()
 	dbConn := s.dbConn
-	cfg := s.curDBCfg
-	generation := s.connGeneration
+	cfg := cloneConnectionConfig(s.curDBCfg)
 	s.stateMu.RUnlock()
 
 	if params.Range != nil {
@@ -82,7 +83,6 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		)
 	}
 
-	variant := dbConn.DriverVariant()
 	sqlDialect := variant.Variant.InterBaseSQLDialect()
 
 	queryKey, err := hashJSON([]interface{}{sqlDialect, selected})
@@ -98,11 +98,13 @@ func (s *Server) parameterSelection(params lsp.ExecuteCommandParams) (parameterS
 		Text: selected,
 		Context: lsp.QueryParameterContext{
 			Version:              parameterProtocolVersion,
-			ConnectionGeneration: generation,
+			ConnectionGeneration: snapshot.Generation,
 			QueryKey:             queryKey,
 			DocumentKey:          documentKey,
 		},
-		Variant: variant,
+		Variant:    variant,
+		Cache:      snapshot.Cache,
+		Repository: snapshot.Repository,
 	}
 
 	if variant.Driver == dialect.DatabaseDriverInterBase {
@@ -184,6 +186,9 @@ func (s *Server) getQueryParameters(ctx context.Context, params lsp.ExecuteComma
 	if err != nil {
 		return nil, err
 	}
+	if sel.Repository != nil {
+		repo = sel.Repository
+	}
 
 	discovery := lsp.QueryParameterDiscovery{
 		QueryParameterContext: sel.Context,
@@ -233,6 +238,7 @@ type boundStatement struct {
 	sql     string
 	args    []any
 	routing procedureRouting
+	repo    database.DBRepository
 }
 
 // executeBoundStatements runs a submitted parameter batch. The caller holds
@@ -245,7 +251,7 @@ func (s *Server) executeBoundStatements(ctx context.Context, params lsp.ExecuteC
 		return nil, err
 	}
 	rendered, err := renderStatements(ctx, len(plan), func(i int) (string, error) {
-		return s.runRoutedStatement(ctx, plan[i].sql, vertical, plan[i].routing, plan[i].args...)
+		return s.runRoutedStatementWithRepository(ctx, plan[i].sql, vertical, plan[i].routing, plan[i].repo, plan[i].args...)
 	})
 	if err != nil {
 		return nil, err
@@ -285,16 +291,17 @@ func (s *Server) preflightBoundBatch(ctx context.Context, params lsp.ExecuteComm
 		return nil, err
 	}
 
-	repo, err := s.newDBRepository(ctx)
-	if err != nil {
-		return nil, err
+	repo := sel.Repository
+	if repo == nil {
+		return nil, ErrNoConnection
 	}
 	plan := make([]boundStatement, 0, len(batch.Statements))
 	for i, stmt := range batch.Statements {
 		bound := boundStatement{
 			sql:     stmt.SQL,
 			args:    args[i],
-			routing: s.statementRouting(stmt.SQL),
+			routing: statementRoutingWithSnapshot(stmt.SQL, sel.Variant, sel.Cache),
+			repo:    repo,
 		}
 		if err := boundRouteSupported(repo, bound); err != nil {
 			return nil, err
@@ -363,7 +370,10 @@ func boundRouteSupported(repo database.DBRepository, stmt boundStatement) error 
 // bare "?" — keeps the unparameterized path it has always taken, with the
 // driver as the authority on it.
 func (s *Server) refuseLegacyNamedParameters(text string) error {
-	variant := s.parserDriverVariant()
+	return s.refuseLegacyNamedParametersWithVariant(text, s.parserDriverVariant())
+}
+
+func (s *Server) refuseLegacyNamedParametersWithVariant(text string, variant dialect.DriverVariant) error {
 	if variant.Driver != dialect.DatabaseDriverInterBase {
 		return nil
 	}

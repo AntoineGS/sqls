@@ -3,10 +3,10 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/internal/completer"
+	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -20,17 +20,40 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 		return nil, err
 	}
 
-	text, ok := s.fileText(params.TextDocument.URI)
-	if !ok {
-		return nil, fmt.Errorf("document not found: %s", params.TextDocument.URI)
-	}
-
-	c := completer.NewCompleter(s.metadata.Cache())
-	dv := s.parserDriverVariant()
-	c.Driver, c.Variant = dv.Driver, dv.Variant
-	completionItems, err := c.Complete(text, params, s.getConfig().LowercaseKeywords)
+	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
 	if err != nil {
 		return nil, err
 	}
-	return completionItems, nil
+	c := completer.NewCompleter(snapshot.Cache)
+	c.Driver, c.Variant = snapshot.Variant.Driver, snapshot.Variant.Variant
+	completionItems, err := c.Complete(snapshot.Text, params, snapshot.LowercaseKeywords)
+	if err != nil {
+		return nil, err
+	}
+	return lsp.CompletionList{Items: completionItems, IsIncomplete: completionMetadataIncomplete(snapshot)}, nil
+}
+
+func completionMetadataIncomplete(snapshot editorSnapshot) bool {
+	if snapshot.Attaching {
+		return true
+	}
+	if snapshot.Metadata == nil {
+		return false
+	}
+	// These are the categories that can contribute catalog candidates. A
+	// failed/blocked/cancelled category is terminal; it must not keep clients
+	// spinning forever when progressive loading has degraded.
+	relevant := []database.MetadataKind{
+		database.MetadataSchemas, database.MetadataRelations,
+		database.MetadataColumnsCurrent, database.MetadataColumnsAll,
+		database.MetadataViews, database.MetadataProcedures,
+		database.MetadataGenerators, database.MetadataFunctions,
+	}
+	for _, kind := range relevant {
+		state := snapshot.Metadata.Status[kind].State
+		if state == database.MetadataPending || state == database.MetadataLoading {
+			return true
+		}
+	}
+	return false
 }

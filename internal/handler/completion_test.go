@@ -1118,11 +1118,11 @@ func TestCompleteMain(t *testing.T) {
 					},
 				}
 
-				var got []lsp.CompletionItem
+				var got lsp.CompletionList
 				if err := tx.conn.Call(tx.ctx, "textDocument/completion", completionParams, &got); err != nil {
 					t.Fatal("conn.Call textDocument/completion:", err)
 				}
-				testCompletionItem(t, tt.want, tt.bad, got)
+				testCompletionItem(t, tt.want, tt.bad, got.Items)
 			})
 		}
 	}
@@ -1168,11 +1168,11 @@ func TestCompleteJoin(t *testing.T) {
 					},
 				}
 
-				var got []lsp.CompletionItem
+				var got lsp.CompletionList
 				if err := tx.conn.Call(tx.ctx, "textDocument/completion", completionParams, &got); err != nil {
 					t.Fatal("conn.Call textDocument/completion:", err)
 				}
-				testCompletionItem(t, tt.want, tt.bad, got)
+				testCompletionItem(t, tt.want, tt.bad, got.Items)
 			})
 		}
 	}
@@ -1219,9 +1219,12 @@ func TestCompleteNoneDBConnection(t *testing.T) {
 				}
 
 				// Without a DB connection, it is not possible to provide functions using the DB connection, so just make sure that no errors occur.
-				var got []lsp.CompletionItem
+				var got lsp.CompletionList
 				if err := tx.conn.Call(tx.ctx, "textDocument/completion", completionParams, &got); err != nil {
 					t.Fatal("conn.Call textDocument/completion:", err)
+				}
+				if got.IsIncomplete {
+					t.Fatal("completion without a connection should not be marked incomplete")
 				}
 			})
 		}

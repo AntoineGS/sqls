@@ -49,12 +49,12 @@ func TestInterBaseDialect1LanguageServerCompletion(t *testing.T) {
 					Position:     lsp.Position{Line: 0, Character: tt.col},
 				},
 			}
-			var got []lsp.CompletionItem
+			var got lsp.CompletionList
 			if err := tx.conn.Call(tx.ctx, "textDocument/completion", params, &got); err != nil {
 				t.Fatal("conn.Call textDocument/completion:", err)
 			}
 
-			labels := handlerCompletionLabels(got)
+			labels := handlerCompletionLabels(got.Items)
 			if !labels[tt.want] {
 				t.Errorf("missing completion %q in %v", tt.want, labels)
 			}
@@ -152,7 +152,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			const text = "select rdb$ from rdb$database"
 			tx.textDocumentDidOpen(t, testFileURI, text)
 
-			var completions []lsp.CompletionItem
+			var completions lsp.CompletionList
 			if err := tx.conn.Call(tx.ctx, "textDocument/completion", lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 					TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
@@ -161,7 +161,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			}, &completions); err != nil {
 				t.Fatal("conn.Call textDocument/completion:", err)
 			}
-			if labels := handlerCompletionLabels(completions); !labels["RDB$RELATION_ID"] {
+			if labels := handlerCompletionLabels(completions.Items); !labels["RDB$RELATION_ID"] {
 				t.Errorf("missing catalog column completion under %s: %v", tt.variant, labels)
 			}
 
@@ -198,7 +198,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			const text = "TIM"
 			tx.textDocumentDidOpen(t, testFileURI, text)
 
-			var completions []lsp.CompletionItem
+			var completions lsp.CompletionList
 			if err := tx.conn.Call(tx.ctx, "textDocument/completion", lsp.CompletionParams{
 				TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 					TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
@@ -207,7 +207,7 @@ func TestInterBaseVariantReachesCompletionAndHover(t *testing.T) {
 			}, &completions); err != nil {
 				t.Fatal("conn.Call textDocument/completion:", err)
 			}
-			if got := handlerCompletionLabels(completions)["TIMESTAMP"]; got != tt.want {
+			if got := handlerCompletionLabels(completions.Items)["TIMESTAMP"]; got != tt.want {
 				t.Errorf("TIMESTAMP offered = %v, want %v under %s", got, tt.want, tt.variant)
 			}
 		})
@@ -361,6 +361,7 @@ func configureInterBaseTestServer(t *testing.T, tx *TestContext, variant dialect
 		Driver:  dialect.DatabaseDriverInterBase,
 		Variant: variant,
 	}
+	tx.server.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Dialect: variant.InterBaseSQLDialect()}
 	tx.server.connectionState = connectionReady
 	tx.server.stateMu.Unlock()
 	loadMetadataForTest(t, tx.server, repo)

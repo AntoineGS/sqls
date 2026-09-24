@@ -112,7 +112,7 @@ func hoverAt(t *testing.T, server *Server, repo database.DBRepository, cache *da
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		t.Fatal("hoverWithDriver:", err)
 	}
-	return server.interBaseHover(context.Background(), repo, cache, params, text, base)
+	return server.interBaseHover(context.Background(), repo, cache, params, text, base, server.connectionGeneration(), server.parserDriverVariant())
 }
 
 func TestResolveInterBaseHoverTarget(t *testing.T) {
@@ -680,7 +680,7 @@ func TestHoverMemoLockIsNotHeldAcrossObjectDDL(t *testing.T) {
 	}
 	done := make(chan *lsp.Hover, 1)
 	go func() {
-		done <- server.interBaseHover(context.Background(), repo, cache, params, "execute procedure myproc", nil)
+		done <- server.interBaseHover(context.Background(), repo, cache, params, "execute procedure myproc", nil, server.connectionGeneration(), server.parserDriverVariant())
 	}()
 
 	select {
