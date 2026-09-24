@@ -32,6 +32,19 @@ type diagnosticModel struct {
 	procedureNameFor map[relationSourceKey]Name // owning query + alias -> the FROM-clause callable's procedure name
 	cteColumns       map[int][]Name             // CTE query index -> its explicit WITH-column-list names, in order
 
+	// relationDeclPositions marks every item index that is part of a
+	// relation reference's own name, call-arguments, or alias within a
+	// FROM clause -- never a column value reference in that relation's
+	// owning query. a.contexts' relation/alias flags (resolve.go's
+	// markSQLPositions) only cover a single name token directly after
+	// FROM/JOIN/UPDATE/INSERT INTO/DELETE FROM; they do not see a
+	// comma-continued relation in a multi-table FROM list, nor a derived
+	// table's or FROM-clause callable's alias (whose relation "name" is a
+	// parenthesized construct, not a name token markSQLPositions can
+	// anchor to). This is a second, independent source of the same
+	// concept, built directly from the already-parsed RelationRef list.
+	relationDeclPositions map[int]bool
+
 	unionOf     []int   // per query index: the union-chain group it belongs to, or -1
 	unionGroups [][]int // group id -> ordered arm query indices
 
@@ -150,6 +163,7 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 
 	m.buildQueryAt(len(items))
 	m.connectRelationSources(a.Text, items, depths, matching)
+	m.computeRelationDeclPositions(a.Text, items, depths, matching)
 	// DDL detection must run before computeOutputs: expandStar resolves
 	// through resolveRelationOutput, which checks DDLInvalidated while
 	// computing a query's own output shape, not only when a caller later
@@ -689,7 +703,7 @@ func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []
 			return index
 		}
 		seen[index] = true
-		details = append(details, relationDetail{ref: ref, start: index})
+		details = append(details, relationDetail{ref: ref, start: index, end: next})
 		return next - 1
 	}
 	inFrom := false
@@ -722,6 +736,7 @@ func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []
 type relationDetail struct {
 	ref   RelationRef
 	start int
+	end   int // item index one past this relation reference's own text (name/call-args/derived-body and optional alias)
 }
 
 func (m *diagnosticModel) connectRelationSources(text string, items []lexeme, depths []int, matching map[int]int) {
@@ -750,6 +765,46 @@ func (m *diagnosticModel) connectRelationSources(text string, items []lexeme, de
 			}
 			if plain, _, ok := relationAt(text, items, source, q.end, depths, matching, false); ok && plain.Name.Key() != "" {
 				m.procedureNameFor[key] = plain.Name
+			}
+		}
+	}
+}
+
+// computeRelationDeclPositions builds relationDeclPositions from the same
+// per-query relation detail scan connectRelationSources already performs,
+// but for every relation (not only the alias-only derived-table/callable
+// ones connectRelationSources itself keys). A derived table's own body
+// belongs to a separate, independently modeled inner query and is
+// deliberately not swept in here: only its alias token is a declaration
+// from the outer query's point of view. A plain table or a FROM-clause
+// callable's whole [start, end) span (name, and call-arguments if any, and
+// alias if any) is swept, since none of it is ever a column value
+// reference in the owning query's own scope -- including call arguments,
+// whose column-existence validation this task does not attempt.
+func (m *diagnosticModel) computeRelationDeclPositions(text string, items []lexeme, depths []int, matching map[int]int) {
+	m.relationDeclPositions = make(map[int]bool)
+	for _, q := range m.queries {
+		if q.kind != "SELECT" {
+			continue
+		}
+		synthetic := sqlQuery{start: q.start, end: q.end, baseDepth: q.baseDepth, kind: q.kind}
+		details := queryRelationDetails(text, items, synthetic, depths, matching)
+		if len(details) != len(q.relations) {
+			continue
+		}
+		for k, ref := range q.relations {
+			source, end := details[k].start, details[k].end
+			if source < 0 || end > len(items) || source >= end {
+				continue
+			}
+			if items[source].Token.Kind == token.LParen {
+				if ref.Alias != nil {
+					m.relationDeclPositions[end-1] = true
+				}
+				continue
+			}
+			for p := source; p < end; p++ {
+				m.relationDeclPositions[p] = true
 			}
 		}
 	}
