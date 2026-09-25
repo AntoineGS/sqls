@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -511,6 +512,53 @@ func TestProductionDefinitionReturnsCancellationWithoutPublishingSource(t *testi
 	}
 	if !snapshotRootIsEmpty(t, s.snapshots) {
 		t.Fatal("canceled definition published a source snapshot")
+	}
+}
+
+func TestProductionDefinitionDegradesCleanlyWhenSnapshotWriteFails(t *testing.T) {
+	s := newDefinitionServer(t)
+	provider := newGatedHoverProvider("MYPROC", "CREATE PROCEDURE MYPROC AS BEGIN SUSPEND; END")
+	lease := readyHoverLease(t, s, "definition-write-failure", provider)
+	const text = "execute procedure myproc"
+	s.files[testFileURI] = &File{Text: text, Version: 5, Revision: 5}
+	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, lease
+	written := make(chan string, 1)
+	s.snapshots.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if err := os.WriteFile(path, data, mode); err != nil {
+			return err
+		}
+		written <- path
+		return errors.New("injected disk failure after partial file write")
+	}
+	answer := make(chan struct {
+		locations []lsp.Location
+		err       error
+	}, 1)
+	go func() {
+		locations, err := invokeDefinition(s, text, 20)
+		answer <- struct {
+			locations []lsp.Location
+			err       error
+		}{locations, err}
+	}()
+	waitSignal(t, provider.entered, "definition Detail.Load before write failure")
+	close(provider.release)
+	got := <-answer
+	if got.err != nil || len(got.locations) != 0 {
+		t.Fatalf("definition after snapshot write failure = (%#v, %v), want empty locations and nil protocol error", got.locations, got.err)
+	}
+	var path string
+	select {
+	case path = <-written:
+	case <-time.After(3 * time.Second):
+		t.Fatal("snapshot write failure injection was not reached")
+	}
+	candidateDir := filepath.Dir(filepath.Dir(path))
+	if _, err := os.Stat(candidateDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial candidate directory %q remains after failure: %v", candidateDir, err)
+	}
+	if !snapshotRootIsEmpty(t, s.snapshots) {
+		t.Fatal("failed definition left a partial source file in the snapshot store")
 	}
 }
 

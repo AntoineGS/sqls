@@ -7,6 +7,8 @@ import (
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/catalog"
+	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -34,6 +36,11 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 		return Result[Hover]{}, err
 	}
 	if !ok {
+		if summary, viewRange, found, err := knownViewSummaryWhileViewsLoad(req, position); err != nil {
+			return Result[Hover]{}, err
+		} else if found {
+			return Result[Hover]{Value: Hover{Markdown: summary, Range: &viewRange}, Stamp: stampFor(req)}, nil
+		}
 		if cacheErr != nil {
 			return Result[Hover]{}, cacheErr
 		}
@@ -108,6 +115,46 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 		return result, nil
 	}
 	return Result[Hover]{Value: Hover{Markdown: markdown, Range: &hoverRange}, Stamp: stampFor(req)}, nil
+}
+
+// knownViewSummaryWhileViewsLoad keeps an already-published view hover
+// available while the view category is being refreshed. Relation columns may
+// be published earlier, but they are not sufficient evidence to label an
+// unknown relation as a table. This path returns only the known cached view
+// summary; it deliberately does not issue a detail request before readiness.
+func knownViewSummaryWhileViewsLoad(req Request, position Position) (string, Range, bool, error) {
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
+		return "", Range{}, false, nil
+	}
+	cache := req.Context.SnapshotCache()
+	if cache == nil || !cache.MetadataReady(catalog.MetadataRelations) {
+		return "", Range{}, false, nil
+	}
+	state, tracked := cache.Metadata[catalog.MetadataViews]
+	if !tracked || state == catalog.MetadataReady {
+		return "", Range{}, false, nil
+	}
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return "", Range{}, false, nil
+	}
+	analysis, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
+	if err != nil {
+		return "", Range{}, false, err
+	}
+	resolution := analysis.Resolve(offset)
+	if resolution.Role != sqlsymbol.Relation || resolution.SQL == nil {
+		return "", Range{}, false, nil
+	}
+	name, found, ambiguous := resolveCatalogObjectName(catalog.ObjectKindView, resolution.SQL.Name, cache)
+	if !found || len(ambiguous) != 0 {
+		return "", Range{}, false, nil
+	}
+	view, found := cache.ViewByID(name)
+	if !found {
+		return "", Range{}, false, nil
+	}
+	return catalog.ViewDoc(view), rangeForResolution(req.Document.Text, resolution), true, nil
 }
 
 func catalogObjectHoverSummary(object catalog.ObjectID, cache *catalog.Cache) string {

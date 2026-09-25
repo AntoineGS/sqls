@@ -65,6 +65,23 @@ func readyNavigationCache() *catalog.Cache {
 	return cache
 }
 
+func addNavigationTable(cache *catalog.Cache, name string, columns ...string) {
+	if cache.ColumnsByID == nil {
+		cache.ColumnsByID = make(map[string][]*catalog.ColumnDesc)
+	}
+	if cache.ColumnsWithParent == nil {
+		cache.ColumnsWithParent = make(map[string][]*catalog.ColumnDesc)
+	}
+	cache.SchemaTables["A"] = append(cache.SchemaTables["A"], name)
+	descs := make([]*catalog.ColumnDesc, 0, len(columns))
+	for _, column := range columns {
+		descs = append(descs, &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "A", Table: name, Name: column}, Type: "INTEGER"})
+	}
+	cache.ColumnsByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: name}).Key()] = descs
+	cache.ColumnsWithParent[catalog.ColumnDatabaseKey("A", name)] = descs
+	cache.Catalog.RebuildObjects(strings.ToUpper)
+}
+
 func definitionDetails(t *testing.T, req language.Request, pos language.Position) []metadata.Request {
 	t.Helper()
 	details := req.Context.Details.(*recordingDetails)
@@ -119,6 +136,78 @@ func TestNavigationDefinitionRefusesPartialRelationMetadata(t *testing.T) {
 	calls := definitionDetails(t, req, language.Position{Line: 0, UTF16Column: 14})
 	if len(calls) != 0 {
 		t.Fatalf("partial relation metadata made detail requests: %#v", calls)
+	}
+}
+
+func TestNavigationDefinitionRejectsUnprovenColumnOwnersWithoutDetailReads(t *testing.T) {
+	cases := []struct {
+		name, text, marker string
+		prepare            func(*catalog.Cache)
+	}{
+		{
+			name:   "unknown column",
+			text:   "SELECT ci.MISSING FROM CUSTOMERINVOICE ci",
+			marker: "MISSING",
+			prepare: func(cache *catalog.Cache) {
+				addNavigationTable(cache, "CUSTOMERINVOICE", "BALANCE")
+			},
+		},
+		{
+			name:   "column ambiguous between two tables",
+			text:   "SELECT BALANCE FROM CUSTOMERINVOICE ci JOIN OTHERINVOICE oi ON 1=1",
+			marker: "BALANCE",
+			prepare: func(cache *catalog.Cache) {
+				addNavigationTable(cache, "CUSTOMERINVOICE", "BALANCE")
+				addNavigationTable(cache, "OTHERINVOICE", "BALANCE")
+			},
+		},
+		{
+			name:   "unknown inner derived binding shadows known outer",
+			text:   "SELECT c.BALANCE FROM CUSTOMERINVOICE c WHERE EXISTS (SELECT 1 FROM (SELECT 1) c WHERE c.BALANCE = 1)",
+			marker: "BALANCE",
+			prepare: func(cache *catalog.Cache) {
+				addNavigationTable(cache, "CUSTOMERINVOICE", "BALANCE")
+			},
+		},
+		{
+			name:   "duplicate same-scope qualifier",
+			text:   "SELECT c.BALANCE FROM CUSTOMERINVOICE c JOIN OTHERINVOICE c ON 1=1",
+			marker: "BALANCE",
+			prepare: func(cache *catalog.Cache) {
+				addNavigationTable(cache, "CUSTOMERINVOICE", "BALANCE")
+				addNavigationTable(cache, "OTHERINVOICE", "BALANCE")
+			},
+		},
+		{
+			name:   "quoted mixed-case column mismatch",
+			text:   `SELECT ci."camelcol" FROM "MixedCase" ci`,
+			marker: `"camelcol"`,
+			prepare: func(cache *catalog.Cache) {
+				addNavigationTable(cache, "MixedCase", "CamelCol")
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := readyNavigationCache()
+			tc.prepare(cache)
+			req := navigationRequest(tc.text, cache)
+			offset := strings.LastIndex(tc.text, tc.marker)
+			pos, err := language.PositionAt(tc.text, offset+1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := language.NewService().Definition(context.Background(), req, pos)
+			if err != nil {
+				t.Fatalf("Definition: %v", err)
+			}
+			if len(result.Value) != 0 {
+				t.Fatalf("Definition = %#v, want no source location", result.Value)
+			}
+			if calls := req.Context.Details.(*recordingDetails).requests; len(calls) != 0 {
+				t.Fatalf("unproven owner made detail requests: %#v", calls)
+			}
+		})
 	}
 }
 
