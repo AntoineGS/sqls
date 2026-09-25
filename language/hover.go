@@ -2,10 +2,12 @@ package language
 
 import (
 	"context"
+	"errors"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/catalog"
+	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -20,13 +22,48 @@ type errNoHover struct{}
 
 func (errNoHover) Error() string { return "language: no hover information found" }
 
-// Hover returns cache-only hover information for the identifier at
-// position: it never performs I/O and answers only from
-// req.Context.Snapshot's already-published Cache. A host that also offers
-// live-repository augmentation (for example a DDL summary fetched through
-// Context.Details) computes that separately and merges it with this
-// result; Hover itself has no knowledge of DetailReader.
+// Hover returns cache-derived hover information, augmented with database
+// source when the selected relation has a supported detail. Detail loading is
+// always through the request's shared metadata lease.
 func (s *Service) Hover(ctx context.Context, req Request, position Position) (Result[Hover], error) {
+	result, cacheErr := s.hoverCached(ctx, req, position)
+	if ctx.Err() != nil {
+		return Result[Hover]{}, ErrCanceled
+	}
+	target, selectedRange, ok, err := relationAt(req, position)
+	if err != nil {
+		return Result[Hover]{}, err
+	}
+	if !ok || req.Context.Details == nil {
+		if cacheErr != nil {
+			return Result[Hover]{}, cacheErr
+		}
+		return result, nil
+	}
+	detail, err := req.Context.Details.Detail(ctx, metadata.Request{Object: target, Facet: "ddl", Dialect: req.Context.Variant.Variant.InterBaseSQLDialect(), Consistency: metadata.Committed})
+	if err != nil {
+		if ctx.Err() != nil {
+			return Result[Hover]{}, ErrCanceled
+		}
+		if errors.Is(err, metadata.ErrUnsupported) {
+			if cacheErr != nil {
+				return Result[Hover]{}, cacheErr
+			}
+			return result, nil
+		}
+		return Result[Hover]{}, err
+	}
+	if ctx.Err() != nil {
+		return Result[Hover]{}, ErrCanceled
+	}
+	markdown := "```sql\n" + detail.Text + "\n```"
+	if cacheErr == nil && result.Value.Markdown != "" {
+		markdown = result.Value.Markdown + "\n\n" + markdown
+	}
+	return Result[Hover]{Value: Hover{Markdown: markdown, Range: &selectedRange}, Stamp: stampFor(req)}, nil
+}
+
+func (s *Service) hoverCached(ctx context.Context, req Request, position Position) (Result[Hover], error) {
 	if err := ctx.Err(); err != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
