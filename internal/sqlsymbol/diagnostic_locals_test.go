@@ -83,6 +83,28 @@ BEGIN V = X + 1; END`
 	requireCodeCount(t, sql, nil, codeUnknownVariable, 0)
 }
 
+func TestDiagnosticMalformedDeclarationSuppressionUsesSparseProcedureIndex(t *testing.T) {
+	sql := `CREATE PROCEDURE P0 AS DECLARE VARIABLE A INTEGER; BEGIN A = 1; END;
+CREATE PROCEDURE P1 AS
+DECLARE VARIABLE X;
+DECLARE VARIABLE V INTEGER;
+BEGIN V = X + 1; V = Y + 1; END`
+	a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var findings []Finding
+	for _, f := range a.Diagnostics(nil) {
+		if f.Code == codeUnknownVariable {
+			findings = append(findings, f)
+		}
+	}
+	y := strings.LastIndex(sql, "Y")
+	if len(findings) != 1 || findings[0].Span != (Span{Start: y, End: y + 1}) {
+		t.Fatalf("unknown-variable findings=%+v, want only undeclared Y at [%d,%d)", findings, y, y+1)
+	}
+}
+
 func TestDiagnosticUnknownLocalKnownNameNotFlagged(t *testing.T) {
 	requireCodeCount(t,
 		"CREATE PROCEDURE Q AS DECLARE VARIABLE V_TOTAL INTEGER; BEGIN V_TOTAL = 1; END",
