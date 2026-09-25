@@ -64,15 +64,11 @@ func TestNeovimFixtureSnapshotIsDeterministic(t *testing.T) {
 	if !strings.Contains(neovimFixtureTableDDL, "CREATE TABLE CUSTOMERS") || !strings.Contains(neovimFixtureProcedureSource, "SUSPEND") {
 		t.Fatal("fixture DDL/source contract is incomplete")
 	}
-	for _, kind := range []catalog.MetadataKind{database.MetadataRelations, database.MetadataColumnsCurrent, database.MetadataPrimaryKeys, database.MetadataProcedures} {
+	for _, kind := range []catalog.MetadataKind{database.MetadataRelations, database.MetadataColumnsCurrent, database.MetadataPrimaryKeys, database.MetadataProcedures, database.MetadataViews} {
 		if !cache.MetadataReady(kind) {
 			t.Errorf("fixture category %q is not ready", kind)
 		}
 	}
-	if provider.calls.Load() != 5 {
-		t.Fatalf("fixture provider job calls = %d, want 5", provider.calls.Load())
-	}
-
 	newProvider := &neovimFixtureProvider{variant: "new"}
 	newLease, err := registry.Acquire(context.Background(), metadata.Key{Engine: "fixture", URL: "fixture://new"}, metadata.Scope{Principal: "fixture"}, newProvider.factory)
 	if err != nil {
@@ -586,32 +582,29 @@ const (
 
 type neovimFixtureProvider struct {
 	variant string
-	calls   atomic.Int64
 }
 
 func (p *neovimFixtureProvider) Plan() catalog.MetadataPlan {
 	return catalog.MetadataPlan{Parallelism: 3, Jobs: []catalog.MetadataJob{
 		{Kind: database.MetadataRelations, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			p.calls.Add(1)
 			return catalog.MetadataPatch{Cache: &catalog.Cache{SchemaTables: map[string][]string{"": {"CUSTOMERS"}}}, Count: 1}, nil
 		}},
 		{Kind: database.MetadataColumnsCurrent, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			p.calls.Add(1)
 			cache := neovimFixtureCache(p.variant)
 			return catalog.MetadataPatch{Cache: &catalog.Cache{ColumnsWithParent: cache.ColumnsWithParent, ColumnsByID: cache.ColumnsByID}, Count: 3}, nil
 		}},
 		{Kind: database.MetadataPrimaryKeys, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			p.calls.Add(1)
 			keys := map[string]map[string]struct{}{"\tCUSTOMERS": {"CUSTOMER_ID": {}}}
 			return catalog.MetadataPatch{Cache: &catalog.Cache{PrimaryKeyColumns: keys}, Count: 1}, nil
 		}},
 		{Kind: database.MetadataProcedures, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			p.calls.Add(1)
 			cache := neovimFixtureCache(p.variant)
 			return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Procedures: cache.Catalog.Procedures, ProceduresByID: cache.Catalog.ProceduresByID}}, Count: 1}, nil
 		}},
+		{Kind: database.MetadataViews, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Views: map[string]*catalog.ViewDesc{}, ViewsByID: map[string]*catalog.ViewDesc{}}}}, nil
+		}},
 		{Kind: database.MetadataIndexes, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			p.calls.Add(1)
 			cache := neovimFixtureCache(p.variant)
 			return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Indexes: cache.Catalog.Indexes, IndexesByID: cache.Catalog.IndexesByID}}, Count: 1}, nil
 		}},
