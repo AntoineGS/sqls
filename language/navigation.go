@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/ast"
@@ -255,6 +254,7 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 		if resolution.Role != sqlsymbol.Alias {
 			return Location{}, false, nil
 		}
+		return interBaseAliasDefinition(req, resolution)
 	}
 	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
 	if err != nil {
@@ -297,9 +297,6 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 		if !rangeWithin(aliasRange, statementRange) {
 			continue
 		}
-		if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase && !aliasInResolutionScope(aliased, resolution) {
-			continue
-		}
 		candidates = append(candidates, aliased)
 	}
 	// Duplicate declarations that cannot be uniquely associated with this
@@ -315,47 +312,36 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 	return Location{}, false, nil
 }
 
-func aliasInResolutionScope(alias *ast.Aliased, resolution sqlsymbol.Resolution) bool {
+func interBaseAliasDefinition(req Request, resolution sqlsymbol.Resolution) (Location, bool, error) {
 	if resolution.SQL == nil {
-		return false
+		return Location{}, false, nil
 	}
-	for _, scope := range resolution.SQL.Scopes {
+	for _, scope := range resolution.SQL.Scopes { // SQL scopes are nearest-first.
+		matches := make([]sqlsymbol.RelationRef, 0, 1)
 		for _, relation := range scope {
-			if relation.Alias == nil || !nameMatchesNode(*relation.Alias, alias.AliasedName) {
-				continue
+			if relation.Alias != nil && relation.Alias.Key() == resolution.SQL.Name.Key() {
+				matches = append(matches, relation)
 			}
-			// A named relation binding disambiguates repeated alias spellings
-			// in nested/sibling query scopes. Derived-query bindings have no
-			// base relation name, so their owning scope is the alias binding.
-			if relation.Name.Text != "" && !nameMatchesNode(relation.Name, alias.RealName) {
-				continue
-			}
-			return true
 		}
+		if len(matches) == 0 {
+			continue
+		}
+		// The nearest matching scope owns this name. Ambiguous or malformed
+		// bindings do not fall through to an outer same-spelled declaration.
+		if len(matches) != 1 {
+			return Location{}, false, nil
+		}
+		span := matches[0].AliasDeclaration
+		if span.Start < 0 || span.End <= span.Start || span.End > len(req.Document.Text) {
+			return Location{}, false, nil
+		}
+		rng, ok := navigationSpanRange(req.Document.Text, span)
+		if !ok {
+			return Location{}, false, nil
+		}
+		return Location{URI: req.Document.URI, Range: rng}, true, nil
 	}
-	return false
-}
-
-func nameMatchesNode(name sqlsymbol.Name, node ast.Node) bool {
-	value := astNodeName(node)
-	if value == "" {
-		return false
-	}
-	if name.Quoted {
-		return value == name.Text
-	}
-	return strings.EqualFold(value, name.Text)
-}
-
-func astNodeName(node ast.Node) string {
-	switch n := node.(type) {
-	case *ast.Identifier:
-		return n.Tok.NoQuoteString()
-	case *ast.MemberIdentifier:
-		return n.ChildTok.NoQuoteString()
-	default:
-		return ""
-	}
+	return Location{}, false, nil
 }
 
 func findContainingStatement(root ast.Node, text string, offset int, best *ast.Node) {

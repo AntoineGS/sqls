@@ -141,6 +141,10 @@ func TestSQLCallableSourceIsUnknownWithAlias(t *testing.T) {
 	if got := member.SQL.Scopes[0][0]; got.Name != (Name{}) || got.Alias == nil || got.Alias.Key() != "P" {
 		t.Fatalf("callable source: %+v", got)
 	}
+	callableAlias := strings.Index(text, "FROM get_rows(1) p") + len("FROM get_rows(1) ")
+	if got, want := member.SQL.Scopes[0][0].AliasDeclaration, (Span{Start: callableAlias, End: callableAlias + 1}); got != want {
+		t.Fatalf("callable alias span = %+v, want %+v", got, want)
+	}
 	if got := member.SQL.Scopes[0][1]; got.Name.Key() != "TOTALS" || got.Alias == nil || got.Alias.Key() != "T" {
 		t.Fatalf("joined concrete source: %+v", got)
 	}
@@ -172,6 +176,14 @@ WHERE EXISTS (SELECT o.id FROM orders o WHERE c.id = o.id);`
 	if r.SQL.Scopes[0][0].Name.Key() != "ORDERS" || r.SQL.Scopes[1][0].Name.Key() != "CUSTOMER" {
 		t.Fatalf("scope order: %+v", r.SQL.Scopes)
 	}
+	innerAlias := strings.Index(text, "orders o") + len("orders ")
+	outerAlias := strings.Index(text, "customer c") + len("customer ")
+	if got, want := r.SQL.Scopes[0][0].AliasDeclaration, (Span{Start: innerAlias, End: innerAlias + 1}); got != want {
+		t.Fatalf("inner alias declaration span = %+v, want %+v", got, want)
+	}
+	if got, want := r.SQL.Scopes[1][0].AliasDeclaration, (Span{Start: outerAlias, End: outerAlias + 1}); got != want {
+		t.Fatalf("outer alias declaration span = %+v, want %+v", got, want)
+	}
 	qualifier := a.Resolve(strings.Index(text, "WHERE c.id") + len("WHERE "))
 	if qualifier.Role != Alias {
 		t.Fatalf("outer qualifier role: %+v", qualifier)
@@ -193,8 +205,21 @@ WHERE c.id IN (SELECT c.id FROM orders c WHERE c.id = c.id);`
 	if got := r.SQL.Scopes[0][0]; got.Name.Key() != "ORDERS" || got.Alias == nil || got.Alias.Key() != "C" {
 		t.Fatalf("inner alias binding: %+v", got)
 	}
+	innerAlias := strings.Index(text, "FROM orders c") + len("FROM orders ")
+	if got, want := r.SQL.Scopes[0][0].AliasDeclaration, (Span{Start: innerAlias, End: innerAlias + 1}); got != want {
+		t.Fatalf("inner reused alias declaration span = %+v, want %+v", got, want)
+	}
 	if got := r.SQL.Scopes[1][0]; got.Name.Key() != "CUSTOMER" || got.Alias == nil || got.Alias.Key() != "C" {
 		t.Fatalf("outer alias binding: %+v", got)
+	}
+	outerAlias := strings.Index(text, "FROM customer c") + len("FROM customer ")
+	if got, want := r.SQL.Scopes[1][0].AliasDeclaration, (Span{Start: outerAlias, End: outerAlias + 1}); got != want {
+		t.Fatalf("outer reused alias declaration span = %+v, want %+v", got, want)
+	}
+	outerOffset := strings.Index(text, "WHERE c.id") + len("WHERE ")
+	outerRef := a.Resolve(outerOffset)
+	if outerRef.Role != Alias || outerRef.SQL == nil || len(outerRef.SQL.Scopes) != 1 || outerRef.SQL.Scopes[0][0].AliasDeclaration != (Span{Start: outerAlias, End: outerAlias + 1}) {
+		t.Fatalf("outer reused alias binding = %+v, want only outer alias span %+v", outerRef, Span{Start: outerAlias, End: outerAlias + 1})
 	}
 }
 
@@ -211,6 +236,10 @@ func TestSQLDerivedRelationRetainsUnknownOwnership(t *testing.T) {
 	}
 	if r.SQL.Scopes[0][0].Name != (Name{}) || r.SQL.Scopes[0][0].Alias == nil || r.SQL.Scopes[0][0].Alias.Key() != "D" {
 		t.Fatalf("derived binding: %+v", r.SQL.Scopes[0][0])
+	}
+	derivedAlias := strings.Index(text, ") d JOIN") + len(") ")
+	if got, want := r.SQL.Scopes[0][0].AliasDeclaration, (Span{Start: derivedAlias, End: derivedAlias + 1}); got != want {
+		t.Fatalf("derived alias declaration span = %+v, want %+v", got, want)
 	}
 	if r.SQL.Scopes[0][1].Name.Key() != "TOTALS" {
 		t.Fatalf("concrete binding: %+v", r.SQL.Scopes[0][1])

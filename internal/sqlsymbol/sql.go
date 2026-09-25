@@ -292,12 +292,14 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 			next++
 		}
 		var alias *Name
+		var aliasDeclaration Span
 		if next < end && depths[next] == depths[start] && isNameToken(items[next]) && !isSQLClause(items[next]) {
 			name, _ := nameFromLexeme(text, items[next])
 			alias = &name
+			aliasDeclaration = items[next].Span
 			next++
 		}
-		return RelationRef{Alias: alias}, next, true
+		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
 	}
 	if !isNameToken(items[start]) {
 		return RelationRef{}, start, false
@@ -321,21 +323,25 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 			next++
 		}
 		var alias *Name
+		var aliasDeclaration Span
 		if next < end && depths[next] == depths[start] && isNameToken(items[next]) && !isSQLClause(items[next]) {
 			aliasName, _ := nameFromLexeme(text, items[next])
 			alias = &aliasName
+			aliasDeclaration = items[next].Span
 			next++
 		}
-		return RelationRef{Alias: alias}, next, true
+		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
 	}
 	var alias *Name
+	var aliasDeclaration Span
 	if next < end && isWord(items[next], "AS") {
 		next++
 	}
 	if next < end && depths[next] == depths[start] && isNameToken(items[next]) && !isSQLClause(items[next]) {
 		aliasName, _ := nameFromLexeme(text, items[next])
 		alias = &aliasName
+		aliasDeclaration = items[next].Span
 		next++
 	}
-	return RelationRef{Name: name, Alias: alias}, next, true
+	return RelationRef{Name: name, Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
 }

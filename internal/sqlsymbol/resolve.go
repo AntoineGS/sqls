@@ -25,8 +25,9 @@ const (
 // populated by the SQL ownership pass; the binding pass keeps this small value
 // available on every SQL reference.
 type RelationRef struct {
-	Name  Name
-	Alias *Name
+	Name             Name
+	Alias            *Name
+	AliasDeclaration Span
 }
 
 // SQLReference identifies an identifier occurring in a SQL statement.

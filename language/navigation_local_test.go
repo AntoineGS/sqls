@@ -193,3 +193,56 @@ func TestNavigationDefinitionFindsAliasInsideProcedureSQL(t *testing.T) {
 		t.Fatalf("procedure alias definition = %#v, want scoped alias at %+v", got.Value, want)
 	}
 }
+
+func TestNavigationDefinitionCorrelatedAliasUsesOuterDeclaration(t *testing.T) {
+	text := "SELECT c.id FROM customer c WHERE EXISTS (SELECT o.id FROM orders o WHERE c.id = o.id);"
+	declaration := strings.Index(text, "customer c") + len("customer ")
+	use := strings.LastIndex(text, "WHERE c.id") + len("WHERE ")
+	assertAliasDefinitionAt(t, text, use, declaration)
+}
+
+func TestNavigationDefinitionReusedAliasUsesBindingIdentity(t *testing.T) {
+	text := "SELECT c.id FROM customer c WHERE c.id IN (SELECT c.id FROM customer c WHERE c.id = c.id);"
+	outerDeclaration := strings.Index(text, "customer c") + len("customer ")
+	innerDeclaration := strings.LastIndex(text, "customer c") + len("customer ")
+	outerUse := strings.Index(text, "WHERE c.id") + len("WHERE ")
+	innerWhere := strings.Index(text[outerUse+1:], "WHERE c.id") + outerUse + 1
+	innerUse := innerWhere + len("WHERE ")
+	assertAliasDefinitionAt(t, text, outerUse, outerDeclaration)
+	assertAliasDefinitionAt(t, text, innerUse, innerDeclaration)
+}
+
+func TestNavigationDefinitionAmbiguousSameScopeAliasReturnsNoLocation(t *testing.T) {
+	text := "SELECT c.id FROM customer c JOIN orders c ON c.id = c.id"
+	use := strings.Index(text, "SELECT ") + len("SELECT ")
+	req := navRequest(text, dialect.DatabaseDriverInterBase)
+	got, err := language.NewService().Definition(context.Background(), req, testPosition(text, use))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Value) != 0 {
+		t.Fatalf("ambiguous same-scope alias resolved to %#v, want none", got.Value)
+	}
+}
+
+func assertAliasDefinitionAt(t *testing.T, text string, use, declaration int) {
+	t.Helper()
+	req := navRequest(text, dialect.DatabaseDriverInterBase)
+	got, err := language.NewService().Definition(context.Background(), req, testPosition(text, use))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantStart := testPosition(text, declaration)
+	want := language.Range{Start: wantStart, End: language.Position{Line: wantStart.Line, UTF16Column: wantStart.UTF16Column + 1}}
+	if len(got.Value) != 1 || got.Value[0].URI != req.Document.URI || got.Value[0].Range != want {
+		t.Fatalf("alias at byte %d resolved to %#v, want declaration byte %d range %+v", use, got.Value, declaration, want)
+	}
+}
+
+func testPosition(text string, offset int) language.Position {
+	position, err := language.PositionAt(text, offset)
+	if err != nil {
+		panic(err)
+	}
+	return position
+}
