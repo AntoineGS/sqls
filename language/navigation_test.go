@@ -2,6 +2,7 @@ package language_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -155,6 +156,95 @@ func TestDefinitionUsesNativeSourceOnlyAfterUnsupportedDDL(t *testing.T) {
 	}
 }
 
+func TestDefinitionNativeViewColumnUsesOnlyDeclaredColumnSpan(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		source     string
+		wantSource bool
+	}{
+		{name: "explicit declaration", source: "-- 😀\r\nCREATE VIEW DUP (ID) AS SELECT 1 FROM CITY", wantSource: true},
+		{name: "source body without declaration", source: "-- 😀\r\nSELECT DUP FROM CITY", wantSource: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := readyNavigationCache()
+			viewColumn := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "A", Table: "DUP", Name: "ID"}}
+			cache.Catalog.Views["DUP"].Columns = []*catalog.ColumnDesc{viewColumn}
+			cache.Catalog.ViewsByID[(catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key()].Columns = []*catalog.ColumnDesc{viewColumn}
+			details := &facetDetails{results: map[string]detailResult{
+				"ddl":    {err: database.ErrUnsupportedDDL},
+				"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: tc.source, Provenance: "interbase:view-source"}},
+			}}
+			req := facetNavigationRequest("SELECT ID FROM DUP", details)
+			req.Context.Snapshot.Cache = cache
+			location := detailLocation(t, req, "ID")
+			if !tc.wantSource {
+				if location.Source != nil {
+					t.Fatalf("undeclared view column got a fabricated source range: %#v", location)
+				}
+				return
+			}
+			if location.Source == nil || location.Source.Text != tc.source {
+				t.Fatalf("view source = %#v, want declared native source", location.Source)
+			}
+			start := strings.Index(tc.source, "ID")
+			wantStart, err := language.PositionAt(tc.source, start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantEnd, err := language.PositionAt(tc.source, start+len("ID"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if location.Range != (language.Range{Start: wantStart, End: wantEnd}) {
+				t.Fatalf("native view-column range=%#v, want declaration span %#v..%#v", location.Range, wantStart, wantEnd)
+			}
+		})
+	}
+}
+
+func TestDefinitionRequiresDDLDeclarationNotCommentOrLiteralName(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "comment and literal precede declaration", body: "-- DUP\r\nSELECT 'DUP';\r\nCREATE PROCEDURE DUP AS BEGIN END"},
+		{name: "quoted declaration follows comment", body: "-- DUP\r\nCREATE PROCEDURE \"DUP\" AS BEGIN END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+				Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: tc.body, Provenance: "interbase:procedure-ddl",
+			}}}}
+			req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+			location := detailLocation(t, req, "DUP")
+			if location.Source == nil {
+				t.Fatalf("valid declaration was not navigable")
+			}
+			declarationName := strings.LastIndex(tc.body, "DUP")
+			if tc.body[declarationName-1] == '"' {
+				declarationName--
+			}
+			want, err := language.PositionAt(tc.body, declarationName)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if location.Range.Start != want || location.Range.End != want {
+				t.Fatalf("range=%#v, want declaration point %#v in %q", location.Range, want, tc.body)
+			}
+		})
+	}
+}
+
+func TestDefinitionRejectsNameWithoutDDLDeclaration(t *testing.T) {
+	body := "-- DUP\r\nSELECT 'DUP'"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: body, Provenance: "interbase:procedure-ddl",
+	}}}}
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+	if location := detailLocation(t, req, "DUP"); location.Source != nil {
+		t.Fatalf("comment/literal identifier published as declaration: %#v", location)
+	}
+}
+
 func TestDefinitionTableUnsupportedUsesValidatedDescriptionSpan(t *testing.T) {
 	body := "CREATE TABLE T (\r\n  C INTEGER\r\n)"
 	colSpan := spanOf(body, "C")
@@ -250,6 +340,119 @@ func TestHoverKeepsTableSummaryWithoutExecutableDDLClaim(t *testing.T) {
 	}
 	if len(details.calls) != 2 || details.calls[0].Facet != "ddl" || details.calls[1].Facet != "description" {
 		t.Fatalf("hover detail requests = %#v, want DDL then description", details.calls)
+	}
+}
+
+func TestHoverReturnsCachedProcedureSummaryWithoutDetails(t *testing.T) {
+	cache := readyNavigationCache()
+	desc := &catalog.ProcedureDesc{Name: "DUP", Description: sql.NullString{String: "procedure documentation", Valid: true}}
+	cache.Catalog.Procedures["DUP"] = desc
+	cache.Catalog.ProceduresByID[(catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key()] = desc
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", nil)
+	req.Context.Snapshot.Cache = cache
+	req.Context.Details = nil
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")})
+	if err != nil {
+		t.Fatalf("Hover without details: %v", err)
+	}
+	want := catalog.ProcedureDoc(desc)
+	if result.Value.Markdown != want {
+		t.Fatalf("cached procedure hover = %q, want %q", result.Value.Markdown, want)
+	}
+}
+
+func TestHoverReturnsCachedTriggerSummaryWithoutDetails(t *testing.T) {
+	cache := readyNavigationCache()
+	delete(cache.Catalog.Procedures, "DUP")
+	delete(cache.Catalog.ProceduresByID, (catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key())
+	delete(cache.Catalog.Views, "DUP")
+	delete(cache.Catalog.ViewsByID, (catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key())
+	trigger := &catalog.TriggerDesc{Name: "DUP", Description: sql.NullString{String: "trigger documentation", Valid: true}}
+	cache.Catalog.Triggers["DUP"] = trigger
+	cache.Catalog.TriggersByID[(catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: "DUP"}).Key()] = trigger
+	cache.Catalog.RebuildObjects(strings.ToUpper)
+	req := facetNavigationRequest("DUP", nil)
+	req.Context.Snapshot.Cache = cache
+	req.Context.Details = nil
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: 1})
+	if err != nil {
+		t.Fatalf("Hover without details: %v", err)
+	}
+	if result.Value.Markdown != catalog.TriggerDoc(trigger) {
+		t.Fatalf("cached trigger hover = %q, want %q", result.Value.Markdown, catalog.TriggerDoc(trigger))
+	}
+}
+
+func TestHoverCombinesCachedProcedureSummaryAndDDLAppendix(t *testing.T) {
+	cache := readyNavigationCache()
+	desc := &catalog.ProcedureDesc{Name: "DUP", Description: sql.NullString{String: "procedure documentation", Valid: true}}
+	cache.Catalog.Procedures["DUP"] = desc
+	cache.Catalog.ProceduresByID[(catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key()] = desc
+	body := "CREATE PROCEDURE DUP AS BEGIN END"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: body, Provenance: "interbase:procedure-ddl",
+	}}}}
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+	req.Context.Snapshot.Cache = cache
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")})
+	if err != nil {
+		t.Fatalf("Hover with DDL: %v", err)
+	}
+	want := strings.TrimRight(catalog.ProcedureDoc(desc), "\n") + "\n\n```sql\n" + body + "\n```"
+	if result.Value.Markdown != want {
+		t.Fatalf("hover summary+DDL = %q, want %q", result.Value.Markdown, want)
+	}
+}
+
+func TestHoverPreservesCachedProcedureSummaryWhenDetailIsUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "unsupported facet", err: metadata.ErrUnsupported},
+		{name: "object not found", err: database.ErrObjectNotFound},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := readyNavigationCache()
+			desc := &catalog.ProcedureDesc{Name: "DUP", Description: sql.NullString{String: "procedure documentation", Valid: true}}
+			cache.Catalog.Procedures["DUP"] = desc
+			cache.Catalog.ProceduresByID[(catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key()] = desc
+			details := &facetDetails{results: map[string]detailResult{"ddl": {err: tc.err}}}
+			req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+			req.Context.Snapshot.Cache = cache
+			result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")})
+			if err != nil {
+				t.Fatalf("Hover: %v", err)
+			}
+			if result.Value.Markdown != catalog.ProcedureDoc(desc) {
+				t.Fatalf("hover summary = %q, want %q", result.Value.Markdown, catalog.ProcedureDoc(desc))
+			}
+		})
+	}
+}
+
+func TestHoverUsesViewSummaryBeforeSameNamedTable(t *testing.T) {
+	cache := readyNavigationCache()
+	cache.SchemaTables["A"] = append(cache.SchemaTables["A"], "DUP")
+	view := &catalog.ViewDesc{Name: "DUP", Description: sql.NullString{String: "view documentation", Valid: true}}
+	cache.Catalog.Views["DUP"] = view
+	cache.Catalog.ViewsByID[(catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key()] = view
+	body := "CREATE VIEW DUP AS SELECT 1 FROM RDB$DATABASE"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: body, Provenance: "interbase:view-ddl",
+	}}}}
+	req := facetNavigationRequest("SELECT * FROM DUP", details)
+	req.Context.Snapshot.Cache = cache
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")})
+	if err != nil {
+		t.Fatalf("Hover: %v", err)
+	}
+	want := strings.TrimRight(catalog.ViewDoc(view), "\n") + "\n\n```sql\n" + body + "\n```"
+	if result.Value.Markdown != want {
+		t.Fatalf("view hover = %q, want view summary before DDL: %q", result.Value.Markdown, want)
+	}
+	if len(details.calls) != 1 || details.calls[0].Object.Kind != catalog.ObjectKindView {
+		t.Fatalf("hover detail requests = %#v, want view DDL before same-name table", details.calls)
 	}
 }
 

@@ -2,6 +2,7 @@ package language
 
 import (
 	"context"
+	"strings"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
@@ -32,11 +33,29 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 	if err != nil {
 		return Result[Hover]{}, err
 	}
-	if !ok || req.Context.Details == nil {
+	if !ok {
 		if cacheErr != nil {
 			return Result[Hover]{}, cacheErr
 		}
 		return result, nil
+	}
+	summary := catalogObjectHoverSummary(target, req.Context.SnapshotCache())
+	markdown := summary
+	if markdown == "" && cacheErr == nil {
+		markdown = result.Value.Markdown
+	}
+	hoverRange := selectedRange
+	if summary == "" && cacheErr == nil && result.Value.Range != nil {
+		hoverRange = *result.Value.Range
+	}
+	if req.Context.Details == nil {
+		if markdown == "" {
+			if cacheErr != nil {
+				return Result[Hover]{}, cacheErr
+			}
+			return Result[Hover]{}, ErrNoHover
+		}
+		return Result[Hover]{Value: Hover{Markdown: markdown, Range: &hoverRange}, Stamp: stampFor(req)}, nil
 	}
 	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
 	if err != nil {
@@ -45,21 +64,34 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 	if ctx.Err() != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
-	markdown := ""
 	if available && detail.source != nil {
+		appendix := ""
 		if !detail.executable {
 			if detail.source.Provenance == "catalog-description" {
-				markdown = "_Informational catalog description; not executable DDL._"
+				appendix = "_Informational catalog description; not executable DDL._"
 			} else {
-				markdown = "_Verbatim catalog source._"
+				appendix = "_Verbatim catalog source._"
 			}
 		}
 		if detail.source.Note != "" {
-			markdown += "\n\n" + detail.source.Note
+			if appendix != "" {
+				appendix += "\n\n"
+			}
+			appendix += detail.source.Note
 		}
-		markdown += "\n\n```sql\n" + detail.source.Text + "\n```"
+		if appendix != "" {
+			appendix += "\n\n"
+		}
+		appendix += "```sql\n" + detail.source.Text + "\n```"
+		if markdown != "" {
+			markdown = strings.TrimRight(markdown, "\n") + "\n\n"
+		}
+		markdown += appendix
 	} else if detail.unsupported {
-		markdown = "_DDL unavailable._"
+		if markdown != "" {
+			markdown += "\n\n"
+		}
+		markdown += "_DDL unavailable._"
 	}
 	if markdown == "" {
 		if cacheErr != nil {
@@ -67,10 +99,28 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 		}
 		return result, nil
 	}
-	if cacheErr == nil && result.Value.Markdown != "" {
-		markdown = result.Value.Markdown + "\n\n" + markdown
+	return Result[Hover]{Value: Hover{Markdown: markdown, Range: &hoverRange}, Stamp: stampFor(req)}, nil
+}
+
+func catalogObjectHoverSummary(object catalog.ObjectID, cache *catalog.Cache) string {
+	if cache == nil || cache.Catalog == nil {
+		return ""
 	}
-	return Result[Hover]{Value: Hover{Markdown: markdown, Range: &selectedRange}, Stamp: stampFor(req)}, nil
+	switch object.Kind {
+	case catalog.ObjectKindView:
+		if desc, ok := cache.ViewByID(object.Name); ok {
+			return catalog.ViewDoc(desc)
+		}
+	case catalog.ObjectKindProcedure:
+		if desc, ok := cache.ProcedureByID(object.Name); ok {
+			return catalog.ProcedureDoc(desc)
+		}
+	case catalog.ObjectKindTrigger:
+		if desc, ok := cache.TriggerByID(object.Name); ok {
+			return catalog.TriggerDoc(desc)
+		}
+	}
+	return ""
 }
 
 func (s *Service) hoverCached(ctx context.Context, req Request, position Position) (Result[Hover], error) {

@@ -14,6 +14,7 @@ import (
 type navigationDetail struct {
 	source     *Source
 	range_     Range
+	hasRange   bool
 	executable bool
 	// unsupported is true only when a typed DDL refusal was returned. Hosts
 	// may explain that executable DDL is unavailable without labeling fallback
@@ -34,11 +35,8 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if detail.Object != object || detail.Text == "" {
 			return navigationDetail{}, false, nil
 		}
-		rng, ok := detailBodyRange(detail.Text, object, selectedNavigationColumn(req, object, position))
-		if !ok {
-			return navigationDetail{}, false, nil
-		}
-		return navigationDetail{source: &Source{Object: detail.Object, Text: detail.Text, Provenance: detail.Provenance}, range_: rng, executable: true}, true, nil
+		rng, hasRange := detailBodyRange(detail.Text, object, selectedNavigationColumn(req, object, position))
+		return navigationDetail{source: &Source{Object: detail.Object, Text: detail.Text, Provenance: detail.Provenance}, range_: rng, hasRange: hasRange, executable: true}, true, nil
 	}
 	if ctx.Err() != nil {
 		return navigationDetail{}, false, ErrCanceled
@@ -79,11 +77,11 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if !ok {
 			return navigationDetail{}, true, nil
 		}
-		return navigationDetail{source: &Source{Object: description.Object, Text: description.Description.Body, Provenance: "catalog-description", Note: "Catalog reconstruction; unsupported table facets may be incomplete."}, range_: rng, unsupported: true}, true, nil
+		return navigationDetail{source: &Source{Object: description.Object, Text: description.Description.Body, Provenance: "catalog-description", Note: "Catalog reconstruction; unsupported table facets may be incomplete."}, range_: rng, hasRange: true, unsupported: true}, true, nil
 	}
 
 	if object.Kind != catalog.ObjectKindProcedure && object.Kind != catalog.ObjectKindView && object.Kind != catalog.ObjectKindTrigger {
-		return navigationDetail{}, true, nil
+		return navigationDetail{unsupported: true}, true, nil
 	}
 	source, err := req.Context.Details.Detail(ctx, metadata.Request{Object: object, Facet: "source", Dialect: request.Dialect, Consistency: request.Consistency})
 	if ctx.Err() != nil {
@@ -91,18 +89,15 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 	}
 	if err != nil {
 		if errors.Is(err, database.ErrObjectNotFound) || errors.Is(err, metadata.ErrUnsupported) {
-			return navigationDetail{}, true, nil
+			return navigationDetail{unsupported: true}, true, nil
 		}
 		return navigationDetail{}, false, err
 	}
 	if source.Object != object || source.Text == "" {
-		return navigationDetail{}, true, nil
+		return navigationDetail{unsupported: true}, true, nil
 	}
-	rng, ok := snapshotNameRange(source.Text, object.Name)
-	if !ok {
-		return navigationDetail{}, true, nil
-	}
-	return navigationDetail{source: &Source{Object: source.Object, Text: source.Text, Provenance: source.Provenance, Note: unsupportedDDLNote(unsupportedErr)}, range_: rng, unsupported: true}, true, nil
+	rng, hasRange := detailBodyRange(source.Text, object, selectedNavigationColumn(req, object, position))
+	return navigationDetail{source: &Source{Object: source.Object, Text: source.Text, Provenance: source.Provenance, Note: unsupportedDDLNote(unsupportedErr)}, range_: rng, hasRange: hasRange, unsupported: true}, true, nil
 }
 
 func unsupportedDDLNote(err error) string {
@@ -143,7 +138,7 @@ func detailBodyRange(body string, object catalog.ObjectID, column *sqlsymbol.Nam
 			span, ok = sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true})
 		}
 	} else {
-		return snapshotNameRange(body, object.Name)
+		return ddlDeclarationNameRange(body, object)
 	}
 	if !ok {
 		return Range{}, false
@@ -201,15 +196,122 @@ func catalogDescriptionSpan(body string, span catalog.DescriptionSpan, name stri
 	return sqlsymbol.Span{Start: span.Start, End: span.End}, true
 }
 
-func snapshotNameRange(body, name string) (Range, bool) {
-	for _, candidate := range []string{`"` + strings.ReplaceAll(name, `"`, `""`) + `"`, name} {
-		start := strings.Index(body, candidate)
-		if start < 0 || candidate == name && (start > 0 && descriptionIdentifierByte(body[start-1]) || start+len(candidate) < len(body) && descriptionIdentifierByte(body[start+len(candidate)])) {
+type declarationToken struct {
+	text   string
+	start  int
+	quoted bool
+	ident  bool
+}
+
+// ddlDeclarationNameRange finds the declared name after CREATE, ignoring
+// comments and string literals. Native InterBase source facets commonly omit
+// their CREATE header; in that case there is intentionally no navigable name.
+func ddlDeclarationNameRange(body string, object catalog.ObjectID) (Range, bool) {
+	tokens := declarationTokens(body)
+	for i := 0; i < len(tokens); i++ {
+		if !declarationWord(tokens[i], "CREATE") {
 			continue
 		}
-		return byteSpanRange(body, start, start)
+		j := i + 1
+		if j+1 < len(tokens) && declarationWord(tokens[j], "OR") && (declarationWord(tokens[j+1], "ALTER") || declarationWord(tokens[j+1], "REPLACE")) {
+			j += 2
+		}
+		if j+1 < len(tokens) && declarationWord(tokens[j], "GLOBAL") && declarationWord(tokens[j+1], "TEMPORARY") {
+			j += 2
+		}
+		if j >= len(tokens) || !declarationWord(tokens[j], strings.ToUpper(string(object.Kind))) || j+1 >= len(tokens) {
+			continue
+		}
+		nameIndex := j + 1
+		if nameIndex+2 < len(tokens) && tokens[nameIndex+1].text == "." && tokens[nameIndex+2].ident {
+			nameIndex += 2
+		}
+		name := tokens[nameIndex]
+		if !name.ident || !(sqlsymbol.Name{Text: name.text, Quoted: name.quoted}).MatchesCatalogName(object.Name) {
+			continue
+		}
+		return byteSpanRange(body, name.start, name.start)
 	}
 	return Range{}, false
+}
+
+func declarationWord(token declarationToken, word string) bool {
+	return token.ident && !token.quoted && strings.EqualFold(token.text, word)
+}
+
+func declarationTokens(text string) []declarationToken {
+	tokens := make([]declarationToken, 0, 32)
+	for i := 0; i < len(text); {
+		switch {
+		case text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n' || text[i] == '\f':
+			i++
+		case i+1 < len(text) && text[i] == '-' && text[i+1] == '-':
+			i += 2
+			for i < len(text) && text[i] != '\n' && text[i] != '\r' {
+				i++
+			}
+		case i+1 < len(text) && text[i] == '/' && text[i+1] == '*':
+			i += 2
+			for i+1 < len(text) && !(text[i] == '*' && text[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(text) {
+				i += 2
+			}
+		case text[i] == '\'':
+			i++
+			for i < len(text) {
+				if text[i] == '\'' {
+					i++
+					if i < len(text) && text[i] == '\'' {
+						i++
+						continue
+					}
+					break
+				}
+				i++
+			}
+		case text[i] == '"':
+			start := i
+			i++
+			var value strings.Builder
+			closed := false
+			for i < len(text) {
+				if text[i] == '"' {
+					i++
+					if i < len(text) && text[i] == '"' {
+						value.WriteByte('"')
+						i++
+						continue
+					}
+					closed = true
+					break
+				}
+				value.WriteByte(text[i])
+				i++
+			}
+			if closed {
+				tokens = append(tokens, declarationToken{text: value.String(), start: start, quoted: true, ident: true})
+			}
+		case declarationIdentifierByte(text[i]):
+			start := i
+			i++
+			for i < len(text) && declarationIdentifierByte(text[i]) {
+				i++
+			}
+			tokens = append(tokens, declarationToken{text: text[start:i], start: start, ident: true})
+		default:
+			if text[i] == '.' {
+				tokens = append(tokens, declarationToken{text: ".", start: i})
+			}
+			i++
+		}
+	}
+	return tokens
+}
+
+func declarationIdentifierByte(value byte) bool {
+	return value == '_' || value == '$' || value >= '0' && value <= '9' || value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value >= 0x80
 }
 
 func validDescriptionIdentifier(name string) bool {

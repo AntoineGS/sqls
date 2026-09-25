@@ -58,7 +58,7 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	if err := ctx.Err(); err != nil {
 		return Result[[]Location]{}, ErrCanceled
 	}
-	if !available || detail.source == nil {
+	if !available || detail.source == nil || !detail.hasRange {
 		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
 	}
 	return Result[[]Location]{Value: []Location{{Range: detail.range_, Source: detail.source}}, Stamp: stampFor(req)}, nil
