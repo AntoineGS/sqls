@@ -35,11 +35,6 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 			return Result[[]Location]{}, err
 		}
 		role = resolution.Role
-		if role == sqlsymbol.Column {
-			// Column targets are contextual catalog navigation. There is no
-			// column resolver in this B3a core, so do not guess by spelling.
-			return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
-		}
 	}
 	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase || role == sqlsymbol.Alias {
 		if alias, ok, err := aliasDefinition(req, position); err != nil {
@@ -51,7 +46,7 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 			return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
 		}
 	}
-	target, _, ok, err := relationAt(req, position)
+	target, _, ok, err := navigationTargetAt(req, position)
 	if err != nil {
 		return Result[[]Location]{}, err
 	}
@@ -393,7 +388,7 @@ func astRange(text string, node ast.Node) (Range, error) {
 	return Range{Start: Position{Line: node.Pos().Line, UTF16Column: start}, End: Position{Line: node.End().Line, UTF16Column: end}}, nil
 }
 
-func relationAt(req Request, position Position) (catalog.ObjectID, Range, bool, error) {
+func legacyRelationAt(req Request, position Position) (catalog.ObjectID, Range, bool, error) {
 	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return catalog.ObjectID{}, Range{}, false, err

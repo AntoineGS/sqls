@@ -33,7 +33,7 @@ func TestSourceSharingBetweenHoverAndDefinition(t *testing.T) {
 	}
 	req := language.Request{
 		Document: language.Document{URI: "file:///query.sql", Text: "SELECT * FROM T", Version: 1, Binding: 1},
-		Context: language.Context{Key: key, Incarnation: lease.Incarnation(), Snapshot: lease.Snapshot(),
+		Context: language.Context{Key: key, Incarnation: lease.Incarnation(), Snapshot: navigationSnapshotWithViewsReady(lease.Snapshot()),
 			Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, DialectResolved: true, Details: lease},
 	}
 	service := language.NewService()
@@ -71,7 +71,7 @@ func TestOldBindingDefinitionResultRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	req := language.Request{Document: language.Document{URI: "file:///q.sql", Text: "SELECT * FROM T", Version: 4, Binding: 8},
-		Context: language.Context{Key: key, Incarnation: lease.Incarnation(), Snapshot: lease.Snapshot(),
+		Context: language.Context{Key: key, Incarnation: lease.Incarnation(), Snapshot: navigationSnapshotWithViewsReady(lease.Snapshot()),
 			Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, Details: lease}}
 	done := make(chan struct{})
 	var result language.Result[[]language.Location]
@@ -100,4 +100,16 @@ func TestOldBindingDefinitionResultRejected(t *testing.T) {
 	if language.Current(completedDefinition.Stamp, currentDocument, req.Context) {
 		t.Fatal("definition from old database binding accepted")
 	}
+}
+
+func navigationSnapshotWithViewsReady(snapshot *catalog.MetadataSnapshot) *catalog.MetadataSnapshot {
+	copySnapshot := *snapshot
+	copyCache := *snapshot.Cache
+	copyCache.Metadata = make(map[catalog.MetadataKind]catalog.MetadataState, len(snapshot.Cache.Metadata)+1)
+	for kind, state := range snapshot.Cache.Metadata {
+		copyCache.Metadata[kind] = state
+	}
+	copyCache.Metadata[catalog.MetadataViews] = catalog.MetadataReady
+	copySnapshot.Cache = &copyCache
+	return &copySnapshot
 }
