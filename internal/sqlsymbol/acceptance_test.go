@@ -154,12 +154,43 @@ func TestDiagnosticExpansionRecoveryAndCommentLiteralNegatives(t *testing.T) {
 	}
 }
 
+func TestDiagnosticExpansionBudgetWithholdsPartialRegionAndKeepsCompleteNeighbor(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("SELECT ID FROM T WHERE V = NULL;\n")
+	source.WriteString("CREATE PROCEDURE OVER_BUDGET RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN O = V;")
+	for i := 0; i < 6000; i++ {
+		source.WriteString(" V = 1;")
+	}
+	source.WriteString(" SUSPEND; END")
+	text := source.String()
+	a, err := Analyze(text, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatalf("Analyze adversarial bounded fixture: %v", err)
+	}
+	options := DiagnosticOptions{Rules: map[string]string{
+		codeReadBeforeAssignment: "warning",
+		codeOutputNotAssigned:    "warning",
+		codeDeadStore:            "warning",
+		codeUnreachable:          "warning",
+		codeNullableAssignment:   "warning",
+		codeNullableNotIn:        "warning",
+		codeOuterJoinFilter:      "warning",
+	}}
+	findings := a.DiagnosticsWithOptions(nil, options)
+	if len(findings) != 1 || findings[0].Code != codeNullComparison {
+		t.Fatalf("findings after an over-budget procedure = %+v, want only the independently complete neighboring null-comparison", findings)
+	}
+	if got, want := text[findings[0].Span.Start:findings[0].Span.End], "V = NULL"; got != want {
+		t.Fatalf("neighbor finding span text = %q, want %q", got, want)
+	}
+}
+
 func FuzzDiagnosticExpansionRecovery(f *testing.F) {
 	for _, seed := range []string{
 		"SELECT A FROM T; SELECT FROM; SELECT B FROM U;",
 		"SELECT (1 + 2) * 3 FROM T WHERE ID = NULL;",
 		"WITH A AS (SELECT 1 AS X), B AS (SELECT X FROM A) SELECT X FROM B;",
-		"SELECT 'FROM T WHERE MISSING = NULL' FROM T; -- UPDATE U SET X = NULL",
+		"SELECT 'MISSING = NULL' FROM T; -- MISSING = NULL\nSELECT 1 FROM T;",
 		"CREATE PROCEDURE P AS BEGIN V = CASE WHEN 1 = 1 THEN 2 ELSE 3 END; END",
 		"SELECT (((((((1)))))));",
 	} {
@@ -182,6 +213,14 @@ func FuzzDiagnosticExpansionRecovery(f *testing.F) {
 		for _, finding := range first {
 			if finding.Span.Start < 0 || finding.Span.Start >= finding.Span.End || finding.Span.End > len(text) {
 				t.Fatalf("finding %s span %+v outside source length %d", finding.Code, finding.Span, len(text))
+			}
+			for _, ignored := range []string{"'MISSING = NULL'", "-- MISSING = NULL"} {
+				if start := strings.Index(text, ignored); start >= 0 {
+					end := start + len(ignored)
+					if finding.Span.Start < end && start < finding.Span.End {
+						t.Fatalf("finding %s span %+v overlaps comment/literal seed %q", finding.Code, finding.Span, ignored)
+					}
+				}
 			}
 		}
 	})

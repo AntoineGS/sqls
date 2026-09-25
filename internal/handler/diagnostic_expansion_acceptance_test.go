@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"runtime"
 	"strings"
 	"sync"
@@ -101,8 +102,10 @@ func TestDiagnosticsUnknownColumnAndProceduralUnknownVariableCoexist(t *testing.
 
 func TestDiagnosticExpansionMixedDocumentKeepsIndependentFindingsAndCloseReopen(t *testing.T) {
 	const uri = "file:///diagnostic-expansion-mixed.sql"
-	text := "SELECT ID FROM T WHERE V = NULL;\n" +
+	text := "/*😀*/ SELECT ID FROM T WHERE V = NULL;\n" +
 		"SELECT FROM;\n" +
+		"INSERT INTO T (ID) SELECT ID FROM T WHERE V = NULL;\n" +
+		"UPDATE T SET ID = 1 WHERE V = NULL;\n" +
 		"CREATE PROCEDURE P AS BEGIN BAD_PROC = 1; END\n" +
 		"CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN BAD_TRIGGER = 1; END"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
@@ -113,17 +116,51 @@ func TestDiagnosticExpansionMixedDocumentKeepsIndependentFindingsAndCloseReopen(
 	if string(initial.rawDiagnostics) == "null" || string(initial.rawDiagnostics) == "" || initial.rawDiagnostics[0] != '[' {
 		t.Fatalf("wire diagnostics payload = %s, want a JSON array", initial.rawDiagnostics)
 	}
-	codes := map[string]bool{}
-	for _, finding := range initial.Diagnostics {
-		codes[diagnosticCode(finding)] = true
+	want := []struct {
+		code  string
+		text  string
+		line  int
+		start int
+	}{
+		{code: "interbase-null-comparison", text: "V = NULL", line: 0, start: 30},
+		{code: "interbase-null-comparison", text: "V = NULL", line: 2, start: 42},
+		{code: "interbase-null-comparison", text: "V = NULL", line: 3, start: 26},
+		{code: "interbase-unknown-variable", text: "BAD_PROC", line: 4, start: 28},
+		{code: "interbase-unknown-variable", text: "BAD_TRIGGER", line: 5, start: 47},
 	}
-	for _, code := range []string{"interbase-null-comparison", "interbase-unknown-variable"} {
-		if !codes[code] {
-			t.Fatalf("mixed complete/unsupported document findings = %+v, missing independent %s", initial.Diagnostics, code)
+	if len(initial.Diagnostics) != len(want) {
+		t.Fatalf("findings = %+v, want exactly %d independent findings (the incomplete neighbor and unproven catalog claims stay silent)", initial.Diagnostics, len(want))
+	}
+	for _, expected := range want {
+		var match *lsp.Diagnostic
+		for index := range initial.Diagnostics {
+			finding := &initial.Diagnostics[index]
+			if diagnosticCode(*finding) == expected.code && finding.Range.Start.Line == expected.line && finding.Range.Start.Character == expected.start {
+				if match != nil {
+					t.Fatalf("multiple diagnostics match expected %s at line %d character %d", expected.code, expected.line, expected.start)
+				}
+				match = finding
+			}
+		}
+		if match == nil {
+			t.Fatalf("findings = %+v, missing %s over %q at line %d character %d", initial.Diagnostics, expected.code, expected.text, expected.line, expected.start)
+		}
+		lineText := strings.Split(text, "\n")[expected.line]
+		if expected.start < 0 || expected.start+utf16Units(expected.text) > utf16Units(lineText) {
+			t.Fatalf("invalid expected range for %q on line %d", expected.text, expected.line)
+		}
+		wantRange := lsp.Range{
+			Start: lsp.Position{Line: expected.line, Character: expected.start},
+			End:   lsp.Position{Line: expected.line, Character: expected.start + utf16Units(expected.text)},
+		}
+		if match.Range != wantRange {
+			t.Fatalf("%s range = %+v, want exact UTF-16 range %+v for %q", expected.code, match.Range, wantRange, expected.text)
 		}
 	}
-	if len(initial.Diagnostics) != 3 {
-		t.Fatalf("findings = %+v, want the standalone null comparison and two procedural write findings only", initial.Diagnostics)
+	for _, finding := range initial.Diagnostics {
+		if finding.Range.Start.Line == 1 {
+			t.Fatalf("incomplete neighboring statement produced a finding: %+v", finding)
+		}
 	}
 
 	tx.call(t, "textDocument/didClose", lsp.DidCloseTextDocumentParams{TextDocument: lsp.TextDocumentIdentifier{URI: uri}})
@@ -144,6 +181,9 @@ func TestDiagnosticExpansionSlowOldVersionDoesNotBlockEditorRequestsOrPublish(t 
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
 	entered := make(chan struct{})
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseGate)
 	var block atomic.Bool
 	var once sync.Once
 	tx.server.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
@@ -163,13 +203,35 @@ func TestDiagnosticExpansionSlowOldVersionDoesNotBlockEditorRequestsOrPublish(t 
 		t.Fatal("version 1 analysis did not enter the gate")
 	}
 
-	// These editor RPCs must be handled independently of the blocked diagnostic worker.
-	tx.change(t, uri, "SELECT 1;", 2)
-	tx.open(t, otherURI, "SELECT 2;", 1)
-	close(release)
+	// The version-N+1 edit request and an unrelated editor request must return
+	// while N's analyzer is blocked. The queued N+1 diagnostic is not expected
+	// to publish until the single diagnostics worker is released.
+	request := func(method string, params any) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(tx.ctx, 2*time.Second)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- tx.clientConn.Call(ctx, method, params, nil) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s while diagnostics are gated: %v", method, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("%s did not return while version 1 diagnostics were gated", method)
+		}
+	}
+	request("textDocument/didChange", lsp.DidChangeTextDocumentParams{
+		TextDocument:   lsp.VersionedTextDocumentIdentifier{URI: uri, Version: 2},
+		ContentChanges: []lsp.TextDocumentContentChangeEvent{{Text: "SELECT 1;"}},
+	})
+	request("textDocument/didOpen", lsp.DidOpenTextDocumentParams{
+		TextDocument: lsp.TextDocumentItem{URI: otherURI, LanguageID: "sql", Version: 1, Text: "SELECT 2;"},
+	})
 	block.Store(false)
+	releaseGate()
 	latest := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 2 })
-	if len(latest.Diagnostics) != 0 || string(latest.rawDiagnostics) != "[]" {
+	if len(latest.Diagnostics) != 0 || string(latest.rawDiagnostics) != "[]" || latest.Version == nil || *latest.Version != 2 {
 		t.Fatalf("latest version diagnostics = %+v (%s), want []", latest.Diagnostics, latest.rawDiagnostics)
 	}
 	other := tx.client.next(t, otherURI, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
@@ -187,9 +249,47 @@ func TestDiagnosticExpansionSlowOldVersionDoesNotBlockEditorRequestsOrPublish(t 
 	tx.client.mu.Lock()
 	defer tx.client.mu.Unlock()
 	for _, notification := range tx.client.notifications {
-		if notification.URI == uri && notification.Version != nil && *notification.Version == 1 && len(notification.Diagnostics) > 0 {
-			t.Fatalf("stale version 1 diagnostics published after version 2: %+v", notification)
+		if notification.URI == uri && notification.Version != nil && *notification.Version == 1 {
+			t.Fatalf("stale version 1 notification published after version 2, regardless of diagnostics payload: %+v", notification)
 		}
+	}
+}
+
+func TestDiagnosticExpansionFailedMetadataRefreshKeepsOnlyIndependentFindings(t *testing.T) {
+	const uri = "file:///diagnostic-expansion-failed-metadata.sql"
+	text := "SELECT MISSING_COL FROM T WHERE V = NULL;"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if len(initial.Diagnostics) != 1 || diagnosticCode(initial.Diagnostics[0]) != "interbase-null-comparison" {
+		t.Fatalf("no-catalog diagnostics = %+v, want only independent null-comparison warning", initial.Diagnostics)
+	}
+
+	fail := func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+		return database.MetadataPatch{}, errors.New("simulated metadata refresh failure")
+	}
+	repo := readinessPlanRepository{
+		DBRepository: &database.MockDBRepository{},
+		plan: database.MetadataPlan{Parallelism: 3, Jobs: []database.MetadataJob{
+			{Kind: database.MetadataRelations, Run: fail},
+			{Kind: database.MetadataViews, Run: fail},
+			{Kind: database.MetadataProcedures, Run: fail},
+			{Kind: database.MetadataColumnsCurrent, Run: fail},
+		}},
+	}
+	loadMetadataForTest(t, tx.server, repo)
+	status := tx.server.metadata.Snapshot().Status
+	for _, kind := range []database.MetadataKind{database.MetadataRelations, database.MetadataViews, database.MetadataProcedures, database.MetadataColumnsCurrent} {
+		if status[kind].State != database.MetadataFailed {
+			t.Fatalf("metadata category %s state = %s, want failed", kind, status[kind].State)
+		}
+	}
+	refreshed := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if len(refreshed.Diagnostics) != 1 || diagnosticCode(refreshed.Diagnostics[0]) != "interbase-null-comparison" {
+		t.Fatalf("failed-refresh diagnostics = %+v, want only the metadata-independent finding", refreshed.Diagnostics)
+	}
+	if string(refreshed.rawDiagnostics) == "null" || string(refreshed.rawDiagnostics) == "" || refreshed.rawDiagnostics[0] != '[' {
+		t.Fatalf("failed-refresh wire diagnostics = %s, want JSON array", refreshed.rawDiagnostics)
 	}
 }
 
