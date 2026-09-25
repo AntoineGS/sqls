@@ -28,6 +28,51 @@ func TestUTF16PositionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNonBMPWidthIsTwoUTF16Units(t *testing.T) {
+	// "😀x": the emoji is a single Unicode code point above U+FFFF, so it
+	// occupies UTF16Column 0 AND 1 (a surrogate pair), and 'x' starts at
+	// UTF16Column 2. These are direct, non-round-trip assertions: each
+	// function is checked against an independently reasoned value, not
+	// just against the other.
+	text := "😀x"
+
+	pos, err := language.PositionAt(text, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos != (language.Position{Line: 0, UTF16Column: 2}) {
+		t.Fatalf("PositionAt(%q, 4) = %+v, want {Line:0 UTF16Column:2}", text, pos)
+	}
+
+	offset, err := language.ByteOffset(text, language.Position{Line: 0, UTF16Column: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if offset != 4 {
+		t.Fatalf("ByteOffset(%q, {0,2}) = %d, want 4", text, offset)
+	}
+
+	multiline := "-- 😀\r\nselect Café from T"
+	target := strings.Index(multiline, "Café")
+	multilinePos, err := language.PositionAt(multiline, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if multilinePos != (language.Position{Line: 1, UTF16Column: 7}) {
+		t.Fatalf("PositionAt(multiline, %d) = %+v, want {Line:1 UTF16Column:7}", target, multilinePos)
+	}
+}
+
+func TestPositionAtRejectsOffsetInsideFourByteEncoding(t *testing.T) {
+	// "😀" is a 4-byte UTF-8 sequence; offsets 1-3 all land mid-encoding.
+	text := "😀x"
+	for offset := 1; offset <= 3; offset++ {
+		if _, err := language.PositionAt(text, offset); err == nil {
+			t.Fatalf("accepted offset %d inside 4-byte encoding", offset)
+		}
+	}
+}
+
 func TestByteOffsetRejectsMalformedPositions(t *testing.T) {
 	text := "select 1\nfrom T"
 	cases := []struct {
@@ -135,6 +180,11 @@ func TestPositionCombiningMarkRoundTrip(t *testing.T) {
 	pos, err := language.PositionAt(text, want)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// "select " (7) + "e" (1) + the combining mark (1) + " " (1) = 10: the
+	// combining mark occupies its own column rather than merging into "e"'s.
+	if pos != (language.Position{Line: 0, UTF16Column: 10}) {
+		t.Fatalf("got %+v, want {Line:0 UTF16Column:10}", pos)
 	}
 	got, err := language.ByteOffset(text, pos)
 	if err != nil {

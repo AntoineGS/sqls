@@ -63,8 +63,15 @@ func PositionAt(text string, byteOffset int) (Position, error) {
 	if byteOffset < 0 || byteOffset > len(text) {
 		return Position{}, ErrPosition
 	}
-	if byteOffset < len(text) && !utf8.RuneStart(text[byteOffset]) {
-		return Position{}, ErrPosition
+	if byteOffset < len(text) {
+		if !utf8.RuneStart(text[byteOffset]) {
+			return Position{}, ErrPosition
+		}
+		if r, size := utf8.DecodeRuneInString(text[byteOffset:]); r == utf8.RuneError && size <= 1 {
+			// byteOffset is a rune-start byte, but the bytes there do not
+			// decode to a valid rune (for example a lone 0xFF lead byte).
+			return Position{}, ErrPosition
+		}
 	}
 
 	line := 0
@@ -102,6 +109,58 @@ func PositionAt(text string, byteOffset int) (Position, error) {
 		offset += size
 	}
 	return Position{Line: line, UTF16Column: column}, nil
+}
+
+// codePointColumnToUTF16 converts a zero-based Unicode code point column on
+// line (the unit token.Tokenizer's Col counts: one per rune, regardless of
+// whether that rune needs one or two UTF-16 code units) into the UTF-16
+// code unit column Position.UTF16Column uses. A token's code-point column
+// and a Position's UTF16Column are not interchangeable for text containing
+// any rune above U+FFFF; this is the conversion a caller applies at that
+// boundary. It returns ErrPosition for the same malformed-input cases as
+// PositionAt/ByteOffset: a negative line/column, a line text does not have,
+// a code-point column past the end of its line, or invalid UTF-8.
+func codePointColumnToUTF16(text string, line, codePointColumn int) (int, error) {
+	if line < 0 || codePointColumn < 0 {
+		return 0, ErrPosition
+	}
+
+	lineStart := 0
+	for l := 0; l < line; l++ {
+		delim, delimLen := nextLineDelimiter(text, lineStart)
+		if delim < 0 {
+			return 0, ErrPosition
+		}
+		lineStart = delim + delimLen
+	}
+	lineEnd := len(text)
+	if delim, _ := nextLineDelimiter(text, lineStart); delim >= 0 {
+		lineEnd = delim
+	}
+
+	codePoints := 0
+	utf16Column := 0
+	offset := lineStart
+	for offset < lineEnd {
+		if codePoints == codePointColumn {
+			return utf16Column, nil
+		}
+		r, size := utf8.DecodeRuneInString(text[offset:])
+		if r == utf8.RuneError && size <= 1 {
+			return 0, ErrPosition
+		}
+		width := 1
+		if r > 0xFFFF {
+			width = 2
+		}
+		utf16Column += width
+		codePoints++
+		offset += size
+	}
+	if codePoints == codePointColumn {
+		return utf16Column, nil
+	}
+	return 0, ErrPosition
 }
 
 // nextLineDelimiter returns the byte offset and length of the next line

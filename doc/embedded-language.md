@@ -35,14 +35,27 @@ pos, err := language.PositionAt(text, offset)
   a UTF-8 rune boundary, and a `UTF16Column`/offset that lands on the low
   half of a surrogate pair (or inside a CRLF pair) are all rejected.
 
-This intentionally reuses the column-unit boundary the existing SQL
-tokenizer already targets (`token.Tokenizer`'s `Col`, which the
-`// A tab is a single character in LSP position terms.` comment and its
-one-Line-advance-per-CRLF handling document as UTF-16-oriented), rather than
-inventing a second convention. See the task report for the one place the
-tokenizer's own counting falls short of true UTF-16 width for supplementary-
-plane runes inside identifiers and quoted strings, and why that gap is out
-of scope for this package.
+**`token.Tokenizer`'s `Col` (`token/lexer.go`) is a different unit and is
+not interchangeable with `Position.UTF16Column`.** The tokenizer counts one
+Unicode code point (rune) per column everywhere it advances multi-rune runs
+— `tokenizeWord`, `tokenizeQuotedString`, `tokenizeDelimitedIdentifier` and
+`tokenizeMultilineComment` all add `len(...)` over a `[]rune` or increment
+once per rune in a loop — regardless of whether that rune needs one or two
+UTF-16 code units. Its single-character operator/punctuation cases
+(`t.Col++`) only ever see BMP runes, so they happen to agree with UTF-16
+width, but that agreement does not extend to identifiers, quoted strings or
+comments containing a rune above U+FFFF. A host or a later task that maps a
+`token.Pos`/`token.Token` into a `language.Position` must explicitly convert
+that token's code-point column into a UTF-16 column at the token boundary —
+it must never assume the two are already equal, or ranges will be wrong for
+any SQL text containing emoji or other supplementary-plane characters
+inside a word, string or comment. `language`'s own line-delimiter handling
+(CRLF as one two-byte delimiter, lone CR also terminating a line) does match
+the tokenizer's `\r`/`\r\n`/`\n` cases; only the column unit differs.
+`language`'s unexported `codePointColumnToUTF16` (`language/positions.go`)
+performs exactly that conversion given the line's source text, the
+tokenizer's zero-based line and code-point column; a later task doing the
+token→`Position` mapping from inside this package can call it directly.
 
 Native SQL execution may still encode text as CP1252 for InterBase; that is
 a separate, later concern for the execution path. Editor text and positions
@@ -91,10 +104,11 @@ A future embedder builds a request with nothing but public packages:
 req := language.Request{
     Document: language.Document{URI: "memory:one", Text: "SELECT * FROM T", Version: 1, Binding: 1},
     Context: language.Context{
-        Key:      metadata.Key{Engine: "interbase", URL: dsn},
-        Snapshot: lease.Snapshot(),
-        Variant:  dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3},
-        Details:  lease, // *metadata.Lease satisfies language.DetailReader
+        Key:         metadata.Key{Engine: "interbase", URL: dsn},
+        Incarnation: lease.Incarnation(), // ties a Result's Stamp to this store instance; see Current
+        Snapshot:    lease.Snapshot(),
+        Variant:     dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3},
+        Details:     lease, // *metadata.Lease satisfies language.DetailReader
     },
 }
 ```
