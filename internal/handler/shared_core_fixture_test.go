@@ -1,20 +1,29 @@
 package handler
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/metadata/metadatatest"
 )
@@ -31,7 +40,9 @@ func TestNeovimFixtureSnapshotIsDeterministic(t *testing.T) {
 	if err := lease.Refresh(context.Background()); err != nil {
 		t.Fatal("start fixture metadata lease:", err)
 	}
-	if err := metadatatest.WaitReady(context.Background(), lease); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metadatatest.WaitReady(ctx, lease); err != nil {
 		t.Fatalf("fixture metadata readiness: %v; snapshot=%+v", err, lease.Snapshot())
 	}
 	cache := lease.Snapshot().Cache
@@ -70,12 +81,396 @@ func TestNeovimFixtureSnapshotIsDeterministic(t *testing.T) {
 	if err := newLease.Refresh(context.Background()); err != nil {
 		t.Fatal("start new-target fixture metadata lease:", err)
 	}
-	if err := metadatatest.WaitReady(context.Background(), newLease); err != nil {
+	ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := metadatatest.WaitReady(ctx, newLease); err != nil {
 		t.Fatal("new-target metadata readiness:", err)
 	}
 	newName, _ := newLease.Snapshot().Cache.ColumnDescs("CUSTOMERS")
 	if len(newName) != 3 || newName[1].Type != "VARCHAR(100)" || columns[1].Type != "VARCHAR(80)" {
 		t.Fatalf("old/new fixture target values = %v / %v, want VARCHAR(80) / VARCHAR(100)", columns, newName)
+	}
+}
+
+func TestNeovimFixtureProcedureLocalNavigationAndSymbols(t *testing.T) {
+	request := language.Request{Document: language.Document{URI: "file:///fixture-local.sql", Text: neovimFixtureProcedureBuffer, Version: 1}, Context: language.Context{Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}}}
+	service := language.NewService()
+	refs, err := service.References(context.Background(), request, language.Position{Line: 4, UTF16Column: 29}, true)
+	if err != nil {
+		t.Fatal("procedure-local references:", err)
+	}
+	wantRanges := []language.Range{
+		{Start: language.Position{Line: 1, UTF16Column: 17}, End: language.Position{Line: 1, UTF16Column: 18}},
+		{Start: language.Position{Line: 3, UTF16Column: 0}, End: language.Position{Line: 3, UTF16Column: 1}},
+		{Start: language.Position{Line: 4, UTF16Column: 0}, End: language.Position{Line: 4, UTF16Column: 1}},
+		{Start: language.Position{Line: 4, UTF16Column: 5}, End: language.Position{Line: 4, UTF16Column: 6}},
+		{Start: language.Position{Line: 4, UTF16Column: 29}, End: language.Position{Line: 4, UTF16Column: 30}},
+	}
+	if len(refs.Value) != len(wantRanges) {
+		t.Fatalf("procedure-local references = %#v, want %d declaration/use spans", refs.Value, len(wantRanges))
+	}
+	for i, want := range wantRanges {
+		if refs.Value[i].Range != want {
+			t.Errorf("reference %d range = %+v, want %+v", i, refs.Value[i].Range, want)
+		}
+	}
+	rename, err := service.Rename(context.Background(), request, language.Position{Line: 4, UTF16Column: 29}, "V_AMOUNT")
+	if err != nil {
+		t.Fatal("procedure-local rename:", err)
+	}
+	if len(rename.Value) != 1 || len(rename.Value[0].Edits) != len(wantRanges) {
+		t.Fatalf("procedure-local rename = %#v, want one workspace edit with %d spans", rename.Value, len(wantRanges))
+	}
+	for i, want := range wantRanges {
+		edit := rename.Value[0].Edits[i]
+		if edit.Range != want || edit.Text != "V_AMOUNT" {
+			t.Errorf("rename edit %d = %+v, want span %+v replacing with V_AMOUNT", i, edit, want)
+		}
+	}
+
+	symbolRequest := request
+	symbolRequest.Document = language.Document{URI: "file:///fixture-symbols.sql", Text: neovimFixtureProcedureSymbols, Version: 1}
+	symbols, err := service.Symbols(context.Background(), symbolRequest)
+	if err != nil {
+		t.Fatal("procedure document symbols:", err)
+	}
+	found := false
+	for _, symbol := range symbols.Value {
+		if symbol.Name == "X" && symbol.Kind == language.SymbolKindVariable {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("procedure fixture symbols = %#v, want local variable X", symbols.Value)
+	}
+	for _, symbol := range symbols.Value {
+		if symbol.Name == "X" && (symbol.Range != (language.Range{Start: language.Position{Line: 0, UTF16Column: 0}, End: language.Position{Line: 0, UTF16Column: 66}}) || symbol.SelectionRange != (language.Range{Start: language.Position{Line: 0, UTF16Column: 39}, End: language.Position{Line: 0, UTF16Column: 40}})) {
+			t.Errorf("variable symbol = %+v, want scope [0:0,0:66] and selection [0:39,0:40]", symbol)
+		}
+	}
+}
+
+func TestNeovimFixtureCancellationWaitsForQueryEntry(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	client := startFixtureRawClient(t, ctx)
+	defer client.stop()
+	if err := client.initialize(ctx); err != nil {
+		t.Fatal("initialize fixture child:", err)
+	}
+	if err := client.waitReady(ctx); err != nil {
+		t.Fatal("wait for fixture metadata readiness:", err)
+	}
+	const (
+		uri   = "file:///fixture-cancel.sql"
+		query = "SELECT SQLS_FIXTURE_WAIT FROM CUSTOMERS"
+	)
+	client.notify("textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": uri, "languageId": "sql", "version": 1, "text": query}})
+	client.requestAsync(100, "workspace/executeCommand", map[string]any{"command": CommandExecuteQuery, "arguments": []string{uri}})
+	entryCtx, entryCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer entryCancel()
+	entered, err := client.waitNotification(entryCtx, "sqls/fixtureQueryEntered")
+	if err != nil {
+		t.Fatal("wait for gated query-entry notification:", err)
+	}
+	var gate struct {
+		Marker string `json:"marker"`
+		SQL    string `json:"sql"`
+		Target string `json:"target"`
+	}
+	if err := json.Unmarshal(entered.Params, &gate); err != nil {
+		t.Fatal("decode fixture query-entry notification:", err)
+	}
+	if gate.Marker != "SQLS_FIXTURE_WAIT" || gate.SQL != query || gate.Target != "fixture://old" {
+		t.Fatalf("query-entry gate = %+v, want exact SQL marker and active fixture target", gate)
+	}
+	client.notify("$/cancelRequest", map[string]any{"id": 100})
+	response, err := client.waitResponse(ctx, 100)
+	if err != nil {
+		t.Fatal("wait for cancelled execute response:", err)
+	}
+	if len(response.Error) != 0 {
+		t.Fatalf("cancelled execute response has JSON-RPC error: %s", response.Error)
+	}
+	var result string
+	if err := json.Unmarshal(response.Result, &result); err != nil || !strings.Contains(strings.ToLower(result), "cancel") {
+		t.Fatalf("cancelled execute result = %q, decode err=%v; want cancellation notice", result, err)
+	}
+	if err := client.shutdown(ctx); err != nil {
+		t.Fatal("shutdown fixture child:", err)
+	}
+}
+
+type fixtureRPCMessage struct {
+	ID     json.RawMessage `json:"id"`
+	Method string          `json:"method"`
+	Params json.RawMessage `json:"params"`
+	Result json.RawMessage `json:"result"`
+	Error  json.RawMessage `json:"error"`
+}
+
+type fixtureRawClient struct {
+	cmd       *exec.Cmd
+	stdin     io.WriteCloser
+	messages  chan fixtureRPCMessage
+	readErr   chan error
+	waitDone  chan error
+	stderr    bytes.Buffer
+	stderrEnd chan struct{}
+	writeMu   sync.Mutex
+	closed    bool
+	waited    bool
+}
+
+func startFixtureRawClient(t *testing.T, ctx context.Context) *fixtureRawClient {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal("locate current test binary:", err)
+	}
+	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestNeovimFixtureServer$")
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "SQLS_NEOVIM_FIXTURE=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
+	cmd.Env = append(cmd.Env, "SQLS_NEOVIM_FIXTURE=1")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal("create fixture child stdin:", err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal("create fixture child stdout:", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal("create fixture child stderr:", err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal("start fixture test-binary child:", err)
+	}
+	c := &fixtureRawClient{cmd: cmd, stdin: stdin, messages: make(chan fixtureRPCMessage, 64), readErr: make(chan error, 1), waitDone: make(chan error, 1), stderrEnd: make(chan struct{})}
+	go func() { c.waitDone <- cmd.Wait() }()
+	go func() {
+		_, _ = io.Copy(&c.stderr, stderr)
+		close(c.stderrEnd)
+	}()
+	go c.readFrames(stdout)
+	return c
+}
+
+func (c *fixtureRawClient) initialize(ctx context.Context) error {
+	params := map[string]any{"initializationOptions": map[string]any{"connectionConfig": map[string]any{
+		"alias": "old", "driver": string(neovimFixtureDriver), "dataSourceName": "fixture://old",
+	}}}
+	if err := c.request(1, "initialize", params); err != nil {
+		return err
+	}
+	c.notify("initialized", map[string]any{})
+	return nil
+}
+
+func (c *fixtureRawClient) waitReady(ctx context.Context) error {
+	deadline := time.NewTicker(10 * time.Millisecond)
+	defer deadline.Stop()
+	for id := int64(10); ; id++ {
+		if err := c.write(map[string]any{"jsonrpc": "2.0", "id": id, "method": "workspace/executeCommand", "params": map[string]any{"command": CommandShowMetadataStatus}}); err != nil {
+			return err
+		}
+		response, err := c.waitResponse(ctx, id)
+		if err != nil {
+			return err
+		}
+		var status struct {
+			ConnectionState string `json:"connectionState"`
+			Settled         bool   `json:"settled"`
+			Degraded        bool   `json:"degraded"`
+		}
+		if len(response.Error) == 0 && json.Unmarshal(response.Result, &status) == nil && status.ConnectionState == string(connectionReady) && status.Settled && !status.Degraded {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("fixture never became ready (last status: %s): %w", response.Result, ctx.Err())
+		case <-deadline.C:
+		}
+	}
+}
+
+func (c *fixtureRawClient) request(id int64, method string, params any) error {
+	if err := c.write(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	response, err := c.waitResponse(ctx, id)
+	if err != nil {
+		return err
+	}
+	if len(response.Error) != 0 {
+		return fmt.Errorf("%s returned JSON-RPC error: %s", method, response.Error)
+	}
+	return nil
+}
+
+func (c *fixtureRawClient) requestAsync(id int64, method string, params any) {
+	_ = c.write(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params})
+}
+
+func (c *fixtureRawClient) notify(method string, params any) {
+	_ = c.write(map[string]any{"jsonrpc": "2.0", "method": method, "params": params})
+}
+
+func (c *fixtureRawClient) write(value any) error {
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return err
+	}
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed {
+		return io.ErrClosedPipe
+	}
+	if _, err := fmt.Fprintf(c.stdin, "Content-Length: %d\r\n\r\n", len(payload)); err != nil {
+		return err
+	}
+	_, err = c.stdin.Write(payload)
+	return err
+}
+
+func (c *fixtureRawClient) waitResponse(ctx context.Context, id int64) (fixtureRPCMessage, error) {
+	want := strconv.FormatInt(id, 10)
+	for {
+		message, err := c.next(ctx)
+		if err != nil {
+			return fixtureRPCMessage{}, err
+		}
+		if string(message.ID) == want {
+			return message, nil
+		}
+	}
+}
+
+func (c *fixtureRawClient) waitNotification(ctx context.Context, method string) (fixtureRPCMessage, error) {
+	for {
+		message, err := c.next(ctx)
+		if err != nil {
+			return fixtureRPCMessage{}, err
+		}
+		if message.Method == method {
+			return message, nil
+		}
+	}
+}
+
+func (c *fixtureRawClient) next(ctx context.Context) (fixtureRPCMessage, error) {
+	select {
+	case message := <-c.messages:
+		return message, nil
+	case err := <-c.readErr:
+		if err == nil {
+			err = io.EOF
+		}
+		return fixtureRPCMessage{}, fmt.Errorf("fixture stdio stream ended: %w", err)
+	case <-ctx.Done():
+		return fixtureRPCMessage{}, ctx.Err()
+	}
+}
+
+func (c *fixtureRawClient) readFrames(r io.Reader) {
+	reader := bufio.NewReader(r)
+	for {
+		length := -1
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				c.readErr <- err
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				break
+			}
+			name, value, ok := strings.Cut(line, ":")
+			if !ok || !strings.EqualFold(strings.TrimSpace(name), "Content-Length") {
+				c.readErr <- fmt.Errorf("unexpected stdout outside JSON-RPC framing: %q", line)
+				return
+			}
+			length, err = strconv.Atoi(strings.TrimSpace(value))
+			if err != nil || length < 0 || length > 8<<20 {
+				c.readErr <- fmt.Errorf("invalid JSON-RPC content length %q", value)
+				return
+			}
+		}
+		if length < 0 {
+			c.readErr <- fmt.Errorf("JSON-RPC frame missing Content-Length")
+			return
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(reader, payload); err != nil {
+			c.readErr <- err
+			return
+		}
+		var message fixtureRPCMessage
+		if err := json.Unmarshal(payload, &message); err != nil {
+			c.readErr <- fmt.Errorf("invalid JSON-RPC JSON: %w", err)
+			return
+		}
+		c.messages <- message
+	}
+}
+
+func (c *fixtureRawClient) shutdown(ctx context.Context) error {
+	if err := c.request(200, "shutdown", nil); err != nil {
+		return err
+	}
+	c.notify("exit", nil)
+	c.writeMu.Lock()
+	c.closed = true
+	err := c.stdin.Close()
+	c.writeMu.Unlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-c.waitDone:
+		c.waited = true
+		if err != nil {
+			return fmt.Errorf("fixture child exit: %w (stderr: %s)", err, c.stderr.String())
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("fixture child did not exit after shutdown: %w", ctx.Err())
+	}
+	select {
+	case err := <-c.readErr:
+		if !errors.Is(err, io.EOF) {
+			return fmt.Errorf("fixture stdout was not exclusively framed JSON-RPC: %w", err)
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
+func (c *fixtureRawClient) stop() {
+	c.writeMu.Lock()
+	if !c.closed {
+		c.closed = true
+		_ = c.stdin.Close()
+	}
+	c.writeMu.Unlock()
+	if c.cmd.Process != nil && !c.waited {
+		_ = c.cmd.Process.Kill()
+		select {
+		case <-c.waitDone:
+			c.waited = true
+		case <-time.After(2 * time.Second):
+		}
+	}
+	select {
+	case <-c.stderrEnd:
+	case <-time.After(2 * time.Second):
 	}
 }
 
@@ -117,8 +512,10 @@ func neovimFixtureCache(variant string) *catalog.Cache {
 }
 
 const (
-	neovimFixtureTableDDL        = "CREATE TABLE CUSTOMERS (CUSTOMER_ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(80), EMAIL VARCHAR(120));"
-	neovimFixtureProcedureSource = "BEGIN\n  SELECT NAME FROM CUSTOMERS WHERE CUSTOMER_ID = :P_CUSTOMER_ID INTO :O_NAME;\n  SUSPEND;\nEND"
+	neovimFixtureTableDDL         = "CREATE TABLE CUSTOMERS (CUSTOMER_ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(80), EMAIL VARCHAR(120));"
+	neovimFixtureProcedureSource  = "BEGIN\n  SELECT NAME FROM CUSTOMERS WHERE CUSTOMER_ID = :P_CUSTOMER_ID INTO :O_NAME;\n  SUSPEND;\nEND"
+	neovimFixtureProcedureBuffer  = "ALTER PROCEDURE p AS\nDECLARE VARIABLE v INTEGER;\nBEGIN\nv = 0;\nv = :v + CHAR_LENGTH('😀') + v; -- v\nSELECT 'v' FROM t;\nEND"
+	neovimFixtureProcedureSymbols = "CREATE PROCEDURE P AS DECLARE VARIABLE X INTEGER; BEGIN X = 1; END"
 )
 
 type neovimFixtureProvider struct {
@@ -181,8 +578,14 @@ func serveNeovimFixture(t *testing.T) {
 	backend := installStubBackend(t)
 	_ = backend
 	registerNeovimFixtureDriver()
+	notifier := &fixtureRPCNotifier{}
+	activeFixtureNotifier.Store(notifier)
+	defer activeFixtureNotifier.CompareAndSwap(notifier, nil)
 	server := NewServer()
-	server.openConnection = database.OpenContext
+	server.openConnection = func(ctx context.Context, cfg *database.DBConfig) (*database.DBConnection, error) {
+		notifier.setTarget(cfg.DataSourceName)
+		return database.OpenContext(ctx, cfg)
+	}
 	server.stateMu.Lock()
 	server.metadataFactoryOverride = func(cfg *database.DBConfig) (metadata.Key, metadata.Scope, metadata.Factory, bool) {
 		variant := "old"
@@ -196,6 +599,7 @@ func serveNeovimFixture(t *testing.T) {
 	handler := NewDispatcher(jsonrpc2.HandlerWithError(server.Handle))
 	stream := jsonrpc2.NewBufferedStream(fixtureStdio{Reader: os.Stdin, Writer: protocolOut}, jsonrpc2.VSCodeObjectCodec{})
 	conn := jsonrpc2.NewConn(context.Background(), stream, handler, jsonrpc2.SetLogger(log.New(os.Stderr, "sqls fixture: ", 0)))
+	notifier.setConn(conn)
 	<-conn.DisconnectNotify()
 	_ = server.Stop()
 	<-server.cleanupDone
@@ -204,6 +608,37 @@ func serveNeovimFixture(t *testing.T) {
 const neovimFixtureDriver dialect.DatabaseDriver = "sqls-neovim-fixture"
 
 var fixtureDriverOnce sync.Once
+var activeFixtureNotifier atomic.Pointer[fixtureRPCNotifier]
+
+type fixtureRPCNotifier struct {
+	mu     sync.RWMutex
+	conn   *jsonrpc2.Conn
+	target string
+}
+
+func (n *fixtureRPCNotifier) setConn(conn *jsonrpc2.Conn) {
+	n.mu.Lock()
+	n.conn = conn
+	n.mu.Unlock()
+}
+
+func (n *fixtureRPCNotifier) setTarget(target string) {
+	n.mu.Lock()
+	n.target = target
+	n.mu.Unlock()
+}
+
+func (n *fixtureRPCNotifier) queryEntered(query string) error {
+	n.mu.RLock()
+	conn, target := n.conn, n.target
+	n.mu.RUnlock()
+	if conn == nil {
+		return fmt.Errorf("fixture LSP connection is not initialized")
+	}
+	return conn.Notify(context.Background(), "sqls/fixtureQueryEntered", map[string]string{
+		"marker": "SQLS_FIXTURE_WAIT", "sql": query, "target": target,
+	})
+}
 
 func registerNeovimFixtureDriver() {
 	fixtureDriverOnce.Do(func() {
@@ -219,7 +654,7 @@ func registerNeovimFixtureDriver() {
 			if backend == nil {
 				backend = &stubBackend{gates: map[string]*stubGate{}}
 			}
-			return &neovimFixtureRepository{stubRepository: &stubRepository{MockDBRepository: database.NewMockDBRepository(db).(*database.MockDBRepository), backend: backend, db: db}}
+			return &neovimFixtureRepository{stubRepository: &stubRepository{MockDBRepository: database.NewMockDBRepository(db).(*database.MockDBRepository), backend: backend, db: db}, notifier: activeFixtureNotifier.Load()}
 		})
 	})
 }
@@ -231,11 +666,19 @@ type fixtureStdio struct {
 
 func (fixtureStdio) Close() error { return nil }
 
-type neovimFixtureRepository struct{ *stubRepository }
+type neovimFixtureRepository struct {
+	*stubRepository
+	notifier *fixtureRPCNotifier
+}
 
 func (r *neovimFixtureRepository) Query(ctx context.Context, query string) (*sql.Rows, error) {
 	if strings.Contains(query, "SQLS_FIXTURE_WAIT") {
 		r.backend.recordQuery(r.db, query)
+		if r.notifier != nil {
+			if err := r.notifier.queryEntered(query); err != nil {
+				return nil, err
+			}
+		}
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
