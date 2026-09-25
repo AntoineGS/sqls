@@ -21,31 +21,31 @@ import (
 // enumeration exactly so a host can cast language.CompletionItem.Kind to its
 // own transport type without a translation table.
 const (
-	KindText          = 1
-	KindMethod        = 2
-	KindFunction      = 3
-	KindConstructor   = 4
-	KindField         = 5
-	KindVariable      = 6
-	KindClass         = 7
-	KindInterface     = 8
-	KindModule        = 9
-	KindProperty      = 10
-	KindUnit          = 11
-	KindValue         = 12
-	KindEnum          = 13
-	KindKeyword       = 14
-	KindSnippet       = 15
-	KindColor         = 16
-	KindFile          = 17
-	KindReference     = 18
-	KindFolder        = 19
-	KindEnumMember    = 20
-	KindConstant      = 21
-	KindStruct        = 22
-	KindEvent         = 23
-	KindOperator      = 24
-	KindTypeParameter = 25
+	KindText          CompletionKind = 1
+	KindMethod        CompletionKind = 2
+	KindFunction      CompletionKind = 3
+	KindConstructor   CompletionKind = 4
+	KindField         CompletionKind = 5
+	KindVariable      CompletionKind = 6
+	KindClass         CompletionKind = 7
+	KindInterface     CompletionKind = 8
+	KindModule        CompletionKind = 9
+	KindProperty      CompletionKind = 10
+	KindUnit          CompletionKind = 11
+	KindValue         CompletionKind = 12
+	KindEnum          CompletionKind = 13
+	KindKeyword       CompletionKind = 14
+	KindSnippet       CompletionKind = 15
+	KindColor         CompletionKind = 16
+	KindFile          CompletionKind = 17
+	KindReference     CompletionKind = 18
+	KindFolder        CompletionKind = 19
+	KindEnumMember    CompletionKind = 20
+	KindConstant      CompletionKind = 21
+	KindStruct        CompletionKind = 22
+	KindEvent         CompletionKind = 23
+	KindOperator      CompletionKind = 24
+	KindTypeParameter CompletionKind = 25
 )
 
 // Service implements the language algorithms (completion, hover,
@@ -150,23 +150,23 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 	var items []CompletionItem
 
 	if eng.cache != nil {
-		if completionTypeIs(completionCtx.types, CompletionTypeColumn) {
+		if completionTypeIs(completionCtx.types, completionTypeColumn) {
 			candidates := eng.columnCandidates(definedTables, completionCtx.parent)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeReferencedTable) {
+		if completionTypeIs(completionCtx.types, completionTypeReferencedTable) {
 			candidates := eng.referencedTableCandidates(definedTables)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeTable) {
+		if completionTypeIs(completionCtx.types, completionTypeTable) {
 			excl := definedTables
-			if completionTypeIs(completionCtx.types, CompletionTypeJoin) {
+			if completionTypeIs(completionCtx.types, completionTypeJoin) {
 				excl = nil
 			}
 			candidates := eng.tableCandidates(completionCtx.parent, excl)
@@ -179,38 +179,38 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 			// SchemaTables, so tableCandidates has offered them once.
 			items = append(items, eng.selectableProcedureCandidates()...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeProcedureName) {
+		if completionTypeIs(completionCtx.types, completionTypeProcedureName) {
 			items = append(items, eng.procedureCandidates()...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeView) && !completionTypeIs(completionCtx.types, CompletionTypeTable) {
+		if completionTypeIs(completionCtx.types, completionTypeView) && !completionTypeIs(completionCtx.types, completionTypeTable) {
 			items = append(items, eng.viewCandidates(completionCtx.parent)...)
 		}
 		if insideGenIDCall(nodeWalker) {
 			items = append(items, eng.generatorCandidates()...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeSchema) {
+		if completionTypeIs(completionCtx.types, completionTypeSchema) {
 			candidates := eng.schemaCandidates()
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeSubQuery) {
+		if completionTypeIs(completionCtx.types, completionTypeSubQuery) {
 			candidates := eng.subQueryCandidates(definedSubQueries)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
-		if completionTypeIs(completionCtx.types, CompletionTypeSubQueryColumn) {
+		if completionTypeIs(completionCtx.types, completionTypeSubQueryColumn) {
 			candidates := eng.subQueryColumnCandidates(definedSubQueries)
 			if withBackQuote {
 				candidates = toQuotedCandidates(candidates)
 			}
 			items = append(items, candidates...)
 		}
-		joinOn := completionTypeIs(completionCtx.types, CompletionTypeJoinOn)
-		if completionTypeIs(completionCtx.types, CompletionTypeJoin) || joinOn {
+		joinOn := completionTypeIs(completionCtx.types, completionTypeJoinOn)
+		if completionTypeIs(completionCtx.types, completionTypeJoin) || joinOn {
 			table, err := parseutil.ExtractLastTable(parsed, pos)
 			if err != nil {
 				return Result[CompletionList]{}, err
@@ -227,11 +227,11 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 		}
 	}
 
-	if completionTypeIs(completionCtx.types, CompletionTypeKeyword) {
+	if completionTypeIs(completionCtx.types, completionTypeKeyword) {
 		drivers := dialect.DataBaseKeywordsForVariant(eng.driverVariant())
 		items = append(items, eng.keywordCandidates(req.Context.LowercaseKeywords, drivers)...)
 	}
-	if completionTypeIs(completionCtx.types, CompletionTypeFunction) {
+	if completionTypeIs(completionCtx.types, completionTypeFunction) {
 		drivers := dialect.DataBaseFunctionsForVariant(eng.driverVariant())
 		items = append(items, eng.functionCandidates(req.Context.LowercaseKeywords, drivers)...)
 		// A UDF is callable exactly where a built-in function is, so it needs
@@ -278,51 +278,51 @@ type completionType int
 
 const (
 	_ completionType = iota
-	CompletionTypeKeyword
-	CompletionTypeFunction
-	CompletionTypeColumn
-	CompletionTypeTable
-	CompletionTypeReferencedTable
-	CompletionTypeView
-	CompletionTypeProcedureName
-	CompletionTypeSubQuery
-	CompletionTypeSubQueryColumn
-	CompletionTypeChange
-	CompletionTypeUser
-	CompletionTypeSchema
-	CompletionTypeJoin
-	CompletionTypeJoinOn
+	completionTypeKeyword
+	completionTypeFunction
+	completionTypeColumn
+	completionTypeTable
+	completionTypeReferencedTable
+	completionTypeView
+	completionTypeProcedureName
+	completionTypeSubQuery
+	completionTypeSubQueryColumn
+	completionTypeChange
+	completionTypeUser
+	completionTypeSchema
+	completionTypeJoin
+	completionTypeJoinOn
 )
 
 func (ct completionType) String() string {
 	switch ct {
-	case CompletionTypeKeyword:
+	case completionTypeKeyword:
 		return "Keyword"
-	case CompletionTypeFunction:
+	case completionTypeFunction:
 		return "Function"
-	case CompletionTypeColumn:
+	case completionTypeColumn:
 		return "Column"
-	case CompletionTypeTable:
+	case completionTypeTable:
 		return "Table"
-	case CompletionTypeReferencedTable:
+	case completionTypeReferencedTable:
 		return "ReferencedTable"
-	case CompletionTypeView:
+	case completionTypeView:
 		return "View"
-	case CompletionTypeProcedureName:
+	case completionTypeProcedureName:
 		return "ProcedureName"
-	case CompletionTypeChange:
+	case completionTypeChange:
 		return "Change"
-	case CompletionTypeUser:
+	case completionTypeUser:
 		return "User"
-	case CompletionTypeSchema:
+	case completionTypeSchema:
 		return "Schema"
-	case CompletionTypeSubQuery:
+	case completionTypeSubQuery:
 		return "SubQuery"
-	case CompletionTypeSubQueryColumn:
+	case completionTypeSubQueryColumn:
 		return "SubQueryColumn"
-	case CompletionTypeJoin:
+	case completionTypeJoin:
 		return "Join clause"
-	case CompletionTypeJoinOn:
+	case completionTypeJoinOn:
 		return "Join On condition"
 	default:
 		return ""
@@ -347,7 +347,7 @@ func populateSortText(items []CompletionItem) {
 
 // Some completion kinds are more relevant than others.
 // This prefix defines the alphabetic priority of each kind.
-func getSortTextPrefix(kind int) string {
+func getSortTextPrefix(kind CompletionKind) string {
 	switch kind {
 	case KindSnippet:
 		return "00"
@@ -390,29 +390,29 @@ func getSortTextPrefix(kind int) string {
 	}
 }
 
-type ParentType int
+type completionParentType int
 
 const (
-	_ ParentType = iota
-	ParentTypeNone
-	ParentTypeSchema
-	ParentTypeTable
-	ParentTypeSubQuery
+	_ completionParentType = iota
+	completionParentTypeNone
+	completionParentTypeSchema
+	completionParentTypeTable
+	completionParentTypeSubQuery
 )
 
 type completionParent struct {
-	Type ParentType
+	Type completionParentType
 	Name string
 }
 
-var noneCompletionParent = &completionParent{Type: ParentTypeNone}
+var noneCompletionParent = &completionParent{Type: completionParentTypeNone}
 
-type CompletionContext struct {
+type completionContext struct {
 	types  []completionType
 	parent *completionParent
 }
 
-func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
+func getCompletionTypes(nw *parseutil.NodeWalker) *completionContext {
 	memberIdentifierMatcher := astutil.NodeMatcher{
 		NodeTypes: []ast.NodeType{ast.TypeMemberIdentifier},
 	}
@@ -426,23 +426,23 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			// has parent
 			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeSubQueryColumn,
-				CompletionTypeView,
+				completionTypeColumn,
+				completionTypeSubQueryColumn,
+				completionTypeView,
 			}
 			p = &completionParent{
-				Type: ParentTypeTable,
+				Type: completionParentTypeTable,
 				Name: mi.Parent.String(),
 			}
 		} else {
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeTable,
-				CompletionTypeReferencedTable,
-				CompletionTypeSubQueryColumn,
-				CompletionTypeSubQuery,
-				CompletionTypeView,
-				CompletionTypeFunction,
+				completionTypeColumn,
+				completionTypeTable,
+				completionTypeReferencedTable,
+				completionTypeSubQueryColumn,
+				completionTypeSubQuery,
+				completionTypeView,
+				completionTypeFunction,
 			}
 			p = noneCompletionParent
 		}
@@ -453,23 +453,23 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			// has parent
 			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeView,
-				CompletionTypeSubQueryColumn,
+				completionTypeColumn,
+				completionTypeView,
+				completionTypeSubQueryColumn,
 			}
 			p = &completionParent{
-				Type: ParentTypeTable,
+				Type: completionParentTypeTable,
 				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeTable,
-				CompletionTypeReferencedTable,
-				CompletionTypeView,
-				CompletionTypeSubQueryColumn,
-				CompletionTypeSubQuery,
-				CompletionTypeFunction,
+				completionTypeColumn,
+				completionTypeTable,
+				completionTypeReferencedTable,
+				completionTypeView,
+				completionTypeSubQueryColumn,
+				completionTypeSubQuery,
+				completionTypeFunction,
 			}
 		}
 	case syntaxPos == parseutil.TableReference:
@@ -477,21 +477,21 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			// has parent
 			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
-				CompletionTypeTable,
-				CompletionTypeView,
-				CompletionTypeSubQueryColumn,
+				completionTypeTable,
+				completionTypeView,
+				completionTypeSubQueryColumn,
 			}
 			p = &completionParent{
-				Type: ParentTypeSchema,
+				Type: completionParentTypeSchema,
 				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
-				CompletionTypeTable,
-				CompletionTypeReferencedTable,
-				CompletionTypeSchema,
-				CompletionTypeView,
-				CompletionTypeSubQuery,
+				completionTypeTable,
+				completionTypeReferencedTable,
+				completionTypeSchema,
+				completionTypeView,
+				completionTypeSubQuery,
 			}
 		}
 	case syntaxPos == parseutil.WhereCondition:
@@ -499,63 +499,63 @@ func getCompletionTypes(nw *parseutil.NodeWalker) *CompletionContext {
 			// has parent
 			mi := nw.CurNodeTopMatched(memberIdentifierMatcher).(*ast.MemberIdentifier)
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeView,
-				CompletionTypeSubQueryColumn,
+				completionTypeColumn,
+				completionTypeView,
+				completionTypeSubQueryColumn,
 			}
 			p = &completionParent{
-				Type: ParentTypeTable,
+				Type: completionParentTypeTable,
 				Name: mi.ParentTok.NoQuoteString(),
 			}
 		} else {
 			t = []completionType{
-				CompletionTypeColumn,
-				CompletionTypeTable,
-				CompletionTypeReferencedTable,
-				CompletionTypeView,
-				CompletionTypeSubQueryColumn,
-				CompletionTypeSubQuery,
-				CompletionTypeFunction,
+				completionTypeColumn,
+				completionTypeTable,
+				completionTypeReferencedTable,
+				completionTypeView,
+				completionTypeSubQueryColumn,
+				completionTypeSubQuery,
+				completionTypeFunction,
 			}
 		}
 	case syntaxPos == parseutil.JoinClause:
 		t = []completionType{
-			CompletionTypeJoin,
-			CompletionTypeTable,
-			CompletionTypeReferencedTable,
-			CompletionTypeSchema,
-			CompletionTypeView,
-			CompletionTypeSubQuery,
+			completionTypeJoin,
+			completionTypeTable,
+			completionTypeReferencedTable,
+			completionTypeSchema,
+			completionTypeView,
+			completionTypeSubQuery,
 		}
 	case syntaxPos == parseutil.JoinOn:
 		t = []completionType{
-			CompletionTypeJoinOn,
-			CompletionTypeColumn,
-			CompletionTypeReferencedTable,
-			CompletionTypeSubQueryColumn,
-			CompletionTypeSubQuery,
+			completionTypeJoinOn,
+			completionTypeColumn,
+			completionTypeReferencedTable,
+			completionTypeSubQueryColumn,
+			completionTypeSubQuery,
 		}
 	case syntaxPos == parseutil.InsertColumn:
 		t = []completionType{
-			CompletionTypeColumn,
-			CompletionTypeView,
+			completionTypeColumn,
+			completionTypeView,
 		}
 	case syntaxPos == parseutil.ExecuteProcedure:
-		// CompletionTypeKeyword is retained deliberately. multiKeywordMap is
+		// completionTypeKeyword is retained deliberately. multiKeywordMap is
 		// dialect-independent, so PostgreSQL's legacy
 		// "CREATE TRIGGER ... EXECUTE PROCEDURE f()" reaches this branch too;
 		// without the keywords a PostgreSQL user would receive nothing at all,
 		// because no procedure cache exists for that driver.
 		t = []completionType{
-			CompletionTypeProcedureName,
-			CompletionTypeKeyword,
+			completionTypeProcedureName,
+			completionTypeKeyword,
 		}
 	default:
 		t = []completionType{
-			CompletionTypeKeyword,
+			completionTypeKeyword,
 		}
 	}
-	return &CompletionContext{
+	return &completionContext{
 		types:  t,
 		parent: p,
 	}

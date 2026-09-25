@@ -57,16 +57,16 @@ func procedureCandidate(desc *catalog.ProcedureDesc, detail string) CompletionIt
 	}
 }
 
-// viewCandidates is called only where CompletionTypeView is set and
-// CompletionTypeTable is not. Views stay in SchemaTables, so in every position
+// viewCandidates is called only where completionTypeView is set and
+// completionTypeTable is not. Views stay in SchemaTables, so in every position
 // that offers tables the existing table candidate already represents the view
 // and gains only the "view" detail; emitting here as well would offer every
 // view twice.
 //
-// A non-ParentTypeNone parent yields nothing: those branches are the
+// A non-completionParentTypeNone parent yields nothing: those branches are the
 // member-identifier positions, and a view name is not a member of a table.
 func (c *completionEngine) viewCandidates(parent *completionParent) []CompletionItem {
-	if !c.catalogEnabled() || parent.Type != ParentTypeNone {
+	if !c.catalogEnabled() || parent.Type != completionParentTypeNone {
 		return nil
 	}
 	candidates := []CompletionItem{}

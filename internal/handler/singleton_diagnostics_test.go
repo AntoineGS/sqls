@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
@@ -17,13 +18,21 @@ func singletonDiagnosticCache() *database.DBCache {
 		Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true},
 		ConstraintName: sql.NullString{String: "PK_ORDERS", Valid: true},
 	}
+	orderColumns := []*database.ColumnDesc{
+		{ColumnBase: database.ColumnBase{Table: "ORDERS", Name: "ID"}, Type: "INTEGER", Key: "YES"},
+		{ColumnBase: database.ColumnBase{Table: "ORDERS", Name: "LINE_NO"}, Type: "INTEGER", Key: "YES"},
+	}
 	return &database.DBCache{
 		SchemaTables: map[string][]string{"": {"ORDERS"}},
 		ColumnsWithParent: map[string][]*database.ColumnDesc{
-			"\tORDERS": {
-				{ColumnBase: database.ColumnBase{Table: "ORDERS", Name: "ID"}, Type: "INTEGER", Key: "YES"},
-				{ColumnBase: database.ColumnBase{Table: "ORDERS", Name: "LINE_NO"}, Type: "INTEGER", Key: "YES"},
-			},
+			"\tORDERS": orderColumns,
+		},
+		// diagnostics resolve columns through the exact-identity ColumnsByID,
+		// matching how InterBase's real metadata jobs populate it (see
+		// readMetadataColumns), never through the shared upper-cased
+		// ColumnsWithParent.
+		ColumnsByID: map[string][]*database.ColumnDesc{
+			catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key(): orderColumns,
 		},
 		Catalog: &database.CatalogCache{
 			Indexes:        map[string]*database.IndexDesc{"PK_ORDERS": index},
@@ -66,7 +75,11 @@ func TestSingletonDiagnosticCatalogAndRanges(t *testing.T) {
 			c.Catalog.IndexesByTable = nil
 		}},
 		{name: "view", where: "ID > 1", mutate: func(c *database.DBCache) {
-			c.Catalog.Views = map[string]*database.ViewDesc{"ORDERS": {Name: "ORDERS"}}
+			view := &database.ViewDesc{Name: "ORDERS"}
+			c.Catalog.Views = map[string]*database.ViewDesc{"ORDERS": view}
+			c.Catalog.ViewsByID = map[string]*database.ViewDesc{
+				catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "ORDERS"}.Key(): view,
+			}
 		}},
 		{name: "expression index metadata", where: "ID = 1 AND LINE_NO = 2", mutate: func(c *database.DBCache) {
 			c.Catalog.Indexes["PK_ORDERS"].Expression = sql.NullString{String: "ID + LINE_NO", Valid: true}

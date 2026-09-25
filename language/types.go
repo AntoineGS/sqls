@@ -110,6 +110,14 @@ type Result[T any] struct {
 	Stamp Stamp
 }
 
+// CompletionKind classifies a CompletionItem for client-side icon/sorting
+// purposes. Its values match the LSP CompletionItemKind enumeration
+// exactly so a host can cast a CompletionKind to its own transport type
+// without a translation table; it is a distinct named type from SymbolKind
+// so a value from one enumeration can never be passed to an API expecting
+// the other, even though their numeric ranges overlap.
+type CompletionKind int
+
 // CompletionItem is one completion candidate.
 type CompletionItem struct {
 	Label           string
@@ -118,7 +126,7 @@ type CompletionItem struct {
 	InsertText      string
 	FilterText      string
 	SortText        string
-	Kind            int
+	Kind            CompletionKind
 	Edit            *TextEdit
 	AdditionalEdits []TextEdit
 	Snippet         bool
@@ -194,10 +202,17 @@ type Location struct {
 	Source *Source
 }
 
+// SymbolKind classifies a DocumentSymbol for client-side icon purposes.
+// Its values match the LSP SymbolKind enumeration; it is a distinct named
+// type from CompletionKind so a value from one enumeration can never be
+// passed to an API expecting the other, even though their numeric ranges
+// overlap (SymbolKindVariable and CompletionKind's KindEnum both equal 13).
+type SymbolKind int
+
 // DocumentSymbol is one entry in a document's symbol outline.
 type DocumentSymbol struct {
 	Name           string
-	Kind           int
+	Kind           SymbolKind
 	Range          Range
 	SelectionRange Range
 	Children       []DocumentSymbol

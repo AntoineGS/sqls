@@ -46,7 +46,7 @@ func (s *Service) SignatureHelp(ctx context.Context, req Request, position Posit
 		// arguments are typed. CheckSyntaxPosition is not consulted: it is
 		// position-shaped and this is a node fact.
 		sh = procedureCallSignature(nodeWalker, pos, cache)
-	case signatureHelpIs(types, SignatureHelpTypeInsertValue):
+	case signatureHelpIs(types, signatureHelpTypeInsertValue):
 		insert, err := parseutil.ExtractInsert(parsed, pos)
 		if err != nil {
 			return Result[SignatureHelp]{}, err
@@ -139,8 +139,8 @@ type signatureHelpType int
 
 const (
 	_ signatureHelpType = iota
-	SignatureHelpTypeInsertValue
-	SignatureHelpTypeExecuteProcedure
+	signatureHelpTypeInsertValue
+	signatureHelpTypeExecuteProcedure
 )
 
 func getSignatureHelpTypes(nw *parseutil.NodeWalker) []signatureHelpType {
@@ -149,7 +149,7 @@ func getSignatureHelpTypes(nw *parseutil.NodeWalker) []signatureHelpType {
 	switch {
 	case syntaxPos == parseutil.InsertValue:
 		types = []signatureHelpType{
-			SignatureHelpTypeInsertValue,
+			signatureHelpTypeInsertValue,
 		}
 	default:
 		// pass

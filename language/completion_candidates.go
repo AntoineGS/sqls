@@ -45,7 +45,7 @@ func (c *completionEngine) columnCandidates(targetTables []*parseutil.TableInfo,
 	candidates := []CompletionItem{}
 
 	switch parent.Type {
-	case ParentTypeNone:
+	case completionParentTypeNone:
 		for _, table := range targetTables {
 			if table.DatabaseSchema != "" && table.Name != "" {
 				columns, ok := c.cache.ColumnDatabase(table.DatabaseSchema, table.Name)
@@ -65,9 +65,9 @@ func (c *completionEngine) columnCandidates(targetTables []*parseutil.TableInfo,
 				candidates = append(candidates, c.procedureColumnCandidates(table.Name)...)
 			}
 		}
-	case ParentTypeSchema:
+	case completionParentTypeSchema:
 		// pass
-	case ParentTypeTable:
+	case completionParentTypeTable:
 		for _, table := range targetTables {
 			if table.Name != parent.Name && table.Alias != parent.Name {
 				continue
@@ -79,7 +79,7 @@ func (c *completionEngine) columnCandidates(targetTables []*parseutil.TableInfo,
 			}
 			candidates = append(candidates, c.procedureColumnCandidates(table.Name)...)
 		}
-	case ParentTypeSubQuery:
+	case completionParentTypeSubQuery:
 		// pass
 	}
 	return candidates
@@ -130,7 +130,7 @@ func (c *completionEngine) tableCandidates(parent *completionParent, targetTable
 	candidates := []CompletionItem{}
 
 	switch parent.Type {
-	case ParentTypeNone:
+	case completionParentTypeNone:
 		excludeTables := []string{}
 		for _, table := range c.cache.SortedTables() {
 			isExclude := false
@@ -145,14 +145,14 @@ func (c *completionEngine) tableCandidates(parent *completionParent, targetTable
 			excludeTables = append(excludeTables, table)
 		}
 		candidates = append(candidates, generateTableCandidates(excludeTables, c.cache)...)
-	case ParentTypeSchema:
+	case completionParentTypeSchema:
 		tables, ok := c.cache.SortedTablesByDBName(parent.Name)
 		if ok {
 			candidates = append(candidates, generateTableCandidates(tables, c.cache)...)
 		}
-	case ParentTypeTable:
+	case completionParentTypeTable:
 		// pass
-	case ParentTypeSubQuery:
+	case completionParentTypeSubQuery:
 		// pass
 	}
 	return candidates

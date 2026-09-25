@@ -11,7 +11,7 @@ import (
 // "parameter" kind, so InterBase's input/output procedure parameters and
 // local variables are reported alike, distinguishable only by name and
 // range.
-const SymbolKindVariable = 13
+const SymbolKindVariable SymbolKind = 13
 
 // Symbols returns an outline of req.Document's InterBase procedural
 // declarations: one entry per input parameter, output parameter and local

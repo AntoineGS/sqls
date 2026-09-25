@@ -12,17 +12,31 @@ import (
 // cacheDiagnosticCatalog answers sqlsymbol's Catalog/UniqueKeyCatalog
 // interfaces directly from a *catalog.Cache, on demand, per lookup. It never
 // builds a second copy of the cache's column or index data: Columns and
-// UniqueKeys resolve straight from cache.ColumnDescs/cache.IndexesForTable
+// UniqueKeys resolve straight from cache.ColumnDescsByID/cache.IndexesForTable
 // each time they are called.
 type cacheDiagnosticCatalog struct {
 	cache *catalog.Cache
 }
 
+// Columns resolves table by its exact catalog identity via
+// cache.ColumnDescsByID first: the shared upper-cased ColumnDescs/
+// ColumnDatabase accessors fold every lookup to upper-case, so a quoted
+// table (table.Key() preserves its exact spelling) would otherwise
+// silently collide with, and read the columns of, any other relation
+// whose name happens to upper-case to the same key. ColumnDescsByID
+// returning false does not distinguish "no such relation" from "this
+// repository never populated exact-identity storage" (see its doc
+// comment), so Columns falls back to the folded lookup rather than
+// reporting every table unknown for engines/tests that only populate
+// ColumnsWithParent.
 func (c cacheDiagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnType, bool) {
 	if c.cache == nil {
 		return nil, false
 	}
-	descriptions, ok := c.cache.ColumnDescs(table.Key())
+	descriptions, ok := c.cache.ColumnDescsByID(table.Key())
+	if !ok {
+		descriptions, ok = c.cache.ColumnDescs(table.Key())
+	}
 	if !ok {
 		return nil, false
 	}
@@ -46,10 +60,18 @@ func (c cacheDiagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bo
 		return nil, false
 	}
 	key := table.Key()
-	for _, view := range cache.Catalog.Views {
-		if view != nil && view.Name == key {
-			return nil, false
-		}
+	// ViewByID resolves key by its exact catalog identity first, the same
+	// requirement Columns above has: looping cache.Catalog.Views (the
+	// shared upper-cased map) would miss a quoted view name that collides
+	// with an unrelated relation's folded key. Fall back to the folded
+	// View lookup when ViewByID reports no match, the same "not populated
+	// yet" ambiguity Columns handles.
+	_, isView := cache.ViewByID(key)
+	if !isView {
+		_, isView = cache.View(key)
+	}
+	if isView {
+		return nil, false
 	}
 	columns, ok := c.Columns(table)
 	if !ok {

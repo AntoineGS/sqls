@@ -7,10 +7,10 @@ import (
 	"time"
 
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/internal/completer"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 )
 
 type partialCatalogRepository struct{ *database.MockDBRepository }
@@ -163,15 +163,12 @@ func TestEditorSnapshotPreservesConfiguredDriverWhenConnectionOmitsIt(t *testing
 	if snapshot.Repository == nil {
 		t.Fatal("ready PostgreSQL connection should produce a repository")
 	}
-	c := completer.NewCompleter(snapshot.Cache)
-	c.Driver, c.Variant = snapshot.Variant.Driver, snapshot.Variant.Variant
-	items, err := c.Complete("ILI", lsp.CompletionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-		Position: lsp.Position{Line: 0, Character: 3},
-	}}, false)
+	snapshot.Text = "ILI"
+	res, err := language.NewService().Complete(context.Background(), languageRequest(snapshot), language.Position{Line: 0, UTF16Column: 3})
 	if err != nil {
 		t.Fatalf("PostgreSQL completion parse: %v", err)
 	}
-	for _, item := range items {
+	for _, item := range res.Value.Items {
 		if item.Label == "ILIKE" {
 			return
 		}
@@ -209,11 +206,11 @@ func TestCompletionRemainsIncompleteBeforeMetadataStart(t *testing.T) {
 			},
 		},
 	}
-	if !completionMetadataIncomplete(snapshot) {
+	if !completionIncomplete(snapshot, language.CompletionIncomplete(snapshot.Metadata)) {
 		t.Fatal("ready attachment before MetadataLoader.Start must remain incomplete")
 	}
 	snapshot.Metadata.StartFailed = true
-	if completionMetadataIncomplete(snapshot) {
+	if completionIncomplete(snapshot, language.CompletionIncomplete(snapshot.Metadata)) {
 		t.Fatal("terminal metadata start failure must not remain incomplete")
 	}
 }
@@ -242,7 +239,7 @@ func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *tes
 	if !preBind.ConnectionReady || preBind.Metadata != nil {
 		t.Fatalf("pre-bind snapshot = ready:%v metadata:%#v", preBind.ConnectionReady, preBind.Metadata)
 	}
-	if !completionMetadataIncomplete(preBind) {
+	if !completionIncomplete(preBind, language.CompletionIncomplete(preBind.Metadata)) {
 		t.Fatal("completion incorrectly settled before any metadata lease was bound")
 	}
 
@@ -262,7 +259,7 @@ func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *tes
 	if loading.Metadata == nil || !loading.Metadata.Started {
 		t.Fatalf("loading snapshot = metadata:%#v", loading.Metadata)
 	}
-	if !completionMetadataIncomplete(loading) {
+	if !completionIncomplete(loading, language.CompletionIncomplete(loading.Metadata)) {
 		t.Fatal("completion incorrectly settled while the only relevant category is loading")
 	}
 	close(release)
@@ -272,7 +269,7 @@ func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completionMetadataIncomplete(final) {
+	if completionIncomplete(final, language.CompletionIncomplete(final.Metadata)) {
 		t.Fatal("terminal ready category should settle completion")
 	}
 }
@@ -300,18 +297,12 @@ func TestProgressiveEditorSnapshotKeepsReadyProcedureWhenViewsFail(t *testing.T)
 	if snapshot.Metadata.Status[database.MetadataViews].State != database.MetadataFailed {
 		t.Fatalf("views state = %s, want failed", snapshot.Metadata.Status[database.MetadataViews].State)
 	}
-	params := lsp.CompletionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-		TextDocument: lsp.TextDocumentIdentifier{URI: snapshot.URI},
-		Position:     lsp.Position{Line: 0, Character: len(snapshot.Text)},
-	}}
-	c := completer.NewCompleter(snapshot.Cache)
-	c.Driver, c.Variant = snapshot.Variant.Driver, snapshot.Variant.Variant
-	items, err := c.Complete(snapshot.Text, params, false)
+	res, err := language.NewService().Complete(context.Background(), languageRequest(snapshot), language.Position{Line: 0, UTF16Column: len(snapshot.Text)})
 	if err != nil {
 		t.Fatal(err)
 	}
 	found := false
-	for _, item := range items {
+	for _, item := range res.Value.Items {
 		if item.Label == "READYPROC" {
 			found = true
 		}
@@ -319,11 +310,11 @@ func TestProgressiveEditorSnapshotKeepsReadyProcedureWhenViewsFail(t *testing.T)
 	if !found {
 		t.Fatal("procedure completion missing while unrelated views category failed")
 	}
-	if completionMetadataIncomplete(snapshot) {
+	if completionIncomplete(snapshot, language.CompletionIncomplete(snapshot.Metadata)) {
 		t.Fatal("terminal failed category must not keep completion incomplete")
 	}
 	signatureText := "execute procedure readyproc("
-	signature, err := SignatureHelpWithDriverVariant(signatureText, lsp.SignatureHelpParams{
+	signature, err := SignatureHelpWithDriverVariant(context.Background(), signatureText, lsp.SignatureHelpParams{
 		TextDocumentPositionParams: lsp.TextDocumentPositionParams{Position: lsp.Position{Line: 0, Character: len(signatureText)}},
 	}, snapshot.Cache, snapshot.Variant)
 	if err != nil {
@@ -359,7 +350,7 @@ func TestEditorSnapshotDoesNotMixLateConnectionAMetadataIntoB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !completionMetadataIncomplete(loading) {
+	if !completionIncomplete(loading, language.CompletionIncomplete(loading.Metadata)) {
 		t.Fatal("completion should be incomplete while a relevant category is loading")
 	}
 

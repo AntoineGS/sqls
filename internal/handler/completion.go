@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/language"
 )
@@ -30,7 +29,7 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 	}
 	return lsp.CompletionList{
 		Items:        lspCompletionItems(res.Value.Items),
-		IsIncomplete: completionMetadataIncomplete(snapshot),
+		IsIncomplete: completionIncomplete(snapshot, res.Value.Incomplete),
 	}, nil
 }
 
@@ -71,30 +70,24 @@ func lspCompletionItem(item language.CompletionItem) lsp.CompletionItem {
 	return out
 }
 
-func completionMetadataIncomplete(snapshot editorSnapshot) bool {
+// completionIncomplete composes the host's own connection-lifecycle facts
+// (Attaching, ConnectionReady — concepts a catalog.MetadataSnapshot has no
+// representation for) with metadataIncomplete, the metadata-readiness half
+// of the rule. metadataIncomplete must be language.CompletionIncomplete's
+// verdict for snapshot.Metadata — res.Value.Incomplete from the same
+// Service.Complete call already is that verdict, so callers pass it
+// through rather than recomputing it here. This is the single place the
+// two halves combine; there is exactly one metadata-readiness rule,
+// encoded once in language.CompletionIncomplete.
+func completionIncomplete(snapshot editorSnapshot, metadataIncomplete bool) bool {
 	if snapshot.Attaching {
 		return true
 	}
-	if snapshot.ConnectionReady && (snapshot.Metadata == nil || (!snapshot.Metadata.Started && !snapshot.Metadata.StartFailed)) {
-		return true
-	}
-	if snapshot.Metadata == nil {
+	if !snapshot.ConnectionReady {
 		return false
 	}
-	// These are the categories that can contribute catalog candidates. A
-	// failed/blocked/cancelled category is terminal; it must not keep clients
-	// spinning forever when progressive loading has degraded.
-	relevant := []database.MetadataKind{
-		database.MetadataSchemas, database.MetadataRelations,
-		database.MetadataColumnsCurrent, database.MetadataColumnsAll,
-		database.MetadataViews, database.MetadataProcedures,
-		database.MetadataGenerators, database.MetadataFunctions,
+	if snapshot.Metadata == nil {
+		return true
 	}
-	for _, kind := range relevant {
-		state := snapshot.Metadata.Status[kind].State
-		if state == database.MetadataPending || state == database.MetadataLoading {
-			return true
-		}
-	}
-	return false
+	return metadataIncomplete
 }

@@ -8,9 +8,9 @@ package language
 // snapshot was ever observed.
 //
 // The Service type that produces Stamps, and its Complete/Hover/Definition
-// and other methods, are introduced in later tasks alongside their actual
-// implementations. Current is usable standalone by a host that only needs
-// to fence its own previously cached Results.
+// and other methods, are defined in completion.go and this package's other
+// per-operation files. Current is usable standalone by a host that only
+// needs to fence its own previously cached Results.
 func Current(stamp Stamp, document Document, context Context) bool {
 	generation, revision := uint64(0), uint64(0)
 	if context.Snapshot != nil {

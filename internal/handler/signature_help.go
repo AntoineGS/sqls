@@ -26,7 +26,7 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 	if err != nil {
 		return nil, err
 	}
-	res, err := SignatureHelpWithDriverVariant(snapshot.Text, params, snapshot.Cache, snapshot.Variant)
+	res, err := SignatureHelpWithDriverVariant(ctx, snapshot.Text, params, snapshot.Cache, snapshot.Variant)
 	if err != nil {
 		return nil, err
 	}
@@ -38,15 +38,18 @@ func SignatureHelp(text string, params lsp.SignatureHelpParams, dbCache *databas
 }
 
 func SignatureHelpWithDriver(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.SignatureHelp, error) {
-	return SignatureHelpWithDriverVariant(text, params, dbCache, dialect.DriverVariant{Driver: driver})
+	return SignatureHelpWithDriverVariant(context.Background(), text, params, dbCache, dialect.DriverVariant{Driver: driver})
 }
 
 // SignatureHelpWithDriverVariant is a thin wrapper over
 // language.Service.SignatureHelp: it builds a minimal metadata snapshot
 // around dbCache, delegates the cache-only signature-help algorithm, and
 // converts the result back to lsp types (int -> float64 for
-// ActiveSignature/ActiveParameter).
-func SignatureHelpWithDriverVariant(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.SignatureHelp, error) {
+// ActiveSignature/ActiveParameter). ctx comes from the caller's own
+// request context (handleTextDocumentSignatureHelp's ctx in production)
+// rather than a fresh context.Background(), so a canceled request
+// actually cancels SignatureHelp's own ctx.Err() check.
+func SignatureHelpWithDriverVariant(ctx context.Context, text string, params lsp.SignatureHelpParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.SignatureHelp, error) {
 	if dbCache == nil {
 		return nil, nil
 	}
@@ -57,7 +60,7 @@ func SignatureHelpWithDriverVariant(text string, params lsp.SignatureHelpParams,
 			Variant:  dv,
 		},
 	}
-	res, err := language.NewService().SignatureHelp(context.Background(), req, languagePosition(params.Position))
+	res, err := language.NewService().SignatureHelp(ctx, req, languagePosition(params.Position))
 	if err != nil {
 		return nil, err
 	}

@@ -37,9 +37,9 @@ func TestCacheDiagnosticCatalogHoldsNoCopy(t *testing.T) {
 // copying implementation could only do by rebuilding its whole copy on
 // every lookup.
 func TestCacheDiagnosticCatalogSharesUnderlyingCache(t *testing.T) {
-	key := catalog.ColumnDatabaseKey("", "EMPLOYEE")
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "EMPLOYEE"}.Key()
 	cache := &catalog.Cache{
-		ColumnsWithParent: map[string][]*catalog.ColumnDesc{
+		ColumnsByID: map[string][]*catalog.ColumnDesc{
 			key: {{ColumnBase: catalog.ColumnBase{Name: "ID"}, Type: "INTEGER"}},
 		},
 	}
@@ -56,11 +56,40 @@ func TestCacheDiagnosticCatalogSharesUnderlyingCache(t *testing.T) {
 		t.Fatalf("first.Columns before mutation = %+v, %v", columns, ok)
 	}
 
-	cache.ColumnsWithParent[key] = append(cache.ColumnsWithParent[key], &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Name: "NAME"}, Type: "VARCHAR(40)"})
+	cache.ColumnsByID[key] = append(cache.ColumnsByID[key], &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Name: "NAME"}, Type: "VARCHAR(40)"})
 
 	columns, ok = second.Columns(table)
 	if !ok || len(columns) != 2 || columns[1].Name != "NAME" {
 		t.Fatalf("second.Columns after mutation = %+v, %v; a second adapter that held its own copy would not see the mutation", columns, ok)
+	}
+}
+
+// TestCacheDiagnosticCatalogColumnsResolvesExactIdentity is the
+// quoted-vs-unquoted regression test for the exact-identity fix: two
+// relations whose names differ only by quoting/case must never share
+// columns, even though they fold to the same upper-cased key that the
+// legacy ColumnDescs/ColumnDatabase accessors use.
+func TestCacheDiagnosticCatalogColumnsResolvesExactIdentity(t *testing.T) {
+	quotedKey := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "Orders"}.Key()
+	unquotedKey := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key()
+	cache := &catalog.Cache{
+		ColumnsByID: map[string][]*catalog.ColumnDesc{
+			quotedKey:   {{ColumnBase: catalog.ColumnBase{Name: "CustomerId"}, Type: "INTEGER"}},
+			unquotedKey: {{ColumnBase: catalog.ColumnBase{Name: "ID"}, Type: "INTEGER"}, {ColumnBase: catalog.ColumnBase{Name: "TOTAL"}, Type: "DECIMAL"}},
+		},
+	}
+	view := cacheDiagnosticCatalog{cache: cache}
+
+	quoted := sqlsymbol.Name{Text: "Orders", Quoted: true}
+	quotedColumns, ok := view.Columns(quoted)
+	if !ok || len(quotedColumns) != 1 || quotedColumns[0].Name != "CustomerId" {
+		t.Fatalf("quoted Orders columns = %+v, %v; want [{CustomerId}], true", quotedColumns, ok)
+	}
+
+	unquoted := sqlsymbol.Name{Text: "orders"}
+	unquotedColumns, ok := view.Columns(unquoted)
+	if !ok || len(unquotedColumns) != 2 || unquotedColumns[0].Name != "ID" || unquotedColumns[1].Name != "TOTAL" {
+		t.Fatalf("unquoted orders columns = %+v, %v; want [{ID} {TOTAL}], true", unquotedColumns, ok)
 	}
 }
 
@@ -91,13 +120,13 @@ func TestDiagnosticCatalogReadyRequiresColumnsReady(t *testing.T) {
 // against cacheDiagnosticCatalog.UniqueKeys, the function that now owns this
 // gating.
 func TestCacheDiagnosticCatalogUniqueKeysRequiresCompleteCatalogInputs(t *testing.T) {
-	key := catalog.ColumnDatabaseKey("", "T")
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key()
 	index := &catalog.IndexDesc{
 		Name: "UQ_T", RelationName: "T", Columns: []string{"ID"},
 		Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true},
 	}
 	cache := &catalog.Cache{
-		ColumnsWithParent: map[string][]*catalog.ColumnDesc{
+		ColumnsByID: map[string][]*catalog.ColumnDesc{
 			key: {{ColumnBase: catalog.ColumnBase{Name: "ID"}, Type: "INTEGER"}},
 		},
 		Catalog: &catalog.CatalogCache{
