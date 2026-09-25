@@ -23,6 +23,7 @@ import (
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/metadata/metadatatest"
@@ -147,6 +148,71 @@ func TestNeovimFixtureProcedureLocalNavigationAndSymbols(t *testing.T) {
 		if symbol.Name == "X" && (symbol.Range != (language.Range{Start: language.Position{Line: 0, UTF16Column: 0}, End: language.Position{Line: 0, UTF16Column: 66}}) || symbol.SelectionRange != (language.Range{Start: language.Position{Line: 0, UTF16Column: 39}, End: language.Position{Line: 0, UTF16Column: 40}})) {
 			t.Errorf("variable symbol = %+v, want scope [0:0,0:66] and selection [0:39,0:40]", symbol)
 		}
+	}
+}
+
+func TestNeovimFixtureDocumentSymbolOverRawStdio(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer cancel()
+	client := startFixtureRawClient(t, ctx)
+	defer client.stop()
+
+	initParams := map[string]any{"initializationOptions": map[string]any{"connectionConfig": map[string]any{
+		"alias": "old", "driver": string(neovimFixtureDriver), "dataSourceName": "fixture://old",
+	}}}
+	if err := client.write(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": initParams}); err != nil {
+		t.Fatal("write initialize:", err)
+	}
+	initialized, err := client.waitResponse(ctx, 1)
+	if err != nil {
+		t.Fatal("initialize response:", err)
+	}
+	var init struct {
+		Capabilities struct {
+			DocumentSymbolProvider  bool `json:"documentSymbolProvider"`
+			WorkspaceSymbolProvider bool `json:"workspaceSymbolProvider"`
+			FoldingRangeProvider    bool `json:"foldingRangeProvider"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(initialized.Result, &init); err != nil {
+		t.Fatal("decode initialize result:", err)
+	}
+	if !init.Capabilities.DocumentSymbolProvider || init.Capabilities.WorkspaceSymbolProvider || init.Capabilities.FoldingRangeProvider {
+		t.Fatalf("outline capabilities = %+v, want document symbols only", init.Capabilities)
+	}
+	if err := client.write(map[string]any{"jsonrpc": "2.0", "method": "initialized", "params": map[string]any{}}); err != nil {
+		t.Fatal("write initialized:", err)
+	}
+	if err := client.waitReady(ctx); err != nil {
+		t.Fatal("wait for fixture readiness:", err)
+	}
+	uri := "file:///fixture-symbols.sql"
+	if err := client.write(map[string]any{"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": map[string]any{
+		"textDocument": map[string]any{"uri": uri, "languageId": "sql", "version": 1, "text": neovimFixtureProcedureSymbols},
+	}}); err != nil {
+		t.Fatal("write didOpen:", err)
+	}
+	if err := client.write(map[string]any{"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol", "params": map[string]any{
+		"textDocument": map[string]any{"uri": uri},
+	}}); err != nil {
+		t.Fatal("write documentSymbol:", err)
+	}
+	response, err := client.waitResponse(ctx, 2)
+	if err != nil {
+		t.Fatal("documentSymbol response:", err)
+	}
+	if len(response.Error) != 0 {
+		t.Fatalf("documentSymbol JSON-RPC error: %s", response.Error)
+	}
+	var symbols []documentSymbolResult
+	if err := json.Unmarshal(response.Result, &symbols); err != nil {
+		t.Fatal("decode document symbols:", err)
+	}
+	if len(symbols) != 1 || symbols[0].Name != "X" || symbols[0].Kind != 13 || symbols[0].SelectionRange.Start != (lsp.Position{Line: 0, Character: 39}) {
+		t.Fatalf("fixture document symbols = %#v, want local X kind 13 at UTF-16 0:39", symbols)
+	}
+	if err := client.shutdown(ctx); err != nil {
+		t.Fatal("shutdown fixture:", err)
 	}
 }
 

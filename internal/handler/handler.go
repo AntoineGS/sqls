@@ -258,6 +258,8 @@ func (s *Server) handle(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.
 		return s.handleTextDocumentCompletion(ctx, conn, req)
 	case "textDocument/hover":
 		return s.handleTextDocumentHover(ctx, conn, req)
+	case "textDocument/documentSymbol":
+		return s.handleTextDocumentDocumentSymbol(ctx, conn, req)
 	case "textDocument/codeAction":
 		return s.handleTextDocumentCodeAction(ctx, conn, req)
 	case "workspace/executeCommand":
@@ -313,6 +315,7 @@ func (s *Server) handleInitialize(ctx context.Context, conn *jsonrpc2.Conn, req 
 			},
 			DefinitionProvider:              true,
 			ReferencesProvider:              true,
+			DocumentSymbolProvider:          true,
 			DocumentFormattingProvider:      true,
 			DocumentRangeFormattingProvider: true,
 			RenameProvider:                  true,

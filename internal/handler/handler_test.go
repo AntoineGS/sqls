@@ -157,6 +157,7 @@ func TestInitialized(t *testing.T) {
 			CodeActionProvider:              true,
 			DefinitionProvider:              true,
 			ReferencesProvider:              true,
+			DocumentSymbolProvider:          true,
 			DocumentFormattingProvider:      true,
 			DocumentRangeFormattingProvider: true,
 			RenameProvider:                  true,

@@ -237,6 +237,20 @@ type TextDocumentIdentifier struct {
 	URI string `json:"uri"`
 }
 
+// DocumentSymbolParams identifies the open document whose outline is requested.
+type DocumentSymbolParams struct {
+	TextDocument TextDocumentIdentifier `json:"textDocument"`
+}
+
+// DocumentSymbol is the LSP document-symbol wire representation.
+type DocumentSymbol struct {
+	Name           string           `json:"name"`
+	Kind           int              `json:"kind"`
+	Range          Range            `json:"range"`
+	SelectionRange Range            `json:"selectionRange"`
+	Children       []DocumentSymbol `json:"children,omitempty"`
+}
+
 type TextDocumentContentChangeEvent struct {
 	Range       Range  `json:"range"`
 	RangeLength int    `json:"rangeLength"`
