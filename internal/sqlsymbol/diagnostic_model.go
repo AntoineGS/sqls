@@ -275,7 +275,14 @@ func (m *diagnosticModel) RelationScope(i int) [][]RelationRef {
 	}
 	var chain [][]RelationRef
 	for qi := m.queryAt[i]; qi >= 0; qi = m.queries[qi].parent {
-		chain = append(chain, m.queries[qi].relations)
+		relations := append([]RelationRef(nil), m.queries[qi].relations...)
+		for ri := range relations {
+			if ri < len(m.relationPositions[qi]) {
+				relations[ri].source = m.relationPositions[qi][ri].start
+				relations[ri].sourceKnown = true
+			}
+		}
+		chain = append(chain, relations)
 	}
 	return chain
 }

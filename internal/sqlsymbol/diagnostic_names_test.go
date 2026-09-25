@@ -1,6 +1,9 @@
 package sqlsymbol
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // --- brief's verbatim paired positive/negative fixtures ---
 
@@ -398,6 +401,61 @@ func TestUnaliasedSelectableProcedureSourcesKeepOccurrenceIdentity(t *testing.T)
 		})
 	}
 	requireCodeCount(t, "SELECT P.OUT1 FROM P(1);", c, codeProcedureArity, 1)
+}
+
+func TestUnqualifiedColumnsKeepUnaliasedProcedureOccurrenceIdentity(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	c.procedures["Q"] = ProcedureFact{
+		InputsKnown: true, OutputsKnown: true,
+		Outputs: []ColumnFact{{Name: "OUT2", Type: "INTEGER"}},
+	}
+	for _, sql := range []string{
+		"SELECT OUT1 FROM P(1, 2), Q();",
+		"SELECT OUT1 FROM Q(), P(1, 2);",
+	} {
+		a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range a.Diagnostics(c) {
+			if f.Code == codeAmbiguousColumn || f.Code == codeUnknownColumn {
+				t.Errorf("%s: unexpected %s finding: %+v", sql, f.Code, f)
+			}
+		}
+	}
+
+	ambiguous := newDiagnosticFixtureCatalog()
+	ambiguous.procedures["Q"] = ProcedureFact{
+		InputsKnown: true, OutputsKnown: true,
+		Outputs: []ColumnFact{{Name: "OUT1", Type: "INTEGER"}},
+	}
+	sql := "SELECT OUT1 FROM P(1, 2), Q();"
+	a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []Finding
+	for _, f := range a.Diagnostics(ambiguous) {
+		if f.Code == codeAmbiguousColumn {
+			got = append(got, f)
+		}
+	}
+	start := strings.Index(sql, "OUT1")
+	if len(got) != 1 || got[0].Span != (Span{Start: start, End: start + len("OUT1")}) {
+		t.Fatalf("ambiguous findings=%+v, want one exact OUT1 finding at [%d,%d)", got, start, start+len("OUT1"))
+	}
+
+	for _, sql := range []string{"SELECT P.OUT1 FROM P(1, 2), Q();", "SELECT Q.OUT2 FROM P(1, 2), Q();"} {
+		a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range a.Diagnostics(c) {
+			if f.Code == codeUnknownQualifier || f.Code == codeUnknownColumn || f.Code == codeAmbiguousColumn {
+				t.Errorf("%s: unexpected qualified finding: %+v", sql, f)
+			}
+		}
+	}
 }
 
 // --- Fix round 1: I4 a malformed statement must not produce speculative

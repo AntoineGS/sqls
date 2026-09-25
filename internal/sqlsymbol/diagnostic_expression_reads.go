@@ -48,6 +48,9 @@ func (a *Analysis) proceduralExpressionReadFindings(m *diagnosticModel) []Findin
 			if !valid || isNonVariableExpressionName(name) {
 				continue
 			}
+			if proc < len(a.malformedDeclarationNames) && a.malformedDeclarationNames[proc][name.Key()] {
+				continue
+			}
 			if declared[name.Key()] > 0 || m.Unsupported(id) {
 				continue
 			}

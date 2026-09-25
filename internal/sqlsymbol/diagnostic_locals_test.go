@@ -75,6 +75,14 @@ func TestDiagnosticUnknownProceduralExpressionReadsPreserveQuotedUnicodeSpan(t *
 	}
 }
 
+func TestDiagnosticMalformedDeclarationSuppressesExpressionRead(t *testing.T) {
+	sql := `CREATE PROCEDURE P AS
+DECLARE VARIABLE X;
+DECLARE VARIABLE V INTEGER;
+BEGIN V = X + 1; END`
+	requireCodeCount(t, sql, nil, codeUnknownVariable, 0)
+}
+
 func TestDiagnosticUnknownLocalKnownNameNotFlagged(t *testing.T) {
 	requireCodeCount(t,
 		"CREATE PROCEDURE Q AS DECLARE VARIABLE V_TOTAL INTEGER; BEGIN V_TOTAL = 1; END",
