@@ -39,7 +39,8 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 
 	// Not having a repository is not a hover failure: the catalog summary
 	// needs none, and a DDL problem must never surface as a JSON-RPC error.
-	if augmented := s.interBaseHover(ctx, snapshot.Repository, snapshot.Cache, params, snapshot.Text, res, snapshot.Generation, snapshot.Variant); augmented != nil {
+	repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
+	if augmented := s.interBaseHover(ctx, repo, snapshot.Cache, params, snapshot.Text, res, snapshot.Generation, snapshot.Variant); augmented != nil {
 		return augmented, nil
 	}
 	if err != nil {

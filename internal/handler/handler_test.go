@@ -12,7 +12,6 @@ import (
 	"github.com/sourcegraph/jsonrpc2"
 
 	"github.com/sqls-server/sqls/internal/config"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -24,29 +23,6 @@ type TestContext struct {
 	connServer *jsonrpc2.Conn
 	server     *Server
 	ctx        context.Context
-}
-
-// loadMetadataForTest installs a loader generation just like an attachment
-// transition, then waits for deterministic settlement rather than sleeping.
-func loadMetadataForTest(t *testing.T, s *Server, repo database.DBRepository) {
-	t.Helper()
-	s.diagnosticsPublishMu.Lock()
-	s.stateMu.Lock()
-	s.connGeneration++
-	generation := s.connGeneration
-	s.metadata.Reset(uint64(generation))
-	s.stateMu.Unlock()
-	s.diagnosticsPublishMu.Unlock()
-	load, err := s.metadata.Start(context.Background(), uint64(generation), repo)
-	if err != nil {
-		t.Fatalf("start metadata: %v", err)
-	}
-	select {
-	case <-load.Done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("metadata loader watchdog expired")
-	}
-	s.republishOpenDiagnostics(context.Background())
 }
 
 func newTestContext() *TestContext {
@@ -121,9 +97,13 @@ func (tx *TestContext) addWorkspaceConfig(t *testing.T, cfg *config.Config) {
 	}
 	ctx, cancel := context.WithTimeout(tx.ctx, 5*time.Second)
 	defer cancel()
-	if err := tx.server.metadata.Wait(ctx); err != nil {
-		t.Fatalf("wait for metadata test readiness: %v", err)
+	tx.server.stateMu.RLock()
+	lease := tx.server.metaLease
+	tx.server.stateMu.RUnlock()
+	if lease == nil {
+		t.Fatalf("wait for metadata test readiness: no metadata lease bound")
 	}
+	waitMetadataSettledForTest(t, ctx, lease)
 }
 
 func (tx *TestContext) changeWorkspaceConfig(t *testing.T, cfg *config.Config) {

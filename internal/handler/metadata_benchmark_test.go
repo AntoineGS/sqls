@@ -128,7 +128,6 @@ func BenchmarkCompletionDuringMetadataLoad(b *testing.B) {
 	s.connGeneration = 1
 	s.connectionState = connectionReady
 	s.stateMu.Unlock()
-	s.metadata.Reset(1)
 	seed, err := database.NewDBCacheUpdater(database.NewMockDBRepository(nil)).GenerateDBCachePrimary(context.Background())
 	if err != nil {
 		b.Fatal(err)
@@ -146,14 +145,11 @@ func BenchmarkCompletionDuringMetadataLoad(b *testing.B) {
 			return database.MetadataPatch{Cache: seed}, nil
 		}},
 	}}
-	load, err := s.metadata.Start(context.Background(), 1, benchmarkPlanRepository{DBRepository: &database.MockDBRepository{}, plan: plan})
-	if err != nil {
-		b.Fatal(err)
-	}
+	lease := bindMetadataRepoForTest(b, s, 1, benchmarkPlanRepository{DBRepository: &database.MockDBRepository{}, plan: plan})
 	var client, server *jsonrpc2.Conn
 	defer func() {
 		close(gate)
-		<-load.Done
+		waitMetadataSettledForTest(b, context.Background(), lease)
 		_ = s.Stop()
 		<-s.cleanupDone
 		<-s.diagnosticsDone

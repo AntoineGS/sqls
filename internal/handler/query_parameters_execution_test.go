@@ -763,7 +763,7 @@ func TestParameterExplainZeroMarkerStatementKeepsItsExistingPath(t *testing.T) {
 // wrong reason.
 func TestParameterExecutionProcedureCatalogIsResolved(t *testing.T) {
 	f := newParameterFixture(t, "EXECUTE PROCEDURE MYPROC(:CODE)", withProcedures)
-	cache := f.tx.server.metadata.Cache()
+	cache := currentLeaseCacheForTest(f.tx.server)
 	if !cache.HasCatalog() {
 		t.Fatal("the catalog never arrived; the routing assertions would be vacuous")
 	}

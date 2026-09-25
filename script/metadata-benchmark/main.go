@@ -167,7 +167,10 @@ func runOne(parent context.Context, serverPath, configPath string, p probe, scen
 	stream := &stdioStream{r: stdout, w: stdin}
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
-	conn := jsonrpc2.NewConn(connCtx, jsonrpc2.NewBufferedStream(stream, jsonrpc2.VSCodeObjectCodec{}), nil, jsonrpc2.SetLogger(log.New(io.Discard, "", 0)))
+	discardServerNotifications := jsonrpc2.HandlerWithError(func(context.Context, *jsonrpc2.Conn, *jsonrpc2.Request) (interface{}, error) {
+		return nil, nil
+	})
+	conn := jsonrpc2.NewConn(connCtx, jsonrpc2.NewBufferedStream(stream, jsonrpc2.VSCodeObjectCodec{}), discardServerNotifications, jsonrpc2.SetLogger(log.New(io.Discard, "", 0)))
 	defer func() {
 		_ = stdin.Close()
 		_ = stdout.Close()

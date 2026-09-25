@@ -302,12 +302,9 @@ func TestReadinessAcceptanceIndependentCatalogJobsRemainVisibleAfterFailures(t *
 	}
 	releaseFailure()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	if err := s.metadata.Wait(ctx); err != nil {
-		cancel()
-		t.Fatalf("initial degraded metadata did not settle: %v", err)
-	}
+	waitCurrentMetadataSettledForTest(t, ctx, s)
 	cancel()
-	if _, ok := s.metadata.Cache().Procedure("READYPROC"); !ok {
+	if _, ok := currentLeaseCacheForTest(s).Procedure("READYPROC"); !ok {
 		t.Fatal("successful procedure metadata was not published")
 	}
 	if err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandShowMetadataStatus}, &status); err != nil {
@@ -327,18 +324,15 @@ func TestReadinessAcceptanceIndependentCatalogJobsRemainVisibleAfterFailures(t *
 		t.Fatal(err)
 	}
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
-	if err := s.metadata.Wait(ctx); err != nil {
-		cancel()
-		t.Fatalf("reset metadata did not settle: %v", err)
-	}
+	waitCurrentMetadataSettledForTest(t, ctx, s)
 	cancel()
 	if err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandShowMetadataStatus}, &status); err != nil {
 		t.Fatal(err)
 	}
-	if !status.Settled || status.Degraded || status.Generation != uint64(s.connGeneration) {
+	if !status.Settled || status.Degraded || status.ConnectionGeneration != uint64(s.connGeneration) {
 		t.Fatalf("status after successful reset = %+v", status)
 	}
-	if _, ok := s.metadata.Cache().Procedure("RESETPROC"); !ok {
+	if _, ok := currentLeaseCacheForTest(s).Procedure("RESETPROC"); !ok {
 		t.Fatal("successful reset procedure was not published")
 	}
 }
@@ -350,13 +344,9 @@ func TestReadinessAcceptanceCompletionsWhileColumnsAreGated(t *testing.T) {
 	s.stateMu.Lock()
 	s.connGeneration, s.connectionState = 52, connectionReady
 	s.stateMu.Unlock()
-	s.metadata.Reset(52)
 	entered, release := make(chan struct{}), make(chan struct{})
-	load, err := s.metadata.Start(context.Background(), 52, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: readinessSeedPlan(readinessSeed(t), entered, release)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { close(release); <-load.Done }()
+	lease := bindMetadataRepoForTest(t, s, 52, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: readinessSeedPlan(readinessSeed(t), entered, release)})
+	defer func() { close(release); waitMetadataSettledForTest(t, context.Background(), lease) }()
 	select {
 	case <-entered:
 	case <-time.After(2 * time.Second):
@@ -460,7 +450,7 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 		t.Fatal("old generation did not enter gated procedure query")
 	}
 	oldReadyDeadline := time.After(2 * time.Second)
-	for s.metadata.Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
+	for currentLeaseForTest(s).Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
 		select {
 		case <-oldReadyDeadline:
 			t.Fatal("old generation columns did not publish for diagnostics")
@@ -468,13 +458,13 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 			runtime.Gosched()
 		}
 	}
-	oldCache := s.metadata.Cache()
+	oldCache := currentLeaseCacheForTest(s)
 	waitForDiagnosticMemo(t, s, events, oldCache)
 	if err := switchCall("2"); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.After(2 * time.Second)
-	for s.metadata.Snapshot().Status[database.MetadataProcedures].State != database.MetadataReady || s.metadata.Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
+	for currentLeaseForTest(s).Snapshot().Status[database.MetadataProcedures].State != database.MetadataReady || currentLeaseForTest(s).Snapshot().Status[database.MetadataColumnsCurrent].State != database.MetadataReady {
 		select {
 		case <-deadline:
 			t.Fatal("replacement metadata did not publish while old call remained gated")
@@ -495,16 +485,16 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 			procedureReady = true
 		}
 	}
-	if !procedureReady || status.Generation != uint64(s.connGeneration) {
+	if !procedureReady || status.ConnectionGeneration != uint64(s.connGeneration) {
 		t.Fatalf("status after RPC switch = %+v; generation=%d", status, s.connGeneration)
 	}
-	if _, ok := s.metadata.Cache().Procedure("NEWPROC"); !ok {
+	if _, ok := currentLeaseCacheForTest(s).Procedure("NEWPROC"); !ok {
 		t.Fatal("replacement procedure output missing")
 	}
-	if _, ok := s.metadata.Cache().Procedure("OLDPROC"); ok {
+	if _, ok := currentLeaseCacheForTest(s).Procedure("OLDPROC"); ok {
 		t.Fatal("stale old-generation procedure leaked into replacement cache")
 	}
-	currentCache := s.metadata.Cache()
+	currentCache := currentLeaseCacheForTest(s)
 	waitForDiagnosticMemo(t, s, events, currentCache)
 	s.diagnosticCatalogMu.Lock()
 	if s.diagnosticCache != currentCache || s.diagnosticCache == oldCache || s.derivedCatalog == nil {
@@ -513,9 +503,7 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 	}
 	s.diagnosticCatalogMu.Unlock()
 	releaseOld()
-	if err := s.metadata.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	waitCurrentMetadataSettledForTest(t, context.Background(), s)
 	if got := peak.Load(); got > 3 {
 		t.Fatalf("peak active jobs = %d, want <=3", got)
 	}
@@ -548,12 +536,9 @@ func TestReadinessAcceptanceDiagnosticMemoTracksOneHundredRPCRefreshes(t *testin
 			t.Fatalf("refresh %d: %v", generation, err)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		if err := s.metadata.Wait(ctx); err != nil {
-			cancel()
-			t.Fatalf("refresh %d loader wait: %v", generation, err)
-		}
+		waitCurrentMetadataSettledForTest(t, ctx, s)
 		cancel()
-		cache := s.metadata.Cache()
+		cache := currentLeaseCacheForTest(s)
 		if !cache.MetadataReady(database.MetadataColumnsCurrent) {
 			t.Fatalf("refresh %d did not publish columns", generation)
 		}
@@ -592,9 +577,7 @@ func TestReadinessAcceptanceStopWithPendingRPCQueryAndNotification(t *testing.T)
 	if err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandSwitchConnection, Arguments: []interface{}{"1"}}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.metadata.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	waitCurrentMetadataSettledForTest(t, context.Background(), s)
 	uri := "file:///pending-query.sql"
 	if err := client.Notify(context.Background(), "textDocument/didOpen", lsp.DidOpenTextDocumentParams{TextDocument: lsp.TextDocumentItem{URI: uri, LanguageID: "sql", Text: "select 1", Version: 1}}); err != nil {
 		t.Fatal(err)

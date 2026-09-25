@@ -70,7 +70,8 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		if snapshot.Repository == nil {
 			return nil, nil
 		}
-		return s.interBaseContextualDefinitionWithSnapshot(ctx, snapshot.Repository, snapshot.Cache, text, params.Position, dv, analysis, snapshot.SourceContext)
+		repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
+		return s.interBaseContextualDefinitionWithSnapshot(ctx, repo, snapshot.Cache, text, params.Position, dv, analysis, snapshot.SourceContext)
 	}
 
 	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, snapshot.Cache, dv)
@@ -87,7 +88,8 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if snapshot.Repository == nil {
 		return nil, nil
 	}
-	return s.interBaseDefinitionWithSnapshot(ctx, snapshot.Repository, snapshot.Cache, params, text, dv, snapshot.SourceContext)
+	repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
+	return s.interBaseDefinitionWithSnapshot(ctx, repo, snapshot.Cache, params, text, dv, snapshot.SourceContext)
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {

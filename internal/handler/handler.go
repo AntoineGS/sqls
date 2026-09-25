@@ -16,6 +16,7 @@ import (
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
+	"github.com/sqls-server/sqls/metadata"
 )
 
 var (
@@ -69,11 +70,37 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration   int
-	lifecycleCtx     context.Context
-	lifecycleCancel  context.CancelFunc
-	coordinator      *connectionCoordinator
-	metadata         *database.MetadataLoader
+	connGeneration  int
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	coordinator     *connectionCoordinator
+
+	// registry is the shared metadata store this server acquires leases from.
+	// metaLease/metaSub/metaKey/metaScope describe the currently active lease
+	// (nil/zero before the first successful connection). The Lease's own
+	// Snapshot().Generation is a DIFFERENT counter from connGeneration: it
+	// starts at 1 and only advances on an explicit Lease.Refresh, and is
+	// identical across every consumer sharing that store. metaBoundGeneration
+	// records the connGeneration value that was active at the moment
+	// metaLease was last (re)assigned via a successful Registry.Acquire — set
+	// once per Acquire, deliberately NOT touched by Refresh (a refresh is not
+	// a reconnect). Comparing s.connGeneration == s.metaBoundGeneration is
+	// the connection-identity fence every editor-snapshot/diagnostics
+	// publication site uses in place of the old fused generation-equality
+	// check. All fields here are guarded by stateMu, like every other
+	// connection-identity field.
+	registry            *metadata.Registry
+	metaLease           *metadata.Lease
+	metaSub             *metadata.Subscription
+	metaKey             metadata.Key
+	metaScope           metadata.Scope
+	metaBoundGeneration int
+	// metadataFactoryOverride lets tests inject a deterministic registry
+	// Key/Scope/Factory in place of the production dispatch (InterBase via
+	// ibmeta, every other driver via the generic adapter). A nil return
+	// (ok=false) falls through to metadataTargetFor.
+	metadataFactoryOverride func(cfg *database.DBConfig) (metadata.Key, metadata.Scope, metadata.Factory, bool)
+
 	initialized      bool
 	connectionState  connectionState
 	metadataStartErr error
@@ -120,7 +147,7 @@ func NewServer() *Server {
 		cancels:             newCancelRegistry(),
 		lifecycleCtx:        lifecycleCtx,
 		lifecycleCancel:     lifecycleCancel,
-		metadata:            database.NewMetadataLoader(),
+		registry:            metadata.NewRegistry(lifecycleCtx, metadata.Options{}),
 		connectionState:     connectionIdle,
 		openConnection:      database.OpenContext,
 		cleanupDone:         make(chan struct{}),
@@ -130,9 +157,6 @@ func NewServer() *Server {
 		diagnosticsDone:     make(chan struct{}),
 		diagnosticDocuments: make(map[string]struct{}),
 	}
-	server.metadata.SetChangedCallback(func() {
-		server.queueAllDiagnostics()
-	})
 	server.coordinator = newConnectionCoordinator(server)
 	go server.cleanupConnections()
 	go server.runDiagnosticSignals()
@@ -174,13 +198,26 @@ func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		s.lifecycleCancel()
 		s.coordinator.Stop()
-		s.metadata.Stop()
-		s.snapshots.BeginShutdown()
 		s.stateMu.Lock()
+		lease, sub := s.metaLease, s.metaSub
+		s.metaLease, s.metaSub = nil, nil
 		s.connectionState = connectionStopped
 		dbConn := s.dbConn
 		s.dbConn = nil
 		s.stateMu.Unlock()
+		if sub != nil {
+			sub.Close()
+		}
+		if lease != nil {
+			// Release only drops this server's own reference and never blocks:
+			// the registry drains the underlying provider/loader asynchronously
+			// (see metadata.Registry.releaseTrackRef/finalizeTrack). Closing the
+			// whole registry below is the belt-and-suspenders sweep for any
+			// track this server still held a reference to.
+			lease.Release()
+		}
+		go func() { _ = s.registry.Close(context.Background()) }()
+		s.snapshots.BeginShutdown()
 		s.cleanupFinal <- dbConn
 		go func() { <-s.coordinator.done; close(s.cleanupQueue) }()
 	})
@@ -600,7 +637,6 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.curConnectionIndex = intent.ConnectionIndex
 	s.curDBName = intent.DatabaseName
 	s.ddlMemo = make(map[ddlKey]string)
-	s.metadata.Reset(uint64(generation))
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
 	_ = s.enqueueDetachedConnection(old)
@@ -643,23 +679,183 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.activeConfigKey = intentKey(intent)
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
-	repo, err := database.CreateRepositoryFromConnection(intent.Config.Driver, candidate)
-	if err == nil {
-		_, err = s.metadata.Start(s.lifecycleCtx, uint64(generation), repo)
-	}
-	if err != nil {
-		if markErr := s.metadata.MarkStartFailed(uint64(generation)); markErr != nil {
-			log.Printf("sqls: marking metadata generation %d start failure: %v", generation, markErr)
-		}
-		s.stateMu.Lock()
-		if s.connGeneration == generation && s.connectionState == connectionReady {
-			s.metadataStartErr = err
-		}
-		s.stateMu.Unlock()
-		log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
-	}
+
+	s.bindMetadata(ctx, intent, candidate, generation)
+
 	s.queueAllDiagnostics()
 	return nil
+}
+
+// resolveMetadataTarget derives the shared-metadata Key/Scope/Factory for
+// intent's config and freshly-opened connection. Tests inject a deterministic
+// target via metadataFactoryOverride instead of the production dispatch
+// (InterBase via ibmeta, every other driver via the generic adapter — see
+// metadataTargetFor).
+func (s *Server) resolveMetadataTarget(cfg *database.DBConfig, conn *database.DBConnection) (metadata.Key, metadata.Scope, metadata.Factory, error) {
+	s.stateMu.RLock()
+	override := s.metadataFactoryOverride
+	s.stateMu.RUnlock()
+	if override != nil {
+		if key, scope, factory, ok := override(cfg); ok {
+			return key, scope, factory, nil
+		}
+	}
+	return metadataTargetFor(cfg, conn)
+}
+
+// bindMetadata acquires or refreshes the shared metadata store for intent's
+// target and binds it to generation.
+//
+// A genuinely different target (or the first successful connection) Acquires
+// a lease for the new Key+Scope and releases any previously active lease only
+// AFTER the new one is fully owned: this never leaves a window with no live
+// lease, and — when the old and new targets are the identical (Key, Scope) —
+// never releases a still-needed shared store early, because the new Acquire
+// has already added a second reference to that same track before the old
+// reference is dropped. Selecting the same target this way (a passive
+// reconnect, or an explicit reselect the caller below has NOT routed to
+// Refresh) reuses the existing store automatically: Registry.Acquire shares
+// one track per (Key, Scope) regardless of how many times it is called.
+//
+// An EXPLICIT reselect of the SAME target the currently active lease already
+// serves calls Lease.Refresh on that lease instead of Acquiring a second one
+// — this is what keeps refresh a same-Incarnation operation rather than a
+// second store, per this task's central "same target reuses metadata, but an
+// explicit reselect is still a refresh" requirement. Refresh only changes
+// what the existing lease serves; it never reassigns s.metaLease itself, so
+// metaBoundGeneration is advanced by this function's own code on both
+// branches (Refresh does not and cannot do this itself — it has no access to
+// Server state), never implicitly "by" the Refresh call.
+func (s *Server) bindMetadata(ctx context.Context, intent *connectionIntent, candidate *database.DBConnection, generation int) {
+	key, scope, factory, err := s.resolveMetadataTarget(intent.Config, candidate)
+	if err != nil {
+		s.recordMetadataAcquireFailure(generation, err)
+		return
+	}
+
+	s.stateMu.RLock()
+	sameTarget := s.metaLease != nil && s.metaKey == key && s.metaScope == scope
+	lease := s.metaLease
+	s.stateMu.RUnlock()
+
+	if intent.explicit && sameTarget {
+		if err := lease.Refresh(ctx); err != nil {
+			s.recordMetadataStartFailure(generation, err)
+			return
+		}
+		s.stateMu.Lock()
+		if s.connGeneration == generation && s.connectionState == connectionReady && s.metaLease == lease {
+			s.metaBoundGeneration = generation
+			s.metadataStartErr = nil
+		}
+		s.stateMu.Unlock()
+		return
+	}
+
+	newLease, err := s.registry.Acquire(s.lifecycleCtx, key, scope, factory)
+	if err != nil {
+		s.recordMetadataAcquireFailure(generation, err)
+		return
+	}
+	sub := newLease.Subscribe()
+
+	s.stateMu.Lock()
+	if s.connGeneration != generation || s.connectionState != connectionReady {
+		// A newer intent (or Stop) superseded this one while Acquire was in
+		// flight. Abandon the freshly acquired lease rather than binding it
+		// to a generation nobody will ever read.
+		s.stateMu.Unlock()
+		sub.Close()
+		newLease.Release()
+		return
+	}
+	oldLease, oldSub := s.metaLease, s.metaSub
+	s.metaLease, s.metaSub = newLease, sub
+	s.metaKey, s.metaScope = key, scope
+	s.metaBoundGeneration = generation
+	// A rejected/invalid MetadataPlan fails inside the registry's own
+	// creation goroutine (Registry.createTrack marks the loader
+	// start-failed but does not surface the cause to Acquire's caller —
+	// Acquire itself still succeeds, since the STORE exists and is usable,
+	// just permanently degraded). metadataStatus() reads Snapshot().
+	// StartFailed directly and does not depend on this field; it exists
+	// only so a caller inspecting metadataStartErr can tell "acquired
+	// successfully but this generation's plan never started" apart from
+	// "no failure at all".
+	if snapshot := newLease.Snapshot(); snapshot != nil && snapshot.StartFailed {
+		s.metadataStartErr = database.ErrInvalidMetadataPlan
+	} else {
+		s.metadataStartErr = nil
+	}
+	s.stateMu.Unlock()
+
+	if oldSub != nil {
+		oldSub.Close()
+	}
+	if oldLease != nil {
+		oldLease.Release()
+	}
+
+	go s.watchMetadataEvents(sub)
+}
+
+func (s *Server) recordMetadataStartFailure(generation int, err error) {
+	s.stateMu.Lock()
+	if s.connGeneration == generation && s.connectionState == connectionReady {
+		s.metadataStartErr = err
+	}
+	s.stateMu.Unlock()
+	log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
+}
+
+// recordMetadataAcquireFailure handles a failed Registry.Acquire for a
+// genuinely new target (resolveMetadataTarget error, or the registry itself
+// refusing the Key/Scope/Factory). Unlike a same-target Refresh failure —
+// where the existing lease/incarnation are still valid and left bound — an
+// Acquire failure means this generation has no metadata store of its own at
+// all, so any previously bound lease is released and metaBoundGeneration
+// still advances to this generation: a stale, unrelated-target lease must
+// never keep reporting as this connection's metadata (metadataStatus's
+// connGeneration != metaBoundGeneration guard would otherwise be the only
+// thing prevented it from doing so, and only by accident).
+func (s *Server) recordMetadataAcquireFailure(generation int, err error) {
+	s.stateMu.Lock()
+	var oldLease *metadata.Lease
+	var oldSub *metadata.Subscription
+	if s.connGeneration == generation && s.connectionState == connectionReady {
+		oldLease, oldSub = s.metaLease, s.metaSub
+		s.metaLease, s.metaSub = nil, nil
+		s.metaKey, s.metaScope = metadata.Key{}, metadata.Scope{}
+		s.metaBoundGeneration = generation
+		s.metadataStartErr = err
+	}
+	s.stateMu.Unlock()
+	if oldSub != nil {
+		oldSub.Close()
+	}
+	if oldLease != nil {
+		oldLease.Release()
+	}
+	log.Printf("sqls: metadata acquire failed for generation %d: %v", generation, err)
+}
+
+// watchMetadataEvents feeds one lease's coalesced change events into the
+// existing capacity-one diagnostics scheduler (diagnosticsWake/
+// runDiagnosticSignals) rather than building a second notification-coalescing
+// mechanism. It returns once sub is closed (a newer bindMetadata call
+// replaced it) or the server's lifecycle ends.
+func (s *Server) watchMetadataEvents(sub *metadata.Subscription) {
+	for {
+		select {
+		case _, ok := <-sub.C:
+			if !ok {
+				return
+			}
+			s.queueAllDiagnostics()
+		case <-s.lifecycleCtx.Done():
+			return
+		}
+	}
 }
 
 func (s *Server) cleanupConnections() {

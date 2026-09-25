@@ -21,20 +21,23 @@ var metadataKindOrder = []database.MetadataKind{
 
 func (s *Server) metadataStatus() lsp.MetadataStatusResult {
 	s.stateMu.RLock()
-	state, generation := s.connectionState, uint64(s.connGeneration)
+	state, connGeneration := s.connectionState, s.connGeneration
+	lease, bound := s.metaLease, s.metaBoundGeneration
 	s.stateMu.RUnlock()
-	result := lsp.MetadataStatusResult{Generation: generation, ConnectionState: string(state), Categories: []lsp.MetadataCategoryStatus{}}
+	result := lsp.MetadataStatusResult{ConnectionGeneration: uint64(connGeneration), ConnectionState: string(state), Categories: []lsp.MetadataCategoryStatus{}}
 	if state == connectionFailed {
 		result.ConnectionErrorCode, result.Settled, result.Degraded = "connection_failed", true, true
 		return result
 	}
-	if state != connectionReady {
+	if state != connectionReady || lease == nil || connGeneration != bound {
+		// Metadata has not yet been bound to the currently active connection
+		// (attachIntent's Acquire/Refresh step has not completed, or a newer
+		// intent has already superseded this one) — the same "not caught up
+		// yet" shape the function has always produced for that window.
 		return result
 	}
-	snapshot := s.metadata.Snapshot()
-	if snapshot.Generation != generation {
-		return result
-	}
+	snapshot := lease.Snapshot()
+	result.Generation = snapshot.Generation
 	result.Revision = snapshot.Revision
 	if snapshot.StartFailed {
 		result.Settled, result.Degraded, result.MetadataErrorCode = true, true, "metadata_load_failed"

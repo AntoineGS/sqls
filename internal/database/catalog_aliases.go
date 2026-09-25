@@ -42,6 +42,13 @@ type (
 	MetadataLoad = metadata.Load
 )
 
+var (
+	ErrMetadataStaleGeneration = metadata.ErrMetadataStaleGeneration
+	ErrMetadataAlreadyStarted  = metadata.ErrMetadataAlreadyStarted
+	ErrMetadataStopped         = metadata.ErrMetadataStopped
+	ErrInvalidMetadataPlan     = metadata.ErrInvalidMetadataPlan
+)
+
 const (
 	ObjectKindTable     = catalog.ObjectKindTable
 	ObjectKindView      = catalog.ObjectKindView

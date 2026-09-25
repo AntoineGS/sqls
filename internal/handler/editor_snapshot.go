@@ -6,25 +6,46 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/metadata"
 )
 
 // editorSnapshot is the immutable set of editor, connection, and metadata
 // inputs used by one language-server operation. Cache and Metadata belong to
 // the same connection generation as Variant and Repository.
+//
+// Generation and MetadataGeneration/MetadataIncarnation are DIFFERENT
+// identities (see handler.go's metaBoundGeneration doc comment):
+// Generation is the request-binding guard for query execution and this
+// snapshot's own staleness (did the connection get replaced), while
+// MetadataIncarnation identifies the shared store instance and
+// MetadataGeneration the store's own revision count (does it get bumped by a
+// Refresh of the SAME connection). A staleness check that only compares
+// Generation cannot tell "the connection changed" apart from "the metadata
+// I'm holding was refreshed under the same connection" — callers that care
+// about the latter compare MetadataIncarnation/MetadataGeneration instead.
+//
+// MetadataLease is the same lease Metadata/MetadataIncarnation/
+// MetadataGeneration were captured from (nil under the same conditions they
+// are zero). It lets a caller load an object detail — see
+// leaseDDLRepository — that shares one Load with any other consumer of the
+// same store, rather than only reading the already-published Cache/Status.
 type editorSnapshot struct {
-	URI, Text         string
-	Version           int
-	Revision          uint64
-	Generation        int
-	Variant           dialect.DriverVariant
-	DialectResolved   bool
-	Cache             *database.DBCache
-	Metadata          *database.MetadataSnapshot
-	Repository        database.DBRepository
-	LowercaseKeywords bool
-	Attaching         bool
-	ConnectionReady   bool
-	SourceContext     snapshotContext
+	URI, Text           string
+	Version             int
+	Revision            uint64
+	Generation          int
+	Variant             dialect.DriverVariant
+	DialectResolved     bool
+	Cache               *database.DBCache
+	Metadata            *database.MetadataSnapshot
+	MetadataIncarnation uint64
+	MetadataGeneration  uint64
+	MetadataLease       *metadata.Lease
+	Repository          database.DBRepository
+	LowercaseKeywords   bool
+	Attaching           bool
+	ConnectionReady     bool
+	SourceContext       snapshotContext
 }
 
 func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
@@ -69,11 +90,16 @@ func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 		}
 	}
 
-	metadata := s.metadata.Snapshot()
-	if metadata != nil && metadata.Generation == uint64(snapshot.Generation) {
-		snapshot.Metadata = metadata
-		if metadata.Cache != nil {
-			snapshot.Cache = metadata.Cache
+	if s.metaLease != nil && s.connGeneration == s.metaBoundGeneration {
+		meta := s.metaLease.Snapshot()
+		if meta != nil {
+			snapshot.Metadata = meta
+			snapshot.MetadataIncarnation = s.metaLease.Incarnation()
+			snapshot.MetadataGeneration = meta.Generation
+			snapshot.MetadataLease = s.metaLease
+			if meta.Cache != nil {
+				snapshot.Cache = meta.Cache
+			}
 		}
 	}
 

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sqls-server/sqls/metadata"
+
 	"interbase-go/schema"
 )
 
@@ -263,12 +265,12 @@ func TestInterBaseMetadataPlanCompletesWithOneConnection(t *testing.T) {
 	db := openInterBaseScalableFixture(t, 1)
 	db.SetMaxOpenConns(1)
 	repo := interBaseMetadataPlanWithParallelism{InterBaseDBRepository: &InterBaseDBRepository{Conn: db}, parallelism: 1}
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	load, err := loader.Start(ctx, 1, repo)
+	load, err := loader.Start(ctx, 1, metadataPlanFor(repo))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,10 +296,10 @@ func TestInterBaseMetadataForeignKeyParityCountsUniqueOrderedCompositeMappings(t
 		t.Fatalf("legacy foreign key count = %d, want one non-self composite FK", len(legacy))
 	}
 
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
-	load, err := loader.Start(ctx, 1, repo)
+	load, err := loader.Start(ctx, 1, metadataPlanFor(repo))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -428,10 +430,10 @@ func TestInterBaseMetadataJobsLeaveInteractiveConnectionCapacity(t *testing.T) {
 			}
 		}}
 	}
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
-	load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 3, Jobs: jobs}))
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(metadataRepo(MetadataPlan{Parallelism: 3, Jobs: jobs})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,12 +469,12 @@ func TestInterBaseMetadataActualPlanLeavesInteractiveSelectCapacity(t *testing.T
 	}
 	db := openInterBaseScalableFixtureWithFault(t, 1, fault)
 	db.SetMaxOpenConns(5)
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+	load, err := loader.Start(ctx, 1, metadataPlanFor(&InterBaseDBRepository{Conn: db}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,10 +523,10 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 		t.Run(string(tc.kind), func(t *testing.T) {
 			failure := errors.New("injected actual-plan reader query failure")
 			db := openInterBaseScalableFixtureWithFault(t, 1, &interBaseFixtureFault{match: tc.match, stage: "query", err: failure})
-			loader := NewMetadataLoader()
+			loader := metadata.NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
-			load, err := loader.Start(context.Background(), 1, &InterBaseDBRepository{Conn: db})
+			load, err := loader.Start(context.Background(), 1, metadataPlanFor(&InterBaseDBRepository{Conn: db}))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -675,10 +677,10 @@ func TestInterBaseMetadataActualPlanDataRowsFaultStagesDiscardCategory(t *testin
 				if tc.view {
 					insertMetadataViewFixtures(t, db, 1)
 				}
-				loader := NewMetadataLoader()
+				loader := metadata.NewLoader(nil)
 				t.Cleanup(loader.Stop)
 				loader.Reset(1)
-				load, err := loader.Start(context.Background(), 1, &InterBaseDBRepository{Conn: db})
+				load, err := loader.Start(context.Background(), 1, metadataPlanFor(&InterBaseDBRepository{Conn: db}))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -696,7 +698,7 @@ func TestInterBaseMetadataActualPlanDataRowsFaultStagesDiscardCategory(t *testin
 }
 
 func TestInterBaseMetadataJobPanicDoesNotSuppressIndependentSibling(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	repo := metadataRepo(MetadataPlan{Parallelism: 2, Jobs: []MetadataJob{
@@ -705,7 +707,7 @@ func TestInterBaseMetadataJobPanicDoesNotSuppressIndependentSibling(t *testing.T
 			return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Procedures: map[string]*ProcedureDesc{"P": {Name: "P"}}}}, Count: 1}, nil
 		}},
 	}})
-	load, err := loader.Start(context.Background(), 1, repo)
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(repo))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -736,10 +738,10 @@ func TestInterBaseMetadataFailureIsIsolatedForEveryIndependentKind(t *testing.T)
 					return MetadataPatch{Cache: emptyMetadataPatch(kind)}, nil
 				}})
 			}
-			loader := NewMetadataLoader()
+			loader := metadata.NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
-			load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 3, Jobs: jobs}))
+			load, err := loader.Start(context.Background(), 1, metadataPlanFor(metadataRepo(MetadataPlan{Parallelism: 3, Jobs: jobs})))
 			if err != nil {
 				t.Fatal(err)
 			}

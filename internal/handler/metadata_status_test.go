@@ -88,7 +88,7 @@ func TestMetadataStatusNeverPushesProgressForEitherCapability(t *testing.T) {
 			if err := client.Call(ctx, "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandShowMetadataStatus}, &status); err != nil {
 				t.Fatal(err)
 			}
-			if status.Generation != 18 || status.Settled || status.Degraded {
+			if status.ConnectionGeneration != 18 || status.Settled || status.Degraded {
 				t.Fatalf("idle status = %+v", status)
 			}
 			if err := s.Stop(); err != nil {
@@ -121,16 +121,25 @@ func TestMetadataStatusNeverPushesProgressForEitherCapability(t *testing.T) {
 	}
 }
 
+type metadataStatusInvalidPlanRepository struct{ *database.MockDBRepository }
+
+// MetadataPlan returns a plan validateMetadataPlan rejects (Parallelism 0),
+// so Registry.createTrack's Start call fails and it calls MarkStartFailed
+// itself before the Acquire this test drives ever returns — the direct
+// replacement for the old "s.metadata.Reset(9); s.metadata.MarkStartFailed(9)"
+// pattern, which forced the identical StartFailed state without going
+// through a real (albeit rejected) plan.
+func (metadataStatusInvalidPlanRepository) MetadataPlan() database.MetadataPlan {
+	return database.MetadataPlan{}
+}
+
 func TestMetadataStatusStartFailureIsNotConnectionFailure(t *testing.T) {
 	s, client, _ := newMetadataStatusRPC(t, true)
 	s.stateMu.Lock()
 	s.connectionState = connectionReady
 	s.connGeneration = 9
 	s.stateMu.Unlock()
-	s.metadata.Reset(9)
-	if err := s.metadata.MarkStartFailed(9); err != nil {
-		t.Fatal(err)
-	}
+	bindMetadataRepoForTest(t, s, 9, metadataStatusInvalidPlanRepository{&database.MockDBRepository{}})
 	s.stateMu.Lock()
 	s.metadataStartErr = errors.New("fake password secret-from-driver")
 	s.stateMu.Unlock()
@@ -172,16 +181,8 @@ func TestMetadataStatusFailedAndBlockedJobsOverJSONRPC(t *testing.T) {
 	s.connectionState = connectionReady
 	s.connGeneration = 22
 	s.stateMu.Unlock()
-	s.metadata.Reset(22)
-	load, err := s.metadata.Start(context.Background(), 22, metadataStatusFailureRepository{&database.MockDBRepository{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-load.Done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("metadata jobs did not settle")
-	}
+	lease := bindMetadataRepoForTest(t, s, 22, metadataStatusFailureRepository{&database.MockDBRepository{}})
+	waitMetadataSettledForTest(t, context.Background(), lease)
 	var got MetadataStatusResult
 	if err := client.Call(context.Background(), "workspace/executeCommand", lsp.ExecuteCommandParams{Command: CommandShowMetadataStatus}, &got); err != nil {
 		t.Fatal(err)
@@ -214,25 +215,21 @@ func TestMetadataStatusQueuedCancellationHasZeroRunDuration(t *testing.T) {
 	s.connectionState = connectionReady
 	s.connGeneration = 23
 	s.stateMu.Unlock()
-	s.metadata.Reset(23)
-	ctx, cancel := context.WithCancel(context.Background())
 	started := make(chan struct{})
-	load, err := s.metadata.Start(ctx, 23, metadataStatusPlanRepository{MockDBRepository: &database.MockDBRepository{}, plan: metadataStatusPlanWithQueuedJob(started)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	lease := bindMetadataRepoForTest(t, s, 23, metadataStatusPlanRepository{MockDBRepository: &database.MockDBRepository{}, plan: metadataStatusPlanWithQueuedJob(started)})
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
-		cancel()
 		t.Fatal("first metadata job did not start")
 	}
-	cancel()
-	select {
-	case <-load.Done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("cancelled metadata generation did not settle")
-	}
+	// Releasing the only reference to this lease cancels the track's own
+	// context (Registry.finalizeTrack), which is what the first job's
+	// ctx.Done() is waiting on — the direct replacement for the old
+	// "cancel the ctx passed to Loader.Start" pattern: Parallelism 1 keeps
+	// the second job queued (never started), so it settles Cancelled with
+	// a zero StartedAt/duration.
+	lease.Release()
+	waitMetadataSettledForTest(t, context.Background(), lease)
 	result := s.metadataStatus()
 	for _, category := range result.Categories {
 		if category.Kind == string(database.MetadataRelations) && category.DurationMS != 0 {

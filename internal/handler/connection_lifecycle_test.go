@@ -64,7 +64,13 @@ func TestMetadataStartRejectionKeepsAttachmentReadyAndRecordsDegradedError(t *te
 	if !errors.Is(startErr, database.ErrInvalidMetadataPlan) {
 		t.Fatalf("metadata start status = %v, want invalid plan error", startErr)
 	}
-	meta := s.metadata.Snapshot()
+	s.stateMu.RLock()
+	lease := s.metaLease
+	s.stateMu.RUnlock()
+	if lease == nil {
+		t.Fatal("no metadata lease bound after successful attachment")
+	}
+	meta := lease.Snapshot()
 	if meta.Started || !meta.StartFailed || !meta.Settled() || !meta.Degraded() {
 		t.Fatalf("rejected metadata generation snapshot = %+v (settled=%v degraded=%v)", meta, meta.Settled(), meta.Degraded())
 	}

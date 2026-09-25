@@ -451,16 +451,20 @@ func stubInterBaseConnections(aliases ...string) *config.Config {
 	return &config.Config{Connections: conns}
 }
 
-// waitForCatalog waits for the current metadata generation to settle, then
-// asserts the loader published catalog data. It never polls or guesses timing.
+// waitForCatalog waits for the currently bound metadata lease to settle, then
+// asserts it published catalog data. It never polls or guesses timing.
 func waitForCatalog(t *testing.T, server *Server) *database.DBCache {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := server.metadata.Wait(ctx); err != nil {
-		t.Fatalf("wait for metadata: %v", err)
+	server.stateMu.RLock()
+	lease := server.metaLease
+	server.stateMu.RUnlock()
+	if lease == nil {
+		t.Fatal("wait for metadata: no metadata lease bound")
 	}
-	snapshot := server.metadata.Snapshot()
+	waitMetadataSettledForTest(t, ctx, lease)
+	snapshot := lease.Snapshot()
 	if snapshot == nil || snapshot.Cache == nil || !snapshot.Cache.HasCatalog() {
 		t.Fatal("metadata loader settled without a catalog")
 	}

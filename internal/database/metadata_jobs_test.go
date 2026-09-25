@@ -6,6 +6,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sqls-server/sqls/metadata"
 )
 
 func TestMetadataGenericPlanIsSerialAndIndependent(t *testing.T) {
@@ -56,9 +58,9 @@ func TestMetadataGenericMocksDoNotGainOptionalCapabilities(t *testing.T) {
 func TestMetadataGenericCurrentSchemaFailureIsIsolated(t *testing.T) {
 	repository := catalogTestRepository()
 	repository.MockDatabase = func(context.Context) (string, error) { return "", errors.New("current schema unavailable") }
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
-	load, err := loader.Start(context.Background(), 1, repository)
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(repository))
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
@@ -138,9 +140,9 @@ func TestMetadataGenericFragmentsOwnRepositoryDescriptors(t *testing.T) {
 	repository.MockDescribeIndexes = func(context.Context) ([]*IndexDesc, error) { return []*IndexDesc{index}, nil }
 	repository.MockDescribeTriggers = func(context.Context) ([]*TriggerDesc, error) { return []*TriggerDesc{trigger}, nil }
 
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
-	load, err := loader.Start(context.Background(), 1, repository)
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(repository))
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}

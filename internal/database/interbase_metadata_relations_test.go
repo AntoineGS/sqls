@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sqls-server/sqls/metadata"
 	"interbase-go/schema"
 )
 
@@ -74,9 +75,9 @@ func TestInterBaseMetadataCoreReadersMatchLegacySnapshot(t *testing.T) {
 	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
 	ctx := context.Background()
 
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
-	if _, err := loader.Start(ctx, 1, &interBaseMetadataFailureRepository{InterBaseDBRepository: repo}); err != nil {
+	if _, err := loader.Start(ctx, 1, metadataPlanFor(&interBaseMetadataFailureRepository{InterBaseDBRepository: repo})); err != nil {
 		t.Fatal(err)
 	}
 	if err := loader.Wait(ctx); err != nil {
@@ -255,12 +256,12 @@ func TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionO
 		db := openInterBaseScalableFixtureWithFault(t, 1, fault)
 		insertMetadataViewFixtures(t, db, 2)
 
-		loader := NewMetadataLoader()
+		loader := metadata.NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		loader.Reset(1)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+		load, err := loader.Start(ctx, 1, metadataPlanFor(&InterBaseDBRepository{Conn: db}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -285,12 +286,12 @@ func TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionO
 		db := openInterBaseScalableFixtureWithFault(t, 1, fault)
 		insertMetadataViewFixtures(t, db, 2)
 
-		loader := NewMetadataLoader()
+		loader := metadata.NewLoader(nil)
 		t.Cleanup(loader.Stop)
 		loader.Reset(1)
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		load, err := loader.Start(ctx, 1, &InterBaseDBRepository{Conn: db})
+		load, err := loader.Start(ctx, 1, metadataPlanFor(&InterBaseDBRepository{Conn: db}))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +314,7 @@ func TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionO
 // waitForInterBaseMetadataStatus blocks until kind reaches want in loader's
 // current snapshot, using the loader's own change callback rather than
 // polling, or until ctx is done.
-func waitForInterBaseMetadataStatus(t *testing.T, ctx context.Context, loader *MetadataLoader, kind MetadataKind, want MetadataState) {
+func waitForInterBaseMetadataStatus(t *testing.T, ctx context.Context, loader *metadata.Loader, kind MetadataKind, want MetadataState) {
 	t.Helper()
 	changed := make(chan struct{}, 1)
 	loader.SetChangedCallback(func() {
@@ -383,9 +384,9 @@ func TestInterBaseMetadataCoreReaderFailureIsIsolated(t *testing.T) {
 			}
 
 			repo := &interBaseMetadataFailureRepository{InterBaseDBRepository: &InterBaseDBRepository{Conn: db}, queryMatch: test.match, queryErr: failure, failedKind: test.failed}
-			loader := NewMetadataLoader()
+			loader := metadata.NewLoader(nil)
 			loader.Reset(1)
-			if _, err := loader.Start(ctx, 1, repo); err != nil {
+			if _, err := loader.Start(ctx, 1, metadataPlanFor(repo)); err != nil {
 				t.Fatal(err)
 			}
 			if err := loader.Wait(ctx); err != nil {

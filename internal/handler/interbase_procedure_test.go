@@ -82,7 +82,7 @@ func runProcedureCommandWithProcedureState(t *testing.T, text string, procs []*d
 	// generation rather than relying on timing after configuration.
 	if procs != nil {
 		waitForCatalog(t, tx.server)
-		cache := tx.server.metadata.Cache()
+		cache := currentLeaseCacheForTest(tx.server)
 		if !cache.HasCatalog() {
 			t.Fatal("the catalog never arrived; every routing assertion below would be vacuous")
 		}
@@ -232,10 +232,10 @@ func TestExecuteProcedureRoutingIgnoresNonInterBaseDrivers(t *testing.T) {
 	tx.addWorkspaceConfig(t, stubConnections("primary"))
 
 	waitForCatalog(t, tx.server)
-	if !tx.server.metadata.Cache().HasCatalog() {
+	if !currentLeaseCacheForTest(tx.server).HasCatalog() {
 		t.Fatal("the non-InterBase connection has no catalog; this test would pass for the wrong reason")
 	}
-	if _, ok := tx.server.metadata.Cache().Procedure("MYPROC"); !ok {
+	if _, ok := currentLeaseCacheForTest(tx.server).Procedure("MYPROC"); !ok {
 		t.Fatal("MYPROC is not in the cache; routing would return unknown regardless of the driver")
 	}
 

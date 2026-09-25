@@ -187,12 +187,19 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	} else {
 		current = current && s.dbConn.DriverVariant() == snapshot.variant
 	}
+	lease, bound := s.metaLease, s.metaBoundGeneration
 	s.stateMu.RUnlock()
 	if !current {
 		return false
 	}
-	meta := s.metadata.Snapshot()
-	return meta != nil && meta.Generation == uint64(snapshot.generation) && meta.Cache == snapshot.cache
+	if lease == nil || snapshot.generation != bound {
+		// The active lease was rebound (a connection switch) since this
+		// diagnostic snapshot was captured: a late-arriving old-generation
+		// result must never publish against the new connection's state.
+		return false
+	}
+	meta := lease.Snapshot()
+	return meta != nil && meta.Cache == snapshot.cache
 }
 
 // configuredDriverVariant mirrors the pre-attachment parser selection used by

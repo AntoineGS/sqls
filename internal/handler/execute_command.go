@@ -398,7 +398,28 @@ func (s *Server) interBaseProcedureRouting(query string) procedureRouting {
 		return procedureRouting{}
 	}
 
-	return interBaseProcedureRouting(query, s.metadata.Cache())
+	return interBaseProcedureRouting(query, s.currentMetadataCache())
+}
+
+// currentMetadataCache reads the active lease's current cache, or nil before
+// any lease is bound. This is a heuristic routing/completion read of the
+// published snapshot, never a connection or transaction acquisition, so it
+// intentionally does not gate on connGeneration == metaBoundGeneration the
+// way editorSnapshot/diagnostics publication does: a slightly stale cache
+// here only means a routing decision briefly falls back to the "unknown"
+// path, never a wrong-target correctness issue.
+func (s *Server) currentMetadataCache() *database.DBCache {
+	s.stateMu.RLock()
+	lease := s.metaLease
+	s.stateMu.RUnlock()
+	if lease == nil {
+		return nil
+	}
+	snapshot := lease.Snapshot()
+	if snapshot == nil {
+		return nil
+	}
+	return snapshot.Cache
 }
 
 func interBaseProcedureRouting(query string, cache *database.DBCache) procedureRouting {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	sqldialect "github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/metadata"
 )
 
 // This is intentionally opt-in and read-only. Run once against maintenance-
@@ -34,10 +35,10 @@ func TestInterBaseMetadataLive(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 			defer cancel()
 			before := connection.Conn.Stats()
-			loader := NewMetadataLoader()
+			loader := metadata.NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
-			load, err := loader.Start(ctx, 1, repo)
+			load, err := loader.Start(ctx, 1, metadataPlanFor(repo))
 			if err != nil {
 				t.Fatalf("start metadata plan: %v", err)
 			}

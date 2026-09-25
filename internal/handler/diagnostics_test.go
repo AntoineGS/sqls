@@ -27,7 +27,9 @@ func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T)
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	s.files["file:///catalog.sql"] = &File{Text: "SELECT * FROM T"}
 	s.stateMu.Unlock()
-	s.metadata.Reset(1)
+	repo := readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}}
+	lease := bindMetadataRepoForTest(t, s, 1, repo)
+	waitMetadataSettledForTest(t, context.Background(), lease)
 	before, ok := s.diagnosticsSnapshot("file:///catalog.sql")
 	if !ok {
 		t.Fatal("snapshot missing for open document")
@@ -35,7 +37,11 @@ func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T)
 	if before.cacheSnapshot != nil {
 		t.Fatalf("catalog built before columns ready: %#v", before.cacheSnapshot)
 	}
-	cache := s.metadata.Cache()
+	// The published snapshot's Cache pointer is stable until the next
+	// publish (Loader.Snapshot returns the same object), so mutating it in
+	// place is visible to the next captureEditorSnapshot read — the same
+	// trick the pre-registry test used directly against the loader's cache.
+	cache := lease.Snapshot().Cache
 	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
 	after, ok := s.diagnosticsSnapshot("file:///catalog.sql")
 	if !ok || after.cacheSnapshot == nil {
@@ -140,17 +146,17 @@ func newDiagnosticsTestContext(t *testing.T, driver dialect.DatabaseDriver) *dia
 	t.Helper()
 	ctx := context.Background()
 	server := NewServer()
-	// These tests drive diagnostic publication explicitly; disable the
-	// constructor callback so its asynchronous startup signal cannot race and
-	// duplicate a document-open notification.
-	server.metadata.SetChangedCallback(nil)
 	t.Cleanup(func() { server.Stop() })
 	server.stateMu.Lock()
 	server.dbConn = &database.DBConnection{Driver: driver}
 	server.connectionState = connectionReady
 	server.connGeneration = 1
 	server.stateMu.Unlock()
-	server.metadata.Reset(1)
+	// Bind an empty-plan lease at generation 1: the equivalent, under the
+	// registry/lease model, of the old "s.metadata.Reset(1)" (establish this
+	// generation's identity and a stable, empty Cache pointer) without
+	// waiting for any job to settle.
+	bindMetadataRepoForTest(t, server, 1, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}})
 	clientEnd, serverEnd := net.Pipe()
 	client := newDiagnosticsClient()
 	clientConn := jsonrpc2.NewConn(ctx, jsonrpc2.NewBufferedStream(clientEnd, jsonrpc2.VSCodeObjectCodec{}), client)
@@ -452,9 +458,9 @@ func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {
 		t.Fatalf("initial diagnostics = %+v, want truncation warning", initial.Diagnostics)
 	}
 
-	oldCache := tx.server.metadata.Cache()
+	oldCache := currentLeaseCacheForTest(tx.server)
 	loadMetadataForTest(t, tx.server, diagnosticsRepository(diagnosticTypes("VARCHAR(50)")))
-	primaryCache := tx.server.metadata.Cache()
+	primaryCache := currentLeaseCacheForTest(tx.server)
 	if primaryCache == oldCache {
 		t.Fatal("metadata cache pointer did not refresh")
 	}
@@ -605,9 +611,10 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 	tx.server.stateMu.Lock()
 	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverMySQL}
 	tx.server.connGeneration++
-	tx.server.metadata.Reset(uint64(tx.server.connGeneration))
+	newGeneration := tx.server.connGeneration
 	tx.server.stateMu.Unlock()
 	tx.server.diagnosticsPublishMu.Unlock()
+	bindMetadataRepoForTest(t, tx.server, newGeneration, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}})
 	tx.server.republishOpenDiagnostics(tx.ctx)
 	cleared := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
 		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 0

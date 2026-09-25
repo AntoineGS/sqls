@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/sqls-server/sqls/metadata"
 )
 
 func TestInterBaseMetadataViewsMatchLegacyAndUseConstantQueries(t *testing.T) {
@@ -74,10 +76,10 @@ func TestInterBaseMetadataPlanViewsMatchLegacy(t *testing.T) {
 				}
 			}
 
-			loader := NewMetadataLoader()
+			loader := metadata.NewLoader(nil)
 			t.Cleanup(loader.Stop)
 			loader.Reset(1)
-			load, err := loader.Start(ctx, 1, repo)
+			load, err := loader.Start(ctx, 1, metadataPlanFor(repo))
 			if err != nil {
 				t.Fatal(err)
 			}

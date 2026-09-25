@@ -80,7 +80,7 @@ func TestDiagnosticsSnapshotCurrentAcceptsConfiguredVariantWithoutConnection(t *
 	s.stateMu.Lock()
 	s.connGeneration = 1
 	s.stateMu.Unlock()
-	s.metadata.Reset(1)
+	bindMetadataRepoForTest(t, s, 1, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}})
 	if err := s.openFileAtVersion("file:///configured.sql", "sql", "SELECT 1", 1); err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,12 @@ func TestEditorSnapshotRejectsMismatchedMetadataGeneration(t *testing.T) {
 	s.stateMu.Lock()
 	s.connGeneration = 2
 	s.stateMu.Unlock()
-	s.metadata.Reset(3) // simulate a loader/server transition observed mid-publication
+	// Simulate a loader/server transition observed mid-publication: a
+	// metadata lease bound to generation 3 while the connection has already
+	// moved on to generation 2 (metaBoundGeneration deliberately mismatched
+	// against connGeneration, the equivalent of the old fused-generation
+	// race this test predates).
+	bindMetadataRepoForTest(t, s, 3, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}})
 
 	snapshot, err := s.captureEditorSnapshot("file:///query.sql")
 	if err != nil {
@@ -225,44 +230,50 @@ func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *tes
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Dialect: 3}
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
 	s.connectionState = connectionReady
-	s.metadata.Reset(1)
 	s.stateMu.Unlock()
-	ready, start := make(chan struct{}), make(chan struct{})
-	started := make(chan error, 1)
-	go func() {
-		close(ready) // attachment is visible; the coordinator has not called Start yet
-		<-start
-		load, err := s.metadata.Start(context.Background(), 1, partialCatalogRepository{&database.MockDBRepository{}})
-		if err == nil {
-			select {
-			case <-load.Done:
-			case <-time.After(time.Second):
-				err = errors.New("metadata jobs did not settle")
-			}
-		}
-		started <- err
-	}()
-	<-ready
-	snapshot, err := s.captureEditorSnapshot(uri)
+
+	// Before any metadata lease is bound, completion must remain incomplete —
+	// the same "attachment ready, metadata not yet started" window the old
+	// loader model produced via Reset-without-Start.
+	preBind, err := s.captureEditorSnapshot(uri)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !snapshot.ConnectionReady || snapshot.Metadata == nil || snapshot.Metadata.Started {
-		t.Fatalf("gated pre-start snapshot = ready:%v metadata:%#v", snapshot.ConnectionReady, snapshot.Metadata)
+	if !preBind.ConnectionReady || preBind.Metadata != nil {
+		t.Fatalf("pre-bind snapshot = ready:%v metadata:%#v", preBind.ConnectionReady, preBind.Metadata)
 	}
-	if !completionMetadataIncomplete(snapshot) {
-		t.Fatal("completion incorrectly settled in attachment-to-Start interval")
+	if !completionMetadataIncomplete(preBind) {
+		t.Fatal("completion incorrectly settled before any metadata lease was bound")
 	}
-	close(start)
-	if err := <-started; err != nil {
-		t.Fatal(err)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	lease := bindMetadataRepoForTest(t, s, 1, gatedProcedureRepository{
+		MockDBRepository: &database.MockDBRepository{}, entered: entered, release: release,
+	})
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("gated metadata job did not start")
 	}
-	snapshot, err = s.captureEditorSnapshot(uri)
+	loading, err := s.captureEditorSnapshot(uri)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if completionMetadataIncomplete(snapshot) {
-		t.Fatal("terminal failed/ready categories should settle completion")
+	if loading.Metadata == nil || !loading.Metadata.Started {
+		t.Fatalf("loading snapshot = metadata:%#v", loading.Metadata)
+	}
+	if !completionMetadataIncomplete(loading) {
+		t.Fatal("completion incorrectly settled while the only relevant category is loading")
+	}
+	close(release)
+	waitMetadataSettledForTest(t, context.Background(), lease)
+
+	final, err := s.captureEditorSnapshot(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completionMetadataIncomplete(final) {
+		t.Fatal("terminal ready category should settle completion")
 	}
 }
 
@@ -276,16 +287,8 @@ func TestProgressiveEditorSnapshotKeepsReadyProcedureWhenViewsFail(t *testing.T)
 	s.stateMu.Lock()
 	s.connGeneration = 1
 	s.stateMu.Unlock()
-	s.metadata.Reset(1)
-	load, err := s.metadata.Start(context.Background(), 1, partialCatalogRepository{&database.MockDBRepository{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-load.Done:
-	case <-time.After(time.Second):
-		t.Fatal("metadata plan did not settle")
-	}
+	lease := bindMetadataRepoForTest(t, s, 1, partialCatalogRepository{&database.MockDBRepository{}})
+	waitMetadataSettledForTest(t, context.Background(), lease)
 
 	snapshot, err := s.captureEditorSnapshot("file:///query.sql")
 	if err != nil {
@@ -341,15 +344,12 @@ func TestEditorSnapshotDoesNotMixLateConnectionAMetadataIntoB(t *testing.T) {
 	s.stateMu.Lock()
 	s.connGeneration = 1
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Dialect: 3, Alias: "A"}
+	s.connectionState = connectionReady
 	s.stateMu.Unlock()
-	s.metadata.Reset(1)
 	entered, release := make(chan struct{}), make(chan struct{})
-	load, err := s.metadata.Start(context.Background(), 1, gatedProcedureRepository{
+	aLease := bindMetadataRepoForTest(t, s, 1, gatedProcedureRepository{
 		MockDBRepository: &database.MockDBRepository{}, entered: entered, release: release,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
@@ -363,23 +363,23 @@ func TestEditorSnapshotDoesNotMixLateConnectionAMetadataIntoB(t *testing.T) {
 		t.Fatal("completion should be incomplete while a relevant category is loading")
 	}
 
-	// Beginning B advances both generation owners before the late A result is
-	// released, exactly as the coordinator's transition fence does.
+	// Beginning B advances both connGeneration and metaBoundGeneration before
+	// the late A result is released, exactly as bindMetadata's Acquire path
+	// does on a genuinely different target: a new, independently tracked
+	// store, never a mutation of A's.
 	s.stateMu.Lock()
 	s.connGeneration = 2
 	s.curDBCfg = &database.DBConfig{Driver: dialect.DatabaseDriverPostgreSQL, Alias: "B"}
 	s.connectionState = connectionConnecting
-	s.metadata.Reset(2)
 	s.stateMu.Unlock()
+	bLease := bindMetadataRepoForTest(t, s, 2, readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}})
+	s.stateMu.Lock()
+	s.connectionState = connectionReady
+	s.stateMu.Unlock()
+	waitMetadataSettledForTest(t, context.Background(), bLease)
+
 	close(release)
-	select {
-	case <-load.Done:
-	case <-time.After(time.Second):
-		t.Fatal("superseded A metadata generation did not settle")
-	}
-	if err := s.metadata.Wait(context.Background()); err != nil {
-		t.Fatal(err)
-	}
+	waitMetadataSettledForTest(t, context.Background(), aLease)
 
 	snapshot, err := s.captureEditorSnapshot(uri)
 	if err != nil {
@@ -390,6 +390,9 @@ func TestEditorSnapshotDoesNotMixLateConnectionAMetadataIntoB(t *testing.T) {
 	}
 	if _, ok := snapshot.Cache.Procedure("ONLY_A"); ok {
 		t.Fatal("late A procedure leaked into B's cache")
+	}
+	if snapshot.MetadataIncarnation != bLease.Incarnation() {
+		t.Fatal("B snapshot did not bind to B's own lease incarnation")
 	}
 }
 

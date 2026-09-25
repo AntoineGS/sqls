@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/sqls-server/sqls/metadata"
 )
 
 type metadataPlanTestRepo struct {
@@ -35,10 +37,10 @@ func waitLoad(t *testing.T, load *MetadataLoad) {
 }
 
 func TestMetadataLoaderUsesGenericPlanWhenAbsent(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
-	load, err := loader.Start(context.Background(), 1, NewMockDBRepository(nil))
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(NewMockDBRepository(nil)))
 	if err != nil {
 		t.Fatalf("Start() with generic repository error = %v", err)
 	}
@@ -61,16 +63,16 @@ func TestMetadataLoaderUsesGenericPlanWhenAbsent(t *testing.T) {
 }
 
 func TestMetadataLoaderPlannerDoesNotBlockReset(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
 	entered, release := make(chan struct{}), make(chan struct{})
 	startDone := make(chan error, 1)
 	go func() {
-		_, err := loader.Start(context.Background(), 1, metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
+		_, err := loader.Start(context.Background(), 1, metadataPlanFor(metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
 			close(entered)
 			<-release
 			return MetadataPlan{Parallelism: 1}
-		}})
+		}}))
 		startDone <- err
 	}()
 	<-entered
@@ -91,16 +93,16 @@ func TestMetadataLoaderPlannerDoesNotBlockReset(t *testing.T) {
 }
 
 func TestMetadataLoaderPlannerCanReenterSnapshot(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
 	startDone := make(chan error, 1)
 	go func() {
-		_, err := loader.Start(context.Background(), 1, metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
+		_, err := loader.Start(context.Background(), 1, metadataPlanFor(metadataPlanFuncRepo{MockDBRepository: &MockDBRepository{}, plan: func() MetadataPlan {
 			if got := loader.Snapshot().Generation; got != 1 {
 				t.Errorf("planner snapshot generation = %d", got)
 			}
 			return MetadataPlan{Parallelism: 1}
-		}})
+		}}))
 		startDone <- err
 	}()
 	select {
@@ -115,7 +117,7 @@ func TestMetadataLoaderPlannerCanReenterSnapshot(t *testing.T) {
 }
 
 func TestMetadataLoaderConcurrentStartsAcceptAtMostOne(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	loader.Reset(1)
 	const contenders = 8
 	ready, release := make(chan struct{}, contenders), make(chan struct{})
@@ -126,7 +128,7 @@ func TestMetadataLoaderConcurrentStartsAcceptAtMostOne(t *testing.T) {
 		return MetadataPlan{Parallelism: 1}
 	}}
 	for i := 0; i < contenders; i++ {
-		go func() { _, err := loader.Start(context.Background(), 1, repo); results <- err }()
+		go func() { _, err := loader.Start(context.Background(), 1, metadataPlanFor(repo)); results <- err }()
 	}
 	for i := 0; i < contenders; i++ {
 		select {
@@ -156,7 +158,7 @@ func TestMetadataLoaderConcurrentStartsAcceptAtMostOne(t *testing.T) {
 }
 
 func TestMetadataLoaderCatalogJobSurvivesColumnFailure(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 	columnErr := errors.New("columns unavailable")
@@ -164,7 +166,7 @@ func TestMetadataLoaderCatalogJobSurvivesColumnFailure(t *testing.T) {
 	repository.MockDescribeDatabaseTable = func(context.Context) ([]*ColumnDesc, error) {
 		return nil, columnErr
 	}
-	load, err := loader.Start(context.Background(), 1, repository)
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(repository))
 	if err != nil {
 		t.Fatal(err)
 	}

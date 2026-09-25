@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/sqls-server/sqls/metadata"
 )
 
 func TestMetadataReadyDistinguishesEmptyFromUnknown(t *testing.T) {
@@ -72,7 +74,7 @@ func TestMetadataReadinessAndSnapshotSettlement(t *testing.T) {
 }
 
 func TestMetadataLoaderResetIsNotSettledBeforeStart(t *testing.T) {
-	loader := NewMetadataLoader()
+	loader := metadata.NewLoader(nil)
 	t.Cleanup(loader.Stop)
 	loader.Reset(1)
 
@@ -81,7 +83,7 @@ func TestMetadataLoaderResetIsNotSettledBeforeStart(t *testing.T) {
 		t.Fatal("reset generation settled before Start")
 	}
 	cache := before.Cache
-	load, err := loader.Start(context.Background(), 1, metadataRepo(MetadataPlan{Parallelism: 1}))
+	load, err := loader.Start(context.Background(), 1, metadataPlanFor(metadataRepo(MetadataPlan{Parallelism: 1})))
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
