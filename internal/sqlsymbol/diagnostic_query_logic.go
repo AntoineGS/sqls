@@ -97,44 +97,101 @@ func (m *diagnosticModel) sourceLocallyNotNull(source []lexeme, qi int) bool {
 	if len(source) != 1 && !(len(source) == 3 && isNameToken(source[0]) && source[1].Token.Kind == token.Period && isNameToken(source[2])) {
 		return false
 	}
-	q := m.queries[qi]
-	depths, _ := sqlDepths(m.items)
-	for i := q.start; i < q.end; i++ {
-		if depths[i] != q.baseDepth || !isWord(m.items[i], "WHERE") {
-			continue
-		}
-		end := clauseEnd(m.items, i+1)
-		if end > q.end {
-			end = q.end
-		}
-		for j := i + 1; j < end; j++ {
-			if isWord(m.items[j], "OR") {
-				return false
-			}
-		}
-		for j := i + 1; j < end; j++ {
-			predicateWidth := len(source)
-			if j+predicateWidth+2 < end && m.sameBoundColumn(source, m.items, j) && isWord(m.items[j+predicateWidth], "IS") && isWord(m.items[j+predicateWidth+1], "NOT") && isWord(m.items[j+predicateWidth+2], "NULL") {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-func (m *diagnosticModel) sameBoundColumn(source, items []lexeme, index int) bool {
-	// Compare the source and predicate's complete identifier shape, not
-	// merely a column spelling.
-	if index < 0 || index >= len(items) {
+	predicate, ok := m.queryWherePredicate(qi)
+	if !ok || !isIsNotNullPredicate(predicate) {
 		return false
 	}
-	predicate := items[index:]
-	if len(source) == 1 {
-		return isNameToken(predicate[0]) && strings.EqualFold(m.analysis.Text[predicate[0].Span.Start:predicate[0].Span.End], m.analysis.Text[source[0].Span.Start:source[0].Span.End])
+	return m.sameSingleRelationColumn(source, predicate[:len(predicate)-3], qi)
+}
+
+// queryWherePredicate returns only a deliberately small predicate fragment:
+// the query's complete top-level WHERE body, when it contains no nested
+// expressions, boolean composition, or unrecognized tail. Query-local
+// refinements and outer-join warnings both consume this proof boundary.
+func (m *diagnosticModel) queryWherePredicate(qi int) ([]lexeme, bool) {
+	if qi < 0 || qi >= len(m.queries) {
+		return nil, false
 	}
-	return len(predicate) >= 3 && isNameToken(predicate[0]) && predicate[1].Token.Kind == token.Period && isNameToken(predicate[2]) &&
-		strings.EqualFold(m.analysis.Text[predicate[0].Span.Start:predicate[0].Span.End], m.analysis.Text[source[0].Span.Start:source[0].Span.End]) &&
-		strings.EqualFold(m.analysis.Text[predicate[2].Span.Start:predicate[2].Span.End], m.analysis.Text[source[2].Span.Start:source[2].Span.End])
+	q := m.queries[qi]
+	depths, _ := sqlDepths(m.items)
+	where := -1
+	for i := q.start; i < q.end; i++ {
+		if depths[i] == q.baseDepth && isWord(m.items[i], "WHERE") {
+			if where >= 0 {
+				return nil, false
+			}
+			where = i
+		}
+	}
+	if where < 0 {
+		return nil, false
+	}
+	end := q.end
+	for i := where + 1; i < end; i++ {
+		if depths[i] != q.baseDepth {
+			return nil, false
+		}
+		if m.items[i].Token.Kind == token.Semicolon || isWord(m.items[i], "INTO") || isWord(m.items[i], "DO") ||
+			isWord(m.items[i], "ORDER") || isWord(m.items[i], "GROUP") || isWord(m.items[i], "HAVING") ||
+			isWord(m.items[i], "ROWS") || isWord(m.items[i], "UNION") || isWord(m.items[i], "PLAN") {
+			end = i
+			break
+		}
+	}
+	if end <= where+1 {
+		return nil, false
+	}
+	return m.items[where+1 : end], true
+}
+
+func isIsNotNullPredicate(predicate []lexeme) bool {
+	_, width, ok := predicateColumn(predicate)
+	return ok && len(predicate) == width+3 && isWord(predicate[width], "IS") &&
+		isWord(predicate[width+1], "NOT") && isWord(predicate[width+2], "NULL")
+}
+
+func predicateColumn(predicate []lexeme) ([]lexeme, int, bool) {
+	if len(predicate) >= 3 && isNameToken(predicate[0]) && predicate[1].Token.Kind == token.Period && isNameToken(predicate[2]) {
+		return predicate[:3], 3, true
+	}
+	if len(predicate) >= 1 && isNameToken(predicate[0]) {
+		return predicate[:1], 1, true
+	}
+	return nil, 0, false
+}
+
+func (m *diagnosticModel) sameSingleRelationColumn(source, predicate []lexeme, qi int) bool {
+	q := m.queries[qi]
+	if len(q.relations) != 1 || len(m.RelationCandidates(qi)) != 1 || q.relations[0].Name.Key() == "" {
+		return false
+	}
+	sourceColumn, _, sourceOK := predicateColumn(source)
+	predicateColumn, _, predicateOK := predicateColumn(predicate)
+	if !sourceOK || !predicateOK {
+		return false
+	}
+	columnName := func(column []lexeme) (Name, bool) { return nameFromLexeme(m.analysis.Text, column[len(column)-1]) }
+	sourceName, ok := columnName(sourceColumn)
+	if !ok {
+		return false
+	}
+	predicateName, ok := columnName(predicateColumn)
+	if !ok || sourceName.Key() != predicateName.Key() {
+		return false
+	}
+	relation := m.RelationCandidates(qi)[0].ref
+	effectiveQualifier := relation.Name
+	if relation.Alias != nil {
+		effectiveQualifier = *relation.Alias
+	}
+	qualifierMatches := func(column []lexeme) bool {
+		if len(column) == 1 {
+			return true
+		}
+		qualifier, ok := nameFromLexeme(m.analysis.Text, column[0])
+		return ok && qualifier.Key() == effectiveQualifier.Key()
+	}
+	return qualifierMatches(sourceColumn) && qualifierMatches(predicateColumn)
 }
 
 func (m *diagnosticModel) nullableNotInFindings(qi int) []Finding {
@@ -232,49 +289,44 @@ func (m *diagnosticModel) outerJoinFilterFinding(qi int) *Finding {
 	if joinCount != 1 || left.ref.Name.Key() == "" || right.ref.Name.Key() == "" || left.ref.Alias != nil && right.ref.Alias != nil && left.ref.Alias.Key() == right.ref.Alias.Key() {
 		return nil
 	}
-	where := -1
-	for i := q.start; i < q.end; i++ {
-		if depths[i] == q.baseDepth && isWord(m.items[i], "WHERE") && i > q.start {
-			where = i
-			break
-		}
-	}
-	if where < 0 {
+	body, ok := m.queryWherePredicate(qi)
+	if !ok {
 		return nil
 	}
-	end := clauseEnd(m.items, where+1)
-	body := m.items[where+1 : end]
-	for _, item := range body {
-		if isWord(item, "OR") || isWord(item, "COALESCE") || isWord(item, "CASE") {
-			return nil
-		}
+	column, width, ok := predicateColumn(body)
+	if !ok || len(column) != 3 {
+		return nil
 	}
-	// Only a direct qualified right-side column followed by an ordinary
-	// comparison is recognized. IS NULL is preserving; IS NOT NULL rejects.
-	for i := 0; i+2 < len(body); i++ {
-		if !isNameToken(body[i]) || body[i+1].Token.Kind != token.Period || !isNameToken(body[i+2]) {
-			continue
-		}
-		qualifier := strings.ToUpper(m.analysis.Text[body[i].Span.Start:body[i].Span.End])
-		alias := right.ref.Name.Key()
-		if right.ref.Alias != nil {
-			alias = right.ref.Alias.Key()
-		}
-		if qualifier != alias {
-			continue
-		}
-		j := i + 3
-		if j+1 < len(body) && isWord(body[j], "IS") {
-			if isWord(body[j+1], "NOT") && j+2 < len(body) && isWord(body[j+2], "NULL") {
-				return queryFinding(body[i].Span.Start, body[j+2].Span.End, codeOuterJoinFilter, "WHERE filters out NULL-extended rows from the LEFT JOIN; this may make it behave like an inner join")
-			}
-			continue
-		}
-		if j < len(body) && (body[j].Token.Kind == token.Gt || body[j].Token.Kind == token.Lt || body[j].Token.Kind == token.Eq || body[j].Token.Kind == token.Neq || body[j].Token.Kind == token.GtEq || body[j].Token.Kind == token.LtEq) && j+1 < len(body) && !isWord(body[j+1], "NULL") {
-			return queryFinding(body[i].Span.Start, body[j+1].Span.End, codeOuterJoinFilter, "WHERE predicate rejects NULL-extended rows from the LEFT JOIN; this may make it behave like an inner join")
-		}
+	qualifier, ok := nameFromLexeme(m.analysis.Text, column[0])
+	if !ok {
+		return nil
+	}
+	alias := right.ref.Name
+	if right.ref.Alias != nil {
+		alias = *right.ref.Alias
+	}
+	if qualifier.Key() != alias.Key() {
+		return nil
+	}
+	if isIsNotNullPredicate(body) {
+		return queryFinding(body[0].Span.Start, body[len(body)-1].Span.End, codeOuterJoinFilter, "WHERE filters out NULL-extended rows from the LEFT JOIN; this may make it behave like an inner join")
+	}
+	if len(body) == width+2 && isNullRejectingComparison(body[width]) && isSimplePredicateValue(body[width+1]) {
+		return queryFinding(body[0].Span.Start, body[len(body)-1].Span.End, codeOuterJoinFilter, "WHERE predicate rejects NULL-extended rows from the LEFT JOIN; this may make it behave like an inner join")
 	}
 	return nil
+}
+
+func isNullRejectingComparison(item lexeme) bool {
+	switch item.Token.Kind {
+	case token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq:
+		return true
+	}
+	return false
+}
+
+func isSimplePredicateValue(item lexeme) bool {
+	return isNameToken(item) || isWord(item, "NULL") || item.Token.Kind == token.Number || item.Token.Kind == token.SingleQuotedString || item.Token.Kind == token.NationalStringLiteral
 }
 
 func queryFinding(start, end int, code, message string) *Finding {
