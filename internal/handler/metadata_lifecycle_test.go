@@ -511,11 +511,11 @@ func (p *procedureDDLDetailProvider) DetailPlan(req metadata.Request) (metadata.
 
 func (p *procedureDDLDetailProvider) Close() error { return nil }
 
-// TestHoverAndDefinitionShareObjectLoad proves hover and go-to-definition
-// against the same InterBase object share exactly one Detail load through the
-// shared metadata lease, via leaseDDLRepository (see
-// interbase_metadata_lease_repository.go) — the production wiring hover.go
-// and definition.go now use, not a bespoke test-only path.
+// TestHoverAndDefinitionShareObjectLoad proves the production hover handler
+// and the legacy private Definition helper can reuse one Detail load through
+// the same metadata lease. Definition is intentionally still invoked through
+// interBaseDefinition here; B3c3 must wire the standalone production Definition
+// route before this test can claim host-to-host production coverage.
 func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 	server := newDefinitionServer(t)
 	cache := definitionCatalog()

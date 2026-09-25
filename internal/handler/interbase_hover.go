@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"strings"
-	"time"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
@@ -17,11 +16,6 @@ import (
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
 )
-
-// hoverDDLTimeout bounds the catalog round trip. textDocument/hover stays on
-// the inline dispatch path — Plan 1 moves only workspace/executeCommand off it
-// — so an unbounded catalog read would freeze the whole server.
-const hoverDDLTimeout = 3 * time.Second
 
 // hoverTarget is a catalog object the cursor is on.
 type hoverTarget struct {

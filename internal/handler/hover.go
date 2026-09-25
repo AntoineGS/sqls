@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/catalog"
@@ -14,6 +15,11 @@ import (
 )
 
 var ErrNoHover = errors.New("no hover information found")
+
+// hoverDDLTimeout bounds the optional detail wait on the inline LSP dispatch
+// path. Its production default preserves the existing three-second budget;
+// tests shorten it to cover the real handler path deterministically.
+var hoverDDLTimeout = 3 * time.Second
 
 func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
 	if req.Params == nil {
