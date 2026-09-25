@@ -589,7 +589,12 @@ func flowTriggerSymbols(text string, items []lexeme, trg triggerModel) ([]*Symbo
 		}
 		span := items[i].Span
 		symbol.Uses = append(symbol.Uses, span)
-		if i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.Eq || outputTarget {
+		// In embedded SQL, a colon-prefixed bind in an expression is an
+		// input/read even when the following SQL token is `=`. Only the
+		// recognizer's explicit INTO target position is a SQL write. The
+		// adjacent-`=` lvalue rule applies to procedural assignments only.
+		proceduralLValue := !ctx.inSQL[i-trg.bodyStart] && i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.Eq
+		if outputTarget || proceduralLValue {
 			symbol.Writes = append(symbol.Writes, span)
 		} else {
 			symbol.Reads = append(symbol.Reads, span)

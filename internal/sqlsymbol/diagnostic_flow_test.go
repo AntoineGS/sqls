@@ -361,6 +361,29 @@ func TestDiagnosticFlowTriggerSQLBindsReadOnlyBoundLocals(t *testing.T) {
 	requireFlowCount(t, flowDiagnostic(t, external, flowRulesOn), "interbase-read-before-assignment", 0)
 }
 
+// Regression for predicate host variables: `:V = 1` is a read, while the
+// INTO `:V` occurrence is a conditional write. The later V read must remain
+// reportable on SELECT's zero-row path.
+func TestDiagnosticFlowTriggerPredicateBindReadsBeforeConditionalIntoWrite(t *testing.T) {
+	source := `CREATE TRIGGER TR_T FOR T BEFORE UPDATE AS DECLARE VARIABLE V INTEGER; BEGIN SELECT ID FROM T WHERE :V = 1 INTO :V; V = V + 1; END`
+	findings := flowFindingsOf(flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment")
+	want := []int{strings.Index(source, ":V") + 1, strings.LastIndex(source, "V = V") + 4}
+	if len(findings) != len(want) {
+		t.Fatalf("read-before-assignment findings = %+v, want predicate bind and post-SELECT read at %v", findings, want)
+	}
+	for i, finding := range findings {
+		if finding.Span.Start != want[i] {
+			t.Errorf("finding[%d] span = %+v, want read span starting at %d", i, finding.Span, want[i])
+		}
+	}
+	intoTarget := strings.LastIndex(source, ":V") + 1
+	for _, finding := range findings {
+		if finding.Span.Start == intoTarget {
+			t.Fatalf("INTO target at %d was incorrectly diagnosed as a read: %+v", intoTarget, finding)
+		}
+	}
+}
+
 // Regression coverage for review spec gap: the exception handler recovers
 // from a SELECT INTO that may raise (for example, a singleton cardinality
 // error), so its affected assignment facts must remain unknown.
