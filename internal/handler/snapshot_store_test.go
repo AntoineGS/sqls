@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,8 @@ import (
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
 // newTestSnapshotStore builds a store rooted at a temporary directory with a
@@ -60,6 +63,49 @@ func TestSnapshotCandidatesHaveUniqueDirectoriesAndIsolatedCleanup(t *testing.T)
 	}
 	if got, err := os.ReadFile(second.path); err != nil || string(got) != "B source" {
 		t.Fatalf("other candidate after cleanup = %q, %v", got, err)
+	}
+}
+
+func TestSnapshotBannerSanitizesHostileFieldsAndPreservesBodyRange(t *testing.T) {
+	store := newTestSnapshotStore(t)
+	target := snapshotTarget{kind: database.ObjectKindProcedure, name: "P\r\nINJECT\nNAME", provenance: "native\r\nsource\n-- provenance"}
+	sc := testSnapshotContext()
+	sc.label = "connection\r\n-- label"
+	const note = "unsupported\r\nDDL\n-- note"
+	const body = "CREATE PROCEDURE P AS\r\nBEGIN\r\nEND"
+	content, bannerLines := renderSnapshot(target, sc, time.Date(2026, 9, 25, 1, 2, 3, 0, time.UTC), body, note)
+	lines := strings.Split(content, "\n")
+	if bannerLines < 1 || bannerLines > len(lines) {
+		t.Fatalf("bannerLines=%d for %d content lines", bannerLines, len(lines))
+	}
+	for i, line := range lines[:bannerLines] {
+		if !strings.HasPrefix(line, "-- ") {
+			t.Errorf("banner line %d escaped comment: %q", i, line)
+		}
+		if strings.ContainsRune(line, '\r') {
+			t.Errorf("banner line %d retains carriage return: %q", i, line)
+		}
+	}
+	bodyOffset := snapshotBodyOffset(content, bannerLines)
+	if got := content[bodyOffset:]; got != body+"\n" {
+		t.Fatalf("body changed during banner rendering: got %q want %q", got, body+"\n")
+	}
+	rng, ok := symbolRange(content, sqlsymbol.Span{Start: bodyOffset, End: bodyOffset + len("CREATE")})
+	if !ok || rng.Start != (lsp.Position{Line: bannerLines, Character: 0}) || rng.End != (lsp.Position{Line: bannerLines, Character: len("CREATE")}) {
+		t.Fatalf("body range=(%+v,%v), want first body token on line %d", rng, ok, bannerLines)
+	}
+	candidate, err := store.writeCandidate(sc, string(target.kind), target.name, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.remove()
+	if strings.ContainsAny(filepath.Base(candidate.path), "\r\n") {
+		t.Fatalf("snapshot basename contains newline: %q", filepath.Base(candidate.path))
+	}
+	u := snapshotURI(candidate.path)
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Scheme != "file" || strings.ContainsAny(u, "\r\n") {
+		t.Fatalf("snapshot URI=%q parsed=%v err=%v", u, parsed, err)
 	}
 }
 

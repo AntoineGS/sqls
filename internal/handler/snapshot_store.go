@@ -71,6 +71,9 @@ type sourceSnapshotStore struct {
 	created      map[string]struct{}
 	shuttingDown atomic.Bool
 	writeFile    func(string, []byte, os.FileMode) error
+	// afterCandidateWrite is a deterministic test seam for exercising races
+	// after the candidate is complete and the store lock has been released.
+	afterCandidateWrite func()
 }
 
 // snapshotCandidate is a uniquely named, unpublished filesystem result. Its

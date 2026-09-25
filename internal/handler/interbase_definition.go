@@ -162,23 +162,18 @@ func snapshotUnsupportedDDLNote(err error) string {
 		object, name, feature)
 }
 
-// singleLine collapses CR and LF into spaces. The connection label is the
-// user's own config alias rather than attacker-controlled data, so this is not
-// closing a live hole — it applies the same rule commentLines applies to the
-// driver's detail strings, so "nothing interpolated into the banner can end a
-// comment" is a property of renderSnapshot rather than a case-by-case argument.
-// It also keeps bannerLines honest: a multi-line label would make the count
-// wrong and push snapshotRange into the banner.
+// singleLine collapses every common SQL/editor line ending before interpolating
+// untrusted catalog/config text into one banner comment line.
 func singleLine(text string) string {
 	return strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(text)
 }
 
-// commentLines prefixes every line with "-- ". The detail strings it renders
-// come from the driver, so a newline in one must not be able to end the comment
-// and leave text that reads like SQL.
+// commentLines normalizes CRLF, lone CR and LF as line boundaries and prefixes
+// every resulting line, so untrusted notes cannot escape SQL line comments.
 func commentLines(text string) string {
 	var b strings.Builder
-	for _, line := range strings.Split(text, "\n") {
+	normalized := strings.NewReplacer("\r\n", "\n", "\r", "\n").Replace(text)
+	for _, line := range strings.Split(normalized, "\n") {
 		b.WriteString("-- ")
 		b.WriteString(line)
 		b.WriteByte('\n')
@@ -191,7 +186,7 @@ func commentLines(text string) string {
 func renderSnapshot(target snapshotTarget, sc snapshotContext, now time.Time, body, note string) (string, int) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- sqls: read-only snapshot of InterBase %s %q\n",
-		strings.ToUpper(string(target.kind)), target.name)
+		singleLine(strings.ToUpper(string(target.kind))), singleLine(target.name))
 	fmt.Fprintf(&b, "-- connection: %s    generated: %s\n",
 		singleLine(sc.label), now.UTC().Format(time.RFC3339))
 	b.WriteString("-- Editing this file does not change the database.\n")

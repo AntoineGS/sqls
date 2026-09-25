@@ -384,13 +384,11 @@ func TestProductionDefinitionRemovesOnlyStaleCandidate(t *testing.T) {
 	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, oldLease
 	writeEntered, writeRelease := make(chan struct{}), make(chan struct{})
 	var first atomic.Bool
-	s.snapshots.writeFile = func(path string, data []byte, mode os.FileMode) error {
-		err := os.WriteFile(path, data, mode)
-		if err == nil && first.CompareAndSwap(false, true) {
+	s.snapshots.afterCandidateWrite = func() {
+		if first.CompareAndSwap(false, true) {
 			close(writeEntered)
 			<-writeRelease
 		}
-		return err
 	}
 	type answer struct {
 		locations []lsp.Location
@@ -408,14 +406,14 @@ func TestProductionDefinitionRemovesOnlyStaleCandidate(t *testing.T) {
 	go func() { locations, err := invokeDefinition(s, text, 20); newAnswer <- answer{locations, err} }()
 	waitSignal(t, newProvider.entered, "candidate B detail")
 	close(newProvider.release)
+	new := <-newAnswer
+	if new.err != nil || len(new.locations) != 1 {
+		t.Fatalf("B result=(%#v,%v), want one location", new.locations, new.err)
+	}
 	close(writeRelease)
 	old := <-oldAnswer
 	if old.err != nil || len(old.locations) != 0 {
 		t.Fatalf("A result=(%#v,%v), want no location", old.locations, old.err)
-	}
-	new := <-newAnswer
-	if new.err != nil || len(new.locations) != 1 {
-		t.Fatalf("B result=(%#v,%v), want one location", new.locations, new.err)
 	}
 	content, err := os.ReadFile(snapshotPathFromURI(t, new.locations[0].URI))
 	if err != nil || !strings.Contains(string(content), "/* B */") {

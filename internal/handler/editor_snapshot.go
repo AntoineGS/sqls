@@ -133,6 +133,9 @@ func (s *Server) publishDefinitionCandidate(ctx context.Context, captured editor
 	if err != nil {
 		return "", false, err
 	}
+	if afterWrite := s.snapshots.afterCandidateWrite; afterWrite != nil {
+		afterWrite()
+	}
 	s.stateMu.RLock()
 	current, captureErr := s.captureEditorSnapshotLocked(captured.URI)
 	valid := ctx.Err() == nil && captureErr == nil &&
