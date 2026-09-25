@@ -230,6 +230,7 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
 		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment,
 		codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable,
+		codeNullableAssignment, codeNullableNotIn, codeOuterJoinFilter,
 	}
 	for _, code := range codes {
 		if _, ok := diagnosticRegistry[code]; !ok {
@@ -238,5 +239,16 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 	}
 	if len(diagnosticRegistry) != len(codes) {
 		t.Errorf("diagnosticRegistry has %d entries, want exactly %d known codes (found an extra or stale entry)", len(diagnosticRegistry), len(codes))
+	}
+}
+
+func TestDiagnosticQueryLogicRulesDefaultOff(t *testing.T) {
+	for _, code := range []string{codeNullableAssignment, codeNullableNotIn, codeOuterJoinFilter} {
+		if !(DiagnosticOptions{}).off(code) {
+			t.Errorf("%s is enabled by default; query-logic advisories must be opt-in", code)
+		}
+		if (DiagnosticOptions{Rules: map[string]string{code: "warning"}}).off(code) {
+			t.Errorf("explicit warning override did not enable %s", code)
+		}
 	}
 }

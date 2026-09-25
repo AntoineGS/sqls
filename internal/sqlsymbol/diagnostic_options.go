@@ -28,6 +28,9 @@ var diagnosticRegistry = map[string]int{
 	codeOutputNotAssigned:    2,
 	codeDeadStore:            4,
 	codeUnreachable:          4,
+	codeNullableAssignment:   2,
+	codeNullableNotIn:        2,
+	codeOuterJoinFilter:      2,
 }
 
 // diagnosticDefaultOff lists every registered code whose default level (an
@@ -43,6 +46,9 @@ var diagnosticDefaultOff = map[string]bool{
 	codeOutputNotAssigned:    true,
 	codeDeadStore:            true,
 	codeUnreachable:          true,
+	codeNullableAssignment:   true,
+	codeNullableNotIn:        true,
+	codeOuterJoinFilter:      true,
 }
 
 // diagnosticLevelSeverity maps every level that overrides a finding's
@@ -186,7 +192,8 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 	if options.anyOn(codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable,
 		codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
-		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment) {
+		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment,
+		codeNullableAssignment, codeNullableNotIn, codeOuterJoinFilter) {
 		m := a.diagnosticModel(c)
 		if options.anyOn(codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable) {
 			findings = append(findings, applyDiagnosticOptions(m.flowFindings(options), options)...)
@@ -205,6 +212,9 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 		}
 		if options.anyOn(codeLossyAssignment) {
 			findings = append(findings, applyDiagnosticOptions(m.lossyAssignmentFindings(), options)...)
+		}
+		if options.anyOn(codeNullableAssignment, codeNullableNotIn, codeOuterJoinFilter) {
+			findings = append(findings, applyDiagnosticOptions(m.queryLogicFindings(options), options)...)
 		}
 	}
 	return findings

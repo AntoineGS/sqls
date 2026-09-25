@@ -35,6 +35,9 @@ absent or set to `default`.
 | `interbase-output-not-assigned` | `off` | A procedure output reaches `SUSPEND`, `EXIT`, or procedure completion on a modeled path without an explicit assignment. This does not assert that the value is necessarily `NULL`; a prior output value can be carried across `SUSPEND`. |
 | `interbase-dead-store` | `off` | A modeled assignment is overwritten before its value is read or, for procedure outputs, observed at `SUSPEND`/exit. Reports only within reachable, supported basic-block paths, including independently modeled branch and loop bodies; proofs are not carried across joins or loop back-edges. |
 | `interbase-unreachable` | `off` | A statement follows an unconditional `EXIT` on every modeled incoming path. |
+| `interbase-nullable-assignment` | `off` | A possibly NULL source flows into a catalog-proven `NOT NULL` database column. This is a risk advisory, not a prediction of engine rejection: defaults, triggers, or other engine-side logic may supply or change the value. Unknown or stale nullability metadata suppresses the finding. |
+| `interbase-nullable-not-in` | `off` | A supported `NOT IN` subquery projects a possibly NULL value, so the predicate can evaluate to `UNKNOWN` and filter rows unexpectedly. A same-subquery `IS NOT NULL` refinement suppresses the warning. |
+| `interbase-outer-join-filter` | `off` | A supported null-rejecting `WHERE` predicate filters the NULL-extended rows from a simple `LEFT [OUTER] JOIN`, which may make it behave like an inner join. This can be intentional. |
 
 Procedural-flow rules are opt-in and deliberately conservative. Supported
 `BEGIN`/`END`, assignment, `IF`/`ELSE`, `WHILE`, `FOR SELECT`, `EXIT`, and
@@ -44,6 +47,16 @@ flow facts; malformed or over-budget procedures produce no flow conclusions.
 Exception handlers are treated as unknown-effect edges until their semantics
 are modeled. Diagnostics use only source/binding facts and perform no database
 I/O.
+
+The three query NULL-logic advisories are also opt-in. Their analysis is
+limited to recognized simple query shapes: complex or multiple joins,
+derived/callable sources, correlated subqueries, ambiguous ownership, and
+unsupported predicate compositions remain silent. `OR`, `COALESCE`, and
+`CASE` are not assumed null-rejecting. The usual `LEFT JOIN ... WHERE
+right_column IS NULL` anti-join is not warned about. A right-side primary key
+can be structurally NULL after an outer join even when its base catalog column
+is `NOT NULL`; this query-local fact does not change the column's catalog
+nullability or expression facts used elsewhere.
 
 Every check withholds a finding rather than guessing: a code is reported
 only when the relevant catalog metadata has finished loading and proves the
