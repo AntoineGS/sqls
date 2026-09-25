@@ -185,7 +185,12 @@ func (l *Lease) Invalidate() error {
 // publishing a new metadata generation with Stale false, and advances the
 // detail store to that same generation: any detail load still in flight for
 // the superseded generation is canceled and its eventual result discarded.
-// It does not create a new provider or a new Incarnation.
+// It does not create a new provider or a new Incarnation. Reset unconditionally
+// replaces the published snapshot with an empty one for the new generation
+// before Start ever runs, so a failed Start leaves no prior data to fall
+// back to; on failure Refresh marks that empty generation StartFailed (the
+// same signal a failed initial creation publishes) so callers reading
+// Snapshot() can distinguish "refresh failed" from "never attempted".
 func (l *Lease) Refresh(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -205,8 +210,11 @@ func (l *Lease) Refresh(ctx context.Context) error {
 	generation := loader.Snapshot().Generation + 1
 	l.track.details.beginGeneration(generation)
 	loader.Reset(generation)
-	_, err := loader.Start(l.track.ctx, generation, provider.Plan())
-	return err
+	if _, err := loader.Start(l.track.ctx, generation, provider.Plan()); err != nil {
+		_ = loader.MarkStartFailed(generation)
+		return err
+	}
+	return nil
 }
 
 // Subscribe returns a Subscription delivering coalesced change events for

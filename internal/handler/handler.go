@@ -82,10 +82,14 @@ type Server struct {
 	// starts at 1 and only advances on an explicit Lease.Refresh, and is
 	// identical across every consumer sharing that store. metaBoundGeneration
 	// records the connGeneration value that was active at the moment
-	// metaLease was last (re)assigned via a successful Registry.Acquire — set
-	// once per Acquire, deliberately NOT touched by Refresh (a refresh is not
-	// a reconnect). Comparing s.connGeneration == s.metaBoundGeneration is
-	// the connection-identity fence every editor-snapshot/diagnostics
+	// bindMetadata last completed a successful bind for metaLease — set on
+	// BOTH the Acquire branch and the explicit-Refresh branch (Ruling R10,
+	// superseding R9's original text): attachIntent unconditionally
+	// increments connGeneration on every intent, including an explicit
+	// same-target reselect, so a Refresh that left metaBoundGeneration
+	// untouched would immediately fail the fence below until the next
+	// unrelated reconnect. Comparing s.connGeneration == s.metaBoundGeneration
+	// is the connection-identity fence every editor-snapshot/diagnostics
 	// publication site uses in place of the old fused generation-equality
 	// check. All fields here are guarded by stateMu, like every other
 	// connection-identity field.
@@ -687,11 +691,10 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 }
 
 // resolveMetadataTarget derives the shared-metadata Key/Scope/Factory for
-// intent's config and freshly-opened connection. Tests inject a deterministic
-// target via metadataFactoryOverride instead of the production dispatch
-// (InterBase via ibmeta, every other driver via the generic adapter — see
-// metadataTargetFor).
-func (s *Server) resolveMetadataTarget(cfg *database.DBConfig, conn *database.DBConnection) (metadata.Key, metadata.Scope, metadata.Factory, error) {
+// cfg. Tests inject a deterministic target via metadataFactoryOverride
+// instead of the production dispatch (InterBase via ibmeta, every other
+// driver via the generic adapter — see metadataTargetFor).
+func (s *Server) resolveMetadataTarget(cfg *database.DBConfig) (metadata.Key, metadata.Scope, metadata.Factory, error) {
 	s.stateMu.RLock()
 	override := s.metadataFactoryOverride
 	s.stateMu.RUnlock()
@@ -700,7 +703,17 @@ func (s *Server) resolveMetadataTarget(cfg *database.DBConfig, conn *database.DB
 			return key, scope, factory, nil
 		}
 	}
-	return metadataTargetFor(cfg, conn)
+	return metadataTargetFor(cfg, s.liveConnection)
+}
+
+// liveConnection returns the server's current query connection. It is safe
+// to call at any time, including from inside a metadata Provider's Plan() —
+// which may run well after the connection that was live when its Factory ran
+// has been superseded and closed (see genericMetadataTarget's doc comment).
+func (s *Server) liveConnection() *database.DBConnection {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.dbConn
 }
 
 // bindMetadata acquires or refreshes the shared metadata store for intent's
@@ -725,9 +738,14 @@ func (s *Server) resolveMetadataTarget(cfg *database.DBConfig, conn *database.DB
 // what the existing lease serves; it never reassigns s.metaLease itself, so
 // metaBoundGeneration is advanced by this function's own code on both
 // branches (Refresh does not and cannot do this itself — it has no access to
-// Server state), never implicitly "by" the Refresh call.
+// Server state) — including when Refresh itself fails (Ruling R10): binding
+// metaBoundGeneration to generation regardless of the Refresh outcome keeps
+// every fencing site correctly reporting THIS connection's metadata state
+// (Lease.Refresh marks the lease's snapshot StartFailed on a failed refresh,
+// which metadataStatus already surfaces as Degraded) instead of looking
+// identical to "metadata never attempted for this connection".
 func (s *Server) bindMetadata(ctx context.Context, intent *connectionIntent, candidate *database.DBConnection, generation int) {
-	key, scope, factory, err := s.resolveMetadataTarget(intent.Config, candidate)
+	key, scope, factory, err := s.resolveMetadataTarget(intent.Config)
 	if err != nil {
 		s.recordMetadataAcquireFailure(generation, err)
 		return
@@ -739,16 +757,16 @@ func (s *Server) bindMetadata(ctx context.Context, intent *connectionIntent, can
 	s.stateMu.RUnlock()
 
 	if intent.explicit && sameTarget {
-		if err := lease.Refresh(ctx); err != nil {
-			s.recordMetadataStartFailure(generation, err)
-			return
-		}
+		refreshErr := lease.Refresh(ctx)
 		s.stateMu.Lock()
 		if s.connGeneration == generation && s.connectionState == connectionReady && s.metaLease == lease {
 			s.metaBoundGeneration = generation
-			s.metadataStartErr = nil
+			s.metadataStartErr = refreshErr
 		}
 		s.stateMu.Unlock()
+		if refreshErr != nil {
+			log.Printf("sqls: metadata refresh failed for generation %d: %v", generation, refreshErr)
+		}
 		return
 	}
 
@@ -797,15 +815,6 @@ func (s *Server) bindMetadata(ctx context.Context, intent *connectionIntent, can
 	}
 
 	go s.watchMetadataEvents(sub)
-}
-
-func (s *Server) recordMetadataStartFailure(generation int, err error) {
-	s.stateMu.Lock()
-	if s.connGeneration == generation && s.connectionState == connectionReady {
-		s.metadataStartErr = err
-	}
-	s.stateMu.Unlock()
-	log.Printf("sqls: metadata start failed for generation %d: %v", generation, err)
 }
 
 // recordMetadataAcquireFailure handles a failed Registry.Acquire for a
