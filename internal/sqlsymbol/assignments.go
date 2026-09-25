@@ -14,6 +14,18 @@ type widthDestination struct {
 	label    string
 }
 
+// assignmentEdge pairs one source expression's own lexemes with the
+// destination it is proven to be written into. It is the shared pairing
+// result both widthDiagnostics (string-truncation) and diagnostic_assignments.go
+// (proven-invalid-assignment) consume, so the shape validation that proves
+// ownership -- matching an UPDATE/INSERT/SELECT-INTO target list against
+// its source list, or a procedure local's write occurrence -- is parsed
+// once, not once per rule.
+type assignmentEdge struct {
+	source      []lexeme
+	destination widthDestination
+}
+
 // widthDiagnostics pairs only source and destination expressions whose
 // ownership is proven by the procedure binder or explicit SQL target lists.
 func (a *Analysis) widthDiagnostics(c Catalog) []Finding {
@@ -22,27 +34,38 @@ func (a *Analysis) widthDiagnostics(c Catalog) []Finding {
 	}
 	items := significantLexemes(a.lexemes)
 	findings := make([]Finding, 0)
-	findings = append(findings, a.procedureAssignmentFindings(items, c)...)
-	findings = append(findings, a.updateFindings(items, c)...)
-	findings = append(findings, a.insertFindings(items, c)...)
-	findings = append(findings, a.selectIntoFindings(items, c)...)
+	for _, edge := range a.assignmentEdges(items, c) {
+		findings = append(findings, a.findingForDestination(edge.source, edge.destination, c)...)
+	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		return findings[i].Span.Start < findings[j].Span.Start
 	})
 	return findings
 }
 
-func (a *Analysis) procedureAssignmentFindings(items []lexeme, c Catalog) []Finding {
+// assignmentEdges enumerates every source/destination edge whose ownership
+// is proven across the four contexts a plain SQL/procedure binder can
+// establish without catalog-driven procedure or trigger discovery:
+// procedure locals, UPDATE ... SET, INSERT ... VALUES/SELECT, and SELECT
+// ... INTO. EXECUTE PROCEDURE input/output pairing and trigger NEW field
+// writes are additional contexts only diagnostic_assignments.go's
+// assignmentFindings needs, so they are not enumerated here.
+func (a *Analysis) assignmentEdges(items []lexeme, c Catalog) []assignmentEdge {
+	edges := make([]assignmentEdge, 0)
+	edges = append(edges, a.procedureAssignmentEdges(items)...)
+	edges = append(edges, a.updateEdges(items, c)...)
+	edges = append(edges, a.insertEdges(items, c)...)
+	edges = append(edges, a.selectIntoEdges(items)...)
+	return edges
+}
+
+func (a *Analysis) procedureAssignmentEdges(items []lexeme) []assignmentEdge {
 	indices := make(map[Span]int, len(items))
 	for i, item := range items {
 		indices[item.Span] = i
 	}
-	var findings []Finding
+	var edges []assignmentEdge
 	for _, symbol := range a.Symbols {
-		destinationWidth, known := stringTypeWidth(symbol.Type)
-		if !known {
-			continue
-		}
 		for _, write := range symbol.Writes {
 			index, ok := indices[write]
 			if !ok || index+2 >= len(items) || items[index+1].Token.Kind != token.Eq {
@@ -52,20 +75,22 @@ func (a *Analysis) procedureAssignmentFindings(items []lexeme, c Catalog) []Find
 			if !complete || end == index+2 || !balancedExpression(items[index+2:end]) {
 				continue
 			}
-			source := items[index+2 : end]
-			sourceWidth, known := a.expressionWidth(source, c)
-			if !known || sourceWidth <= destinationWidth {
-				continue
-			}
-			findings = append(findings, a.widthFinding(source, write, symbol.Name.Text, sourceWidth, destinationWidth))
+			edges = append(edges, assignmentEdge{
+				source: items[index+2 : end],
+				destination: widthDestination{
+					span:     write,
+					typeName: symbol.Type,
+					label:    symbol.Name.Text,
+				},
+			})
 		}
 	}
-	return findings
+	return edges
 }
 
-func (a *Analysis) updateFindings(items []lexeme, c Catalog) []Finding {
+func (a *Analysis) updateEdges(items []lexeme, c Catalog) []assignmentEdge {
 	depths, matching := statementSQLDepths(items)
-	var findings []Finding
+	var edges []assignmentEdge
 	for i, item := range items {
 		if !isWord(item, "UPDATE") || !a.inSQLContext(i) {
 			continue
@@ -106,19 +131,16 @@ func (a *Analysis) updateFindings(items []lexeme, c Catalog) []Finding {
 		if !ok || !completeAssignmentList(a.Text, assignments) || !completeSelectTail(a.Text, items[setEnd:end]) {
 			continue
 		}
-		statementFindings := make([]Finding, 0)
 		for _, assignment := range assignments {
 			eq := topLevelTokenIndex(assignment, token.Eq)
 			destination, ok := updateDestination(a.Text, assignment[:eq], target, c)
 			if !ok {
 				continue
 			}
-			statementFindings = append(statementFindings, a.findingForDestination(assignment[eq+1:], destination, c)...)
+			edges = append(edges, assignmentEdge{source: assignment[eq+1:], destination: destination})
 		}
-		findings = append(findings, statementFindings...)
-		i = end
 	}
-	return findings
+	return edges
 }
 
 func updateDestination(text string, items []lexeme, target RelationRef, c Catalog) (widthDestination, bool) {
@@ -157,9 +179,9 @@ func updateDestination(text string, items []lexeme, target RelationRef, c Catalo
 	}, true
 }
 
-func (a *Analysis) insertFindings(items []lexeme, c Catalog) []Finding {
+func (a *Analysis) insertEdges(items []lexeme, c Catalog) []assignmentEdge {
 	depths, matching := statementSQLDepths(items)
-	var findings []Finding
+	var edges []assignmentEdge
 	for i, item := range items {
 		if !isWord(item, "INSERT") || !a.inSQLContext(i) || depths[i] != 0 {
 			continue
@@ -168,16 +190,15 @@ func (a *Analysis) insertFindings(items []lexeme, c Catalog) []Finding {
 		if !complete {
 			continue
 		}
-		insertFindings, ok := a.parseInsert(items, i, end, depths, matching, c)
+		insertEdges, ok := a.parseInsertEdges(items, i, end, depths, matching, c)
 		if ok {
-			findings = append(findings, insertFindings...)
+			edges = append(edges, insertEdges...)
 		}
-		i = end
 	}
-	return findings
+	return edges
 }
 
-func (a *Analysis) parseInsert(items []lexeme, start, end int, depths []int, matching map[int]int, c Catalog) ([]Finding, bool) {
+func (a *Analysis) parseInsertEdges(items []lexeme, start, end int, depths []int, matching map[int]int, c Catalog) ([]assignmentEdge, bool) {
 	if start+2 >= end || !isWord(items[start+1], "INTO") {
 		return nil, false
 	}
@@ -221,17 +242,17 @@ func (a *Analysis) parseInsert(items []lexeme, start, end int, depths []int, mat
 	}
 	switch {
 	case isWord(items[afterColumns], "VALUES"):
-		return a.insertValuesFindings(items, afterColumns+1, end, columns, c)
+		return a.insertValuesEdges(items, afterColumns+1, end, columns)
 	case isWord(items[afterColumns], "SELECT"):
-		return a.insertSelectFindings(items, afterColumns, end, columns, c)
+		return a.insertSelectEdges(items, afterColumns, end, columns)
 	default:
 		return nil, false
 	}
 }
 
-func (a *Analysis) insertValuesFindings(items []lexeme, start, end int, columns []widthDestination, c Catalog) ([]Finding, bool) {
+func (a *Analysis) insertValuesEdges(items []lexeme, start, end int, columns []widthDestination) ([]assignmentEdge, bool) {
 	cursor := start
-	var findings []Finding
+	var edges []assignmentEdge
 	for cursor < end {
 		if items[cursor].Token.Kind != token.LParen {
 			return nil, false
@@ -245,11 +266,11 @@ func (a *Analysis) insertValuesFindings(items []lexeme, start, end int, columns 
 			return nil, false
 		}
 		for i, value := range parts {
-			findings = append(findings, a.findingForDestination(value, columns[i], c)...)
+			edges = append(edges, assignmentEdge{source: value, destination: columns[i]})
 		}
 		cursor = next
 		if cursor == end {
-			return findings, true
+			return edges, true
 		}
 		if items[cursor].Token.Kind != token.Comma || cursor+1 >= end {
 			return nil, false
@@ -259,7 +280,7 @@ func (a *Analysis) insertValuesFindings(items []lexeme, start, end int, columns 
 	return nil, false
 }
 
-func (a *Analysis) insertSelectFindings(items []lexeme, selectIndex, end int, columns []widthDestination, c Catalog) ([]Finding, bool) {
+func (a *Analysis) insertSelectEdges(items []lexeme, selectIndex, end int, columns []widthDestination) ([]assignmentEdge, bool) {
 	fromRelative := topLevelWordIndex(items[selectIndex+1:end], "FROM")
 	if fromRelative <= 0 {
 		return nil, false
@@ -275,17 +296,17 @@ func (a *Analysis) insertSelectFindings(items []lexeme, selectIndex, end int, co
 	if !ok || len(projections) != len(columns) {
 		return nil, false
 	}
-	var findings []Finding
+	var edges []assignmentEdge
 	for i, projection := range projections {
 		destination := columns[i]
 		destination.span = Span{Start: projection[0].Span.Start, End: projection[len(projection)-1].Span.End}
-		findings = append(findings, a.findingForDestination(projection, destination, c)...)
+		edges = append(edges, assignmentEdge{source: projection, destination: destination})
 	}
-	return findings, true
+	return edges, true
 }
 
-func (a *Analysis) selectIntoFindings(items []lexeme, c Catalog) []Finding {
-	var findings []Finding
+func (a *Analysis) selectIntoEdges(items []lexeme) []assignmentEdge {
+	var edges []assignmentEdge
 	for i, item := range items {
 		if !isWord(item, "SELECT") || !a.inSQLContext(i) {
 			continue
@@ -294,15 +315,15 @@ func (a *Analysis) selectIntoFindings(items []lexeme, c Catalog) []Finding {
 		if !complete {
 			continue
 		}
-		selectFindings, ok := a.parseSelectInto(items, i, end, c)
+		selectEdges, ok := a.parseSelectIntoEdges(items, i, end)
 		if ok {
-			findings = append(findings, selectFindings...)
+			edges = append(edges, selectEdges...)
 		}
 	}
-	return findings
+	return edges
 }
 
-func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catalog) ([]Finding, bool) {
+func (a *Analysis) parseSelectIntoEdges(items []lexeme, selectIndex, end int) ([]assignmentEdge, bool) {
 	intoRelative := topLevelWordIndex(items[selectIndex+1:end], "INTO")
 	if intoRelative <= 0 {
 		return nil, false
@@ -327,7 +348,7 @@ func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catal
 	if !ok || len(projections) != len(targets) {
 		return nil, false
 	}
-	destinations := make([]widthDestination, len(targets))
+	var edges []assignmentEdge
 	for i, target := range targets {
 		nameIndex := 0
 		if len(target) == 2 && target[0].Token.Kind == token.Colon {
@@ -342,17 +363,14 @@ func (a *Analysis) parseSelectInto(items []lexeme, selectIndex, end int, c Catal
 		if resolution.Role != Local || resolution.Symbol == nil {
 			continue
 		}
-		destinations[i] = widthDestination{
+		destination := widthDestination{
 			span:     resolution.Span,
 			typeName: resolution.Symbol.Type,
 			label:    resolution.Symbol.Name.Text,
 		}
+		edges = append(edges, assignmentEdge{source: projections[i], destination: destination})
 	}
-	var findings []Finding
-	for i, projection := range projections {
-		findings = append(findings, a.findingForDestination(projection, destinations[i], c)...)
-	}
-	return findings, true
+	return edges, true
 }
 
 func (a *Analysis) findingForDestination(source []lexeme, destination widthDestination, c Catalog) []Finding {

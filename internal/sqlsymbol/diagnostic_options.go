@@ -20,6 +20,7 @@ var diagnosticRegistry = map[string]int{
 	codeAmbiguousColumn:      1,
 	codeTargetCount:          1,
 	codeProcedureArity:       1,
+	codeInvalidAssignment:    1,
 }
 
 // diagnosticLevelSeverity maps every level that overrides a finding's
@@ -151,7 +152,7 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 	}
 	if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
-		codeTargetCount, codeProcedureArity) {
+		codeTargetCount, codeProcedureArity, codeInvalidAssignment) {
 		m := a.diagnosticModel(c)
 		if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration) {
 			findings = append(findings, applyDiagnosticOptions(m.localFindings(), options)...)
@@ -161,6 +162,9 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 		}
 		if options.anyOn(codeTargetCount, codeProcedureArity) {
 			findings = append(findings, applyDiagnosticOptions(m.shapeFindings(), options)...)
+		}
+		if options.anyOn(codeInvalidAssignment) {
+			findings = append(findings, applyDiagnosticOptions(m.assignmentFindings(), options)...)
 		}
 	}
 	return findings

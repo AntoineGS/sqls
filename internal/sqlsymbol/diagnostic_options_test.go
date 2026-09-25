@@ -100,12 +100,13 @@ func TestDiagnosticsWithOptionsSkipsWidthAndSingletonComputationWhenOff(t *testi
 	}
 	catalog := &callCountingCatalog{diagnosticFixtureCatalog: newDiagnosticFixtureCatalog()}
 	options := DiagnosticOptions{Rules: map[string]string{
-		codeStringTruncation: "off",
-		codeSingletonSelect:  "off",
+		codeStringTruncation:  "off",
+		codeSingletonSelect:   "off",
+		codeInvalidAssignment: "off",
 	}}
 	a.DiagnosticsWithOptions(catalog, options)
 	if catalog.columnsCalls != 0 {
-		t.Errorf("Columns() called %d times, want 0 while interbase-string-truncation is off", catalog.columnsCalls)
+		t.Errorf("Columns() called %d times, want 0 while interbase-string-truncation and interbase-invalid-assignment are off", catalog.columnsCalls)
 	}
 	if catalog.uniqueKeysCalls != 0 {
 		t.Errorf("UniqueKeys() called %d times, want 0 while interbase-singleton-select is off", catalog.uniqueKeysCalls)
@@ -223,7 +224,7 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 		codeUnused, codeStringTruncation, codeSingletonSelect, codeNullComparison,
 		codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
-		codeTargetCount, codeProcedureArity,
+		codeTargetCount, codeProcedureArity, codeInvalidAssignment,
 	}
 	for _, code := range codes {
 		if _, ok := diagnosticRegistry[code]; !ok {
