@@ -2,12 +2,10 @@ package language
 
 import (
 	"context"
-	"errors"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/catalog"
-	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -30,7 +28,7 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 	if ctx.Err() != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
-	target, selectedRange, ok, err := relationAt(req, position)
+	target, selectedRange, ok, err := navigationTargetAt(req, position)
 	if err != nil {
 		return Result[Hover]{}, err
 	}
@@ -40,23 +38,35 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 		}
 		return result, nil
 	}
-	detail, err := req.Context.Details.Detail(ctx, metadata.Request{Object: target, Facet: "ddl", Dialect: req.Context.Variant.Variant.InterBaseSQLDialect(), Consistency: metadata.Committed})
+	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
 	if err != nil {
-		if ctx.Err() != nil {
-			return Result[Hover]{}, ErrCanceled
-		}
-		if errors.Is(err, metadata.ErrUnsupported) {
-			if cacheErr != nil {
-				return Result[Hover]{}, cacheErr
-			}
-			return result, nil
-		}
 		return Result[Hover]{}, err
 	}
 	if ctx.Err() != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
-	markdown := "```sql\n" + detail.Text + "\n```"
+	markdown := ""
+	if available && detail.source != nil {
+		if !detail.executable {
+			if detail.source.Provenance == "catalog-description" {
+				markdown = "_Informational catalog description; not executable DDL._"
+			} else {
+				markdown = "_Verbatim catalog source._"
+			}
+		}
+		if detail.source.Note != "" {
+			markdown += "\n\n" + detail.source.Note
+		}
+		markdown += "\n\n```sql\n" + detail.source.Text + "\n```"
+	} else if detail.unsupported {
+		markdown = "_DDL unavailable._"
+	}
+	if markdown == "" {
+		if cacheErr != nil {
+			return Result[Hover]{}, cacheErr
+		}
+		return result, nil
+	}
 	if cacheErr == nil && result.Value.Markdown != "" {
 		markdown = result.Value.Markdown + "\n\n" + markdown
 	}

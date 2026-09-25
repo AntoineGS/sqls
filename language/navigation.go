@@ -2,7 +2,6 @@ package language
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"unicode/utf8"
 
@@ -11,7 +10,6 @@ import (
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
-	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -53,29 +51,17 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	if !ok {
 		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
 	}
-	if req.Context.Details == nil {
-		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
-	}
-	detail, err := req.Context.Details.Detail(ctx, metadata.Request{Object: target, Facet: "ddl", Dialect: req.Context.Variant.Variant.InterBaseSQLDialect(), Consistency: metadata.Committed})
+	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
 	if err != nil {
-		if errors.Is(err, metadata.ErrUnsupported) {
-			return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
-		}
-		if ctx.Err() != nil {
-			return Result[[]Location]{}, ErrCanceled
-		}
 		return Result[[]Location]{}, err
 	}
 	if err := ctx.Err(); err != nil {
 		return Result[[]Location]{}, ErrCanceled
 	}
-	source := &Source{Object: detail.Object, Text: detail.Text, Provenance: detail.Provenance}
-	// Detail currently materializes database source but does not locate the
-	// selected symbol in that body. Keep the source available for the host,
-	// and leave Range zero rather than presenting a query-relative cursor span
-	// as if it were a range in the returned source. B3b owns body-relative
-	// source target resolution.
-	return Result[[]Location]{Value: []Location{{Source: source}}, Stamp: stampFor(req)}, nil
+	if !available || detail.source == nil {
+		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
+	}
+	return Result[[]Location]{Value: []Location{{Range: detail.range_, Source: detail.source}}, Stamp: stampFor(req)}, nil
 }
 
 // References returns local relation-name references in the document.

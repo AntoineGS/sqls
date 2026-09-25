@@ -191,6 +191,10 @@ type Source struct {
 	Object     catalog.ObjectID
 	Text       string
 	Provenance string
+	// Note explains a non-executable fallback such as native catalog source
+	// selected because DDL was unavailable, or an informational description.
+	// It is empty for executable DDL.
+	Note string
 }
 
 // Location is a navigation target. Source is non-nil when the location

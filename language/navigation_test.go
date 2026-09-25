@@ -2,15 +2,296 @@ package language_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
 	"github.com/sqls-server/sqls/metadata/metadatatest"
 )
+
+type detailResult struct {
+	detail metadata.Detail
+	err    error
+}
+
+type facetDetails struct {
+	results map[string]detailResult
+	calls   []metadata.Request
+}
+
+type structuredUnsupportedDDL struct{}
+
+func (structuredUnsupportedDDL) Error() string { return "unsupported" }
+func (structuredUnsupportedDDL) Unwrap() error { return database.ErrUnsupportedDDL }
+func (structuredUnsupportedDDL) UnsupportedDDLDetail() (string, string, string) {
+	return "procedure", "DUP", "parameter nullability"
+}
+
+type cancelingDetails struct{ cancel context.CancelFunc }
+
+func (d cancelingDetails) Detail(context.Context, metadata.Request) (metadata.Detail, error) {
+	d.cancel()
+	return metadata.Detail{}, database.ErrUnsupportedDDL
+}
+
+func (d *facetDetails) Detail(_ context.Context, req metadata.Request) (metadata.Detail, error) {
+	d.calls = append(d.calls, req)
+	result, ok := d.results[req.Facet]
+	if !ok {
+		return metadata.Detail{}, metadata.ErrUnsupported
+	}
+	return result.detail, result.err
+}
+
+func facetNavigationRequest(text string, details *facetDetails) language.Request {
+	req := navigationRequest(text, readyNavigationCache())
+	req.Context.Details = details
+	return req
+}
+
+func detailLocation(t *testing.T, req language.Request, marker string) language.Location {
+	t.Helper()
+	offset := strings.LastIndex(req.Document.Text, marker)
+	if offset < 0 {
+		t.Fatalf("marker %q absent from %q", marker, req.Document.Text)
+	}
+	position, err := language.PositionAt(req.Document.Text, offset)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := language.NewService().Definition(context.Background(), req, position)
+	if err != nil {
+		t.Fatalf("Definition: %v", err)
+	}
+	if len(result.Value) == 0 {
+		return language.Location{}
+	}
+	if len(result.Value) != 1 {
+		t.Fatalf("Definition locations = %#v, want one", result.Value)
+	}
+	return result.Value[0]
+}
+
+func spanOf(body, name string) catalog.DescriptionSpan {
+	start := strings.LastIndex(body, name)
+	return catalog.DescriptionSpan{Start: start, End: start + len(name)}
+}
+
+func TestDefinitionUsesDDLAndBodyRelativeUTF16Range(t *testing.T) {
+	body := "-- 😀\r\nCREATE TABLE T (ID INTEGER)"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Text: body, Provenance: "generated-ddl",
+	}}}}
+	req := facetNavigationRequest("SELECT * FROM T", details)
+	location := detailLocation(t, req, "T")
+	if location.Source == nil || location.Source.Text != body || location.Source.Provenance != "generated-ddl" {
+		t.Fatalf("source = %#v, want generated DDL body", location.Source)
+	}
+	position, err := language.PositionAt(body, strings.Index(body, "T ("))
+	if err != nil {
+		t.Fatal(err)
+	}
+	end, err := language.PositionAt(body, strings.Index(body, "T (")+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Range.Start != position || location.Range.End != end {
+		t.Fatalf("DDL body range = %#v, want table declaration span %#v..%#v", location.Range, position, end)
+	}
+	if len(details.calls) != 1 || details.calls[0].Facet != "ddl" {
+		t.Fatalf("detail calls = %#v, want only DDL", details.calls)
+	}
+}
+
+func TestDefinitionUsesNameRangeForExecutableViewDDL(t *testing.T) {
+	body := "CREATE VIEW DUP AS SELECT 1 FROM RDB$DATABASE"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: body, Provenance: "interbase:view-ddl",
+	}}}}
+	req := facetNavigationRequest("SELECT * FROM DUP", details)
+	location := detailLocation(t, req, "DUP")
+	if location.Source == nil || location.Source.Provenance != "interbase:view-ddl" {
+		t.Fatalf("view DDL source = %#v, want executable view DDL", location.Source)
+	}
+	want, err := language.PositionAt(body, strings.Index(body, "DUP"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Range.Start != want || location.Range.End != want {
+		t.Fatalf("view DDL range = %#v, want name point %#v", location.Range, want)
+	}
+}
+
+func TestDefinitionUsesNativeSourceOnlyAfterUnsupportedDDL(t *testing.T) {
+	text := "EXECUTE PROCEDURE DUP"
+	body := "CREATE PROCEDURE DUP AS BEGIN END"
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":    {err: structuredUnsupportedDDL{}},
+		"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: body, Provenance: "interbase:procedure-source"}},
+	}}
+	req := facetNavigationRequest(text, details)
+	location := detailLocation(t, req, "DUP")
+	if location.Source == nil || location.Source.Provenance != "interbase:procedure-source" || location.Source.Text != body {
+		t.Fatalf("source = %#v, want native procedure source", location.Source)
+	}
+	if !strings.Contains(location.Source.Note, `procedure "DUP": parameter nullability`) {
+		t.Fatalf("native source explanation = %q, want structured DDL refusal", location.Source.Note)
+	}
+	want, err := language.PositionAt(body, strings.Index(body, "DUP"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Range.Start != want || location.Range.End != want {
+		t.Fatalf("native source range = %#v, want name point %#v", location.Range, want)
+	}
+	if len(details.calls) != 2 || details.calls[0].Facet != "ddl" || details.calls[1].Facet != "source" {
+		t.Fatalf("facet sequence = %#v, want DDL then native source", details.calls)
+	}
+}
+
+func TestDefinitionTableUnsupportedUsesValidatedDescriptionSpan(t *testing.T) {
+	body := "CREATE TABLE T (\r\n  C INTEGER\r\n)"
+	colSpan := spanOf(body, "C")
+	tableStart := strings.Index(body, "T (")
+	description := catalog.TableDescription{Body: body, Table: catalog.DescriptionSpan{Start: tableStart, End: tableStart + 1}, Columns: []catalog.DescriptionColumn{{Name: "C", Span: colSpan}}}
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":         {err: database.ErrUnsupportedDDL},
+		"description": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Description: description}},
+	}}
+	cache := readyNavigationCache()
+	cache.ColumnsByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}).Key()] = append(cache.ColumnsByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}).Key()], &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "A", Table: "T", Name: "C"}})
+	req := facetNavigationRequest("SELECT C FROM T", details)
+	req.Context.Snapshot.Cache = cache
+	location := detailLocation(t, req, "C")
+	if location.Source == nil || location.Source.Text != body || location.Source.Provenance != "catalog-description" {
+		t.Fatalf("source = %#v, calls=%#v, want informational table description", location.Source, details.calls)
+	}
+	wantStart, err := language.PositionAt(body, colSpan.Start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnd, err := language.PositionAt(body, colSpan.End)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if location.Range != (language.Range{Start: wantStart, End: wantEnd}) {
+		t.Fatalf("description column range = %#v, want %#v", location.Range, language.Range{Start: wantStart, End: wantEnd})
+	}
+	if len(details.calls) != 2 || details.calls[1].Facet != "description" {
+		t.Fatalf("facet sequence = %#v, want DDL then description", details.calls)
+	}
+}
+
+func TestDefinitionRefusesMalformedDescriptionSpan(t *testing.T) {
+	body := "CREATE TABLE T (C INTEGER)"
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":         {err: database.ErrUnsupportedDDL},
+		"description": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Description: catalog.TableDescription{Body: body, Table: catalog.DescriptionSpan{Start: strings.Index(body, "T ("), End: strings.Index(body, "T (") + 1}, Columns: []catalog.DescriptionColumn{{Name: "C", Span: catalog.DescriptionSpan{Start: -1, End: 1}}}}}},
+	}}
+	cache := readyNavigationCache()
+	cache.ColumnsByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}).Key()] = append(cache.ColumnsByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}).Key()], &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "A", Table: "T", Name: "C"}})
+	req := facetNavigationRequest("SELECT C FROM T", details)
+	req.Context.Snapshot.Cache = cache
+	location := detailLocation(t, req, "C")
+	if location.Source != nil {
+		t.Fatalf("malformed description published as source: %#v", location)
+	}
+}
+
+func TestDefinitionDoesNotFallbackAfterDetailWaitIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", nil)
+	req.Context.Details = cancelingDetails{cancel: cancel}
+	position := language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")}
+	_, err := language.NewService().Definition(ctx, req, position)
+	if !errors.Is(err, language.ErrCanceled) {
+		t.Fatalf("Definition err=%v, want canceled after DDL wait", err)
+	}
+}
+
+func TestDefinitionRejectsMismatchedDetailIdentity(t *testing.T) {
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":    {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "t"}, Text: "CREATE TABLE t (ID INTEGER)", Provenance: "generated-ddl"}},
+		"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Text: "SHOULD NOT BE USED"}},
+	}}
+	req := facetNavigationRequest("SELECT * FROM T", details)
+	position := language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "T")}
+	result, err := language.NewService().Definition(context.Background(), req, position)
+	if err != nil {
+		t.Fatalf("Definition: %v", err)
+	}
+	if len(result.Value) != 0 || len(details.calls) != 1 {
+		t.Fatalf("mismatched detail identity published or fell back: result=%#v calls=%#v", result, details.calls)
+	}
+}
+
+func TestHoverKeepsTableSummaryWithoutExecutableDDLClaim(t *testing.T) {
+	body := "CREATE TABLE T (ID INTEGER)"
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":         {err: database.ErrUnsupportedDDL},
+		"description": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}, Description: catalog.TableDescription{Body: body, Table: catalog.DescriptionSpan{Start: strings.Index(body, "T ("), End: strings.Index(body, "T (") + 1}}}},
+	}}
+	cache := readyNavigationCache()
+	req := facetNavigationRequest("SELECT * FROM T", details)
+	req.Context.Snapshot.Cache = cache
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: 14})
+	if err != nil {
+		t.Fatalf("Hover: %v", err)
+	}
+	if !strings.Contains(result.Value.Markdown, "ID") || !strings.Contains(result.Value.Markdown, "Informational catalog description") || strings.Contains(result.Value.Markdown, "DDL unavailable") {
+		t.Fatalf("hover markdown lost table summary or mislabeled fallback: %q", result.Value.Markdown)
+	}
+	if len(details.calls) != 2 || details.calls[0].Facet != "ddl" || details.calls[1].Facet != "description" {
+		t.Fatalf("hover detail requests = %#v, want DDL then description", details.calls)
+	}
+}
+
+func TestDefinitionDoesNotFallbackOnNotFoundTransportOrCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "not found", err: database.ErrObjectNotFound},
+		{name: "transport", err: errors.New("network failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			details := &facetDetails{results: map[string]detailResult{"ddl": {err: tc.err}, "source": {detail: metadata.Detail{Text: "SHOULD NOT BE USED"}}}}
+			req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+			position := language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")}
+			result, err := language.NewService().Definition(context.Background(), req, position)
+			if tc.name == "transport" {
+				if err == nil || len(details.calls) != 1 {
+					t.Fatalf("Definition err=%v calls=%#v, want transport error without fallback", err, details.calls)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Definition: %v", err)
+			}
+			if len(result.Value) != 0 || len(details.calls) != 1 {
+				t.Fatalf("unexpected fallback: result=%#v calls=%#v", result, details.calls)
+			}
+		})
+	}
+	t.Run("canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		details := &facetDetails{results: map[string]detailResult{"ddl": {err: database.ErrUnsupportedDDL}, "source": {detail: metadata.Detail{Text: "SHOULD NOT BE USED"}}}}
+		req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+		position := language.Position{Line: 0, UTF16Column: strings.Index(req.Document.Text, "DUP")}
+		_, err := language.NewService().Definition(ctx, req, position)
+		if !errors.Is(err, language.ErrCanceled) || len(details.calls) != 0 {
+			t.Fatalf("Definition err=%v calls=%#v, want canceled before detail", err, details.calls)
+		}
+	})
+}
 
 func TestSourceSharingBetweenHoverAndDefinition(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

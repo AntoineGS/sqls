@@ -17,7 +17,11 @@ type recordingDetails struct {
 
 func (r *recordingDetails) Detail(_ context.Context, req metadata.Request) (metadata.Detail, error) {
 	r.requests = append(r.requests, req)
-	return metadata.Detail{Object: req.Object, Text: "source", Provenance: "generated-ddl"}, nil
+	text := "source"
+	if req.Object.Kind == catalog.ObjectKindTable {
+		text = "CREATE TABLE " + req.Object.Name + " (ID INTEGER)"
+	}
+	return metadata.Detail{Object: req.Object, Text: text, Provenance: "generated-ddl"}, nil
 }
 
 func navigationRequest(text string, cache *catalog.Cache) language.Request {
