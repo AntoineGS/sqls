@@ -19,22 +19,43 @@ type cacheDiagnosticCatalog struct {
 }
 
 // Columns resolves table by its exact catalog identity via
-// cache.ColumnDescsByID first: the shared upper-cased ColumnDescs/
-// ColumnDatabase accessors fold every lookup to upper-case, so a quoted
-// table (table.Key() preserves its exact spelling) would otherwise
-// silently collide with, and read the columns of, any other relation
-// whose name happens to upper-case to the same key. ColumnDescsByID
-// returning false does not distinguish "no such relation" from "this
-// repository never populated exact-identity storage" (see its doc
-// comment), so Columns falls back to the folded lookup rather than
-// reporting every table unknown for engines/tests that only populate
-// ColumnsWithParent.
+// cache.ColumnDescsByID whenever cache.ColumnsByID has been populated at
+// all: the shared upper-cased ColumnDescs/ColumnDatabase accessors fold
+// every lookup to upper-case, so a quoted table (table.Key() preserves
+// its exact spelling) would otherwise silently collide with, and read the
+// columns of, any other relation whose name happens to upper-case to the
+// same key. A per-key miss from ColumnDescsByID is NOT reason enough to
+// fall back to the folded accessor: once a repository has populated
+// exact-identity storage at all, a miss is authoritative — "no relation
+// exists under this exact identity" — and falling back would reintroduce
+// the exact collision this adapter exists to prevent (see
+// catalog.Cache.ColumnsByID's doc comment on nil vs. populated-but-absent).
+//
+// Columns tests len(cache.ColumnsByID) > 0, NOT cache.ColumnsByID != nil:
+// metadata.Merge's cloneColumnSlices(nil) — reached whenever a repository's
+// patch never sets ColumnsByID, which is every driver/test path but
+// InterBase's real readMetadataColumns — returns a non-nil EMPTY map, not
+// nil, so a nil-check is always true once MetadataColumnsCurrent/
+// MetadataColumnsAll has merged at all and cannot tell "this repository
+// populates exact-identity storage" apart from "this repository does not
+// and the merge machinery's clone-on-nil just produced an empty map
+// anyway" (confirmed against internal/handler's MockDBRepository-backed
+// diagnostics tests, which regressed under the nil-check). A non-empty
+// map is the reliable signal instead: readMetadataColumns adds every
+// scanned column under its table's key in the same bulk job that
+// populates ColumnsWithParent, so any real InterBase catalog with at
+// least one column anywhere yields a non-empty map, while every path that
+// never populates exact-identity data at all (mocks, other drivers, a
+// merge of an empty fragment) stays at length zero forever.
 func (c cacheDiagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnType, bool) {
 	if c.cache == nil {
 		return nil, false
 	}
-	descriptions, ok := c.cache.ColumnDescsByID(table.Key())
-	if !ok {
+	var descriptions []*catalog.ColumnDesc
+	var ok bool
+	if len(c.cache.ColumnsByID) > 0 {
+		descriptions, ok = c.cache.ColumnDescsByID(table.Key())
+	} else {
 		descriptions, ok = c.cache.ColumnDescs(table.Key())
 	}
 	if !ok {
@@ -60,14 +81,20 @@ func (c cacheDiagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bo
 		return nil, false
 	}
 	key := table.Key()
-	// ViewByID resolves key by its exact catalog identity first, the same
+	// ViewByID resolves key by its exact catalog identity, the same
 	// requirement Columns above has: looping cache.Catalog.Views (the
 	// shared upper-cased map) would miss a quoted view name that collides
-	// with an unrelated relation's folded key. Fall back to the folded
-	// View lookup when ViewByID reports no match, the same "not populated
-	// yet" ambiguity Columns handles.
-	_, isView := cache.ViewByID(key)
-	if !isView {
+	// with an unrelated relation's folded key. Mirror Columns' cache-wide
+	// (not per-key) length check, not a nil check: metadata.Merge's
+	// mapOrEmpty+cloneMap always produce a non-nil ViewsByID once
+	// MetadataViews has merged at all, so nil-vs-populated is
+	// indistinguishable the same way it is for ColumnsByID (see Columns'
+	// doc comment) and only a non-empty map reliably means "this
+	// repository populates exact-identity view storage."
+	var isView bool
+	if cache.HasCatalog() && len(cache.Catalog.ViewsByID) > 0 {
+		_, isView = cache.ViewByID(key)
+	} else {
 		_, isView = cache.View(key)
 	}
 	if isView {

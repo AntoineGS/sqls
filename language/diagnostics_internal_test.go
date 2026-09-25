@@ -93,6 +93,31 @@ func TestCacheDiagnosticCatalogColumnsResolvesExactIdentity(t *testing.T) {
 	}
 }
 
+// TestCacheDiagnosticCatalogColumnsPopulatedByIDMissIsUnknownNotFolded is the
+// regression test for the round-1 reintroduction: once ColumnsByID has been
+// populated at all (here, with only the unquoted upper-cased key present),
+// a quoted lookup that misses ColumnsByID must report unknown outright, not
+// fall through to the folded ColumnDescs accessor and silently return a
+// different relation's columns.
+func TestCacheDiagnosticCatalogColumnsPopulatedByIDMissIsUnknownNotFolded(t *testing.T) {
+	unquotedKey := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key()
+	cache := &catalog.Cache{
+		ColumnsByID: map[string][]*catalog.ColumnDesc{
+			unquotedKey: {{ColumnBase: catalog.ColumnBase{Name: "ID"}, Type: "INTEGER"}},
+		},
+		ColumnsWithParent: map[string][]*catalog.ColumnDesc{
+			"\tORDERS": {{ColumnBase: catalog.ColumnBase{Name: "ID"}, Type: "INTEGER"}},
+		},
+	}
+	view := cacheDiagnosticCatalog{cache: cache}
+
+	quoted := sqlsymbol.Name{Text: "Orders", Quoted: true}
+	columns, ok := view.Columns(quoted)
+	if ok {
+		t.Fatalf("quoted Orders columns = %+v, ok=true; want ok=false: ColumnsByID is populated (for a different exact identity), so a miss must mean \"no such relation,\" not fall back to the folded accessor and return ORDERS's columns", columns)
+	}
+}
+
 // TestDiagnosticCatalogReadyRequiresColumnsReady relocates the handler-level
 // assertion (formerly TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild)
 // that a catalog view is never attached to diagnostics before the cache's

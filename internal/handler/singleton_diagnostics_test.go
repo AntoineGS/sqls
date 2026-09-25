@@ -27,10 +27,11 @@ func singletonDiagnosticCache() *database.DBCache {
 		ColumnsWithParent: map[string][]*database.ColumnDesc{
 			"\tORDERS": orderColumns,
 		},
-		// diagnostics resolve columns through the exact-identity ColumnsByID,
-		// matching how InterBase's real metadata jobs populate it (see
-		// readMetadataColumns), never through the shared upper-cased
-		// ColumnsWithParent.
+		// diagnostics resolve columns through the exact-identity ColumnsByID
+		// once it is populated at all, matching how InterBase's real
+		// metadata jobs populate it (see readMetadataColumns): a per-key
+		// miss against a populated ColumnsByID is authoritative and never
+		// falls back to the shared upper-cased ColumnsWithParent.
 		ColumnsByID: map[string][]*database.ColumnDesc{
 			catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key(): orderColumns,
 		},

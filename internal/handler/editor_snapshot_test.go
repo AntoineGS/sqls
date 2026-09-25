@@ -215,6 +215,37 @@ func TestCompletionRemainsIncompleteBeforeMetadataStart(t *testing.T) {
 	}
 }
 
+// TestCompletionStaysIncompleteForStillLoadingLeaseAfterConnectionDropsToIdle
+// pins the case reachable through attachIntent's nil-Config early return
+// (handler.go: intent.Config == nil sets connectionState to idle and
+// returns ErrNoConnection without bumping connGeneration): a Metadata
+// lease bound to the still-current connGeneration keeps reporting its own
+// pending/loading state even once ConnectionReady has gone false, because
+// dropping the newest connection ATTEMPT back to idle does not retract a
+// lease already bound to the generation still in effect. Gating on
+// ConnectionReady first — as a prior version of completionIncomplete did —
+// would settle completion to false here and the client would never
+// re-request once that lease finishes loading and its candidates arrive.
+func TestCompletionStaysIncompleteForStillLoadingLeaseAfterConnectionDropsToIdle(t *testing.T) {
+	snapshot := editorSnapshot{
+		ConnectionReady: false,
+		Metadata: &database.MetadataSnapshot{
+			Started: true,
+			Status: map[database.MetadataKind]database.MetadataStatus{
+				database.MetadataProcedures: {State: database.MetadataLoading},
+			},
+		},
+	}
+	if !completionIncomplete(snapshot, language.CompletionIncomplete(snapshot.Metadata)) {
+		t.Fatal("a still-loading lease must keep completion incomplete even after ConnectionReady drops to false")
+	}
+
+	snapshot.Metadata.Status[database.MetadataProcedures] = database.MetadataStatus{State: database.MetadataReady}
+	if completionIncomplete(snapshot, language.CompletionIncomplete(snapshot.Metadata)) {
+		t.Fatal("a settled lease must not report incomplete just because ConnectionReady is false")
+	}
+}
+
 func TestCompletionStaysIncompleteInGatedReadyBeforeMetadataStartInterval(t *testing.T) {
 	s := NewServer()
 	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })

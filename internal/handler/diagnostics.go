@@ -138,8 +138,12 @@ func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSna
 		log.Printf("sqls: static diagnostics skipped for %s: %v", snapshot.uri, err)
 		return []lsp.Diagnostic{}
 	}
-	diagnostics := make([]lsp.Diagnostic, len(res.Value))
-	for i, d := range res.Value {
+	return lspDiagnostics(res.Value)
+}
+
+func lspDiagnostics(diags []language.Diagnostic) []lsp.Diagnostic {
+	diagnostics := make([]lsp.Diagnostic, len(diags))
+	for i, d := range diags {
 		code, source := d.Code, d.Source
 		diagnostics[i] = lsp.Diagnostic{
 			Range:    lspRange(d.Range),
@@ -150,6 +154,28 @@ func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSna
 		}
 	}
 	return diagnostics
+}
+
+// DiagnosticsWithDriverVariant is a thin wrapper over
+// language.Service.Diagnostics, in the same family as
+// HoverWithDriverVariant, SignatureHelpWithDriverVariant and
+// CompletionWithDriverVariant: it delegates the diagnostics algorithm
+// directly (diagnostics need no metadata snapshot) and converts the result
+// back to lsp types through the same lspDiagnostics conversion
+// diagnosticsForSnapshot uses in production.
+func DiagnosticsWithDriverVariant(ctx context.Context, text string, dv dialect.DriverVariant, dialectResolved bool) ([]lsp.Diagnostic, error) {
+	req := language.Request{
+		Document: language.Document{Text: text},
+		Context: language.Context{
+			Variant:         dv,
+			DialectResolved: dialectResolved,
+		},
+	}
+	res, err := language.NewService().Diagnostics(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	return lspDiagnostics(res.Value), nil
 }
 
 func (s *Server) publishDiagnosticsSnapshot(ctx context.Context, conn *jsonrpc2.Conn, snapshot documentDiagnosticsSnapshot, diagnostics []lsp.Diagnostic) {

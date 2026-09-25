@@ -108,7 +108,7 @@ func hoverAt(t *testing.T, server *Server, repo database.DBRepository, cache *da
 			Position:     lsp.Position{Line: 0, Character: character},
 		},
 	}
-	base, err := hoverWithDriver(text, params, cache, dialect.DatabaseDriverInterBase)
+	base, err := HoverWithDriver(text, params, cache, dialect.DatabaseDriverInterBase)
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		t.Fatal("hoverWithDriver:", err)
 	}
@@ -217,7 +217,7 @@ func TestHoverDoesNotUseColumnTableFallbackUntilViewsReady(t *testing.T) {
 		Position: lsp.Position{Character: strings.Index(text, "MYVIEW")},
 	}}
 	cache.Metadata[database.MetadataViews] = database.MetadataLoading
-	got, err := hoverWithDriverVariant(context.Background(), text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	got, err := HoverWithDriverVariant(context.Background(), text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		t.Fatal("hover while views are loading:", err)
 	}
@@ -226,7 +226,7 @@ func TestHoverDoesNotUseColumnTableFallbackUntilViewsReady(t *testing.T) {
 	}
 
 	cache.Metadata[database.MetadataViews] = database.MetadataReady
-	got, err = hoverWithDriverVariant(context.Background(), text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	got, err = HoverWithDriverVariant(context.Background(), text, params, cache, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
 	if err != nil {
 		t.Fatal("hover after views are ready:", err)
 	}

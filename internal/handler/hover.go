@@ -29,7 +29,7 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 	if err != nil {
 		return nil, err
 	}
-	res, err := hoverWithDriverVariant(ctx, snapshot.Text, params, snapshot.Cache, snapshot.Variant)
+	res, err := HoverWithDriverVariant(ctx, snapshot.Text, params, snapshot.Cache, snapshot.Variant)
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		return nil, err
 	}
@@ -46,15 +46,15 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 	return res, nil
 }
 
-func hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp.Hover, error) {
-	return hoverWithDriver(text, params, dbCache, "")
+func Hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp.Hover, error) {
+	return HoverWithDriver(text, params, dbCache, "")
 }
 
-func hoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.Hover, error) {
-	return hoverWithDriverVariant(context.Background(), text, params, dbCache, dialect.DriverVariant{Driver: driver})
+func HoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCache, driver dialect.DatabaseDriver) (*lsp.Hover, error) {
+	return HoverWithDriverVariant(context.Background(), text, params, dbCache, dialect.DriverVariant{Driver: driver})
 }
 
-// hoverWithDriverVariant is a thin wrapper over language.Service.Hover: it
+// HoverWithDriverVariant is a thin wrapper over language.Service.Hover: it
 // builds a minimal metadata snapshot around dbCache, delegates the actual
 // cache-only hover algorithm, and converts the result back to lsp types.
 // language.ErrNoHover is translated to this package's own ErrNoHover so
@@ -62,8 +62,10 @@ func hoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCa
 // tests) keep their sentinel identity. ctx comes from the caller's own
 // request context (handleTextDocumentHover's ctx in production) rather
 // than a fresh context.Background(), so a canceled request actually
-// cancels Hover's own ctx.Err() check.
-func hoverWithDriverVariant(ctx context.Context, text string, params lsp.HoverParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.Hover, error) {
+// cancels Hover's own ctx.Err() check. Exported, like SignatureHelpWithDriverVariant,
+// so a fixture-level test (or an embedding host) can route through the same
+// LSP-shape conversion production code uses without a jsonrpc2 request.
+func HoverWithDriverVariant(ctx context.Context, text string, params lsp.HoverParams, dbCache *database.DBCache, dv dialect.DriverVariant) (*lsp.Hover, error) {
 	if dbCache == nil {
 		return nil, nil
 	}

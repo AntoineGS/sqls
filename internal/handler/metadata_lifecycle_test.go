@@ -546,7 +546,7 @@ func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
 		Position:     lsp.Position{Line: 0, Character: 20},
 	}}
-	base, err := hoverWithDriver(text, hoverParams, cache, dialect.DatabaseDriverInterBase)
+	base, err := HoverWithDriver(text, hoverParams, cache, dialect.DatabaseDriverInterBase)
 	if err != nil && !errors.Is(err, ErrNoHover) {
 		t.Fatal("hoverWithDriver:", err)
 	}

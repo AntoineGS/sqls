@@ -20,6 +20,9 @@ func BenchmarkDiagnosticsReusesSharedCatalog(b *testing.B) {
 	const tableCount = 256
 	cache := &catalog.Cache{
 		ColumnsByID: make(map[string][]*catalog.ColumnDesc, tableCount),
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataColumnsCurrent: catalog.MetadataReady,
+		},
 	}
 	for i := 0; i < tableCount; i++ {
 		table := "TABLE_" + strconv.Itoa(i)
@@ -29,10 +32,16 @@ func BenchmarkDiagnosticsReusesSharedCatalog(b *testing.B) {
 		}
 	}
 	snap := &catalog.MetadataSnapshot{Cache: cache}
+	// TABLE_0/TABLE_1 are among the tableCount tables seeded above, so this
+	// insert's width check actually calls cacheDiagnosticCatalog.Columns
+	// against the shared cache on every benchmark iteration; DST/SRC (an
+	// earlier version of this benchmark) named tables outside the seeded
+	// set, so diagnosticCatalogReady never attached a catalog and every
+	// iteration measured the catalog-free path instead.
 	req := language.Request{
 		Document: language.Document{
 			URI:     "memory:bench",
-			Text:    "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO DST (VALUE) SELECT SRC.VALUE FROM SRC; END",
+			Text:    "CREATE PROCEDURE P AS DECLARE VARIABLE LOCAL_VALUE VARCHAR(10); BEGIN INSERT INTO TABLE_0 (VALUE) SELECT TABLE_1.VALUE FROM TABLE_1; END",
 			Version: 1,
 			Binding: 1,
 		},
