@@ -6,10 +6,12 @@ rule `internal/sqlsymbol/diagnostic_types.go` (`parseDiagnosticType`,
 Milestone B ground rule: do not invent an expected native InterBase result;
 if a reference is inconclusive, the rule stays unknown, not enabled.
 
-Live-probe status for every rule below is **NOT VERIFIED — no live database
-available this session.** Live verification against a real InterBase server
-is a separate, later gate; nothing in this document should be read as having
-been confirmed against a running engine.
+Task 14 performed no live database probes: no disposable Dialect 1/3 test
+database was supplied. Individual entries below preserve live observations
+explicitly recorded by earlier implementation/review tasks; entries marked
+NOT VERIFIED remain unconfirmed. The read-only `interbase_reference` database
+is not a disposable DDL test database and was not used for this task's live
+gate. Live verification of unverified rules remains a separate opt-in gate.
 
 ## Enabled rules
 

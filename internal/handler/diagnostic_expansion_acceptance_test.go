@@ -99,6 +99,100 @@ func TestDiagnosticsUnknownColumnAndProceduralUnknownVariableCoexist(t *testing.
 	}
 }
 
+func TestDiagnosticExpansionMixedDocumentKeepsIndependentFindingsAndCloseReopen(t *testing.T) {
+	const uri = "file:///diagnostic-expansion-mixed.sql"
+	text := "SELECT ID FROM T WHERE V = NULL;\n" +
+		"SELECT FROM;\n" +
+		"CREATE PROCEDURE P AS BEGIN BAD_PROC = 1; END\n" +
+		"CREATE TRIGGER TR FOR T BEFORE INSERT AS BEGIN BAD_TRIGGER = 1; END"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1
+	})
+	if string(initial.rawDiagnostics) == "null" || string(initial.rawDiagnostics) == "" || initial.rawDiagnostics[0] != '[' {
+		t.Fatalf("wire diagnostics payload = %s, want a JSON array", initial.rawDiagnostics)
+	}
+	codes := map[string]bool{}
+	for _, finding := range initial.Diagnostics {
+		codes[diagnosticCode(finding)] = true
+	}
+	for _, code := range []string{"interbase-null-comparison", "interbase-unknown-variable"} {
+		if !codes[code] {
+			t.Fatalf("mixed complete/unsupported document findings = %+v, missing independent %s", initial.Diagnostics, code)
+		}
+	}
+	if len(initial.Diagnostics) != 3 {
+		t.Fatalf("findings = %+v, want the standalone null comparison and two procedural write findings only", initial.Diagnostics)
+	}
+
+	tx.call(t, "textDocument/didClose", lsp.DidCloseTextDocumentParams{TextDocument: lsp.TextDocumentIdentifier{URI: uri}})
+	closed := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version == nil })
+	if string(closed.rawDiagnostics) != "[]" {
+		t.Fatalf("close diagnostics wire payload = %s, want []", closed.rawDiagnostics)
+	}
+	tx.open(t, uri, "SELECT 1;", 2)
+	reopened := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 2 })
+	if len(reopened.Diagnostics) != 0 || string(reopened.rawDiagnostics) != "[]" {
+		t.Fatalf("reopened clean document notification = %+v (%s), want empty []", reopened.Diagnostics, reopened.rawDiagnostics)
+	}
+}
+
+func TestDiagnosticExpansionSlowOldVersionDoesNotBlockEditorRequestsOrPublish(t *testing.T) {
+	const uri = "file:///diagnostic-expansion-version.sql"
+	const otherURI = "file:///diagnostic-expansion-other.sql"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var block atomic.Bool
+	var once sync.Once
+	tx.server.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+		if block.Load() && snapshot.uri == uri && snapshot.version == 1 {
+			once.Do(func() { close(entered) })
+			<-release
+		}
+		return diagnosticsForSnapshot(snapshot)
+	}
+	tx.open(t, uri, "SELECT ID FROM T WHERE V = NULL;", 1)
+	tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	block.Store(true)
+	tx.server.queueDiagnosticDocument(uri)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("version 1 analysis did not enter the gate")
+	}
+
+	// These editor RPCs must be handled independently of the blocked diagnostic worker.
+	tx.change(t, uri, "SELECT 1;", 2)
+	tx.open(t, otherURI, "SELECT 2;", 1)
+	close(release)
+	block.Store(false)
+	latest := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 2 })
+	if len(latest.Diagnostics) != 0 || string(latest.rawDiagnostics) != "[]" {
+		t.Fatalf("latest version diagnostics = %+v (%s), want []", latest.Diagnostics, latest.rawDiagnostics)
+	}
+	other := tx.client.next(t, otherURI, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if other.Version == nil || *other.Version != 1 {
+		t.Fatalf("unrelated document publication = %+v, want version 1", other)
+	}
+	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
+		t.Fatal("send notification barrier:", err)
+	}
+	select {
+	case <-tx.client.barrier:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for notification barrier")
+	}
+	tx.client.mu.Lock()
+	defer tx.client.mu.Unlock()
+	for _, notification := range tx.client.notifications {
+		if notification.URI == uri && notification.Version != nil && *notification.Version == 1 && len(notification.Diagnostics) > 0 {
+			t.Fatalf("stale version 1 diagnostics published after version 2: %+v", notification)
+		}
+	}
+}
+
 // --- metadata categories becoming ready in a different order: a Task 4
 // unknown-column finding must appear only once its category is ready ---
 

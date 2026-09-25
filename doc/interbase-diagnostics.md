@@ -48,6 +48,20 @@ Exception handlers are treated as unknown-effect edges until their semantics
 are modeled. Diagnostics use only source/binding facts and perform no database
 I/O.
 
+Analysis is performed independently for complete, supported statements and
+procedural regions. An incomplete or unsupported neighboring statement (for
+example a partially typed `SELECT` or an unsupported recursive query form)
+does not invalidate findings whose source and bindings are independent; the
+unsupported region itself is not treated as proof of a missing name or type.
+Missing, loading, failed, stale, or otherwise incomplete catalog metadata is
+unknown. Local-text findings that need no catalog facts can still be reported
+while metadata is unavailable. Results are ordered deterministically by source
+span and code, use LSP UTF-16 positions, and are published with the document
+version. Empty results are sent as `diagnostics: []` (including close/clear
+notifications), never `null`. The scheduler fences older document versions,
+connection generations, and diagnostic-policy revisions from later
+publications; slow analysis runs off the editor request path.
+
 The three query NULL-logic advisories are also opt-in. Their analysis is
 limited to recognized simple query shapes: complex or multiple joins,
 derived/callable sources, correlated subqueries, ambiguous ownership, and
@@ -121,3 +135,11 @@ applied immediately: every open document is re-evaluated under the new
 rule policy, and diagnostics already published under the previous policy
 are superseded even if the underlying connection and catalog metadata are
 unchanged.
+
+The parser and semantic checks are intentionally bounded and conservative;
+they are not a server-side prepare/execute pass or a complete InterBase SQL
+validator. Database-dependent findings require same-generation metadata that
+is complete for the relevant category. Editor diagnostics never perform
+database I/O. Native semantic confirmation is a separate opt-in activity and
+must use an explicitly disposable Dialect 1/3 database; benchmark fixture
+results are comparative local measurements, not production latency claims.
