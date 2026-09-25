@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -447,18 +448,179 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		}
 	})
 
-	t.Run("table and function ddl remain unsupported, not a full refetch", func(t *testing.T) {
+	t.Run("table ddl is bounded and function ddl remains unsupported", func(t *testing.T) {
 		count := interBaseFixtureCountPrepares(t)
-		if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "CUSTOMER"}, Facet: "ddl", Consistency: metadata.Committed}); err == nil {
-			t.Fatalf("Detail(table ddl) error = nil, want unsupported")
+		tableDDL, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		if err != nil {
+			t.Fatalf("Detail(table ddl) error = %v", err)
+		}
+		if !strings.Contains(tableDDL.Text, `CREATE TABLE "PARENT"`) || !strings.Contains(tableDDL.Text, `CONSTRAINT "PK_PARENT" PRIMARY KEY`) {
+			t.Fatalf("Detail(table ddl).Text = %q, want rendered PARENT DDL", tableDDL.Text)
+		}
+		if tableDDL.Provenance != "interbase:table-ddl" {
+			t.Fatalf("Detail(table ddl).Provenance = %q, want interbase:table-ddl", tableDDL.Provenance)
 		}
 		if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: "F_LTRIM"}, Facet: "ddl", Consistency: metadata.Committed}); err == nil {
 			t.Fatalf("Detail(function ddl) error = nil, want unsupported")
 		}
-		if got := count(); got != 0 {
-			t.Fatalf("queries for unsupported ddl facets = %d, want 0 (no full-catalog refetch)", got)
+		if got := count(); got == 0 {
+			t.Fatalf("queries for table ddl = %d, want bounded provider read", got)
 		}
 	})
+}
+
+func TestInterBaseTableDDLCoalescesAcrossLeases(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 3}
+	ctx := context.Background()
+	registry := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3, MaxDetailBytes: 64 << 20})
+	t.Cleanup(func() { _ = registry.Close(ctx) })
+	factory := func(context.Context) (metadata.Provider, error) { return &interBaseTestProvider{db: repo}, nil }
+	key := metadata.Key{Engine: "interbase", URL: "test://" + t.Name()}
+	scope := metadata.Scope{Principal: "TESTER"}
+	firstLease, err := registry.Acquire(ctx, key, scope, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(firstLease.Release)
+	secondLease, err := registry.Acquire(ctx, key, scope, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(secondLease.Release)
+	if err := metadatatest.WaitReady(ctx, firstLease); err != nil {
+		t.Fatal(err)
+	}
+
+	count := interBaseFixtureCountPrepares(t)
+	object := catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}
+	hover, err := firstLease.Detail(ctx, metadata.Request{Object: object, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("first lease table DDL: %v", err)
+	}
+	reads := count()
+	if reads == 0 {
+		t.Fatal("first table DDL issued no fixture queries")
+	}
+	t.Logf("first table DDL provider read prepared %d statements; the equivalent second lease prepared zero additional statements", reads)
+	definition, err := secondLease.Detail(ctx, metadata.Request{Object: object, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("second lease table DDL: %v", err)
+	}
+	if got := count(); got != reads {
+		t.Fatalf("fixture query count after second equivalent DDL = %d, first = %d; expected one coalesced Load", got, reads)
+	}
+	if definition.Text != hover.Text || definition.Provenance != "interbase:table-ddl" {
+		t.Fatalf("second detail = (%q, %q), want same DDL and table provenance", definition.Text, definition.Provenance)
+	}
+}
+
+func TestInterBaseTableDDLUsesExactNameAndRejectsAmbiguity(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	insertInterBaseMixedCaseTableFixtures(t, db)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 3}
+	_, lease := acquireInterBaseTestLease(t, repo)
+	ctx := context.Background()
+	got, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "Foo"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("exact mixed-case Foo DDL: %v", err)
+	}
+	if !strings.Contains(got.Text, `CREATE TABLE "Foo"`) || strings.Contains(got.Text, `UPPER_FOO_ONLY_COLUMN`) {
+		t.Fatalf("Foo DDL = %q, want exact Foo table only", got.Text)
+	}
+	_, err = lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "foo"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if !errors.Is(err, catalog.ErrAmbiguous) {
+		t.Fatalf("ambiguous folded table DDL error = %v, want catalog.ErrAmbiguous", err)
+	}
+}
+
+func TestInterBaseTableDDLInvalidationDiscardsInFlightResult(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	// Do not gate the initial bulk load: table DDL's later
+	// RDB$RELATION_CONSTRAINTS lookup overlaps a similarly named catalog
+	// query, so enable the gate only after the shared snapshot is ready.
+	fault := &interBaseFixtureFault{match: "__table_ddl_not_gated_yet__", stage: "gate", gate: release, entered: entered}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 3}
+	_, lease := acquireInterBaseTestLease(t, repo)
+	fault.match = "RDB$RELATION_CONSTRAINTS"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request := metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed}
+	done := make(chan error, 1)
+	go func() { _, err := lease.Detail(ctx, request); done <- err }()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		close(release)
+		t.Fatalf("table DDL did not enter gated provider read: %v", ctx.Err())
+	}
+	if err := lease.Invalidate(); err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, metadata.ErrStale) {
+			t.Fatalf("in-flight DDL error = %v, want metadata.ErrStale", err)
+		}
+	case <-ctx.Done():
+		t.Fatalf("in-flight DDL did not settle after gate release: %v", ctx.Err())
+	}
+}
+
+func TestInterBaseTableDDLCoverageIncludesSourceDialect(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	ctx := context.Background()
+	request := metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed}
+	dialect1Plan, err := (&InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 1}).MetadataDetailPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialect3Plan, err := (&InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 3}).MetadataDetailPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dialect1Plan.Coverage == dialect3Plan.Coverage {
+		t.Fatalf("source dialect variants share coverage %q; rendered text would be cached under a dialect-agnostic key", dialect1Plan.Coverage)
+	}
+	var rendered []string
+	for _, tc := range []struct {
+		dialect int
+		want    string
+	}{{1, "CREATE TABLE PARENT"}, {3, `CREATE TABLE "PARENT"`}} {
+		t.Run(fmt.Sprintf("dialect-%d", tc.dialect), func(t *testing.T) {
+			repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: tc.dialect}
+			_, lease := acquireInterBaseTestLease(t, repo)
+			got, err := lease.Detail(ctx, request)
+			if err != nil {
+				t.Fatalf("table DDL: %v", err)
+			}
+			if !strings.Contains(got.Text, tc.want) {
+				t.Fatalf("source Dialect %d table DDL = %q, want %q", tc.dialect, got.Text, tc.want)
+			}
+			rendered = append(rendered, got.Text)
+		})
+	}
+	if len(rendered) != 2 || rendered[0] == rendered[1] {
+		t.Fatalf("table DDL source-dialect variants are not distinct: %q", rendered)
+	}
+}
+
+func TestInterBaseTableDDLWaitsForExactIdentityCategory(t *testing.T) {
+	repo := &InterBaseDBRepository{SQLDialect: 3, SourceSQLDialect: 3}
+	plan, err := repo.MetadataDetailPlan(metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Requires) != 1 || plan.Requires[0] != MetadataRelations {
+		t.Fatalf("table DDL Requires = %v, want only MetadataRelations for exact cached-name resolution", plan.Requires)
+	}
 }
 
 // TestInterBaseMetadataProviderDetailColumnsDoNotMergeAcrossExactIdentities

@@ -11,20 +11,18 @@ import (
 	"interbase-go/schema"
 )
 
-// MetadataDetailPlan adapts one detail request onto InterBase's retained
-// bulk-category facts. Every facet implemented here is satisfiable entirely
-// from data the existing MetadataPlan bulk jobs already loaded: Load only
-// resolves the requested object's exact name against the already-ready
-// category (never issuing SQL), and any dialect-sensitive rendering runs in
-// Render, which is pure and receives the current cache plus the per-request
-// Dialect. This is what lets a hover-then-explorer (or explorer-then-hover)
-// sequence, or two DDL requests at different dialects, share one Load.
+// MetadataDetailPlan adapts detail requests onto InterBase's retained
+// bulk-category facts where possible. Most facets only resolve the requested
+// object against an already-ready category and perform pure per-request
+// rendering. Table DDL is the narrow exception described below: the driver
+// does not retain its complete DDL facts in the bulk cache, so its bounded
+// detail read and source-dialect rendering both run in Load.
 //
-// Table and external-function DDL are not implemented in this increment:
-// full CREATE TABLE reconstruction needs constraint/index/trigger facts no
-// bulk category retains, and the driver's own Function.GenerateDDL always
-// refuses. Both return metadata.ErrUnsupported rather than silently
-// re-fetching the whole catalog or baking one dialect into a shared Load.
+// Table DDL is the narrow provider-owned exception: schema.Table performs
+// bounded, context-aware reads for that exact relation's constraints,
+// indexes and triggers, then renders using the repository's source dialect.
+// Its rendered text is cached with dialect-specific coverage. External
+// function DDL remains unsupported because the driver itself refuses it.
 func (db *InterBaseDBRepository) MetadataDetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
 	if req.Consistency == metadata.TransactionLocal || req.Consistency == metadata.ConsistentSnapshot {
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
@@ -461,12 +459,41 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				return acquired, nil
 			},
 		}, nil
+	case ObjectKindTable:
+		// schema.Table needs to fetch constraints/indexes/triggers and its DDL
+		// is dialect-specific. Keep the rendered text in a coverage key that
+		// includes the effective source dialect, rather than sharing it under
+		// the otherwise dialect-agnostic object/facet key.
+		dialect := interBaseSourceDialect(db)
+		coverage := detailCoverage(req.Object, "ddl") + "\x00source-dialect:" + fmt.Sprint(dialect)
+		return metadata.DetailPlan{
+			Requires: []MetadataKind{MetadataRelations},
+			Coverage: coverage,
+			Load: func(ctx context.Context, cache *DBCache) (metadata.Detail, error) {
+				name, err := interBaseResolveRelationName(cache, req.Object)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				if db == nil || db.Conn == nil {
+					return metadata.Detail{}, fmt.Errorf("interbase: database connection is nil")
+				}
+				table, err := schema.New(db.Conn).Table(ctx, name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				if table == nil {
+					return metadata.Detail{}, ErrObjectNotFound
+				}
+				ddl, err := table.GenerateDDLWithOptions(schema.DDLOptions{Dialect: dialect})
+				if err != nil {
+					return metadata.Detail{}, interBaseWrapDDLError(err)
+				}
+				return metadata.Detail{Object: req.Object, Text: ddl, Provenance: "interbase:table-ddl"}, nil
+			},
+		}, nil
 	default:
-		// Table DDL needs constraint/index/trigger facts no bulk category
-		// retains, and a faithful Load/Render split for it (I/O confined to
-		// Load, dialect confined to Render) is future work. Function DDL is
-		// permanently refused by the driver itself. Neither silently
-		// triggers a full-catalog refetch.
+		// Function DDL is permanently refused by the driver itself. It must
+		// not silently trigger a full-catalog refetch.
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
 	}
 }
