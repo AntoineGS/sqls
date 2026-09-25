@@ -450,6 +450,23 @@ func TestHoverReturnsCachedProcedureSummaryWithoutDetails(t *testing.T) {
 	}
 }
 
+func TestHoverKeepsCachedProcedureSummaryWhenDetailFails(t *testing.T) {
+	cache := readyNavigationCache()
+	desc := &catalog.ProcedureDesc{Name: "DUP", Description: sql.NullString{String: "cached procedure summary", Valid: true}}
+	cache.Catalog.Procedures["DUP"] = desc
+	cache.Catalog.ProceduresByID[(catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key()] = desc
+	details := &facetDetails{results: map[string]detailResult{"ddl": {err: errors.New("temporary transport failure")}}}
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+	req.Context.Snapshot.Cache = cache
+	result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: strings.LastIndex(req.Document.Text, "DUP")})
+	if err != nil {
+		t.Fatalf("Hover with failed optional detail: %v", err)
+	}
+	if !strings.Contains(result.Value.Markdown, "cached procedure summary") {
+		t.Fatalf("hover markdown = %q, want cached summary despite detail failure", result.Value.Markdown)
+	}
+}
+
 func TestHoverReturnsCachedTriggerSummaryWithoutDetails(t *testing.T) {
 	cache := readyNavigationCache()
 	delete(cache.Catalog.Procedures, "DUP")

@@ -2,13 +2,14 @@ package handler
 
 import (
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
@@ -487,7 +488,7 @@ func (p *procedureDDLDetailProvider) Plan() catalog.MetadataPlan {
 		Jobs: []catalog.MetadataJob{
 			{Kind: database.MetadataProcedures, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
 				return catalog.MetadataPatch{Cache: &catalog.Cache{
-					Catalog: &database.CatalogCache{Procedures: map[string]*database.ProcedureDesc{}},
+					Catalog: &database.CatalogCache{Procedures: map[string]*database.ProcedureDesc{"MYPROC": {Name: "MYPROC", InputParameters: []*database.ProcedureParameterDesc{{Name: "P", Position: 0, Direction: database.ParameterInput, Type: "INTEGER"}}}}},
 				}}, nil
 			}},
 		},
@@ -531,33 +532,58 @@ func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 	if err := metadatatest.WaitReady(context.Background(), lease); err != nil {
 		t.Fatal("wait for metadata readiness:", err)
 	}
+	leaseCache := lease.Snapshot().Cache
+	leaseCache.Metadata[database.MetadataViews] = database.MetadataReady
+	leaseCache.Metadata[database.MetadataTriggers] = database.MetadataReady
+	leaseCache.Catalog.Views = map[string]*database.ViewDesc{}
+	leaseCache.Catalog.Triggers = map[string]*database.TriggerDesc{}
+	leaseCache.Catalog.ProceduresByID = map[string]*catalog.ProcedureDesc{
+		(catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "MYPROC"}).Key(): leaseCache.Catalog.Procedures["MYPROC"],
+	}
+	leaseCache.Catalog.ViewsByID = map[string]*catalog.ViewDesc{}
+	leaseCache.Catalog.TriggersByID = map[string]*catalog.TriggerDesc{}
+	leaseCache.Catalog.RebuildObjects(strings.ToUpper)
 
-	// The raw repository must never be asked: every call in this test is for
-	// an object kind the lease's "ddl" facet covers, so leaseDDLRepository
-	// must route both through Detail.
+	// The production route must obtain Detail through languageRequest's lease,
+	// not through the raw repository or a handler-specific memo.
 	rawRepo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
 		t.Fatal("ObjectDDL called on the raw repository; want the shared lease Detail load instead")
 		return "", nil
 	})
-	repo := wrapRepositoryWithLease(rawRepo, lease, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
 
 	text := "execute procedure myproc"
 	hoverParams := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
 		Position:     lsp.Position{Line: 0, Character: 20},
 	}}
-	base, err := HoverWithDriver(text, hoverParams, cache, dialect.DatabaseDriverInterBase)
-	if err != nil && !errors.Is(err, ErrNoHover) {
-		t.Fatal("hoverWithDriver:", err)
+	server.files[testFileURI] = &File{Text: text, Version: 1, Revision: 1}
+	server.connGeneration, server.metaBoundGeneration, server.metaLease = 1, 1, lease
+	paramsJSON, err := json.Marshal(hoverParams)
+	if err != nil {
+		t.Fatal(err)
 	}
-	hover := server.interBaseHover(context.Background(), repo, cache, hoverParams, text, base, server.connectionGeneration(), server.parserDriverVariant())
-	if hover == nil {
-		t.Fatal("interBaseHover returned nil, want a hover with the DDL appendix")
+	rawParams := json.RawMessage(paramsJSON)
+	value, err := server.handleTextDocumentHover(context.Background(), nil, &jsonrpc2.Request{Params: &rawParams})
+	if err != nil {
+		t.Fatal("production hover handler:", err)
+	}
+	hover, ok := value.(*lsp.Hover)
+	if !ok || hover == nil {
+		t.Fatalf("hover result = %#v, want *lsp.Hover", value)
 	}
 	if !strings.Contains(hover.Contents.Value, wantDDL) {
 		t.Fatalf("hover contents = %q, want it to contain %q", hover.Contents.Value, wantDDL)
 	}
+	value, err = server.handleTextDocumentHover(context.Background(), nil, &jsonrpc2.Request{Params: &rawParams})
+	if err != nil {
+		t.Fatal("repeated production hover:", err)
+	}
+	repeated, ok := value.(*lsp.Hover)
+	if !ok || repeated == nil || !strings.Contains(repeated.Contents.Value, wantDDL) {
+		t.Fatalf("repeated hover = %#v, want the cached DDL appendix", value)
+	}
 
+	repo := wrapRepositoryWithLease(rawRepo, lease, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
 	got, err := server.interBaseDefinition(context.Background(), repo, cache, definitionParamsAt(20), text)
 	if err != nil {
 		t.Fatal("interBaseDefinition:", err)

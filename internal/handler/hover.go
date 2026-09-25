@@ -29,21 +29,34 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 	if err != nil {
 		return nil, err
 	}
-	res, err := HoverWithDriverVariant(ctx, snapshot.Text, params, snapshot.Cache, snapshot.Variant)
-	if err != nil && !errors.Is(err, ErrNoHover) {
-		return nil, err
+	// Inline hover may read one demanded detail, but must never hold the LSP
+	// dispatch path beyond its historical bound. The bounded context applies
+	// only to this optional detail wait; cancellation of the original request
+	// remains observable below.
+	detailCtx, cancel := context.WithTimeout(ctx, hoverDDLTimeout)
+	defer cancel()
+	languageResult, err := language.NewService().Hover(detailCtx, languageRequest(snapshot), languagePosition(params.Position))
+	if ctx.Err() != nil {
+		return nil, language.ErrCanceled
 	}
-
-	// Not having a repository is not a hover failure: the catalog summary
-	// needs none, and a DDL problem must never surface as a JSON-RPC error.
-	repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
-	if augmented := s.interBaseHover(ctx, repo, snapshot.Cache, params, snapshot.Text, res, snapshot.Generation, snapshot.Variant); augmented != nil {
-		return augmented, nil
+	if err != nil && !errors.Is(err, language.ErrNoHover) {
+		return nil, err
 	}
 	if err != nil {
 		return nil, nil
 	}
-	return res, nil
+	if err := s.navigationResultCurrent(ctx, snapshot, languageResult.Stamp); err != nil {
+		return nil, err
+	}
+	return lspHover(languageResult.Value), nil
+}
+
+func lspHover(value language.Hover) *lsp.Hover {
+	out := &lsp.Hover{Contents: lsp.MarkupContent{Kind: lsp.Markdown, Value: value.Markdown}}
+	if value.Range != nil {
+		out.Range = lspRange(*value.Range)
+	}
+	return out
 }
 
 func Hover(text string, params lsp.HoverParams, dbCache *database.DBCache) (*lsp.Hover, error) {
@@ -83,11 +96,5 @@ func HoverWithDriverVariant(ctx context.Context, text string, params lsp.HoverPa
 		}
 		return nil, err
 	}
-	out := &lsp.Hover{
-		Contents: lsp.MarkupContent{Kind: lsp.Markdown, Value: res.Value.Markdown},
-	}
-	if res.Value.Range != nil {
-		out.Range = lspRange(*res.Value.Range)
-	}
-	return out, nil
+	return lspHover(res.Value), nil
 }

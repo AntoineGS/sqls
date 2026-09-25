@@ -59,9 +59,17 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 	}
 	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
 	if err != nil {
-		return Result[Hover]{}, err
+		// Detail is optional hover augmentation. A provider error (including
+		// the host's detail deadline) must not discard a valid cache summary.
+		// Actual request cancellation is still fatal and is checked again
+		// below, after the wait.
+		if ctx.Err() == context.Canceled {
+			return Result[Hover]{}, ErrCanceled
+		}
+		detail = navigationDetail{}
+		available = false
 	}
-	if ctx.Err() != nil {
+	if ctx.Err() == context.Canceled {
 		return Result[Hover]{}, ErrCanceled
 	}
 	if available && detail.source != nil {
