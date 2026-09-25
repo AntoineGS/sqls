@@ -2,6 +2,7 @@ package language_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -138,6 +139,35 @@ func TestNavigationReferencesDoNotReportRelationCursorAsReference(t *testing.T) 
 	}
 }
 
+type cancelOnSecondErrContext struct {
+	context.Context
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (ctx *cancelOnSecondErrContext) Err() error {
+	ctx.calls++
+	if ctx.calls == 2 {
+		ctx.cancel()
+	}
+	return ctx.Context.Err()
+}
+
+func TestNavigationReferencesReturnsCanceledWhenContextEndsDuringLocalAnalysis(t *testing.T) {
+	base, cancel := context.WithCancel(context.Background())
+	ctx := &cancelOnSecondErrContext{Context: base, cancel: cancel}
+	text := "ALTER PROCEDURE p AS DECLARE VARIABLE v INTEGER; BEGIN v=1; END"
+	req := navRequest(text, dialect.DatabaseDriverInterBase)
+	position := testPosition(text, strings.Index(text, "v=1"))
+	result, err := language.NewService().References(ctx, req, position, true)
+	if !errors.Is(err, language.ErrCanceled) {
+		t.Fatalf("References error = %v, want %v", err, language.ErrCanceled)
+	}
+	if len(result.Value) != 0 {
+		t.Fatalf("canceled References returned locations: %#v", result.Value)
+	}
+}
+
 func TestNavigationLegacyRenamePreservesSpellingMatchesAndUTF16Ranges(t *testing.T) {
 	text := "-- 😀\nSELECT '😀'; SELECT city.ID, city.Name FROM city WHERE city.ID = 'city' -- city\nSELECT city.ID FROM city"
 	req := navRequest(text, dialect.DatabaseDriverPostgreSQL)
@@ -150,8 +180,10 @@ func TestNavigationLegacyRenamePreservesSpellingMatchesAndUTF16Ranges(t *testing
 	}
 	wantStarts := []language.Position{{Line: 1, UTF16Column: 20}, {Line: 1, UTF16Column: 29}, {Line: 1, UTF16Column: 44}, {Line: 1, UTF16Column: 55}, {Line: 2, UTF16Column: 7}, {Line: 2, UTF16Column: 20}}
 	for i, edit := range got.Value[0].Edits {
-		if edit.Range.Start != wantStarts[i] || edit.Text != "town" {
-			t.Errorf("edit %d = %+v, want start %+v replacing with town", i, edit, wantStarts[i])
+		wantEnd := wantStarts[i]
+		wantEnd.UTF16Column += len("city")
+		if edit.Range.Start != wantStarts[i] || edit.Range.End != wantEnd || edit.Text != "town" {
+			t.Errorf("edit %d = %+v, want range %+v..%+v replacing with town", i, edit, wantStarts[i], wantEnd)
 		}
 	}
 	if got.Value[0].URI != req.Document.URI || got.Value[0].Shape != language.RenameDocumentChanges {

@@ -52,12 +52,16 @@ func lspTextEdit(e language.TextEdit) lsp.TextEdit {
 
 // navigationResultCurrent fences a computed navigation result against the
 // latest editor/metadata snapshot immediately before publishing it.
-func (s *Server) navigationResultCurrent(ctx context.Context, stamp language.Stamp) error {
+func (s *Server) navigationResultCurrent(ctx context.Context, captured editorSnapshot, stamp language.Stamp) error {
 	if err := ctx.Err(); err != nil {
 		return language.ErrCanceled
 	}
-	snapshot, err := s.captureEditorSnapshot(stamp.URI)
+	snapshot, err := s.captureEditorSnapshot(captured.URI)
 	if err != nil {
+		return language.ErrStale
+	}
+	if snapshot.Revision != captured.Revision || snapshot.Text != captured.Text ||
+		snapshot.Variant != captured.Variant || snapshot.DialectResolved != captured.DialectResolved {
 		return language.ErrStale
 	}
 	current := languageRequest(snapshot)

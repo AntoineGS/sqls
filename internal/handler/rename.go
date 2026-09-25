@@ -27,7 +27,7 @@ func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Co
 	if err != nil {
 		return nil, err
 	}
-	if err := s.navigationResultCurrent(ctx, result.Stamp); err != nil {
+	if err := s.navigationResultCurrent(ctx, snapshot, result.Stamp); err != nil {
 		return nil, err
 	}
 	return lspWorkspaceRename(result.Value), nil

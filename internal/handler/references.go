@@ -27,7 +27,7 @@ func (s *Server) handleReferences(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if err != nil {
 		return nil, err
 	}
-	if err := s.navigationResultCurrent(ctx, result.Stamp); err != nil {
+	if err := s.navigationResultCurrent(ctx, snapshot, result.Stamp); err != nil {
 		return nil, err
 	}
 	locations := make([]lsp.Location, 0, len(result.Value))

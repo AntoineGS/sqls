@@ -64,20 +64,25 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	return Result[[]Location]{Value: []Location{{Range: detail.range_, Source: detail.source}}, Stamp: stampFor(req)}, nil
 }
 
-// References returns local relation-name references in the document.
+// References returns same-document procedure-local symbol references.
 func (s *Service) References(ctx context.Context, req Request, position Position, includeDeclaration bool) (Result[[]Location], error) {
 	if err := ctx.Err(); err != nil {
 		return Result[[]Location]{}, ErrCanceled
 	}
-	if locations, handled, err := localReferences(req, position, includeDeclaration); err != nil {
+	locations, handled, err := localReferences(req, position, includeDeclaration)
+	if ctx.Err() != nil {
+		return Result[[]Location]{}, ErrCanceled
+	}
+	if err != nil {
 		return Result[[]Location]{}, err
-	} else if handled {
+	}
+	if handled {
 		return Result[[]Location]{Value: locations, Stamp: stampFor(req)}, nil
 	}
 	// References intentionally has no relation fallback. The legacy LSP
 	// contract only reports InterBase procedure-local symbols; a relation
 	// cursor is not a reference to itself.
-	locations := []Location{}
+	locations = []Location{}
 	if err := ctx.Err(); err != nil {
 		return Result[[]Location]{}, ErrCanceled
 	}
