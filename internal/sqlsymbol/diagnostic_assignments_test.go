@@ -315,6 +315,11 @@ func TestDiagnosticLossyAssignmentOptIn(t *testing.T) {
 		DiagnosticOptions{Rules: map[string]string{"interbase-lossy-assignment": "warning"}}, codeLossyAssignment, 1)
 }
 
+func TestLossyAssignmentWithholdsStaleCatalogWidthAfterDDL(t *testing.T) {
+	sql := "ALTER TABLE T ALTER COLUMN NAME TYPE VARCHAR(100); UPDATE T SET NAME = 'abcdefghijklmnop';"
+	requireCodeCount(t, sql, newDiagnosticFixtureCatalog(), codeStringTruncation, 0)
+}
+
 // --- default-off must skip computation, not merely filter it: leaving
 // codeLossyAssignment unconfigured (its "default" is off) while every other
 // code the shared model group can produce is explicitly off must never even

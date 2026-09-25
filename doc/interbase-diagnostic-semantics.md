@@ -316,9 +316,13 @@ gate. Live verification of unverified rules remains a separate opt-in gate.
   Dialect 1/3 table-driven coverage — precision 4 and 9 identical across
   dialects, precision 12 and 18 diverge to `familyApproximate` under
   Dialect 1 only).
-- **Live-probe status:** NOT VERIFIED — no live database available this
-  session (grounded in `interbase-go/schema/ddl.go`'s source, not a live
-  probe, unlike rule 2's C1 correction).
+- **Live-probe status:** Earlier read-only verification against
+  `interbase_reference` (Task 8 fix round 1) observed Dialect 1 rejection of
+  `CAST(... AS NUMERIC(12..18))` with SQL error -817 and catalog rows stored
+  as DOUBLE PRECISION, consistent with this mapping. Task 14's separate
+  disposable Dialect 1/3 native acceptance gate remains **NOT VERIFIED**;
+  the earlier Dialect 1 observations do not verify Dialect 3 behavior or
+  substitute for that gate.
 
 ### 11. Exact literal folding across top-level `+`/`-`/`*`/`||` in an expression, but not across `CASE ... END` branches (Task 9, corrected in Fix round 3 / I2)
 

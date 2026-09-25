@@ -19,8 +19,60 @@ func TestDiagnosticUnknownLocal(t *testing.T) {
 // which incorrectly asserted that a bare condition read was flagged.
 func TestDiagnosticUnknownLocalConditionReadsNotFlagged(t *testing.T) {
 	requireCodeCount(t,
-		"CREATE PROCEDURE Q AS DECLARE VARIABLE V_TOTAL INTEGER; BEGIN IF (V_TOTLA > 0) THEN V_TOTAL = 1; END",
+		"CREATE PROCEDURE Q AS DECLARE VARIABLE V_TOTAL INTEGER; BEGIN IF (V_TOTAL > 0) THEN V_TOTAL = 1; END",
 		nil, codeUnknownVariable, 0)
+}
+
+func TestDiagnosticUnknownProceduralExpressionReads(t *testing.T) {
+	proc := `CREATE PROCEDURE P AS DECLARE VARIABLE V INTEGER; BEGIN
+IF (V_TYPO > 0) THEN V = 1;
+WHILE (V_TYPO > 0) DO V = 1;
+V = V_TYPO + 1;
+V = V + 1;
+END`
+	requireCodeCount(t, proc, nil, codeUnknownVariable, 3)
+	trigger := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS DECLARE VARIABLE V INTEGER; BEGIN
+IF (V_TYPO > 0) THEN V = 1;
+WHILE (V_TYPO > 0) DO V = 1;
+V = V_TYPO + 1;
+V = V + 1;
+END`
+	requireCodeCount(t, trigger, nil, codeUnknownVariable, 3)
+}
+
+func TestDiagnosticUnknownProceduralExpressionReadsWithholdUnprovenShapes(t *testing.T) {
+	sql := `CREATE PROCEDURE P AS DECLARE VARIABLE V INTEGER; BEGIN
+IF (EXISTS(SELECT ID FROM T)) THEN V = 1;
+V = CURRENT_USER;
+V = GEN_ID(G, 1);
+V = CAST(V_TYPO AS INTEGER);
+V = NEW.BOGUS;
+SELECT ID FROM T WHERE V_TYPO = 1;
+IF (V_TYPO > ) THEN V = 1;
+V = (V_TYPO + 1;
+END`
+	requireCodeCount(t, sql, newDiagnosticFixtureCatalog(), codeUnknownVariable, 0)
+}
+
+func TestDiagnosticUnknownProceduralExpressionReadsPreserveQuotedUnicodeSpan(t *testing.T) {
+	sql := `CREATE PROCEDURE P AS DECLARE VARIABLE V INTEGER; BEGIN V = "名" + 1; END`
+	a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found []Finding
+	for _, f := range a.Diagnostics(nil) {
+		if f.Code == codeUnknownVariable {
+			found = append(found, f)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("got %d unknown-variable findings, want 1: %+v", len(found), found)
+	}
+	start := strings.Index(sql, `"名"`)
+	if found[0].Span != (Span{Start: start, End: start + len(`"名"`)}) {
+		t.Fatalf("span=%+v, want byte span [%d,%d)", found[0].Span, start, start+len(`"名"`))
+	}
 }
 
 func TestDiagnosticUnknownLocalKnownNameNotFlagged(t *testing.T) {

@@ -178,7 +178,7 @@ func (m *diagnosticModel) unknownRelationFindings() []Finding {
 			}
 			name := detail.ref.Name
 			if name.Key() == "" {
-				procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, alias: aliasKeyOf(detail.ref.Alias)}]
+				procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, source: detail.start}]
 				if !ok {
 					continue // a derived table: nothing to check by name
 				}
@@ -482,14 +482,17 @@ func (m *diagnosticModel) resolveQualifier(chain [][]RelationRef, qiChain []int,
 		}
 		matches := 0
 		var candidate RelationRef
-		for _, r := range relations {
+		for ri, r := range relations {
+			if qi >= 0 && ri < len(m.relationPositions[qi]) {
+				r.source, r.sourceKnown = m.relationPositions[qi][ri].start, true
+			}
 			if relationMatchesQualifier(r, qualifier) {
 				matches++
 				candidate = r
 				continue
 			}
 			if r.Name.Key() == "" && r.Alias == nil && qi >= 0 {
-				if procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, alias: ""}]; ok && procName.Key() == qualifier.Key() {
+				if procName, ok := m.procedureNameFor[m.relationSourceKey(qi, ri)]; ok && procName.Key() == qualifier.Key() {
 					matches++
 					candidate = r
 				}
@@ -663,6 +666,7 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 	a := m.analysis
 	var findings []Finding
 	for _, trg := range discoverTriggers(a.Text, m.items) {
+		ctx := newTriggerBodyContext(m.items, trg.bodyStart, trg.bodyEnd)
 		for idx := trg.bodyStart; idx < trg.bodyEnd; idx++ {
 			if !isWord(m.items[idx], "NEW") && !isWord(m.items[idx], "OLD") {
 				continue
@@ -675,7 +679,7 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 			// buildTriggerQueries) from the shared binder's whole-
 			// statement contextUnsupported classification, the same way
 			// it already exempted a recognized WITH statement's body.
-			if m.Unsupported(idx) {
+			if m.Unsupported(idx) || ctx.unsupported[idx-trg.bodyStart] {
 				continue
 			}
 			if m.DDLInvalidated(idx, trg.relation) {

@@ -47,8 +47,12 @@ func (a *Analysis) widthDiagnostics(c Catalog) []Finding {
 		return nil
 	}
 	items := significantLexemes(a.lexemes)
+	model := a.diagnosticModel(c)
 	findings := make([]Finding, 0)
 	for _, edge := range a.assignmentEdges(items, c) {
+		if model.staleCatalogDestination(edge) {
+			continue
+		}
 		findings = append(findings, a.findingForDestination(edge.source, edge.destination, c)...)
 	}
 	sort.SliceStable(findings, func(i, j int) bool {

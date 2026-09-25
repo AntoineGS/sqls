@@ -39,11 +39,13 @@ func (m *diagnosticModel) localFindings() []Finding {
 	var findings []Finding
 	findings = append(findings, a.procedureDuplicateFindings()...)
 	findings = append(findings, a.procedureUnknownVariableFindings(m)...)
+	findings = append(findings, a.proceduralExpressionReadFindings(m)...)
 
 	items := significantLexemes(a.lexemes)
 	for _, trg := range discoverTriggers(a.Text, items) {
 		findings = append(findings, trg.duplicateFindings()...)
 		findings = append(findings, trg.unknownVariableFindings(a.Text, items)...)
+		findings = append(findings, trg.expressionReadFindings(a.Text, items, m)...)
 	}
 
 	sort.SliceStable(findings, func(i, j int) bool { return findings[i].Span.Start < findings[j].Span.Start })

@@ -21,12 +21,15 @@ type diagnosticModel struct {
 	catalog  Catalog
 	semantic SemanticCatalog // nil when catalog does not implement SemanticCatalog
 	items    []lexeme
+	depths   []int
 
-	statements []modelStatement
+	statements  []modelStatement
+	statementAt []int
 
-	queries      []modelQuery
-	queryAt      []int // per item index: owning query index in queries, or -1
-	queryByStart map[int]int
+	queries        []modelQuery
+	queryAt        []int // per item index: owning query index in queries, or -1
+	queryByStart   map[int]int
+	cteByStatement map[cteLookupKey]int
 
 	derivedFor       map[relationSourceKey]int  // owning query + alias -> the derived table's own inner query index
 	procedureNameFor map[relationSourceKey]Name // owning query + alias -> the FROM-clause callable's procedure name
@@ -139,8 +142,13 @@ type modelDDL struct {
 }
 
 type relationSourceKey struct {
-	owner int // owning query index
-	alias string
+	owner  int // owning query index
+	source int // relation occurrence's first item index
+}
+
+type cteLookupKey struct {
+	statement int
+	name      string
 }
 
 // diagnosticModel builds the semantic-scope model for this analysis. c
@@ -161,6 +169,7 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 		return m
 	}
 	depths, matching := sqlDepths(items)
+	m.depths = depths
 	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text))
 	m.statements = splitStatements(items, boundaryAfter)
 
@@ -188,9 +197,24 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 		_ = stmtIndex
 	}
 
-	for qi := range m.queries {
-		m.queries[qi].statementIndex = statementIndexAt(m.statements, m.queries[qi].start)
+	m.statementAt = make([]int, len(items))
+	stmtIndex := 0
+	for pos := range items {
+		for stmtIndex < len(m.statements) && pos >= m.statements[stmtIndex].End {
+			stmtIndex++
+		}
+		m.statementAt[pos] = -1
+		if stmtIndex < len(m.statements) && pos >= m.statements[stmtIndex].Start && pos < m.statements[stmtIndex].End {
+			m.statementAt[pos] = stmtIndex
+		}
 	}
+	for qi := range m.queries {
+		m.queries[qi].statementIndex = -1
+		if m.queries[qi].start >= 0 && m.queries[qi].start < len(m.statementAt) {
+			m.queries[qi].statementIndex = m.statementAt[m.queries[qi].start]
+		}
+	}
+	m.buildCTEIndex()
 
 	m.queryByStart = make(map[int]int, len(m.queries))
 	for qi, q := range m.queries {
@@ -213,6 +237,7 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 	// those same structures directly for its own additions rather than
 	// triggering a second top-level pass.
 	m.buildTriggerQueries(a.Text, items, depths, matching, triggers)
+	m.buildCTEIndex()
 	m.detectUnionGroups(items, depths)
 
 	for _, stmt := range m.statements {
@@ -283,9 +308,16 @@ func (m *diagnosticModel) RelationOutput(i int, ref RelationRef) ([]ColumnFact, 
 		return nil, false
 	}
 	for qi := m.queryAt[i]; qi >= 0; qi = m.queries[qi].parent {
-		for _, candidate := range m.queries[qi].relations {
+		if ref.sourceKnown {
+			for ri, detail := range m.relationPositions[qi] {
+				if detail.start == ref.source {
+					return m.resolveRelationOutput(i, qi, ri, ref)
+				}
+			}
+		}
+		for ri, candidate := range m.queries[qi].relations {
 			if relationRefEqual(candidate, ref) {
-				return m.resolveRelationOutput(i, qi, ref)
+				return m.resolveRelationOutput(i, qi, ri, ref)
 			}
 		}
 	}
@@ -378,12 +410,12 @@ func (m *diagnosticModel) Unsupported(i int) bool {
 // outputs come from the model's own computed body shape and are unaffected
 // by catalog DDL; real-table and procedure lookups check DDLInvalidated
 // first and report unknown rather than trusting stale catalog data.
-func (m *diagnosticModel) resolveRelationOutput(at, owner int, ref RelationRef) ([]ColumnFact, bool) {
+func (m *diagnosticModel) resolveRelationOutput(at, owner, relationIndex int, ref RelationRef) ([]ColumnFact, bool) {
 	// A FROM-clause callable procedure and a derived table share the same
 	// RelationRef shape (empty Name, alias-only): relationAt's callable
 	// branch mirrors its LParen/derived-table branch. Check both keyed
 	// lookups before falling back to a catalog name lookup.
-	key := relationSourceKey{owner: owner, alias: aliasKeyOf(ref.Alias)}
+	key := m.relationSourceKey(owner, relationIndex)
 	if inner, ok := m.derivedFor[key]; ok {
 		return m.queryOutputColumns(inner)
 	}
@@ -428,6 +460,13 @@ func (m *diagnosticModel) resolveRelationOutput(at, owner int, ref RelationRef) 
 	return nil, false
 }
 
+func (m *diagnosticModel) relationSourceKey(owner, relationIndex int) relationSourceKey {
+	if owner >= 0 && owner < len(m.relationPositions) && relationIndex >= 0 && relationIndex < len(m.relationPositions[owner]) {
+		return relationSourceKey{owner: owner, source: m.relationPositions[owner][relationIndex].start}
+	}
+	return relationSourceKey{owner: owner, source: -1}
+}
+
 func (m *diagnosticModel) queryOutputColumns(qi int) ([]ColumnFact, bool) {
 	if qi < 0 || qi >= len(m.queries) || !m.queries[qi].output.CountKnown {
 		return nil, false
@@ -446,13 +485,20 @@ func (m *diagnosticModel) cteFor(owner int, nameKey string) (int, bool) {
 	if owner < 0 || owner >= len(m.queries) {
 		return -1, false
 	}
-	statementIndex := m.queries[owner].statementIndex
+	qi, ok := m.cteByStatement[cteLookupKey{m.queries[owner].statementIndex, nameKey}]
+	return qi, ok
+}
+
+func (m *diagnosticModel) buildCTEIndex() {
+	m.cteByStatement = make(map[cteLookupKey]int)
 	for qi, q := range m.queries {
-		if q.cteName == nameKey && q.statementIndex == statementIndex {
-			return qi, true
+		key := cteLookupKey{q.statementIndex, q.cteName}
+		if q.cteName != "" {
+			if _, exists := m.cteByStatement[key]; !exists {
+				m.cteByStatement[key] = qi
+			}
 		}
 	}
-	return -1, false
 }
 
 func relationRefEqual(a, b RelationRef) bool {
@@ -487,10 +533,9 @@ func (m *diagnosticModel) buildQueryAt(n int) {
 }
 
 func statementIndexAt(statements []modelStatement, pos int) int {
-	for i, s := range statements {
-		if pos >= s.Start && pos < s.End {
-			return i
-		}
+	i := sort.Search(len(statements), func(i int) bool { return statements[i].End > pos })
+	if i < len(statements) && pos >= statements[i].Start && pos < statements[i].End {
+		return i
 	}
 	return -1
 }
@@ -868,7 +913,7 @@ func (m *diagnosticModel) connectRelationSources(text string, items []lexeme, de
 				continue
 			}
 			source := details[k].start
-			key := relationSourceKey{owner: qi, alias: aliasKeyOf(ref.Alias)}
+			key := relationSourceKey{owner: qi, source: details[k].start}
 			if items[source].Token.Kind == token.LParen {
 				if inner, ok := m.queryByStart[source+1]; ok && m.queries[inner].end == matching[source] {
 					m.derivedFor[key] = inner
@@ -1178,29 +1223,29 @@ func (m *diagnosticModel) expandStar(text string, owner int, part []lexeme, rela
 		}
 		qualifier = &name
 	}
-	var target *RelationRef
+	targetIndex := -1
 	if qualifier == nil {
 		if len(relations) != 1 {
 			return nil, false
 		}
-		target = &relations[0]
+		targetIndex = 0
 	} else {
 		matches := 0
 		for i := range relations {
 			if relationMatchesQualifier(relations[i], *qualifier) {
 				matches++
-				target = &relations[i]
+				targetIndex = i
 			}
 		}
 		if matches != 1 {
 			return nil, false
 		}
 	}
-	if target == nil {
+	if targetIndex < 0 {
 		return nil, false
 	}
 	at := m.queries[owner].start
-	cols, ok := m.resolveRelationOutput(at, owner, *target)
+	cols, ok := m.resolveRelationOutput(at, owner, targetIndex, relations[targetIndex])
 	if !ok {
 		return nil, false
 	}

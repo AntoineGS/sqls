@@ -82,3 +82,30 @@ func BenchmarkDiagnosticExpansion(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkRepeatedSelectDiagnostics(b *testing.B) {
+	allOptional := DiagnosticOptions{Rules: map[string]string{
+		codeLossyAssignment: "warning", codeReadBeforeAssignment: "warning",
+		codeOutputNotAssigned: "warning", codeDeadStore: "hint", codeUnreachable: "hint",
+		codeNullableAssignment: "warning", codeNullableNotIn: "warning", codeOuterJoinFilter: "warning",
+	}}
+	for _, n := range []int{100, 800, 1600, 3200} {
+		text := strings.Repeat("SELECT ID FROM T;\n", n)
+		for _, policy := range []struct {
+			name    string
+			options DiagnosticOptions
+		}{{"default", DiagnosticOptions{}}, {"all_optional", allOptional}} {
+			b.Run(policy.name+"/n_"+strconv.Itoa(n), func(b *testing.B) {
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					a, err := AnalyzeDiagnostics(text, interBaseVariant())
+					if err != nil {
+						b.Fatal(err)
+					}
+					diagnosticExpansionBenchSink = a.DiagnosticsWithOptions(nil, policy.options)
+				}
+			})
+		}
+	}
+}

@@ -113,7 +113,7 @@ func (m *diagnosticModel) queryWherePredicate(qi int) ([]lexeme, bool) {
 		return nil, false
 	}
 	q := m.queries[qi]
-	depths, _ := sqlDepths(m.items)
+	depths := m.depths
 	where := -1
 	for i := q.start; i < q.end; i++ {
 		if depths[i] == q.baseDepth && isWord(m.items[i], "WHERE") {
@@ -200,7 +200,7 @@ func (m *diagnosticModel) nullableNotInFindings(qi int) []Finding {
 		return nil
 	}
 	var out []Finding
-	depths, _ := sqlDepths(m.items)
+	depths := m.depths
 	for i := q.start; i+3 < q.end; i++ {
 		if depths[i] != q.baseDepth || !isWord(m.items[i], "NOT") || !isWord(m.items[i+1], "IN") || m.items[i+2].Token.Kind != token.LParen {
 			continue
@@ -272,7 +272,7 @@ func (m *diagnosticModel) outerJoinFilterFinding(qi int) *Finding {
 		return nil
 	}
 	left, right := details[0], details[1]
-	depths, _ := sqlDepths(m.items)
+	depths := m.depths
 	for i := q.start; i < q.end; i++ {
 		if depths[i] == q.baseDepth && isWord(m.items[i], "JOIN") {
 			if i == 0 || !isWord(m.items[i-1], "LEFT") && !(i >= 2 && isWord(m.items[i-1], "OUTER") && isWord(m.items[i-2], "LEFT")) {

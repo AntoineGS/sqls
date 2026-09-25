@@ -375,6 +375,31 @@ func TestDiagnosticFixRound1UnaliasedProcedureCallQualifier(t *testing.T) {
 	requireCodeCount(t, "SELECT P.NOSUCH FROM P(1, 2);", c, codeUnknownColumn, 1)
 }
 
+func TestUnaliasedSelectableProcedureSourcesKeepOccurrenceIdentity(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	c.procedures["Q"] = ProcedureFact{InputsKnown: true, OutputsKnown: true}
+	c.procedures["Q"] = ProcedureFact{InputsKnown: true, OutputsKnown: true, MinInputsKnown: true}
+	for _, sql := range []string{
+		"SELECT P.OUT1 FROM P(1, 2), Q();",
+		"SELECT P.OUT1 FROM Q(), P(1, 2);",
+		"SELECT A.OUT1 FROM P(1, 2) AS A, Q() AS B;",
+	} {
+		t.Run(sql, func(t *testing.T) {
+			a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+			if err != nil {
+				t.Fatal(err)
+			}
+			findings := a.Diagnostics(c)
+			for _, f := range findings {
+				if f.Code == codeUnknownQualifier || f.Code == codeProcedureArity || f.Code == codeUnknownColumn {
+					t.Errorf("unexpected source-identity finding: %+v", f)
+				}
+			}
+		})
+	}
+	requireCodeCount(t, "SELECT P.OUT1 FROM P(1);", c, codeProcedureArity, 1)
+}
+
 // --- Fix round 1: I4 a malformed statement must not produce speculative
 // missing-name errors, across all four finding types ---
 
@@ -438,6 +463,17 @@ BEGIN
 END`
 	requireCodeCount(t, sql, c, codeUnknownRelation, 0)
 	requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+}
+
+func TestTriggerRowColumnsAreWithheldOnlyInsideUnsupportedRegion(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR T BEFORE UPDATE AS
+BEGIN
+  V = NEW.BOGUS;
+  MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = NEW.BOGUS;
+  V = OLD.BOGUS;
+END`
+	requireCodeCount(t, sql, c, codeUnknownColumn, 2)
 }
 
 func TestDiagnosticFixRound2WithInsideTriggerBodyResolvesCTEOutput(t *testing.T) {

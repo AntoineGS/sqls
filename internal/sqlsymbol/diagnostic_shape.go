@@ -474,7 +474,7 @@ func (m *diagnosticModel) fromCallableArityFindings(depths []int, matching map[i
 			if detail.ref.Name.Key() != "" {
 				continue // a real table/view/CTE name: not the alias-only callable form
 			}
-			procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, alias: aliasKeyOf(detail.ref.Alias)}]
+			procName, ok := m.procedureNameFor[relationSourceKey{owner: qi, source: detail.start}]
 			if !ok {
 				continue // a derived table: nothing callable to check
 			}
