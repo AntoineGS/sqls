@@ -395,9 +395,10 @@ func TestDefinitionNavigatesAmbiguousLocalToProvenColumn(t *testing.T) {
 	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
 	tx.server.stateMu.Unlock()
 
-	text := "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID;\r\nDBID = :DBID;\r\nEND"
+	queryLine := "SELECT /*😀*/ DBID FROM DATABASEID INTO :DBID;"
+	text := "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\n" + queryLine + "\r\nEND"
 	tx.textDocumentDidOpen(t, testFileURI, text)
-	queryPrefix := "SELECT /*😀*/ "
+	queryPrefix := queryLine[:strings.Index(queryLine, "DBID FROM")]
 	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
 		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
 		Position:     lsp.Position{Line: 3, Character: len(utf16.Encode([]rune(queryPrefix)))},
@@ -428,14 +429,15 @@ func TestDefinitionNavigatesAmbiguousLocalToProvenColumn(t *testing.T) {
 	if got[0].Range.Start.Character < 0 || got[0].Range.End.Character > len(line) || line[got[0].Range.Start.Character:got[0].Range.End.Character] != "DBID" {
 		t.Fatalf("definition range %+v selects %q, want exact DBID column span", got[0].Range, line[got[0].Range.Start.Character:got[0].Range.End.Character])
 	}
-	for _, character := range []int{0, len("DBID = "), len("DBID = ") + 1} {
-		params.Position = lsp.Position{Line: 4, Character: character}
+	colonCharacter := len(utf16.Encode([]rune(queryLine[:strings.Index(queryLine, ":DBID")])))
+	for _, character := range []int{colonCharacter, colonCharacter + 1} {
+		params.Position = lsp.Position{Line: 3, Character: character}
 		got = nil
 		if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
 			t.Fatal(err)
 		}
 		if len(got) != 1 || got[0].URI != testFileURI || got[0].Range.Start != (lsp.Position{Line: 1, Character: len("DECLARE VARIABLE ")}) || got[0].Range.End != (lsp.Position{Line: 1, Character: len("DECLARE VARIABLE DBID")}) {
-			t.Fatalf("local cursor character %d resolved to %#v, want declaration on line 1", character, got)
+			t.Fatalf("INTO local cursor character %d resolved to %#v, want declaration on line 1", character, got)
 		}
 	}
 	if task5DefinitionSentinel.calls != 1 {
