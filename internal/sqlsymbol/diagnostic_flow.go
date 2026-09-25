@@ -572,7 +572,8 @@ func flowTriggerSymbols(text string, items []lexeme, trg triggerModel) ([]*Symbo
 			continue
 		}
 		outputTarget := ctx.outputTarget[i-trg.bodyStart]
-		if ctx.inSQL[i-trg.bodyStart] && !outputTarget {
+		hostBind := i > trg.bodyStart && items[i-1].Token.Kind == token.Colon
+		if ctx.inSQL[i-trg.bodyStart] && !outputTarget && !hostBind {
 			continue
 		}
 		if i > trg.bodyStart && items[i-1].Token.Kind == token.Period || i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.Period {
@@ -633,33 +634,52 @@ func (m *diagnosticModel) analyzeFlowScope(symbols []*Symbol, root *flowNode, op
 	return findings, true, r.work
 }
 
-// findDeadStores deliberately limits its proof to straight-line basic-block
-// runs. A control-flow node is a barrier, so stores are never called dead
-// across branches, loops, handlers, or unknown effects without a path proof.
+// findDeadStores scans only reachable, supported basic-block paths. Branches
+// are analyzed independently; loops retain zero-iteration reachability and
+// do not carry store proofs across back-edges. Unknown effects clear proofs.
 func (r *flowRun) findDeadStores(root *flowNode) {
 	if !r.options.anyOn(codeDeadStore) || root == nil {
 		return
 	}
-	var scan func(*flowNode)
-	scan = func(block *flowNode) {
+	var scan func(*flowNode, bool) bool
+	scan = func(block *flowNode, reachable bool) bool {
 		if block.kind != flowBlock {
-			return
+			return reachable
 		}
 		pending := make(map[*Symbol]int)
 		clear := func() { clear(pending) }
 		for _, node := range block.children {
+			if !reachable {
+				break
+			}
 			r.charge()
 			if r.failed {
-				return
+				return false
+			}
+			if r.hasUnsupportedSyntax(node) {
+				// Retain possible control continuation, but do not prove an
+				// overwrite relationship across an unsupported effect.
+				clear()
+				continue
+			}
+			if (node.kind == flowIf || node.kind == flowLoop) && r.expressionHasCall(node.condition.start, node.condition.end) {
+				// A called function may mutate locals or have other effects; the
+				// branch/body therefore cannot establish an overwrite proof.
+				clear()
+				continue
 			}
 			switch node.kind {
 			case flowAssignment:
+				if r.expressionHasCall(node.start, node.end) {
+					clear()
+					continue
+				}
 				// Reads are processed before the write in an assignment.
 				for _, symbol := range r.symbols {
 					for _, read := range symbol.Reads {
 						r.charge()
 						if r.failed {
-							return
+							return false
 						}
 						idx := flowIndexAt(r.model.items, read.Start)
 						if idx >= node.start && idx < node.end {
@@ -671,7 +691,7 @@ func (r *flowRun) findDeadStores(root *flowNode) {
 					for _, write := range symbol.Writes {
 						r.charge()
 						if r.failed {
-							return
+							return false
 						}
 						idx := flowIndexAt(r.model.items, write.Start)
 						if idx < node.start || idx >= node.end {
@@ -689,31 +709,40 @@ func (r *flowRun) findDeadStores(root *flowNode) {
 				}
 			case flowBlock:
 				clear()
-				scan(node)
+				reachable = scan(node, reachable)
+				clear()
 			case flowNoop:
 			case flowIf:
 				clear()
-				// Each branch is a separate straight-line region; never carry a
-				// pending store across branch joins.
-				for _, child := range node.children {
-					scan(child)
+				thenContinues := scan(&flowNode{kind: flowBlock, children: node.children}, true)
+				elseContinues := true // the implicit false edge when there is no ELSE
+				if len(node.otherwise) > 0 {
+					elseContinues = scan(&flowNode{kind: flowBlock, children: node.otherwise}, true)
 				}
-				for _, child := range node.otherwise {
-					scan(child)
-				}
+				reachable = thenContinues || elseContinues
+				clear()
 			case flowLoop:
 				clear()
 				// Stores within one loop-body pass may be proven dead, but no
 				// pending store crosses a back-edge or zero-iteration path.
 				for _, child := range node.children {
-					scan(child)
+					if child.kind == flowBlock {
+						scan(child, true)
+					} else {
+						scan(&flowNode{kind: flowBlock, children: []*flowNode{child}}, true)
+					}
 				}
-			case flowUnknown, flowMaybeAssignment, flowExit:
+				clear() // include the loop's possible zero-iteration path
+			case flowExit:
+				clear()
+				reachable = false
+			case flowUnknown, flowMaybeAssignment:
 				clear()
 			}
 		}
+		return reachable
 	}
-	scan(root)
+	scan(root, true)
 }
 
 // flowDeclarationInitial distinguishes the guaranteed engine NULL default
@@ -808,6 +837,9 @@ func (r *flowRun) execute(n *flowNode, states []flowState) []flowState {
 	case flowIf:
 		for i := range states {
 			st := &states[i]
+			if st.terminated {
+				continue
+			}
 			r.checkReads(n.condition.start, n.condition.end, *st)
 			if r.expressionHasCall(n.condition.start, n.condition.end) {
 				r.invalidateState(st)
@@ -832,6 +864,9 @@ func (r *flowRun) execute(n *flowNode, states []flowState) []flowState {
 		return r.limitStates(out)
 	case flowLoop:
 		for i := range states {
+			if states[i].terminated {
+				continue
+			}
 			r.checkReads(n.condition.start, n.condition.end, states[i])
 			if r.expressionHasCall(n.condition.start, n.condition.end) {
 				r.invalidateState(&states[i])
@@ -899,6 +934,10 @@ func (r *flowRun) execute(n *flowNode, states []flowState) []flowState {
 	case flowMaybeAssignment:
 		var out []flowState
 		for _, st := range states {
+			if st.terminated {
+				out = append(out, st)
+				continue
+			}
 			r.checkReads(n.start, n.end, st)
 			out = append(out, cloneFlowState(st))
 			if !st.terminated {

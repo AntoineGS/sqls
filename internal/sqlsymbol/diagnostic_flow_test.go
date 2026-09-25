@@ -297,3 +297,109 @@ func TestDiagnosticFlowRuleRegistryAndSeverityOverrides(t *testing.T) {
 		t.Fatalf("explicit error override findings = %+v, want one severity-1 finding", got)
 	}
 }
+
+// Regression coverage for review finding 1: terminated paths must not
+// semantically evaluate conditions, loop headers, or SELECT INTO inputs.
+func TestDiagnosticFlowDoesNotEvaluateReadsAfterExit(t *testing.T) {
+	cases := map[string]string{
+		"if-condition":    `CREATE PROCEDURE Q RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN EXIT; IF (V = 1) THEN O = 2; END`,
+		"while-condition": `CREATE PROCEDURE Q RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN EXIT; WHILE (V = 1) DO O = 2; END`,
+		"select-into":     `CREATE PROCEDURE Q RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN EXIT; SELECT :V FROM T INTO :O; END`,
+	}
+	for name, source := range cases {
+		t.Run(name, func(t *testing.T) {
+			findings := flowDiagnostic(t, source, flowRulesOn)
+			requireFlowCount(t, findings, "interbase-read-before-assignment", 0)
+			unreachable := flowFindingsOf(findings, "interbase-unreachable")
+			if len(unreachable) != 1 {
+				t.Fatalf("unreachable findings = %+v, want one at the unreachable statement", unreachable)
+			}
+			marker := map[string]string{"if-condition": "IF", "while-condition": "WHILE", "select-into": "SELECT"}[name]
+			if got, want := unreachable[0].Span.Start, strings.Index(source, marker); got != want {
+				t.Fatalf("unreachable span start = %d, want %d (%s)", got, want, marker)
+			}
+		})
+	}
+	live := `CREATE PROCEDURE Q RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN IF (V = 1) THEN O = 2; END`
+	requireFlowCount(t, flowDiagnostic(t, live, flowRulesOn), "interbase-read-before-assignment", 1)
+}
+
+// Regression coverage for review finding 2: dead stores require reachable,
+// supported execution. A repeated store in a reachable branch/loop remains
+// reportable, while an unreachable or unsupported-separated store is not.
+func TestDiagnosticFlowDeadStoresRequireReachableSupportedBlocks(t *testing.T) {
+	cases := map[string]struct {
+		source string
+		want   int
+	}{
+		"unreachable-after-exit":           {`CREATE PROCEDURE Q RETURNS (O INTEGER) AS BEGIN EXIT; O = 1; O = 2; SUSPEND; END`, 0},
+		"no-op-after-exit":                 {`CREATE PROCEDURE Q RETURNS (O INTEGER) AS BEGIN EXIT; ; O = 1; O = 2; SUSPEND; END`, 0},
+		"unknown-effect-barrier":           {`CREATE PROCEDURE Q RETURNS (O INTEGER) AS BEGIN O = 1; MERGE INTO T USING U ON T.ID = U.ID WHEN MATCHED THEN UPDATE SET O = 3; O = 2; SUSPEND; END`, 0},
+		"unknown-effect-control-condition": {`CREATE PROCEDURE Q (FLAG INTEGER) RETURNS (O INTEGER) AS BEGIN IF (CHECK_STATE()) THEN BEGIN O = 1; O = 2; END SUSPEND; END`, 0},
+		"reachable-if-body":                {`CREATE PROCEDURE Q (FLAG INTEGER) RETURNS (O INTEGER) AS BEGIN IF (FLAG = 1) THEN BEGIN O = 1; O = 2; END SUSPEND; END`, 1},
+		"reachable-loop-body":              {`CREATE PROCEDURE Q (FLAG INTEGER) RETURNS (O INTEGER) AS BEGIN WHILE (FLAG = 1) DO BEGIN O = 1; O = 2; END SUSPEND; END`, 1},
+		"local-loop-carried-value":         {`CREATE PROCEDURE Q (FLAG INTEGER) RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN V = 0; WHILE (V < 10) DO V = V + 1; O = V; SUSPEND; END`, 0},
+		"straight-line-positive-control":   {`CREATE PROCEDURE Q RETURNS (O INTEGER) AS BEGIN O = 1; O = 2; SUSPEND; END`, 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			requireFlowCount(t, flowDiagnostic(t, tc.source, flowRulesOn), "interbase-dead-store", tc.want)
+		})
+	}
+}
+
+// Regression coverage for review finding 3: host-variable binds in trigger
+// SQL read locals; unprefixed SQL columns and external bind names do not.
+func TestDiagnosticFlowTriggerSQLBindsReadOnlyBoundLocals(t *testing.T) {
+	read := `CREATE TRIGGER TR_T FOR T BEFORE UPDATE AS DECLARE VARIABLE V INTEGER; BEGIN SELECT :V FROM T INTO :V; END`
+	if got := flowFindingsOf(flowDiagnostic(t, read, flowRulesOn), "interbase-read-before-assignment"); len(got) != 1 {
+		t.Fatalf("trigger bound-local read findings = %+v, want one finding at SELECT bind", got)
+	}
+	column := `CREATE TRIGGER TR_T FOR T BEFORE UPDATE AS DECLARE VARIABLE V INTEGER; BEGIN SELECT V FROM T INTO :V; END`
+	requireFlowCount(t, flowDiagnostic(t, column, flowRulesOn), "interbase-read-before-assignment", 0)
+	external := `CREATE TRIGGER TR_T FOR T BEFORE UPDATE AS DECLARE VARIABLE V INTEGER; BEGIN SELECT :EXTERNAL FROM T INTO :V; END`
+	requireFlowCount(t, flowDiagnostic(t, external, flowRulesOn), "interbase-read-before-assignment", 0)
+}
+
+// Regression coverage for review spec gap: the exception handler recovers
+// from a SELECT INTO that may raise (for example, a singleton cardinality
+// error), so its affected assignment facts must remain unknown.
+func TestDiagnosticFlowExceptionRecoveryAfterRaisingSelectIsUnknown(t *testing.T) {
+	source := `CREATE PROCEDURE Q RETURNS (O INTEGER) AS BEGIN SELECT ID FROM T INTO :O; WHEN ANY DO BEGIN O = 2; END SUSPEND; END`
+	analysis, err := AnalyzeDiagnostics(source, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := analysis.diagnosticModel(nil)
+	start, end := flowProcedureItems(model.items, analysis.procedures[0].Span)
+	body := start
+	for body < end && !isWord(model.items[body], "BEGIN") {
+		body++
+	}
+	parser := flowParser{items: model.items, i: body, end: end}
+	root := parser.parseStatement()
+	if parser.bad || root == nil || !flowTreeHasKind(root, flowMaybeAssignment) || !flowTreeHasKind(root, flowUnknown) {
+		t.Fatalf("raising SELECT INTO and recovery handler were not both modeled as expected: bad=%v root=%+v", parser.bad, root)
+	}
+	requireFlowCount(t, analysis.DiagnosticsWithOptions(nil, flowRulesOn), "interbase-output-not-assigned", 0)
+}
+
+func flowTreeHasKind(node *flowNode, kind flowNodeKind) bool {
+	if node == nil {
+		return false
+	}
+	if node.kind == kind {
+		return true
+	}
+	for _, child := range node.children {
+		if flowTreeHasKind(child, kind) {
+			return true
+		}
+	}
+	for _, child := range node.otherwise {
+		if flowTreeHasKind(child, kind) {
+			return true
+		}
+	}
+	return false
+}
