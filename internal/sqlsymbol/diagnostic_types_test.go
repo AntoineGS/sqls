@@ -465,6 +465,57 @@ func TestAssignmentCompatibilityScaleLossReference(t *testing.T) {
 	}
 }
 
+// TestAssignmentCompatibilityRoundBeforeStorageRangeCheck is the N1
+// regression: InterBase rounds a literal half-away-from-zero to the
+// destination's scale BEFORE checking it against the storage range, not
+// after. A literal whose raw value is past the boundary but whose ROUNDED
+// value lands inside it must not be outcomeDefinitelyInvalid.
+//
+// Live-verified against interbase_reference (Dialect 1): CAST(32767.4 AS
+// SMALLINT) succeeds, returns 32767 (rounds down into range);
+// CAST(-32768.4 AS SMALLINT) succeeds, returns -32768;
+// CAST(2147483647.4 AS INTEGER) succeeds; CAST(327.674 AS NUMERIC(4,2))
+// succeeds, returns 327.67; CAST(-327.684 AS NUMERIC(4,2)) succeeds,
+// returns -327.68. In every case rounding occurred (the literal's exact
+// value changed), so per I1's existing rounding-loss rule the correct
+// outcome is outcomePossibleLoss, not outcomeSafe and not
+// outcomeDefinitelyInvalid.
+//
+// Contrast regressions (unchanged from before this fix): CAST(32767.5 AS
+// SMALLINT) overflows (rounds to 32768, out of range); CAST(327.675 AS
+// NUMERIC(4,2)) overflows likewise -- both must still report
+// outcomeDefinitelyInvalid.
+func TestAssignmentCompatibilityRoundBeforeStorageRangeCheck(t *testing.T) {
+	dv := dialect1Variant()
+	smallint := mustParseDiagnosticType(t, "SMALLINT", dv, nil)
+	integer := mustParseDiagnosticType(t, "INTEGER", dv, nil)
+	numeric42 := mustParseDiagnosticType(t, "NUMERIC(4, 2)", dv, nil)
+
+	tests := []struct {
+		name        string
+		value       *big.Rat
+		destination sqlType
+		want        compatibilityOutcome
+	}{
+		{"SMALLINT <- 32767.4: possible loss (rounds down into range, not invalid)", big.NewRat(327674, 10), smallint, outcomePossibleLoss},
+		{"SMALLINT <- -32768.4: possible loss (rounds into range, not invalid)", big.NewRat(-327684, 10), smallint, outcomePossibleLoss},
+		{"INTEGER <- 2147483647.4: possible loss (rounds down into range, not invalid)", big.NewRat(21474836474, 10), integer, outcomePossibleLoss},
+		{"NUMERIC(4,2) <- 327.674: possible loss (rounds to 327.67, in range)", big.NewRat(327674, 1000), numeric42, outcomePossibleLoss},
+		{"NUMERIC(4,2) <- -327.684: possible loss (rounds to -327.68, in range)", big.NewRat(-327684, 1000), numeric42, outcomePossibleLoss},
+		// Regression: these genuinely round OUT of range and must remain invalid.
+		{"SMALLINT <- 32767.5: definitely invalid (rounds up to 32768, out of range)", big.NewRat(327675, 10), smallint, outcomeDefinitelyInvalid},
+		{"NUMERIC(4,2) <- 327.675: definitely invalid (rounds up out of range)", big.NewRat(327675, 1000), numeric42, outcomeDefinitelyInvalid},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := assignmentCompatibility(expressionFact{Value: tt.value}, tt.destination, dv)
+			if got.Outcome != tt.want {
+				t.Fatalf("Outcome = %v, want %v (reason: %q)", got.Outcome, tt.want, got.Reason)
+			}
+		})
+	}
+}
+
 // TestAssignmentCompatibilityCharacterWidth also pins the I3 hedge: since
 // CharacterWidth may be a byte-length fallback rather than a genuine
 // character count (see sqlType's own doc), a narrower destination is

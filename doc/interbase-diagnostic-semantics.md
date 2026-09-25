@@ -84,8 +84,61 @@ been confirmed against a running engine.
   live-verified `10000`/`32768`/`327.67` values from the reviewer's probes).
 - **Live-probe status:** VERIFIED by the reviewer's own read-only
   `CAST(...) FROM RDB$DATABASE` probes against `interbase_reference` (cited
-  above); this is the one rule in this ledger with actual live confirmation,
-  not merely a codebase-rendering citation.
+  above); this is one of the rules in this ledger with actual live
+  confirmation, not merely a codebase-rendering citation. See rule 10 (N1)
+  below for a follow-up correction to how a literal is compared against
+  this range.
+
+### 10. Literal rounding happens BEFORE the storage-range check, not after (added in Fix round 2, N1)
+
+- **Rule:** InterBase rounds a literal half-away-from-zero to the
+  destination's declared scale, THEN checks the ROUNDED value against the
+  destination's storage-enforced range (rule 2/9) — not the other way
+  around. A literal whose raw, unrounded value lies outside the storage
+  range but whose rounded value lies inside it is accepted by the engine,
+  not rejected.
+- **Corrected bug (was wrong in Fix round 1):** Fix round 1's C1 correction
+  compared the RAW literal against `StorageMin`/`StorageMax` before
+  considering rounding at all, which falsely reported a value that rounds
+  into range as `outcomeDefinitelyInvalid`.
+- **Live-verified proof (against `interbase_reference`, Dialect 1):**
+  `CAST(32767.4 AS SMALLINT)` succeeds, returns `32767` (rounds down into
+  range); `CAST(-32768.4 AS SMALLINT)` succeeds, returns `-32768`;
+  `CAST(2147483647.4 AS INTEGER)` succeeds; `CAST(327.674 AS NUMERIC(4,2))`
+  succeeds, returns `327.67`; `CAST(-327.684 AS NUMERIC(4,2))` succeeds,
+  returns `-327.68`. Contrast: `CAST(32767.5 AS SMALLINT)` overflows
+  (rounds away from zero to `32768`, out of range); `CAST(327.675 AS
+  NUMERIC(4,2))` overflows likewise — both remain `outcomeDefinitelyInvalid`
+  after this fix, unchanged.
+- **How this composes with I1 (Fix round 1)'s rounding-loss rule:** I1
+  established that a literal requiring rounding to fit the destination's
+  scale is `outcomePossibleLoss`, never `outcomeSafe`, once it is known to
+  be in range. N1 does not introduce a third outcome or contradict this —
+  it only moves WHERE the range check happens (after rounding, not before).
+  The composed order in `assignmentCompatibility`'s literal-value path is
+  now: (1) round the literal to `destination.Scale` half-away-from-zero
+  using exact `big.Rat`/`big.Int` arithmetic (`roundToScale`,
+  `roundHalfAwayFromZero` — never `float64`); (2) compare the ROUNDED value
+  against `StorageMin`/`StorageMax` — outside is
+  `outcomeDefinitelyInvalid`; (3) if in range and rounding changed the
+  value, `outcomePossibleLoss` (this is exactly I1's existing rule, now fed
+  the correct in-range determination); (4) if in range and rounding did not
+  change the value, `outcomeSafe`. No duplicate or conflicting
+  fractional-digit check remains — the single `roundToScale` call now
+  serves both what was previously two separate steps (the old
+  `hasExtraFractionalDigits` helper was removed and folded into this one
+  rounding call).
+- **Dialect(s):** both (rounding behavior itself is not dialect-sensitive;
+  it interacts with the already-dialect-sensitive storage range from rules
+  2 and 9).
+- **Authoritative source:** the reviewer's live `CAST(...)` probes against
+  `interbase_reference`, cited above.
+- **Test fixture:**
+  `TestAssignmentCompatibilityRoundBeforeStorageRangeCheck` (all five
+  live-verified round-into-range cases, plus the two round-out-of-range
+  regression cases that must remain `outcomeDefinitelyInvalid`).
+- **Live-probe status:** VERIFIED by the reviewer's own live `CAST(...)`
+  probes against `interbase_reference`, cited above.
 
 ### 3. CHAR(n) / VARCHAR(n) / CSTRING(n) declared width — honest limitation corrected in Fix round 1 (I3)
 

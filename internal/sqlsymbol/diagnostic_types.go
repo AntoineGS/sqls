@@ -263,14 +263,40 @@ func exactNumericRange(precision, scale int, dv dialect.DriverVariant) sqlType {
 	}
 }
 
-// hasExtraFractionalDigits reports whether value, expressed exactly, carries
-// more fractional decimal digits than scale allows -- i.e. whether storing
-// it in a scale-digit fixed-point destination requires InterBase to round
-// it. Live-verified: CAST(1.5 AS INTEGER) (scale 0) returns 2;
-// CAST(1.235 AS NUMERIC(4,2)) (scale 2) returns 1.24.
-func hasExtraFractionalDigits(value *big.Rat, scale int) bool {
-	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(pow10(scale)))
-	return !scaled.IsInt()
+// roundHalfAwayFromZero rounds a *big.Rat to the nearest *big.Int, breaking
+// an exact .5 tie away from zero, using only exact big.Int arithmetic (no
+// float64 anywhere) -- this is InterBase's own literal-to-fixed-point
+// rounding rule (N1): CAST(32767.5 AS SMALLINT) overflows (rounds away from
+// zero to 32768), not CAST(32767.4 AS SMALLINT), which rounds toward zero
+// to 32767 and is accepted.
+func roundHalfAwayFromZero(value *big.Rat) *big.Int {
+	num := value.Num()
+	den := value.Denom() // big.Rat.Denom() is always > 0
+	quotient, remainder := new(big.Int).QuoRem(num, den, new(big.Int))
+	// QuoRem truncates toward zero; remainder has the same sign as num (or
+	// is zero) and |remainder| < den. Round the truncated quotient away
+	// from zero by one when the remainder is at least half of den.
+	doubledRemainder := new(big.Int).Lsh(new(big.Int).Abs(remainder), 1)
+	if doubledRemainder.Cmp(den) >= 0 {
+		if num.Sign() >= 0 {
+			quotient.Add(quotient, big.NewInt(1))
+		} else {
+			quotient.Sub(quotient, big.NewInt(1))
+		}
+	}
+	return quotient
+}
+
+// roundToScale rounds value to scale fractional decimal digits, half away
+// from zero, returning the result as an exact *big.Rat -- the same rounding
+// InterBase itself applies to a literal being assigned into a scale-digit
+// fixed-point destination (N1), performed before comparing against the
+// destination's storage range rather than after.
+func roundToScale(value *big.Rat, scale int) *big.Rat {
+	divisor := pow10(scale)
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(divisor))
+	roundedUnscaled := roundHalfAwayFromZero(scaled)
+	return new(big.Rat).SetFrac(roundedUnscaled, divisor)
 }
 
 // stripTypeSuffixes cuts a rendered type string at the first CHARACTER SET
@@ -529,18 +555,27 @@ func assignmentCompatibility(source expressionFact, destination sqlType, dv dial
 	}
 
 	if source.Value != nil && destination.StorageMin != nil && destination.StorageMax != nil {
-		if source.Value.Cmp(destination.StorageMin) < 0 || source.Value.Cmp(destination.StorageMax) > 0 {
+		// N1: InterBase rounds the literal to the destination's scale
+		// half-away-from-zero BEFORE checking it against the storage
+		// range, not after -- CAST(32767.4 AS SMALLINT) rounds to 32767
+		// (in range, accepted) while CAST(32767.5 AS SMALLINT) rounds to
+		// 32768 (out of range, overflow). Comparing the raw, unrounded
+		// literal against the storage range (as an earlier version of
+		// this function did) falsely reports the former as invalid.
+		rounded := roundToScale(source.Value, destination.Scale)
+		roundingOccurred := rounded.Cmp(source.Value) != 0
+		if rounded.Cmp(destination.StorageMin) < 0 || rounded.Cmp(destination.StorageMax) > 0 {
 			return compatibility{
 				Outcome: outcomeDefinitelyInvalid,
-				Reason: fmt.Sprintf("literal %s is outside the %s destination's engine-enforced storage range [%s, %s]",
-					source.Value.RatString(), destination.Family, destination.StorageMin.RatString(), destination.StorageMax.RatString()),
+				Reason: fmt.Sprintf("literal %s (rounds to %s at scale %d) is outside the %s destination's engine-enforced storage range [%s, %s]",
+					source.Value.RatString(), rounded.RatString(), destination.Scale, destination.Family, destination.StorageMin.RatString(), destination.StorageMax.RatString()),
 			}
 		}
-		if hasExtraFractionalDigits(source.Value, destination.Scale) {
+		if roundingOccurred {
 			return compatibility{
 				Outcome: outcomePossibleLoss,
-				Reason: fmt.Sprintf("literal %s has more fractional digits than the destination's scale %d and will be rounded",
-					source.Value.RatString(), destination.Scale),
+				Reason: fmt.Sprintf("literal %s has more fractional digits than the destination's scale %d and will be rounded to %s",
+					source.Value.RatString(), destination.Scale, rounded.RatString()),
 			}
 		}
 		return compatibility{
