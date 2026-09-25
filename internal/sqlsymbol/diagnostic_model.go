@@ -69,6 +69,11 @@ type diagnosticModel struct {
 	recognizedTriggerBodies []itemRange
 
 	ddl []modelDDL // CREATE/ALTER/DROP object identities, in document order
+
+	// exprFactCache memoizes expressionFact by span within this
+	// diagnosticModel instance only -- never shared across documents,
+	// requests, or other diagnosticModel instances.
+	exprFactCache map[Span]expressionFact
 }
 
 // itemRange is a half-open range of item indices, distinct from the
