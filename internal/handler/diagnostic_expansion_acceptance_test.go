@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -343,5 +344,174 @@ func TestDiagnosticsNeverTriggerDatabaseIO(t *testing.T) {
 	})
 	if len(cleared.Diagnostics) != 0 {
 		t.Fatalf("diagnostics = %+v, want none after the fix; a leaked repository call would have panicked instead", cleared.Diagnostics)
+	}
+}
+
+// --- live settings changes via didChangeConfiguration must be validated;
+// an invalid rule policy must never be silently applied ---
+
+func TestDiagnosticsConfigChangeRejectsUnknownRuleCodeOverRealRPC(t *testing.T) {
+	const uri = "file:///policy-reject-unknown-code.sql"
+	text := "SELECT ID FROM T WHERE V = NULL;"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1
+	})
+	if initial.Diagnostics[0].Severity != 2 {
+		t.Fatalf("initial severity = %d, want 2 (warning, the registry default)", initial.Diagnostics[0].Severity)
+	}
+
+	cfg := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{
+		// A realistic typo: "comparision" instead of "comparison".
+		"interbase-null-comparision": "off",
+	}}}
+	err := tx.clientConn.Call(tx.ctx, "workspace/didChangeConfiguration", didChangeConfigurationParams(cfg), nil)
+	if err == nil {
+		t.Fatal("workspace/didChangeConfiguration with an unknown rule code returned no error, want a rejection")
+	}
+
+	tx.server.stateMu.RLock()
+	wsCfg := tx.server.WSCfg
+	tx.server.stateMu.RUnlock()
+	if wsCfg != nil {
+		t.Fatalf("WSCfg = %+v, want nil (unchanged): a rejected configuration must never be applied", wsCfg)
+	}
+
+	// The previous (default) policy must still be in effect: the rule the
+	// bad config tried (and failed) to turn off must still fire.
+	tx.change(t, uri, text, 2)
+	stillFiring := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 2 && len(n.Diagnostics) == 1
+	})
+	if diagnosticCode(stillFiring.Diagnostics[0]) != "interbase-null-comparison" || stillFiring.Diagnostics[0].Severity != 2 {
+		t.Fatalf("diagnostics after a rejected config change = %+v, want the unaffected default policy still in effect", stillFiring.Diagnostics)
+	}
+}
+
+func TestDiagnosticsConfigChangeRejectsUnknownLevelOverRealRPC(t *testing.T) {
+	const uri = "file:///policy-reject-unknown-level.sql"
+	text := "SELECT ID FROM T WHERE V = NULL;"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1
+	})
+	if initial.Diagnostics[0].Severity != 2 {
+		t.Fatalf("initial severity = %d, want 2 (warning, the registry default)", initial.Diagnostics[0].Severity)
+	}
+
+	cfg := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{
+		// Wrong case: registered levels are lowercase ("error"), not "Error".
+		"interbase-null-comparison": "Error",
+	}}}
+	err := tx.clientConn.Call(tx.ctx, "workspace/didChangeConfiguration", didChangeConfigurationParams(cfg), nil)
+	if err == nil {
+		t.Fatal("workspace/didChangeConfiguration with an unknown level returned no error, want a rejection")
+	}
+
+	tx.server.stateMu.RLock()
+	wsCfg := tx.server.WSCfg
+	tx.server.stateMu.RUnlock()
+	if wsCfg != nil {
+		t.Fatalf("WSCfg = %+v, want nil (unchanged): a rejected configuration must never be applied", wsCfg)
+	}
+
+	tx.change(t, uri, text, 2)
+	stillDefault := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 2 && len(n.Diagnostics) == 1
+	})
+	if diagnosticCode(stillDefault.Diagnostics[0]) != "interbase-null-comparison" || stillDefault.Diagnostics[0].Severity != 2 {
+		t.Fatalf("diagnostics after a rejected config change = %+v, want the unaffected default policy (severity 2) still in effect, not a severity-less finding", stillDefault.Diagnostics)
+	}
+}
+
+// --- a genuinely concurrent in-flight diagnostic computation started under
+// an old policy revision must never publish its result after a newer policy
+// revision has already taken effect ---
+
+func TestDiagnosticsConcurrentInFlightOldPolicyComputationNeverPublishes(t *testing.T) {
+	const uri = "file:///concurrent-policy-race.sql"
+	text := "SELECT ID FROM T WHERE V = NULL;"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(doRelease)
+	var block atomic.Bool
+
+	// diagnosticAnalyzer is invoked directly on the single background
+	// diagnostics-worker goroutine (runDiagnosticSignals ->
+	// publishDocumentDiagnostics). Blocking inside it here models a real
+	// in-flight computation that a concurrent didChangeConfiguration RPC
+	// (handled on its own jsonrpc2 dispatch goroutine) can race against.
+	tx.server.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+		if block.Load() {
+			enteredOnce.Do(func() { close(entered) })
+			<-release
+		}
+		return diagnosticsForSnapshot(snapshot)
+	}
+
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1
+	})
+	if initial.Diagnostics[0].Severity != 2 {
+		t.Fatalf("initial severity = %d, want 2 (warning, the registry default)", initial.Diagnostics[0].Severity)
+	}
+
+	// Arm the hook, then requeue this document so the single background
+	// worker picks it up and blocks mid-computation, still under the OLD
+	// policy revision.
+	block.Store(true)
+	tx.server.queueDiagnosticDocument(uri)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("in-flight computation did not start")
+	}
+
+	// While that computation is genuinely blocked on the background worker
+	// goroutine, send a real didChangeConfiguration over JSON-RPC (a
+	// separate goroutine) changing the rule to error severity. The RPC call
+	// completes without waiting for the busy worker: queueAllDiagnostics
+	// only signals a buffered channel.
+	cfg := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{"interbase-null-comparison": "error"}}}
+	if err := tx.clientConn.Call(tx.ctx, "workspace/didChangeConfiguration", didChangeConfigurationParams(cfg), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Let any FUTURE analyzer calls (the requeued re-evaluation under the
+	// new policy) run normally, then release the stale in-flight call.
+	block.Store(false)
+	doRelease()
+
+	updated := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && len(n.Diagnostics) == 1 && n.Diagnostics[0].Severity == 1
+	})
+	if diagnosticCode(updated.Diagnostics[0]) != "interbase-null-comparison" {
+		t.Fatalf("diagnostics after policy change = %+v, want interbase-null-comparison at error severity", updated.Diagnostics)
+	}
+
+	// Prove the stale in-flight (old-policy, severity-2) computation, which
+	// returned only after being released above, never reached the client:
+	// bar for any straggling notification after everything has settled.
+	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
+		t.Fatal("send notification barrier:", err)
+	}
+	select {
+	case <-tx.client.barrier:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for notification barrier")
+	}
+	tx.client.mu.Lock()
+	defer tx.client.mu.Unlock()
+	for _, notification := range tx.client.notifications {
+		if notification.URI == uri && len(notification.Diagnostics) == 1 && notification.Diagnostics[0].Severity == 2 {
+			t.Fatalf("stale in-flight old-policy computation was published after the policy changed: %+v", notification)
+		}
 	}
 }

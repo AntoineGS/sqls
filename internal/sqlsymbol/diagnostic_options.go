@@ -84,14 +84,25 @@ func (o DiagnosticOptions) off(code string) bool {
 }
 
 // severity resolves the severity a produced finding for code must carry
-// under o. Never consulted for an "off" code, since those are never
-// produced.
-func (o DiagnosticOptions) severity(code string) int {
+// under o, given fallback -- the severity the rule itself already assigned
+// on the Finding it produced. fallback is used whenever the registry or
+// level table cannot resolve a severity: an unregistered code (registry
+// drift when a future rule adds a code and forgets to register it) or an
+// unrecognized level string (defence in depth for a policy that somehow
+// bypassed Validate). Never consulted for an "off" code, since those are
+// never produced.
+func (o DiagnosticOptions) severity(code string, fallback int) int {
 	level := o.level(code)
-	if level == "default" {
-		return diagnosticRegistry[code]
+	if level != "default" {
+		if severity, ok := diagnosticLevelSeverity[level]; ok {
+			return severity
+		}
+		return fallback
 	}
-	return diagnosticLevelSeverity[level]
+	if severity, ok := diagnosticRegistry[code]; ok {
+		return severity
+	}
+	return fallback
 }
 
 // anyOn reports whether at least one of codes is not off under o. It gates
@@ -114,7 +125,7 @@ func applyDiagnosticOptions(findings []Finding, options DiagnosticOptions) []Fin
 		if options.off(f.Code) {
 			continue
 		}
-		f.Severity = options.severity(f.Code)
+		f.Severity = options.severity(f.Code, f.Severity)
 		kept = append(kept, f)
 	}
 	return kept

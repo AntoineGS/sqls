@@ -9,6 +9,7 @@ import (
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
+	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
 
@@ -19,6 +20,18 @@ func marshalConfigChangeParams(t *testing.T, cfg *config.Config) json.RawMessage
 		t.Fatal(err)
 	}
 	return json.RawMessage(raw)
+}
+
+// didChangeConfigurationParams builds real lsp.DidChangeConfigurationParams
+// for sending over an actual jsonrpc2.Conn.Call, matching the shape the real
+// language client sends (as opposed to marshalConfigChangeParams' raw JSON,
+// used for direct handleWorkspaceDidChangeConfiguration calls).
+func didChangeConfigurationParams(cfg *config.Config) lsp.DidChangeConfigurationParams {
+	return lsp.DidChangeConfigurationParams{
+		Settings: struct {
+			SQLS *config.Config `json:"sqls"`
+		}{SQLS: cfg},
+	}
 }
 
 func TestCaptureEditorSnapshotDeepCopiesDiagnosticRules(t *testing.T) {

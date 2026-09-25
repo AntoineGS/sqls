@@ -500,6 +500,23 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
+	// The live editor-settings path is the one most real users go through
+	// (as opposed to a file-loaded Config, validated by Config.Validate() at
+	// load time): it must apply the exact same validation, not silently
+	// accept an unknown rule code or level. params.Settings.SQLS can be nil
+	// (clearing the workspace configuration), which is always valid.
+	if params.Settings.SQLS != nil {
+		if err := params.Settings.SQLS.Diagnostics.Validate(); err != nil {
+			message := fmt.Sprintf("sqls: rejected workspace/didChangeConfiguration: %v", err)
+			log.Println(message)
+			if conn != nil {
+				if sendErr := lsp.NewMessenger(conn).ShowError(ctx, message); sendErr != nil {
+					log.Println("sqls: send configuration rejection message:", sendErr)
+				}
+			}
+			return nil, err
+		}
+	}
 	s.stateMu.Lock()
 	s.WSCfg = params.Settings.SQLS
 	s.policyRevision++
