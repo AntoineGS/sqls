@@ -486,7 +486,32 @@ func TestProductionDefinitionPreservesLocalJumpsAndOffsetsNativeSource(t *testin
 		if err != nil || !strings.Contains(string(content), "provenance: native-source") || !strings.Contains(string(content), provider.native) {
 			t.Fatalf("native snapshot=%q, %v", content, err)
 		}
+		if !strings.HasPrefix(got.locations[0].URI, "file:") || !strings.Contains(string(content), `-- sqls: read-only snapshot of InterBase PROCEDURE "MYPROC"`) || !strings.Contains(string(content), "unsupported metadata") {
+			t.Fatalf("source presentation URI/banner missing: uri=%q content=%q", got.locations[0].URI, content)
+		}
 	})
+}
+
+func TestProductionDefinitionReturnsCancellationWithoutPublishingSource(t *testing.T) {
+	s := newDefinitionServer(t)
+	provider := newGatedHoverProvider("MYPROC", "CREATE PROCEDURE MYPROC AS BEGIN SUSPEND; END")
+	lease := readyHoverLease(t, s, "definition-canceled", provider)
+	const text = "execute procedure myproc"
+	s.files[testFileURI] = &File{Text: text, Version: 1, Revision: 1}
+	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, lease
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	params, _ := json.Marshal(lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 0, Character: 20},
+	}})
+	raw := json.RawMessage(params)
+	value, err := s.handleDefinition(ctx, nil, &jsonrpc2.Request{Params: &raw})
+	if !errors.Is(err, language.ErrCanceled) || value != nil {
+		t.Fatalf("canceled definition = (%#v, %v), want (nil, ErrCanceled)", value, err)
+	}
+	if !snapshotRootIsEmpty(t, s.snapshots) {
+		t.Fatal("canceled definition published a source snapshot")
+	}
 }
 
 func snapshotPathFromURI(t *testing.T, value string) string {

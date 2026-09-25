@@ -76,9 +76,8 @@ func HoverWithDriver(text string, params lsp.HoverParams, dbCache *database.DBCa
 // HoverWithDriverVariant is a thin wrapper over language.Service.Hover: it
 // builds a minimal metadata snapshot around dbCache, delegates the actual
 // cache-only hover algorithm, and converts the result back to lsp types.
-// language.ErrNoHover is translated to this package's own ErrNoHover so
-// existing callers (interBaseHover's errors.Is check, and this package's
-// tests) keep their sentinel identity. ctx comes from the caller's own
+// language.ErrNoHover is translated to this package's own ErrNoHover for
+// compatibility. ctx comes from the caller's own
 // request context (handleTextDocumentHover's ctx in production) rather
 // than a fresh context.Background(), so a canceled request actually
 // cancels Hover's own ctx.Err() check. Exported, like SignatureHelpWithDriverVariant,

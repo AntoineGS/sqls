@@ -417,35 +417,3 @@ func TestEditorSnapshotDoesNotMixLateConnectionAMetadataIntoB(t *testing.T) {
 		t.Fatal("B snapshot did not bind to B's own lease incarnation")
 	}
 }
-
-func TestStaleDDLCompletionCannotPopulateNewGenerationMemo(t *testing.T) {
-	s := NewServer()
-	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
-	s.stateMu.Lock()
-	s.connGeneration = 1
-	s.ddlMemo = make(map[ddlKey]string)
-	s.stateMu.Unlock()
-	entered, release := make(chan struct{}), make(chan struct{})
-	repo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
-		close(entered)
-		<-release
-		return "CREATE PROCEDURE P AS BEGIN SUSPEND; END", nil
-	})
-	done := make(chan struct{})
-	go func() {
-		s.memoisedObjectDDL(context.Background(), repo, hoverTarget{kind: database.ObjectKindProcedure, name: "P"}, 1)
-		close(done)
-	}()
-	<-entered
-	s.stateMu.Lock()
-	s.connGeneration = 2
-	s.ddlMemo = make(map[ddlKey]string)
-	s.stateMu.Unlock()
-	close(release)
-	<-done
-	s.stateMu.RLock()
-	defer s.stateMu.RUnlock()
-	if len(s.ddlMemo) != 0 {
-		t.Fatalf("new generation memo contains stale entry: %#v", s.ddlMemo)
-	}
-}

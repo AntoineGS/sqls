@@ -28,9 +28,8 @@ import (
 //
 // MetadataLease is the same lease Metadata/MetadataIncarnation/
 // MetadataGeneration were captured from (nil under the same conditions they
-// are zero). It lets a caller load an object detail — see
-// leaseDDLRepository — that shares one Load with any other consumer of the
-// same store, rather than only reading the already-published Cache/Status.
+// are zero). Language-service detail requests use this lease so they share
+// retained and in-flight loads with other consumers of the same store.
 type editorSnapshot struct {
 	URI, Text           string
 	Version             int

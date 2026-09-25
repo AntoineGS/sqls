@@ -116,12 +116,6 @@ type Server struct {
 	fileRevision     uint64
 	notificationConn *jsonrpc2.Conn
 
-	// ddlMemo caches the rendered DDL appendix per connection generation.
-	// Hover fires on every cursor rest over the same token; without this,
-	// each one is a catalog round trip. Guarded by stateMu, and never held
-	// across the round trip itself.
-	ddlMemo map[ddlKey]string
-
 	// snapshots materialises database-resident source as read-only files. It is
 	// nil when the user cache directory could not be located, which disables
 	// go-to-definition for database objects and nothing else.
@@ -143,7 +137,6 @@ func NewServer() *Server {
 
 	server := &Server{
 		files:               make(map[string]*File),
-		ddlMemo:             make(map[ddlKey]string),
 		cancels:             newCancelRegistry(),
 		lifecycleCtx:        lifecycleCtx,
 		lifecycleCancel:     lifecycleCancel,
@@ -636,7 +629,6 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.curDBCfg = cloneConnectionConfig(intent.Config)
 	s.curConnectionIndex = intent.ConnectionIndex
 	s.curDBName = intent.DatabaseName
-	s.ddlMemo = make(map[ddlKey]string)
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
 	_ = s.enqueueDetachedConnection(old)

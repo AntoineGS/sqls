@@ -12,7 +12,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/internal/sqlsymbol"
+	"github.com/sqls-server/sqls/language"
 )
 
 // newTestSnapshotStore builds a store rooted at a temporary directory with a
@@ -86,13 +86,15 @@ func TestSnapshotBannerSanitizesHostileFieldsAndPreservesBodyRange(t *testing.T)
 			t.Errorf("banner line %d retains carriage return: %q", i, line)
 		}
 	}
-	bodyOffset := snapshotBodyOffset(content, bannerLines)
+	bodyOffset := strings.Index(content, body)
 	if got := content[bodyOffset:]; got != body+"\n" {
 		t.Fatalf("body changed during banner rendering: got %q want %q", got, body+"\n")
 	}
-	rng, ok := symbolRange(content, sqlsymbol.Span{Start: bodyOffset, End: bodyOffset + len("CREATE")})
-	if !ok || rng.Start != (lsp.Position{Line: bannerLines, Character: 0}) || rng.End != (lsp.Position{Line: bannerLines, Character: len("CREATE")}) {
-		t.Fatalf("body range=(%+v,%v), want first body token on line %d", rng, ok, bannerLines)
+	start, startErr := language.PositionAt(content, bodyOffset)
+	end, endErr := language.PositionAt(content, bodyOffset+len("CREATE"))
+	rng := lsp.Range{Start: lsp.Position{Line: start.Line, Character: start.UTF16Column}, End: lsp.Position{Line: end.Line, Character: end.UTF16Column}}
+	if startErr != nil || endErr != nil || rng.Start != (lsp.Position{Line: bannerLines, Character: 0}) || rng.End != (lsp.Position{Line: bannerLines, Character: len("CREATE")}) {
+		t.Fatalf("body range=(%+v,%v,%v), want first body token on line %d", rng, startErr, endErr, bannerLines)
 	}
 	candidate, err := store.writeCandidate(sc, string(target.kind), target.name, content)
 	if err != nil {
