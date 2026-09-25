@@ -222,8 +222,21 @@ type DocumentSymbol struct {
 	Children       []DocumentSymbol
 }
 
+// RenameShape describes the host-facing WorkspaceEdit container a rename
+// algorithm historically produced. It keeps transport policy out of the
+// semantic algorithm while allowing adapters to preserve wire compatibility.
+type RenameShape uint8
+
+const (
+	// RenameChanges maps document URIs directly to edits.
+	RenameChanges RenameShape = iota
+	// RenameDocumentChanges uses versioned TextDocumentEdit entries.
+	RenameDocumentChanges
+)
+
 // RenameEdit is the edit set for one document produced by a rename.
 type RenameEdit struct {
 	URI   string
 	Edits []TextEdit
+	Shape RenameShape
 }

@@ -3,102 +3,49 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"github.com/sqls-server/sqls/ast"
-	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/internal/sqlsymbol"
-	"github.com/sqls-server/sqls/parser"
-	"github.com/sqls-server/sqls/parser/parseutil"
-	"github.com/sqls-server/sqls/token"
+	"github.com/sqls-server/sqls/language"
 )
 
-func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
+func (s *Server) handleTextDocumentRename(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (interface{}, error) {
 	if req.Params == nil {
 		return nil, &jsonrpc2.Error{Code: jsonrpc2.CodeInvalidParams}
 	}
-
 	var params lsp.RenameParams
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
-
 	snapshot, err := s.captureEditorSnapshot(params.TextDocument.URI)
 	if err != nil {
 		return nil, err
 	}
-	text := snapshot.Text
-
-	res, handled, err := localRename(text, params, snapshot.Variant)
+	request := languageRequest(snapshot)
+	result, err := language.NewService().Rename(ctx, request, languagePosition(params.Position), params.NewName)
 	if err != nil {
 		return nil, err
 	}
-	if handled {
-		return res, nil
-	}
-	res, err = renameWithDriverVariant(text, params, snapshot.Variant)
-	if err != nil {
+	if err := s.navigationResultCurrent(ctx, result.Stamp); err != nil {
 		return nil, err
 	}
-	return res, nil
+	return lspWorkspaceRename(result.Value), nil
 }
 
-// localRename handles procedure-local InterBase symbols. The boolean is false
-// only when the cursor is outside a recognized procedure and the legacy
-// spelling-based rename may safely try the request.
+// localRename is retained for existing package tests. Its semantic result is
+// provided by language.Service; only the legacy helper's handled flag is
+// inferred from the service's transport-neutral rename discriminator.
 func localRename(text string, params lsp.RenameParams, dv dialect.DriverVariant) (*lsp.WorkspaceEdit, bool, error) {
-	if dv.Driver != dialect.DatabaseDriverInterBase {
-		return nil, false, nil
-	}
-	offset, ok := symbolOffset(text, params.Position)
-	if !ok {
-		return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{params.TextDocument.URI: {}}}, true, nil
-	}
-	analysis, err := sqlsymbol.Analyze(text, dv)
+	request := languageRequest(editorSnapshot{URI: params.TextDocument.URI, Text: text, Variant: dv})
+	result, err := language.NewService().Rename(context.Background(), request, languagePosition(params.Position), params.NewName)
 	if err != nil {
-		return nil, true, err
+		return nil, dv.Driver == dialect.DatabaseDriverInterBase, err
 	}
-	resolution := analysis.Resolve(offset)
-	if !resolution.InProcedure {
+	if len(result.Value) == 0 || result.Value[0].Shape != language.RenameChanges {
 		return nil, false, nil
 	}
-
-	switch resolution.Role {
-	case sqlsymbol.Local:
-		if resolution.Symbol == nil {
-			return nil, true, fmt.Errorf("cannot rename procedure local: unresolved symbol")
-		}
-		edits, err := analysis.Rename(resolution.Symbol, params.NewName)
-		if err != nil {
-			return nil, true, err
-		}
-		return workspaceRename(params.TextDocument.URI, text, edits)
-	case sqlsymbol.Ambiguous:
-		return nil, true, fmt.Errorf("cannot rename procedure target: ambiguous symbol")
-	case sqlsymbol.Relation, sqlsymbol.Column:
-		return nil, true, fmt.Errorf("cannot rename SQL target: database column or relation")
-	case sqlsymbol.Callable:
-		return nil, true, fmt.Errorf("cannot rename procedure target: other procedure or callable")
-	case sqlsymbol.Other:
-		return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{params.TextDocument.URI: {}}}, true, nil
-	default:
-		return nil, true, fmt.Errorf("cannot rename procedure target: unsupported symbol")
-	}
-}
-
-func workspaceRename(uri, text string, edits []sqlsymbol.Edit) (*lsp.WorkspaceEdit, bool, error) {
-	result := make([]lsp.TextEdit, 0, len(edits))
-	for _, edit := range edits {
-		rangeValue, ok := symbolRange(text, edit.Span)
-		if !ok {
-			return nil, true, fmt.Errorf("invalid local rename span")
-		}
-		result = append(result, lsp.TextEdit{Range: rangeValue, NewText: edit.NewText})
-	}
-	return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{uri: result}}, true, nil
+	return lspWorkspaceRename(result.Value), true, nil
 }
 
 func rename(text string, params lsp.RenameParams) (*lsp.WorkspaceEdit, error) {
@@ -110,74 +57,34 @@ func renameWithDriver(text string, params lsp.RenameParams, driver dialect.Datab
 }
 
 func renameWithDriverVariant(text string, params lsp.RenameParams, dv dialect.DriverVariant) (*lsp.WorkspaceEdit, error) {
-	parsed, err := parser.ParseWithDriverVariant(text, dv)
+	request := languageRequest(editorSnapshot{URI: params.TextDocument.URI, Text: text, Variant: dv})
+	result, err := language.NewService().Rename(context.Background(), request, languagePosition(params.Position), params.NewName)
 	if err != nil {
 		return nil, err
 	}
+	return lspWorkspaceRename(result.Value), nil
+}
 
-	pos := token.Pos{
-		Line: params.Position.Line,
-		Col:  params.Position.Character,
+func lspWorkspaceRename(edits []language.RenameEdit) *lsp.WorkspaceEdit {
+	if len(edits) == 0 {
+		return nil
 	}
-
-	// Get the identifier on focus
-	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
-	m := astutil.NodeMatcher{
-		NodeTypes: []ast.NodeType{ast.TypeIdentifier},
+	first := edits[0]
+	converted := make([]lsp.TextEdit, 0, len(first.Edits))
+	for _, edit := range first.Edits {
+		converted = append(converted, lspTextEdit(edit))
 	}
-	currentVariable := nodeWalker.CurNodeBottomMatched(m)
-	if currentVariable == nil {
-		return nil, nil
-	}
-
-	// Get all identifiers in the statement
-	idents, err := parseutil.ExtractIdenfiers(parsed, pos)
-	if err != nil {
-		return nil, err
-	}
-
-	// Extract only those with matching names
-	renameTarget := []ast.Node{}
-	for _, ident := range idents {
-		if ident.String() == currentVariable.String() {
-			renameTarget = append(renameTarget, ident)
+	if first.Shape == language.RenameDocumentChanges {
+		if len(converted) == 0 {
+			return nil
 		}
-	}
-	if len(renameTarget) == 0 {
-		return nil, nil
-	}
-
-	edits := make([]lsp.TextEdit, len(renameTarget))
-	for i, target := range renameTarget {
-		edit := lsp.TextEdit{
-			Range: lsp.Range{
-				Start: lsp.Position{
-					Line:      target.Pos().Line,
-					Character: target.Pos().Col,
-				},
-				End: lsp.Position{
-					Line:      target.End().Line,
-					Character: target.End().Col,
-				},
+		return &lsp.WorkspaceEdit{DocumentChanges: []lsp.TextDocumentEdit{{
+			TextDocument: lsp.OptionalVersionedTextDocumentIdentifier{
+				Version:                0,
+				TextDocumentIdentifier: lsp.TextDocumentIdentifier{URI: first.URI},
 			},
-			NewText: params.NewName,
-		}
-		edits[i] = edit
+			Edits: converted,
+		}}}
 	}
-
-	res := &lsp.WorkspaceEdit{
-		DocumentChanges: []lsp.TextDocumentEdit{
-			{
-				TextDocument: lsp.OptionalVersionedTextDocumentIdentifier{
-					Version: 0,
-					TextDocumentIdentifier: lsp.TextDocumentIdentifier{
-						URI: params.TextDocument.URI,
-					},
-				},
-				Edits: edits,
-			},
-		},
-	}
-
-	return res, nil
+	return &lsp.WorkspaceEdit{Changes: map[string][]lsp.TextEdit{first.URI: converted}}
 }

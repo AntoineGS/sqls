@@ -119,6 +119,68 @@ func TestNavigationProcedureLocalDefinitionAndShadowing(t *testing.T) {
 	}
 }
 
+func TestNavigationReferencesDoNotReportRelationCursorAsReference(t *testing.T) {
+	for _, text := range []string{
+		"SELECT * FROM customers",
+		"SELECT c.id FROM customers c",
+		"SELECT value FROM customers WHERE value = 1",
+	} {
+		t.Run(text, func(t *testing.T) {
+			req := navRequest(text, dialect.DatabaseDriverPostgreSQL)
+			got, err := language.NewService().References(context.Background(), req, language.Position{Line: 0, UTF16Column: 17}, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Value == nil || len(got.Value) != 0 {
+				t.Fatalf("relation references = %#v, want non-nil empty", got.Value)
+			}
+		})
+	}
+}
+
+func TestNavigationLegacyRenamePreservesSpellingMatchesAndUTF16Ranges(t *testing.T) {
+	text := "-- 😀\nSELECT '😀'; SELECT city.ID, city.Name FROM city WHERE city.ID = 'city' -- city\nSELECT city.ID FROM city"
+	req := navRequest(text, dialect.DatabaseDriverPostgreSQL)
+	got, err := language.NewService().Rename(context.Background(), req, language.Position{Line: 1, UTF16Column: 23}, "town")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Value) != 1 || len(got.Value[0].Edits) != 6 {
+		t.Fatalf("legacy spelling rename = %#v, want six parsed identifier edits", got.Value)
+	}
+	wantStarts := []language.Position{{Line: 1, UTF16Column: 20}, {Line: 1, UTF16Column: 29}, {Line: 1, UTF16Column: 44}, {Line: 1, UTF16Column: 55}, {Line: 2, UTF16Column: 7}, {Line: 2, UTF16Column: 20}}
+	for i, edit := range got.Value[0].Edits {
+		if edit.Range.Start != wantStarts[i] || edit.Text != "town" {
+			t.Errorf("edit %d = %+v, want start %+v replacing with town", i, edit, wantStarts[i])
+		}
+	}
+	if got.Value[0].URI != req.Document.URI || got.Value[0].Shape != language.RenameDocumentChanges {
+		t.Fatalf("legacy rename discriminator = %#v, want documentChanges for %s", got.Value[0], req.Document.URI)
+	}
+}
+
+func TestNavigationRenameReportsInterBaseProcedureRoleErrors(t *testing.T) {
+	service := language.NewService()
+	for _, tc := range []struct {
+		name string
+		text string
+		pos  language.Position
+		want string
+	}{
+		{name: "ambiguous", text: "ALTER PROCEDURE p AS\nDECLARE VARIABLE duplicate INTEGER;\nDECLARE VARIABLE duplicate INTEGER;\nBEGIN\nduplicate=1;\nEND", pos: language.Position{Line: 4}, want: "cannot rename procedure target: ambiguous symbol"},
+		{name: "sql relation", text: "ALTER PROCEDURE p AS BEGIN SELECT * FROM customer; END", pos: language.Position{Line: 0, UTF16Column: 42}, want: "cannot rename SQL target: database column or relation"},
+		{name: "sql column", text: "ALTER PROCEDURE p AS BEGIN UPDATE customer SET amount = 1; END", pos: language.Position{Line: 0, UTF16Column: 48}, want: "cannot rename SQL target: database column or relation"},
+		{name: "callable", text: "ALTER PROCEDURE p AS BEGIN EXECUTE PROCEDURE otherproc; END", pos: language.Position{Line: 0, UTF16Column: 46}, want: "cannot rename procedure target: other procedure or callable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := service.Rename(context.Background(), navRequest(tc.text, dialect.DatabaseDriverInterBase), tc.pos, "replacement")
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("Rename error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestNavigationLocalSymbolRangesUseUTF16WithEmojiAndCRLF(t *testing.T) {
 	text := "ALTER PROCEDURE p AS\r\nDECLARE VARIABLE v INTEGER;\r\nBEGIN\r\nv='😀'; v=1;\r\nEND"
 	req := navRequest(text, dialect.DatabaseDriverInterBase)

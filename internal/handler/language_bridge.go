@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"context"
+
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/language"
 )
@@ -46,4 +48,21 @@ func lspRange(r language.Range) lsp.Range {
 
 func lspTextEdit(e language.TextEdit) lsp.TextEdit {
 	return lsp.TextEdit{Range: lspRange(e.Range), NewText: e.Text}
+}
+
+// navigationResultCurrent fences a computed navigation result against the
+// latest editor/metadata snapshot immediately before publishing it.
+func (s *Server) navigationResultCurrent(ctx context.Context, stamp language.Stamp) error {
+	if err := ctx.Err(); err != nil {
+		return language.ErrCanceled
+	}
+	snapshot, err := s.captureEditorSnapshot(stamp.URI)
+	if err != nil {
+		return language.ErrStale
+	}
+	current := languageRequest(snapshot)
+	if !language.Current(stamp, current.Document, current.Context) {
+		return language.ErrStale
+	}
+	return nil
 }

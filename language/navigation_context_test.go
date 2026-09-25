@@ -251,8 +251,8 @@ func TestNavigationColumnDefinitionDoesNotBecomeRelationReferencesOrRename(t *te
 	if err != nil {
 		t.Fatalf("Rename: %v", err)
 	}
-	if len(rename.Value) != 0 {
-		t.Fatalf("column Rename became relation edits: %#v", rename.Value)
+	if len(rename.Value) != 1 || rename.Value[0].Shape != language.RenameDocumentChanges || len(rename.Value[0].Edits) != 1 {
+		t.Fatalf("column Rename = %#v, want the legacy spelling-based identifier edit", rename.Value)
 	}
 }
 
@@ -292,8 +292,7 @@ func TestNavigationDefinitionCursorAfterEmojiAndCRLFUsesUTF16(t *testing.T) {
 	if err != nil {
 		t.Fatalf("References: %v", err)
 	}
-	want := language.Range{Start: language.Position{Line: 1, UTF16Column: 14}, End: language.Position{Line: 1, UTF16Column: 19}}
-	if len(references.Value) != 1 || references.Value[0].Range != want {
-		t.Fatalf("UTF-16 target range = %#v, want %#v", references.Value, want)
+	if references.Value == nil || len(references.Value) != 0 {
+		t.Fatalf("relation References = %#v, want non-nil empty under standalone parity", references.Value)
 	}
 }

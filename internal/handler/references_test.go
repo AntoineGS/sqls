@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -11,6 +12,7 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 )
 
 func TestLocalReferencesAcrossStatements(t *testing.T) {
@@ -73,6 +75,24 @@ func TestReferencesUseConfiguredEditorSnapshotBeforeAttachment(t *testing.T) {
 	locations, ok := result.([]lsp.Location)
 	if !ok || len(locations) != 3 {
 		t.Fatalf("configured InterBase references = %#v, want three local references", result)
+	}
+}
+
+func TestReferencesAdapterHonorsRequestCancellation(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	if err := s.openFileAtVersion("file:///canceled.sql", "sql", "SELECT value FROM t", 1); err != nil {
+		t.Fatal(err)
+	}
+	params := lsp.ReferenceParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: "file:///canceled.sql"},
+	}}
+	data, _ := json.Marshal(params)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.handleReferences(ctx, nil, &jsonrpc2.Request{Params: (*json.RawMessage)(&data)})
+	if !errors.Is(err, language.ErrCanceled) {
+		t.Fatalf("canceled References error = %v, want %v", err, language.ErrCanceled)
 	}
 }
 

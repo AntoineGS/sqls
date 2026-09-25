@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 )
 
 var renameTestCases = []struct {
@@ -234,6 +236,22 @@ func TestRenameUsesConfiguredEditorSnapshotBeforeAttachment(t *testing.T) {
 	edit, ok := result.(*lsp.WorkspaceEdit)
 	if !ok || edit == nil || len(edit.Changes[testFileURI]) != 2 {
 		t.Fatalf("configured InterBase rename = %#v, want declaration and use edits", result)
+	}
+}
+
+func TestRenameAdapterHonorsRequestCancellation(t *testing.T) {
+	s := NewServer()
+	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
+	if err := s.openFileAtVersion(testFileURI, "sql", "SELECT value FROM t", 1); err != nil {
+		t.Fatal(err)
+	}
+	params := lsp.RenameParams{TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 0, Character: 7}, NewName: "renamed"}
+	data, _ := json.Marshal(params)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.handleTextDocumentRename(ctx, nil, &jsonrpc2.Request{Params: (*json.RawMessage)(&data)})
+	if !errors.Is(err, language.ErrCanceled) {
+		t.Fatalf("canceled Rename error = %v, want %v", err, language.ErrCanceled)
 	}
 }
 

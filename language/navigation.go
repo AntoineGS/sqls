@@ -74,54 +74,44 @@ func (s *Service) References(ctx context.Context, req Request, position Position
 	} else if handled {
 		return Result[[]Location]{Value: locations, Stamp: stampFor(req)}, nil
 	}
-	_, r, ok, err := relationAt(req, position)
-	if err != nil {
-		return Result[[]Location]{}, err
-	}
+	// References intentionally has no relation fallback. The legacy LSP
+	// contract only reports InterBase procedure-local symbols; a relation
+	// cursor is not a reference to itself.
 	locations := []Location{}
-	if ok {
-		parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
-		if err != nil {
-			return Result[[]Location]{}, err
-		}
-		pos := token.Pos{Line: position.Line, Col: position.UTF16Column + 1}
-		tables, err := parseutil.ExtractTable(parsed, pos)
-		if err != nil {
-			return Result[[]Location]{}, err
-		}
-		for _, table := range tables {
-			if table.Name == "" {
-				continue
-			}
-			locations = append(locations, Location{URI: req.Document.URI, Range: r})
-		}
-	}
 	if err := ctx.Err(); err != nil {
 		return Result[[]Location]{}, ErrCanceled
 	}
 	return Result[[]Location]{Value: locations, Stamp: stampFor(req)}, nil
 }
 
-// Rename creates a local relation-name edit. Database-wide rename remains an
-// execution/workbench operation and is intentionally not performed here.
+// Rename applies the host's local-symbol rename rules. Database-wide rename
+// remains an execution/workbench operation and is intentionally not performed.
 func (s *Service) Rename(ctx context.Context, req Request, position Position, newName string) (Result[[]RenameEdit], error) {
+	if err := ctx.Err(); err != nil {
+		return Result[[]RenameEdit]{}, ErrCanceled
+	}
 	if edits, handled, err := localRename(req, position, newName); err != nil {
+		if ctx.Err() != nil {
+			return Result[[]RenameEdit]{}, ErrCanceled
+		}
 		return Result[[]RenameEdit]{}, err
 	} else if handled {
+		if err := ctx.Err(); err != nil {
+			return Result[[]RenameEdit]{}, ErrCanceled
+		}
 		return Result[[]RenameEdit]{Value: edits, Stamp: stampFor(req)}, nil
 	}
-	refs, err := s.References(ctx, req, position, true)
+	edits, err := legacyRename(req, position, newName)
+	if ctx.Err() != nil {
+		return Result[[]RenameEdit]{}, ErrCanceled
+	}
 	if err != nil {
 		return Result[[]RenameEdit]{}, err
 	}
-	if len(refs.Value) == 0 {
-		return Result[[]RenameEdit]{Value: []RenameEdit{}, Stamp: refs.Stamp}, nil
+	if len(edits) == 0 {
+		return Result[[]RenameEdit]{Value: []RenameEdit{}, Stamp: stampFor(req)}, nil
 	}
-	edits := make([]TextEdit, 0, len(refs.Value))
-	for _, location := range refs.Value {
-		edits = append(edits, TextEdit{Range: location.Range, Text: newName})
-	}
-	return Result[[]RenameEdit]{Value: []RenameEdit{{URI: req.Document.URI, Edits: edits}}, Stamp: refs.Stamp}, nil
+	return Result[[]RenameEdit]{Value: []RenameEdit{{URI: req.Document.URI, Edits: edits, Shape: RenameDocumentChanges}}, Stamp: stampFor(req)}, nil
 }
 
 func localAnalysis(req Request, position Position) (*sqlsymbol.Analysis, sqlsymbol.Resolution, bool, error) {
@@ -183,26 +173,144 @@ func localReferences(req Request, position Position, includeDeclaration bool) ([
 }
 
 func localRename(req Request, position Position, newName string) ([]RenameEdit, bool, error) {
-	a, r, handled, err := localAnalysis(req, position)
-	if err != nil || !handled {
-		return nil, handled, err
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
+		return nil, false, nil
 	}
-	if r.Role != sqlsymbol.Local || r.Symbol == nil {
-		return []RenameEdit{}, true, nil
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return []RenameEdit{{URI: req.Document.URI, Edits: []TextEdit{}}}, true, nil
 	}
-	changes, err := a.Rename(r.Symbol, newName)
+	a, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return nil, true, err
 	}
-	edits := make([]TextEdit, 0, len(changes))
-	for _, change := range changes {
-		rng, ok := navigationSpanRange(req.Document.Text, change.Span)
-		if !ok {
-			return nil, true, fmt.Errorf("invalid local rename span")
-		}
-		edits = append(edits, TextEdit{Range: rng, Text: change.NewText})
+	r := a.Resolve(offset)
+	if !r.InProcedure {
+		return nil, false, nil
 	}
-	return []RenameEdit{{URI: req.Document.URI, Edits: edits}}, true, nil
+	switch r.Role {
+	case sqlsymbol.Local:
+		if r.Symbol == nil {
+			return nil, true, fmt.Errorf("cannot rename procedure local: unresolved symbol")
+		}
+		changes, err := a.Rename(r.Symbol, newName)
+		if err != nil {
+			return nil, true, err
+		}
+		edits := make([]TextEdit, 0, len(changes))
+		for _, change := range changes {
+			rng, ok := navigationSpanRange(req.Document.Text, change.Span)
+			if !ok {
+				return nil, true, fmt.Errorf("invalid local rename span")
+			}
+			edits = append(edits, TextEdit{Range: rng, Text: change.NewText})
+		}
+		return []RenameEdit{{URI: req.Document.URI, Edits: edits, Shape: RenameChanges}}, true, nil
+	case sqlsymbol.Ambiguous:
+		return nil, true, fmt.Errorf("cannot rename procedure target: ambiguous symbol")
+	case sqlsymbol.Relation, sqlsymbol.Column:
+		return nil, true, fmt.Errorf("cannot rename SQL target: database column or relation")
+	case sqlsymbol.Callable:
+		return nil, true, fmt.Errorf("cannot rename procedure target: other procedure or callable")
+	case sqlsymbol.Other:
+		return []RenameEdit{{URI: req.Document.URI, Edits: []TextEdit{}, Shape: RenameChanges}}, true, nil
+	default:
+		return nil, true, fmt.Errorf("cannot rename procedure target: unsupported symbol")
+	}
+}
+
+// legacyRename preserves the standalone server's historical spelling-based
+// identifier rename outside InterBase procedure-local scope.
+func legacyRename(req Request, position Position, newName string) ([]TextEdit, error) {
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return []TextEdit{}, nil
+	}
+	parsePos, err := parserPositionAt(req.Document.Text, offset)
+	if err != nil {
+		return []TextEdit{}, nil
+	}
+	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
+	if err != nil {
+		return nil, err
+	}
+	pos := token.Pos{Line: parsePos.Line, Col: parsePos.UTF16Column + 1}
+	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
+	current := nodeWalker.CurNodeBottomMatched(astutil.NodeMatcher{NodeTypes: []ast.NodeType{ast.TypeIdentifier}})
+	if current == nil {
+		return []TextEdit{}, nil
+	}
+	idents, err := parseutil.ExtractIdenfiers(parsed, pos)
+	if err != nil {
+		return nil, err
+	}
+	edits := make([]TextEdit, 0, len(idents))
+	for _, ident := range idents {
+		if ident.String() != current.String() {
+			continue
+		}
+		start, err := parserPositionToUTF16(req.Document.Text, ident.Pos())
+		if err != nil {
+			return nil, err
+		}
+		end, err := parserPositionToUTF16(req.Document.Text, ident.End())
+		if err != nil {
+			return nil, err
+		}
+		edits = append(edits, TextEdit{Range: Range{Start: start, End: end}, Text: newName})
+	}
+	return edits, nil
+}
+
+// parserPositionAt returns a parser-style zero-based code-point position for a
+// byte offset obtained from an LSP UTF-16 position.
+func parserPositionAt(text string, offset int) (Position, error) {
+	p, err := PositionAt(text, offset)
+	if err != nil {
+		return Position{}, err
+	}
+	lineStart := offset
+	for lineStart > 0 && text[lineStart-1] != '\n' && text[lineStart-1] != '\r' {
+		lineStart--
+	}
+	col := 0
+	for i := lineStart; i < offset; {
+		_, size := utf8.DecodeRuneInString(text[i:])
+		i += size
+		col++
+	}
+	return Position{Line: p.Line, UTF16Column: col}, nil
+}
+
+func parserPositionToUTF16(text string, pos token.Pos) (Position, error) {
+	lineStart := 0
+	for line := 0; line < pos.Line; line++ {
+		delim, delimLen := nextLineDelimiter(text, lineStart)
+		if delim < 0 {
+			return Position{}, ErrPosition
+		}
+		lineStart = delim + delimLen
+	}
+	lineEnd := len(text)
+	if delim, _ := nextLineDelimiter(text, lineStart); delim >= 0 {
+		lineEnd = delim
+	}
+	column := pos.Col
+	if column < 0 {
+		return Position{}, ErrPosition
+	}
+	for i := lineStart; i < lineEnd; {
+		if column == 0 {
+			return PositionAt(text, i)
+		}
+		_, size := utf8.DecodeRuneInString(text[i:])
+		i += size
+		column--
+	}
+	if column == 0 {
+		return PositionAt(text, lineEnd)
+	}
+	return Position{}, ErrPosition
 }
 
 func navigationSpanRange(text string, span sqlsymbol.Span) (Range, bool) {
