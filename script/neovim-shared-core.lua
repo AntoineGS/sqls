@@ -80,6 +80,35 @@ local function read_file(path)
   return text
 end
 
+local function assert_formatting_edits(edits, original)
+  local formatted = edits and edits[1] and edits[1].newText or ""
+  local want_range = { start = position(0, 0), ["end"] = position(1, 0) }
+  if type(edits) ~= "table" or #edits ~= 1 or formatted ~= "SELECT\n  *\nFROM\n  customers"
+      or not vim.deep_equal(edits[1].range, want_range) then
+    fail("formatting edits mismatch: " .. vim.inspect(edits) .. " for " .. vim.inspect(original))
+  end
+end
+
+local function assert_reselected_metadata(before, after)
+  if after.connectionState ~= "ready" or after.settled ~= true or after.degraded == true then
+    fail("reselected metadata is not ready: " .. vim.inspect(after))
+  end
+  if type(after.connectionGeneration) ~= "number" or after.connectionGeneration <= before.connectionGeneration then
+    fail("same-target reselect did not advance connection generation: before=" .. vim.inspect(before)
+      .. " after=" .. vim.inspect(after))
+  end
+  if type(after.generation) ~= "number" or after.generation <= before.generation then
+    fail("explicit metadata Refresh did not advance lease generation: before=" .. vim.inspect(before)
+      .. " after=" .. vim.inspect(after))
+  end
+  -- Lease.Refresh resets Revision within the new generation, so Revision is
+  -- captured for evidence/coherence but is not a globally monotonic counter.
+  if type(after.revision) ~= "number" or after.revision < 1 then
+    fail("refreshed generation has no published metadata revision: before revision=" .. tostring(before.revision)
+      .. " after=" .. vim.inspect(after))
+  end
+end
+
 local function run()
   if vim.fn.executable(".local/sqls-handler-tests") ~= 1 then
     fail("missing .local/sqls-handler-tests; compile internal/handler with go test -c first")
@@ -308,11 +337,20 @@ local function run()
   local formatting = request(client, "textDocument/formatting", {
     textDocument = text_document(format_buf), options = { tabSize = 2, insertSpaces = true },
   }, format_buf)
-  local formatted = formatting and formatting[1] and formatting[1].newText or ""
-  if type(formatting) ~= "table" or #formatting < 1 or not contains(formatted:lower(), "select")
-      or not contains(formatted:lower(), "from") or not contains(formatted:lower(), "customers") then
-    fail("formatting edits mismatch: " .. vim.inspect(formatting))
+  local original_format_text = "select * from customers"
+  local dummy_noop_accepted = pcall(assert_formatting_edits, {
+    { range = { start = position(0, 0), ["end"] = position(0, 0) }, newText = original_format_text },
+  }, original_format_text)
+  if dummy_noop_accepted then
+    fail("formatting assertion accepted a deliberately weakened no-op edit")
   end
+  local dummy_irrelevant_accepted = pcall(assert_formatting_edits, {
+    { range = { start = position(0, 0), ["end"] = position(1, 0) }, newText = "SELECT unrelated text" },
+  }, original_format_text)
+  if dummy_irrelevant_accepted then
+    fail("formatting assertion accepted a deliberately weakened irrelevant edit")
+  end
+  assert_formatting_edits(formatting, original_format_text)
 
   -- Document-symbol LSP adapter DTO: actual local variable and exact ranges.
   local symbols_text = "CREATE PROCEDURE P AS DECLARE VARIABLE X INTEGER; BEGIN X = 1; END"
@@ -392,15 +430,37 @@ local function run()
   if not new_loc or not contains(read_file(vim.uri_to_fname(new_loc.uri)), "NAME VARCHAR(100)") then
     fail("new target definition DDL did not expose VARCHAR(100): " .. vim.inspect(new_definition))
   end
+  local before_reselect = metadata_status()
+  if before_reselect.connectionState ~= "ready" or before_reselect.settled ~= true or before_reselect.degraded == true then
+    fail("new-target metadata was not settled before reselect: " .. vim.inspect(before_reselect))
+  end
+  local no_advance_accepted = pcall(assert_reselected_metadata, before_reselect, vim.deepcopy(before_reselect))
+  if no_advance_accepted then
+    fail("reselection assertion accepted an unchanged metadata status")
+  end
   request(client, "workspace/executeCommand", { command = "switchConnections", arguments = { "new" } }, first_buf)
+  local after_reselect
   wait_for("reselected target refresh readiness", function()
-    local status = metadata_status()
-    return status.connectionState == "ready" and status.settled == true and status.degraded ~= true
-      and (status.revision or 0) > 0
+    after_reselect = metadata_status()
+    assert_reselected_metadata(before_reselect, after_reselect)
+    return true
   end)
+  print(string.format(
+    "new-target reselect metadata: connectionGeneration %d -> %d; generation %d -> %d; revision %d -> %d",
+    before_reselect.connectionGeneration, after_reselect.connectionGeneration,
+    before_reselect.generation, after_reselect.generation, before_reselect.revision, after_reselect.revision
+  ))
   new_hover = request(client, "textDocument/hover", text_document_position(hover_buf, 0, 20), hover_buf)
-  if not contains(vim.inspect(new_hover.contents), "VARCHAR(100)") then
+  local reselected_hover_text = vim.inspect(new_hover.contents)
+  if not contains(reselected_hover_text, "VARCHAR(100)") or contains(reselected_hover_text, "VARCHAR(80)") then
     fail("reselected target lost NAME VARCHAR(100): " .. vim.inspect(new_hover))
+  end
+  local reselected_definition = request(client, "textDocument/definition", text_document_position(navigation_buf, 0, 20), navigation_buf)
+  local reselected_location = type(reselected_definition) == "table" and reselected_definition[1] or nil
+  local reselected_ddl = reselected_location and read_file(vim.uri_to_fname(reselected_location.uri)) or ""
+  if not contains(reselected_ddl, "NAME VARCHAR(100)") or contains(reselected_ddl, "NAME VARCHAR(80)") then
+    fail("reselected target definition accepted stale old-target DDL: " .. vim.inspect(reselected_definition)
+      .. "; DDL=" .. reselected_ddl)
   end
 
   -- Cancel only after the framed query-entry notification proves the exact SQL
