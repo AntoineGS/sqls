@@ -3,6 +3,7 @@ package sqlsymbol
 import (
 	"math/big"
 	"sort"
+	"strings"
 
 	"github.com/sqls-server/sqls/token"
 )
@@ -74,6 +75,26 @@ func (m *diagnosticModel) computeExpressionFact(items []lexeme, depth int) expre
 		return negatedNumberFact(m.analysis.Text, items[1])
 	}
 
+	// A whole expression shaped exactly like CASE...END is dispatched to
+	// caseFact directly, before any operator-splitting is attempted on it.
+	// concatenationFact, hasTopLevelConcatenation, and
+	// topLevelArithmeticSplits (via additiveFact/multiplicativeFact) all
+	// track CASE...END nesting for an operator that appears INSIDE a
+	// CASE used as one operand of a larger expression (see their own doc
+	// comments), but there is no simpler or more direct way to keep them
+	// from misreading a WHEN/THEN/ELSE branch's own "-", "*", or "||" as
+	// this expression's own top-level operator than to recognize the
+	// CASE...END shell first, when it is the entire expression.
+	if len(items) >= 2 && isWord(items[0], "CASE") && isWord(items[len(items)-1], "END") {
+		fact, ok, recognized := m.caseFact(items, depth)
+		if recognized {
+			if ok {
+				return fact
+			}
+			return expressionFact{}
+		}
+	}
+
 	if fact, ok := m.concatenationFact(items, depth); ok {
 		return fact
 	}
@@ -96,16 +117,6 @@ func (m *diagnosticModel) computeExpressionFact(items []lexeme, depth int) expre
 		return m.singleTokenFact(items[0])
 	}
 
-	if len(items) >= 2 && isWord(items[0], "CASE") && isWord(items[len(items)-1], "END") {
-		fact, ok, recognized := m.caseFact(items, depth)
-		if recognized {
-			if ok {
-				return fact
-			}
-			return expressionFact{}
-		}
-	}
-
 	if fact, ok, recognized := m.callFact(items, depth); recognized {
 		if ok {
 			return fact
@@ -123,6 +134,14 @@ func numberFact(text string, item lexeme) expressionFact {
 	raw, ok := item.Token.Value.(string)
 	if !ok {
 		raw = text[item.Span.Start:item.Span.End]
+	}
+	// An exponent literal (1e5, 2.5E-3, ...) is approximate/floating-point
+	// valued, not an exact decimal value: big.Rat.SetString itself accepts
+	// this shape and would silently fold it to an exact rational, which
+	// would misrepresent what InterBase actually stores for it. Treat it
+	// as unknown rather than fabricate an exact Value.
+	if strings.ContainsAny(raw, "eE") {
+		return expressionFact{}
 	}
 	value, ok := new(big.Rat).SetString(raw)
 	if !ok {
@@ -243,9 +262,14 @@ func (m *diagnosticModel) multiplicativeFact(items []lexeme, depth int) (express
 // items matching one of kinds at paren-depth 0 relative to items, excluding
 // index 0 and excluding any operator immediately following another
 // arithmetic operator token (a unary sign attached to the next operand,
-// never a binary split point).
+// never a binary split point). An operator lexically inside a nested
+// CASE...END (tracked the same way caseFact tracks its own nested
+// CASE...END pairs) is never a split point either: it belongs to that
+// CASE's own WHEN/THEN/ELSE branch, not to this call's operand list, even
+// though it sits at the same paren depth.
 func topLevelArithmeticSplits(items []lexeme, kinds ...token.Kind) []int {
 	depth := 0
+	caseDepth := 0
 	var splits []int
 	for i, item := range items {
 		switch item.Token.Kind {
@@ -256,7 +280,17 @@ func topLevelArithmeticSplits(items []lexeme, kinds ...token.Kind) []int {
 			depth--
 			continue
 		}
-		if depth != 0 || i == 0 {
+		if depth == 0 {
+			switch {
+			case isWord(item, "CASE"):
+				caseDepth++
+			case isWord(item, "END"):
+				if caseDepth > 0 {
+					caseDepth--
+				}
+			}
+		}
+		if depth != 0 || caseDepth != 0 || i == 0 {
 			continue
 		}
 		matched := false
@@ -285,6 +319,7 @@ func topLevelArithmeticSplits(items []lexeme, kinds ...token.Kind) []int {
 func (m *diagnosticModel) concatenationFact(items []lexeme, depth int) (expressionFact, bool) {
 	text := m.analysis.Text
 	parenDepth := 0
+	caseDepth := 0
 	start := 0
 	totalWidth := 0
 	widthKnown := true
@@ -317,7 +352,17 @@ func (m *diagnosticModel) concatenationFact(items []lexeme, depth int) (expressi
 		case token.RParen:
 			parenDepth--
 		}
-		if parenDepth != 0 || item.Token.Kind != token.Char || items[i+1].Token.Kind != token.Char {
+		if parenDepth == 0 {
+			switch {
+			case isWord(item, "CASE"):
+				caseDepth++
+			case isWord(item, "END"):
+				if caseDepth > 0 {
+					caseDepth--
+				}
+			}
+		}
+		if parenDepth != 0 || caseDepth != 0 || item.Token.Kind != token.Char || items[i+1].Token.Kind != token.Char {
 			continue
 		}
 		if item.Span.End != items[i+1].Span.Start || text[item.Span.Start:items[i+1].Span.End] != "||" {
@@ -348,8 +393,17 @@ func (m *diagnosticModel) concatenationFact(items []lexeme, depth int) (expressi
 // a SQL Column reference -- this is also how an unresolved identifier, a
 // client bind parameter never bound to a declared local, and a bare "?"
 // placeholder all fall through to unknown, per the brief.
+//
+// A colon-prefixed name (the two-token case) is never resolved as a Column
+// reference, even when resolution.Role happens to be Column because its
+// name matches a real column: a client bind parameter's runtime value is
+// never provably related to any column's facts, no matter what the client
+// currently has bound to it or what name they chose for it. Only Role ==
+// Local (a declared PSQL variable, genuinely referenced by that name) may
+// produce a fact for the colon-prefixed form.
 func (m *diagnosticModel) identifierFact(items []lexeme) (expressionFact, bool) {
 	var item lexeme
+	colonForm := false
 	switch len(items) {
 	case 1:
 		item = items[0]
@@ -358,6 +412,7 @@ func (m *diagnosticModel) identifierFact(items []lexeme) (expressionFact, bool) 
 			return expressionFact{}, false
 		}
 		item = items[1]
+		colonForm = true
 	case 3:
 		if items[1].Token.Kind != token.Period {
 			return expressionFact{}, false
@@ -377,8 +432,11 @@ func (m *diagnosticModel) identifierFact(items []lexeme) (expressionFact, bool) 
 		}
 		return expressionFact{Type: t}, true
 	}
+	if colonForm {
+		return expressionFact{}, false
+	}
 	if resolution.Role == Column && resolution.SQL != nil {
-		return m.sqlColumnFact(resolution.SQL)
+		return m.sqlColumnFact(resolution.SQL, item.Span.Start)
 	}
 	return expressionFact{}, false
 }
@@ -386,12 +444,15 @@ func (m *diagnosticModel) identifierFact(items []lexeme) (expressionFact, bool) 
 // relationColumnFacts resolves name's column list, preferring
 // SemanticCatalog.RelationInfo (which carries per-column Nullability) and
 // falling back to plain Catalog.Columns (NullUnknown for every column) when
-// the catalog does not implement SemanticCatalog. This mirrors
-// sqlColumnWidth's own direct-catalog-lookup pattern; it does not attempt
-// resolveRelationOutput's richer CTE/derived-table/DDL-invalidation
-// handling, since a bare SQLReference's Scopes carries no query-index or
-// item-position context for that.
-func (m *diagnosticModel) relationColumnFacts(name Name) ([]ColumnFact, bool) {
+// the catalog does not implement SemanticCatalog. at is the item position
+// the reference was seen from (mirroring resolveRelationOutput's own
+// parameter of the same name): name's catalog facts are stale, and are
+// therefore refused rather than trusted, once an earlier CREATE/ALTER/DROP
+// in the same document has invalidated them as of at (DDLInvalidated).
+func (m *diagnosticModel) relationColumnFacts(at int, name Name) ([]ColumnFact, bool) {
+	if m.DDLInvalidated(at, name) {
+		return nil, false
+	}
 	if m.semantic != nil {
 		fact, knowledge := m.semantic.RelationInfo(name)
 		if knowledge != Present || !fact.ColumnsKnown {
@@ -415,11 +476,19 @@ func (m *diagnosticModel) relationColumnFacts(name Name) ([]ColumnFact, bool) {
 
 // sqlColumnFact mirrors sqlColumnWidth's scope-walking and ambiguity rules
 // exactly, resolving to a ColumnFact (type string + Nullability) instead of
-// only a width.
-func (m *diagnosticModel) sqlColumnFact(reference *SQLReference) (expressionFact, bool) {
+// only a width. offset is the reference's own byte position, used both to
+// evaluate DDLInvalidated (via relationColumnFacts) and to conservatively
+// detect an enclosing outer join (see outerJoinInStatementAt): this package
+// tracks no per-relation join-side/nullable-side information at all, so a
+// column's own declared NOT NULL cannot be trusted to still hold once it may
+// be read from the nullable side of a LEFT/RIGHT/FULL JOIN -- that
+// statement-wide fallback downgrades NotNullable to NullUnknown rather than
+// asserting a fact this package cannot actually prove.
+func (m *diagnosticModel) sqlColumnFact(reference *SQLReference, offset int) (expressionFact, bool) {
 	if reference == nil {
 		return expressionFact{}, false
 	}
+	at := m.itemIndexAt(offset)
 	for _, scope := range reference.Scopes {
 		matches := 0
 		var match ColumnFact
@@ -434,7 +503,7 @@ func (m *diagnosticModel) sqlColumnFact(reference *SQLReference) (expressionFact
 				allOwnersKnown = false
 				continue
 			}
-			columns, ok := m.relationColumnFacts(relation.Name)
+			columns, ok := m.relationColumnFacts(at, relation.Name)
 			if !ok {
 				allOwnersKnown = false
 				continue
@@ -460,14 +529,65 @@ func (m *diagnosticModel) sqlColumnFact(reference *SQLReference) (expressionFact
 			return expressionFact{}, false
 		}
 		if matches == 1 {
+			nullability := match.Nullability
+			if nullability == NotNullable && m.outerJoinInStatementAt(at) {
+				nullability = NullUnknown
+			}
 			t, ok := parseDiagnosticType(match.Type, m.analysis.Variant, m.catalog)
 			if !ok {
-				return expressionFact{Nullability: match.Nullability}, true
+				return expressionFact{Nullability: nullability}, true
 			}
-			return expressionFact{Type: t, Nullability: match.Nullability}, true
+			return expressionFact{Type: t, Nullability: nullability}, true
 		}
 	}
 	return expressionFact{}, false
+}
+
+// itemIndexAt returns the index into m.items of the lexeme starting exactly
+// at offset, or -1 when none does (m.items is sorted by Span.Start, so this
+// is a direct binary search, the same technique itemsInSpan uses).
+func (m *diagnosticModel) itemIndexAt(offset int) int {
+	i := sort.Search(len(m.items), func(i int) bool {
+		return m.items[i].Span.Start >= offset
+	})
+	if i < len(m.items) && m.items[i].Span.Start == offset {
+		return i
+	}
+	return -1
+}
+
+// outerJoinInStatementAt conservatively reports whether the statement
+// containing item position at spells any LEFT/RIGHT/FULL [OUTER] JOIN
+// anywhere in its text, at any nesting depth (including inside a
+// subquery). This package has no per-relation join-side tracking (which
+// relation sits on a join's nullable side) anywhere, so precisely which
+// column a specific outer join can null out cannot be determined; rather
+// than risk a false NotNullable claim, the presence of any outer join
+// anywhere in the same statement is treated as reason enough to withhold
+// NotNullable for every column fact resolved in that statement.
+func (m *diagnosticModel) outerJoinInStatementAt(at int) bool {
+	if at < 0 {
+		return false
+	}
+	si := statementIndexAt(m.statements, at)
+	if si < 0 {
+		return false
+	}
+	stmt := m.statements[si]
+	items := m.items[stmt.Start:stmt.End]
+	for i, item := range items {
+		if !isWord(item, "LEFT") && !isWord(item, "RIGHT") && !isWord(item, "FULL") {
+			continue
+		}
+		j := i + 1
+		if j < len(items) && isWord(items[j], "OUTER") {
+			j++
+		}
+		if j < len(items) && isWord(items[j], "JOIN") {
+			return true
+		}
+	}
+	return false
 }
 
 // callFact recognizes CAST(expr AS type) and COALESCE(expr, ...) using
@@ -501,8 +621,18 @@ func (m *diagnosticModel) callFact(items []lexeme, depth int) (fact expressionFa
 		}
 		inner := m.computeExpressionFact(arguments[:as], depth+1)
 		result := expressionFact{Type: t, ExplicitCast: true, Nullability: inner.Nullability}
-		if inner.Value != nil {
-			result.Value = inner.Value
+		if inner.Value != nil && (t.Family == familyExactInteger || t.Family == familyExactNumeric) {
+			// N1 (reused from Task 8): InterBase rounds a literal
+			// half-away-from-zero to the destination's declared scale as
+			// part of the conversion itself, so the CAST's own resulting
+			// value -- not just a later assignment's compatibility
+			// verdict -- must reflect that rounding. t.Scale is the zero
+			// value (0) for familyExactInteger, so this rounds to a whole
+			// number for that family with no extra branch needed. Every
+			// other target family (character, approximate, date/time,
+			// etc.) has no verified exact-value conversion rule at all,
+			// so Value is left nil rather than fabricating one.
+			result.Value = roundToScale(inner.Value, t.Scale)
 		}
 		return result, true, true
 	case isWord(items[0], "COALESCE"):

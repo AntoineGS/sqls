@@ -318,6 +318,172 @@ been confirmed against a running engine.
   session (grounded in `interbase-go/schema/ddl.go`'s source, not a live
   probe, unlike rule 2's C1 correction).
 
+### 11. Exact literal folding across top-level `+`/`-`/`*`/`||` in an expression, but not across `CASE ... END` branches (Task 9, corrected in Fix round 3 / I2)
+
+- **Rule:** `internal/sqlsymbol/diagnostic_expressions.go` folds a chain of
+  literal operands connected by top-level `+`, `-`, `*` (exact `big.Rat`
+  arithmetic, never `float64`) or `||` (character concatenation) into a
+  single known `Value`/family, but only when every operand in the chain is
+  itself fully known. `CASE ... END` is a nesting construct exactly like
+  parentheses for this purpose: an operator that appears inside a `CASE`
+  branch (between `WHEN`/`THEN`/`ELSE` and the next keyword or `END`) is not
+  a top-level operator of the outer expression and must not be spliced into
+  the outer fold.
+- **Corrected bug:** the initial Task 9 implementation of
+  `topLevelArithmeticSplits` and `concatenationFact` tracked only
+  parenthesis depth, not `CASE`/`END` nesting. This caused two classes of
+  false results: (1) an operator inside a `CASE` branch (e.g. the `-` in
+  `CASE WHEN ID = 1 THEN -1 ELSE 1 END`) was treated as a top-level split
+  point of the whole expression, producing a false unknown; (2) a `CASE`
+  expression whose branches used `||` was misreported as `familyCharacter`
+  for the outer expression by the concatenation splitter, even though the
+  actual result type depends on the branch taken. Both are now fixed by
+  tracking a `caseDepth` counter alongside paren depth in both splitters, and
+  by having `computeExpressionFact` detect a whole-expression `CASE ... END`
+  shape and dispatch it directly to `caseFact` before either splitter runs.
+- **Test fixture:** `TestDiagnosticExpressionCaseWithArithmeticInBranch`,
+  `TestDiagnosticExpressionCaseWithArithmeticInCondition`,
+  `TestDiagnosticExpressionCaseWithConcatenationInConditionIsNotCharacter`.
+- **Live-probe status:** NOT VERIFIED — this is a parsing/scoping rule about
+  how this codebase splits an expression string, not an InterBase runtime
+  behavior; no live probe is applicable.
+
+### 12. `CAST` propagates a folded `Value` only into an exact-integer/exact-numeric target; every other target family drops `Value` (Fix round 3, C1)
+
+- **Rule:** when the inner expression of a `CAST(expr AS type)` has a fully
+  known `Value`, that value can only be carried forward into the outer
+  `CAST`'s fact when `type`'s family is `familyExactInteger` or
+  `familyExactNumeric` — in which case the value is first rounded
+  half-away-from-zero to `type.Scale` using the same exact `roundToScale`
+  helper rule 10 (N1) established for assignment compatibility. For every
+  other target family (`familyApproximate`, `familyCharacter`,
+  date/time, `familyBlob`, or any unrecognized/unknown family), `Value` is
+  set to `nil`: this codebase has no verified rule for what exact value (if
+  any) a CAST into those families produces, so asserting one would be a
+  guess.
+- **Corrected bug:** the initial Task 9 implementation kept the inner
+  `Value` unconditionally for every `CAST` target family, which could
+  produce a false `outcomeDefinitelyInvalid` downstream — e.g. folding
+  `CAST(32767.5 AS CHAR(7))` to a numeric value `32767.5` and then treating
+  that value as if it were still subject to a SMALLINT range check in an
+  outer numeric context, when the CAST to CHAR(7) makes the original numeric
+  value's fate at that point actually unknown.
+- **Test fixture:** `TestDiagnosticExpressionCastToCharacterDropsValue`
+  (`CAST(32767.5 AS CHAR(7))` used in a SMALLINT context must not be
+  definitely-invalid), `TestDiagnosticExpressionCastToApproximateDropsValue`
+  (`CAST(1.5 AS DOUBLE PRECISION)` has `Value == nil`),
+  `TestDiagnosticExpressionCastToNumericRoundsValue` (`CAST(1.25 AS
+  NUMERIC(4,1))` rounds to `1.3`, reusing rule 10's rounding order).
+- **Live-probe status:** the rounding-into-exact-numeric branch reuses rule
+  10's live-verified rounding order; the Value-drop for every other family
+  is a conservative code-side rule, NOT VERIFIED against a live engine (no
+  claim is made about what a live CAST to CHAR/DOUBLE PRECISION/etc. actually
+  produces — this codebase simply stops asserting a value past that point).
+
+### 13. A bind parameter (`:NAME`) never resolves to a real column's fact, even when its name matches an in-scope column (Fix round 3, C2)
+
+- **Rule:** a colon-prefixed identifier's runtime value is supplied by the
+  client at statement execution time and is never available to this static
+  analyzer. `identifierFact` must report the zero-value `expressionFact{}`
+  (fully unknown) for every colon-prefixed identifier, and must never fall
+  through to `Role == Column` resolution, even when a real column in scope
+  happens to share the same name (e.g. a parameter named `:ID` in a
+  statement that also selects from a table with an `ID` column).
+- **Corrected bug:** the initial Task 9 implementation resolved any
+  identifier — including colon-prefixed ones — through `a.Resolve`, and
+  only special-cased the colon form for the `Role == Local` case, not the
+  `Role == Column` fallback. When a bind parameter's name collided with a
+  real column's name, the code fell through to that column's fact, wrongly
+  reporting real column facts (including `NotNullable`, storage
+  ranges, etc.) for what is actually an unknown client-supplied value.
+- **Test fixture:**
+  `TestDiagnosticExpressionBindParameterMatchingRealColumnNameIsUnknown`
+  (table-driven, `:V` and `:ID` matching real columns of those names, both
+  asserted unknown).
+- **Known parallel gap, intentionally not fixed here:** `width.go`'s
+  `identifierWidth` has the same colon-prefixed-name collision gap as C2 and
+  was left unfixed — it is a different file/function outside this task's
+  assigned scope, noted here so it is not mistaken for an oversight.
+- **Live-probe status:** NOT VERIFIED — this is a static-resolution scoping
+  rule about this codebase's own symbol table, not an InterBase runtime
+  behavior; no live probe is applicable.
+
+### 14. A column normally known NOT NULL cannot be asserted `NotNullable` inside any statement containing an outer join (Fix round 3, C3)
+
+- **Rule:** `LEFT`/`RIGHT`/`FULL [OUTER] JOIN` can produce a NULL for an
+  otherwise-NOT-NULL column's slot when the joined side has no matching row.
+  Because this codebase has no per-relation join-side tracking (confirmed by
+  reading `internal/sqlsymbol/sql.go`: no join-kind is recorded per
+  relation), the conservative rule adopted is statement-wide: if any outer
+  join keyword appears anywhere in the enclosing statement, `sqlColumnFact`
+  downgrades what would otherwise be `NotNullable` to `NullUnknown` for
+  every column fact resolved in that statement, never asserting
+  `NotNullable` in that scope at all. This may be over-conservative for
+  columns provably on the non-nullable side of the join, but per this
+  feature's stated priority (a false `NotNullable` is worse than a missed
+  one), it is the correct default absent real join-side tracking.
+- **Corrected bug:** the initial Task 9 implementation (and its own test
+  fixture) asserted `NotNullable` for a column read from a table on the
+  nullable side of a `LEFT JOIN`; the fixture itself used a nullable column
+  (`U.V`) in a way that happened to mask the bug, then a `COALESCE(U.V,
+  ...)`-based test was corrected to use `U.ID` (a genuinely NOT NULL column)
+  so the outer-join downgrade is actually exercised.
+- **Test fixture:**
+  `TestDiagnosticExpressionOuterJoinedNotNullColumnIsDowngraded`,
+  `TestDiagnosticExpressionCaseOverOuterJoinIsNotNotNullable`,
+  `TestDiagnosticExpressionInnerJoinedNotNullColumnStaysNotNullable`
+  (control case: an ordinary `INNER JOIN`/comma-join statement still reports
+  `NotNullable` — the downgrade is specific to outer joins, not a blanket
+  suppression), and the corrected
+  `TestDiagnosticExpressionCoalesceOuterJoinedField` fixture (now keyed on
+  `U.ID`).
+- **Live-probe status:** NOT VERIFIED — this is a conservative code-side
+  fallback adopted in the absence of per-relation join-side tracking, not a
+  claim about a specific InterBase runtime value; no live probe applies.
+
+### 15. Relation-level column facts respect DDL invalidation the same way whole-relation output resolution does (Fix round 3, I1)
+
+- **Rule:** once `m.DDLInvalidated(at, name)` reports that a relation's
+  schema has been invalidated by an intervening DDL statement before item
+  index `at`, any column fact resolved against that relation must report
+  unknown, not the pre-invalidation column metadata. `resolveRelationOutput`
+  already enforced this; `relationColumnFacts` (the column-level path used
+  by expression fact resolution) did not.
+- **Corrected bug:** the initial Task 9 implementation of
+  `relationColumnFacts` looked up column metadata directly without checking
+  `m.DDLInvalidated`, so an expression referencing a column after a DDL
+  statement that altered its relation could still report stale,
+  pre-invalidation facts (e.g. a since-changed NOT NULL constraint).
+- **Test fixture:**
+  `TestDiagnosticExpressionRelationColumnFactsRespectsDDLInvalidation`,
+  mirroring the setup of `diagnostic_model_test.go`'s
+  `TestDiagnosticModelDDLInvalidatesLaterUse` /
+  `TestDiagnosticModelRelationOutputRespectsDDLInvalidation`.
+- **Live-probe status:** NOT VERIFIED — this is a static staleness-tracking
+  rule about this codebase's own invalidation bookkeeping, not an InterBase
+  runtime behavior; no live probe is applicable.
+
+### 16. An exponent-form numeric literal is approximate, never an exact folded value (Fix round 3, I3)
+
+- **Rule:** a numeric literal written in exponent form (`1e5`, `1E-3`,
+  `2.5e+10`, etc.) is approximate binary floating point at the lexer/grammar
+  level, not an exact decimal value, and `numberFact` must report the
+  zero-value `expressionFact{}` (unknown), never fold it into an exact
+  `Value`.
+- **Corrected bug:** the initial Task 9 implementation of `numberFact`
+  attempted to fold every numeric-literal token — including exponent-form
+  ones — into an exact `big.Rat` value, which would have asserted a false
+  exactness for a literal that is not guaranteed to be exact.
+- **Authoritative source:** `token/lexer.go` (repo-root `token` package,
+  lines 247-271): confirms an exponent-form literal is lexed as a single
+  `Number` token whose raw text includes the `e`/`E` marker and any sign, so
+  checking `strings.ContainsAny(raw, "eE")` on that raw text is a sufficient
+  and correct guard.
+- **Test fixture:** `TestDiagnosticExpressionExponentLiteralIsUnknown`.
+- **Live-probe status:** NOT VERIFIED — grounded in this repository's own
+  lexer source, not a live InterBase probe; no live probe is needed to
+  establish that exponent notation denotes an approximate literal.
+
 ## Rules left disabled/unknown (inconclusive or out of scope)
 
 - **FLOAT / DOUBLE PRECISION exact range or float-to-exact-numeric
