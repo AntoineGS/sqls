@@ -2,6 +2,7 @@ package language_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -40,6 +41,29 @@ func TestNavigationProcedureLocalReferencesAndRename(t *testing.T) {
 		if len(refs.Value) != tc.want {
 			t.Fatalf("includeDeclaration=%v refs=%d want %d: %#v", tc.include, len(refs.Value), tc.want, refs.Value)
 		}
+		wantRanges := []language.Range{
+			{Start: language.Position{Line: 3, UTF16Column: 0}, End: language.Position{Line: 3, UTF16Column: 1}},
+			{Start: language.Position{Line: 4, UTF16Column: 0}, End: language.Position{Line: 4, UTF16Column: 1}},
+			{Start: language.Position{Line: 4, UTF16Column: 5}, End: language.Position{Line: 4, UTF16Column: 6}},
+		}
+		if tc.include {
+			wantRanges = append([]language.Range{{Start: language.Position{Line: 1, UTF16Column: 17}, End: language.Position{Line: 1, UTF16Column: 18}}}, wantRanges...)
+		}
+		if len(refs.Value) != len(wantRanges) {
+			t.Fatalf("reference ranges count = %d, want %d", len(refs.Value), len(wantRanges))
+		}
+		for i, want := range wantRanges {
+			if refs.Value[i].Range != want {
+				t.Fatalf("reference %d range = %+v, want %+v", i, refs.Value[i].Range, want)
+			}
+		}
+	}
+	colonRefs, err := service.References(context.Background(), req, language.Position{Line: 4, UTF16Column: 4}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(colonRefs.Value) != 3 || colonRefs.Value[2].Range.Start.UTF16Column != 5 {
+		t.Fatalf("colon-cursor references = %#v, want the identifier-only local spans", colonRefs.Value)
 	}
 	renamed, err := service.Rename(context.Background(), req, language.Position{Line: 4, UTF16Column: 5}, "amount")
 	if err != nil {
@@ -47,6 +71,28 @@ func TestNavigationProcedureLocalReferencesAndRename(t *testing.T) {
 	}
 	if len(renamed.Value) != 1 || len(renamed.Value[0].Edits) != 4 {
 		t.Fatalf("rename = %#v, want declaration and three use edits (comments/strings excluded)", renamed.Value)
+	}
+	wantEdits := []language.Range{
+		{Start: language.Position{Line: 1, UTF16Column: 17}, End: language.Position{Line: 1, UTF16Column: 18}},
+		{Start: language.Position{Line: 3, UTF16Column: 0}, End: language.Position{Line: 3, UTF16Column: 1}},
+		{Start: language.Position{Line: 4, UTF16Column: 0}, End: language.Position{Line: 4, UTF16Column: 1}},
+		{Start: language.Position{Line: 4, UTF16Column: 5}, End: language.Position{Line: 4, UTF16Column: 6}},
+	}
+	for i, want := range wantEdits {
+		edit := renamed.Value[0].Edits[i]
+		if edit.Range != want || edit.Text != "amount" {
+			t.Fatalf("rename edit %d = %+v, want span %+v replacing with amount", i, edit, want)
+		}
+	}
+	colonRename, err := service.Rename(context.Background(), req, language.Position{Line: 4, UTF16Column: 4}, "amount")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(colonRename.Value) != 1 || len(colonRename.Value[0].Edits) != 4 || colonRename.Value[0].Edits[3].Range.Start.UTF16Column != 5 {
+		t.Fatalf("colon-cursor rename = %#v, want identifier-only edits", colonRename.Value)
+	}
+	if text[strings.Index(text, "v = :v")+4] != ':' {
+		t.Fatal("source colon changed during rename analysis")
 	}
 }
 
@@ -102,5 +148,48 @@ func TestNavigationNonInterBaseAliasDefinitionFallback(t *testing.T) {
 	want := language.Range{Start: language.Position{Line: 0, UTF16Column: 25}, End: language.Position{Line: 0, UTF16Column: 26}}
 	if len(got.Value) != 1 || got.Value[0].Range != want {
 		t.Fatalf("non-InterBase alias definition = %#v, want %+v", got.Value, want)
+	}
+}
+
+func TestNavigationDefinitionDoesNotUseUnrelatedAliasForSQLRoles(t *testing.T) {
+	text := "SELECT customer FROM other AS customer;\nSELECT id FROM customer;"
+	req := navRequest(text, dialect.DatabaseDriverInterBase)
+	for _, tc := range []struct {
+		line int
+		text string
+	}{
+		{line: 0, text: "customer FROM"}, // column spelling matches an alias elsewhere
+		{line: 1, text: "FROM customer"}, // relation spelling matches an alias elsewhere
+	} {
+		line := strings.Split(text, "\n")[tc.line]
+		column := strings.Index(line, tc.text)
+		if tc.line == 0 {
+			column += strings.Index(line[column:], "customer")
+		}
+		if tc.line == 1 {
+			column += strings.Index(line[column:], "customer")
+		}
+		got, err := language.NewService().Definition(context.Background(), req, language.Position{Line: tc.line, UTF16Column: column})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Value) != 0 {
+			t.Fatalf("SQL role at line %d resolved unrelated alias: %#v", tc.line, got.Value)
+		}
+	}
+}
+
+func TestNavigationDefinitionFindsAliasInsideProcedureSQL(t *testing.T) {
+	text := "ALTER PROCEDURE p AS BEGIN SELECT c.id FROM city AS c; END"
+	cursor := strings.Index(text, "c.id")
+	alias := strings.LastIndex(text, " AS c") + len(" AS ")
+	req := navRequest(text, dialect.DatabaseDriverInterBase)
+	got, err := language.NewService().Definition(context.Background(), req, language.Position{Line: 0, UTF16Column: cursor})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := language.Range{Start: language.Position{Line: 0, UTF16Column: alias}, End: language.Position{Line: 0, UTF16Column: alias + 1}}
+	if len(got.Value) != 1 || got.Value[0].URI != req.Document.URI || got.Value[0].Range != want {
+		t.Fatalf("procedure alias definition = %#v, want scoped alias at %+v", got.Value, want)
 	}
 }

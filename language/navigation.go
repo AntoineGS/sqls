@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/ast"
@@ -28,10 +29,28 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	} else if handled {
 		return Result[[]Location]{Value: local, Stamp: stampFor(req)}, nil
 	}
-	if alias, ok, err := aliasDefinition(req, position); err != nil {
-		return Result[[]Location]{}, err
-	} else if ok {
-		return Result[[]Location]{Value: []Location{alias}, Stamp: stampFor(req)}, nil
+	role := sqlsymbol.Outside
+	if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase {
+		_, resolution, _, err := localAnalysis(req, position)
+		if err != nil {
+			return Result[[]Location]{}, err
+		}
+		role = resolution.Role
+		if role == sqlsymbol.Column {
+			// Column targets are contextual catalog navigation. There is no
+			// column resolver in this B3a core, so do not guess by spelling.
+			return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
+		}
+	}
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase || role == sqlsymbol.Alias {
+		if alias, ok, err := aliasDefinition(req, position); err != nil {
+			return Result[[]Location]{}, err
+		} else if ok {
+			return Result[[]Location]{Value: []Location{alias}, Stamp: stampFor(req)}, nil
+		}
+		if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase && role == sqlsymbol.Alias {
+			return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
+		}
 	}
 	target, _, ok, err := relationAt(req, position)
 	if err != nil {
@@ -138,7 +157,14 @@ func localAnalysis(req Request, position Position) (*sqlsymbol.Analysis, sqlsymb
 		return nil, sqlsymbol.Resolution{}, true, err
 	}
 	r := a.Resolve(offset)
-	return a, r, r.InProcedure, nil
+	handled := false
+	if r.InProcedure {
+		switch r.Role {
+		case sqlsymbol.Local, sqlsymbol.Other, sqlsymbol.Ambiguous:
+			handled = true
+		}
+	}
+	return a, r, handled, nil
 }
 
 func localDefinition(req Request, position Position) ([]Location, bool, error) {
@@ -219,6 +245,17 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 	if err != nil {
 		return Location{}, false, nil
 	}
+	var resolution sqlsymbol.Resolution
+	if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase {
+		analysis, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
+		if err != nil {
+			return Location{}, false, err
+		}
+		resolution = analysis.Resolve(offset)
+		if resolution.Role != sqlsymbol.Alias {
+			return Location{}, false, nil
+		}
+	}
 	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return Location{}, false, err
@@ -238,11 +275,37 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 	if current == nil {
 		return Location{}, false, nil
 	}
+	var statement ast.Node
+	findContainingStatement(parsed, req.Document.Text, offset, &statement)
+	if statement == nil {
+		return Location{}, false, nil
+	}
+	statementRange, err := astRange(req.Document.Text, statement)
+	if err != nil {
+		return Location{}, false, err
+	}
+	candidates := make([]*ast.Aliased, 0, 1)
 	for _, candidate := range parseutil.ExtractAliased(parsed) {
 		aliased, ok := candidate.(*ast.Aliased)
 		if !ok || aliased.AliasedName == nil || aliased.AliasedName.String() != current.String() {
 			continue
 		}
+		aliasRange, err := astRange(req.Document.Text, aliased.AliasedName)
+		if err != nil {
+			return Location{}, false, err
+		}
+		if !rangeWithin(aliasRange, statementRange) {
+			continue
+		}
+		if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase && !aliasInResolutionScope(aliased, resolution) {
+			continue
+		}
+		candidates = append(candidates, aliased)
+	}
+	// Duplicate declarations that cannot be uniquely associated with this
+	// statement's SQL ownership scopes are intentionally not guessed.
+	if len(candidates) == 1 {
+		aliased := candidates[0]
 		rng, err := astRange(req.Document.Text, aliased.AliasedName)
 		if err != nil {
 			return Location{}, false, err
@@ -250,6 +313,86 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 		return Location{URI: req.Document.URI, Range: rng}, true, nil
 	}
 	return Location{}, false, nil
+}
+
+func aliasInResolutionScope(alias *ast.Aliased, resolution sqlsymbol.Resolution) bool {
+	if resolution.SQL == nil {
+		return false
+	}
+	for _, scope := range resolution.SQL.Scopes {
+		for _, relation := range scope {
+			if relation.Alias == nil || !nameMatchesNode(*relation.Alias, alias.AliasedName) {
+				continue
+			}
+			// A named relation binding disambiguates repeated alias spellings
+			// in nested/sibling query scopes. Derived-query bindings have no
+			// base relation name, so their owning scope is the alias binding.
+			if relation.Name.Text != "" && !nameMatchesNode(relation.Name, alias.RealName) {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func nameMatchesNode(name sqlsymbol.Name, node ast.Node) bool {
+	value := astNodeName(node)
+	if value == "" {
+		return false
+	}
+	if name.Quoted {
+		return value == name.Text
+	}
+	return strings.EqualFold(value, name.Text)
+}
+
+func astNodeName(node ast.Node) string {
+	switch n := node.(type) {
+	case *ast.Identifier:
+		return n.Tok.NoQuoteString()
+	case *ast.MemberIdentifier:
+		return n.ChildTok.NoQuoteString()
+	default:
+		return ""
+	}
+}
+
+func findContainingStatement(root ast.Node, text string, offset int, best *ast.Node) {
+	if statement, ok := root.(*ast.Statement); ok {
+		rng, err := astRange(text, statement)
+		if err == nil {
+			start, startErr := ByteOffset(text, rng.Start)
+			end, endErr := ByteOffset(text, rng.End)
+			if startErr == nil && endErr == nil && start <= offset && offset < end {
+				if *best == nil {
+					*best = statement
+				} else if prior, ok := (*best).(*ast.Statement); ok {
+					priorRange, rangeErr := astRange(text, prior)
+					if rangeErr == nil {
+						priorStart, _ := ByteOffset(text, priorRange.Start)
+						priorEnd, _ := ByteOffset(text, priorRange.End)
+						if end-start < priorEnd-priorStart {
+							*best = statement
+						}
+					}
+				}
+			}
+		}
+	}
+	if list, ok := root.(ast.TokenList); ok {
+		for _, child := range list.GetTokens() {
+			findContainingStatement(child, text, offset, best)
+		}
+	}
+}
+
+func rangeWithin(child, parent Range) bool {
+	return positionLE(parent.Start, child.Start) && positionLE(child.End, parent.End)
+}
+
+func positionLE(left, right Position) bool {
+	return left.Line < right.Line || left.Line == right.Line && left.UTF16Column <= right.UTF16Column
 }
 
 func astRange(text string, node ast.Node) (Range, error) {
@@ -297,7 +440,7 @@ func relationAt(req Request, position Position) (catalog.ObjectID, Range, bool, 
 		return catalog.ObjectID{}, Range{}, false, err
 	}
 	for _, table := range tables {
-		if table.Name != name && table.Alias != name {
+		if table.Name != name && (req.Context.Variant.Driver == dialect.DatabaseDriverInterBase || table.Alias != name) {
 			continue
 		}
 		if schema == "" {
