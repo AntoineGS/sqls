@@ -2,6 +2,7 @@ package sqlsymbol
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 	"strconv"
 	"strings"
@@ -23,13 +24,21 @@ const (
 	// not InterBase-specific).
 	familyExactInteger
 	// familyExactNumeric is NUMERIC(p, s)/DECIMAL(p, s): exact fixed-point
-	// storage. Its Min/Max are the range implied by the declared precision
-	// and scale alone -- see sqlType.Min's own doc for why this codebase
-	// cannot go further and infer an underlying storage width.
+	// storage backed by a fixed-width integer type InterBase selects from
+	// the declared precision (see numericStorageBackedRange, live-verified
+	// against interbase_reference). StorageMin/StorageMax hold that
+	// engine-enforced range; DeclaredMin/DeclaredMax separately hold the
+	// range implied purely by the declared digit count. See sqlType's own
+	// field docs for why both exist and which one assignmentCompatibility
+	// actually uses for the safe/definitely-invalid boundary.
 	familyExactNumeric
-	// familyApproximate is FLOAT or bare DOUBLE PRECISION: binary floating
-	// point. No exact range or conversion rule is verified for this family;
-	// assignmentCompatibility always reports it unknown.
+	// familyApproximate is FLOAT or bare DOUBLE PRECISION, or -- per the
+	// live-verified correction in doc/interbase-diagnostic-semantics.md's
+	// I2 entry -- a Dialect 1 NUMERIC(p, s)/DECIMAL(p, s) declaration whose
+	// precision (10-18) InterBase actually backs with DOUBLE PRECISION
+	// storage rather than a fixed-width exact integer. No exact range or
+	// conversion rule is verified for this family; assignmentCompatibility
+	// always reports it unknown.
 	familyApproximate
 	// familyDateOnly is a Dialect 3 DATE: a calendar date with no time
 	// component.
@@ -85,55 +94,93 @@ func (f sqlTypeFamily) String() string {
 // independently, since a destination type is checked against each dimension
 // separately by assignmentCompatibility.
 //
-// Dialect note: a bare "DATE" string is genuinely ambiguous under Dialect 1,
-// since both RDB$FIELD_TYPE 12 (a real date-only field) and RDB$FIELD_TYPE
-// 35 (Dialect 1's own spelling for what Dialect 3 calls TIMESTAMP) render as
-// "DATE" there (internal/database/interbase_catalog.go:29-39). This parser
-// cannot recover which one produced a given string, so it resolves every
-// Dialect 1 "DATE" to familyDateTime (the wider, date+time interpretation).
-// This is a safe-direction choice: it can only cause a real date-only
-// Dialect 1 column to be treated as if it also carried a time component,
-// which can suppress a would-be narrowing finding but can never fabricate
-// one. See doc/interbase-diagnostic-semantics.md for the full citation.
+// Dialect note (DATE/TIMESTAMP): a bare "DATE" string is genuinely ambiguous
+// under Dialect 1, since both RDB$FIELD_TYPE 12 (a real date-only field) and
+// RDB$FIELD_TYPE 35 (Dialect 1's own spelling for what Dialect 3 calls
+// TIMESTAMP) render as "DATE" there
+// (internal/database/interbase_catalog.go:29-39). This parser cannot
+// recover which one produced a given string, so it resolves every Dialect 1
+// "DATE" to familyDateTime (the wider, date+time interpretation). Field
+// type 35 always means date+time under Dialect 1, so a same-dialect
+// DATE-into-DATE assignment built on this rule is genuinely type-compatible
+// on that basis. This is a safe-direction choice for the narrowing checks
+// this task enables: it can cause a real date-only Dialect 1 column to be
+// treated as if it also carried a time component, which can only suppress a
+// would-be narrowing finding in those checks, never introduce one -- but
+// that is not a blanket guarantee against every possible false "safe"
+// verdict from every rule in this file. See doc/interbase-diagnostic-
+// semantics.md's I4 entry for the precise scope of this guarantee.
 type sqlType struct {
 	// Family is the type's broad kind. familyUnknown means
 	// parseDiagnosticType could not determine any family for the input;
 	// assignmentCompatibility checks this first, before any other field.
 	Family sqlTypeFamily
 
-	// Min and Max are the type's exact provable value bounds, as exact
-	// rationals (math/big.Rat, never float64 -- a float64 bound would
-	// reintroduce the precision-loss bugs this task exists to catch).
-	// They are non-nil only for familyExactInteger and familyExactNumeric;
-	// nil for every other family, including familyApproximate, which has no
-	// verified exact range at all.
+	// DeclaredMin and DeclaredMax are the value range implied purely by a
+	// NUMERIC(p,s)/DECIMAL(p,s) declaration's own digit count (p decimal
+	// digits, s of them fractional) -- e.g. NUMERIC(4,0) implies ±9999.
+	// Populated only for familyExactNumeric; nil for every other family,
+	// including familyExactInteger (a bare SMALLINT/INTEGER/BIGINT has no
+	// separate "declared" concept distinct from its storage type, so only
+	// StorageMin/StorageMax are populated for it).
+	//
+	// This range is informational only. assignmentCompatibility's
+	// safe/definitely-invalid boundary never uses these fields -- see
+	// StorageMin/StorageMax below and doc/interbase-diagnostic-semantics.md's
+	// C1 entry, which live-verifies (via CAST probes against
+	// interbase_reference) that InterBase does NOT enforce the declared
+	// digit count at the storage layer: CAST(10000 AS NUMERIC(4,0))
+	// succeeds even though 10000 exceeds ±9999. A future task may still
+	// want DeclaredMin/DeclaredMax to phrase a message like "this value has
+	// more digits than declared, though the engine will still accept it."
+	DeclaredMin, DeclaredMax *big.Rat
+
+	// StorageMin and StorageMax are the value range InterBase actually
+	// enforces at the storage layer, as exact rationals (math/big.Rat,
+	// never float64 -- a float64 bound would reintroduce the
+	// precision-loss bugs this task exists to catch). Non-nil only for
+	// familyExactInteger and familyExactNumeric; nil for every other
+	// family, including familyApproximate, which has no verified exact
+	// range at all.
 	//
 	// For familyExactInteger these are the type's fixed two's-complement
-	// bounds. For familyExactNumeric these are the range implied by
-	// Precision/Scale alone -- a p-digit decimal has a provable exact value
-	// range as a matter of decimal arithmetic -- never a storage-width
-	// assumption. This codebase's catalog rendering
-	// (internal/database/interbase_catalog.go's interBaseNumericType) does
-	// not expose which underlying fixed-width field backs a given
-	// NUMERIC(p,s)/DECIMAL(p,s) (naturalPrecision is a display default, not
-	// a storage signal), so no width-based bound is ever asserted here.
-	Min, Max *big.Rat
+	// bounds (SMALLINT/INTEGER/BIGINT). For familyExactNumeric these are
+	// the exact two's-complement bounds of whichever fixed-width integer
+	// type InterBase selects to back the declaration, based on precision
+	// alone (see numericStorageBackedRange), scaled by 10^-Scale --
+	// live-verified: CAST(32768 AS NUMERIC(4,0)) overflows (SMALLINT's
+	// ±32767 boundary) and CAST(327.67 AS NUMERIC(4,2)) succeeds (also
+	// exactly SMALLINT's max, scaled). assignmentCompatibility's
+	// safe/definitely-invalid judgment always uses these fields, never
+	// DeclaredMin/DeclaredMax.
+	StorageMin, StorageMax *big.Rat
 
 	// Precision and Scale are the declared decimal digits and fractional
 	// digits, populated only for familyExactNumeric (NUMERIC(p,s)/
-	// DECIMAL(p,s), including the legacy Dialect-1 scaled DOUBLE PRECISION
-	// form, which renders as the identical NUMERIC/DECIMAL string and so is
-	// modeled identically -- see interBaseNumericType). Zero for every
-	// other family.
+	// DECIMAL(p,s)). Scale is implicitly 0 for familyExactInteger (the zero
+	// value, left unset rather than explicitly assigned, since a bare
+	// integer type has no fractional part) -- this lets
+	// assignmentCompatibility compare Scale across an
+	// exact-integer/exact-numeric pair uniformly, without a family special
+	// case. Zero for every other family.
 	Precision, Scale int
 
-	// CharacterWidth is the declared maximum character count for
-	// familyCharacter (CHAR(n)/VARCHAR(n)/CSTRING(n)); zero for every other
-	// family, and zero is never a valid declared width for a real
-	// familyCharacter type (CHAR(0)/VARCHAR(0) cannot occur), so zero
-	// safely doubles as "not applicable." It is a character count, not a
-	// byte length: a CHARACTER SET suffix is parsed and discarded, never
-	// folded into this count.
+	// CharacterWidth is the maximum count this codebase's own catalog
+	// renderer wrote inside CHAR(n)/VARCHAR(n)/CSTRING(n)'s parentheses;
+	// zero for every other family (and zero is never a valid declared
+	// width for a real familyCharacter type, so it safely doubles as "not
+	// applicable").
+	//
+	// CAUTION: this number is not reliably a character count.
+	// interBaseCharacterLength (the renderer this parser targets,
+	// internal/database/interbase_catalog.go:121-132) falls back to
+	// RDB$FIELD_LENGTH -- a byte count -- whenever RDB$CHARACTER_LENGTH is
+	// NULL, and that byte count is written into the identical
+	// CHAR(n)/VARCHAR(n) position with no marker distinguishing it from a
+	// genuine character count. This parser cannot tell the two cases apart
+	// from the rendered string alone. See doc/interbase-diagnostic-
+	// semantics.md's I3 entry for how assignmentCompatibility hedges
+	// around this honest limitation.
 	CharacterWidth int
 }
 
@@ -147,19 +194,83 @@ func pow10(n int) *big.Int {
 }
 
 func exactIntegerRange(min, max int64) sqlType {
-	return sqlType{Family: familyExactInteger, Min: big.NewRat(min, 1), Max: big.NewRat(max, 1)}
+	return sqlType{Family: familyExactInteger, StorageMin: big.NewRat(min, 1), StorageMax: big.NewRat(max, 1)}
 }
 
-// exactNumericRange computes NUMERIC(precision, scale)'s exact value range
-// directly from its declared digits: a precision-digit decimal magnitude
-// (10^precision - 1) scaled by 10^-scale. This is sound independently of
-// whatever storage width actually backs the field -- see sqlType.Min's doc.
-func exactNumericRange(precision, scale int) sqlType {
-	unscaledMax := new(big.Int).Sub(pow10(precision), big.NewInt(1))
+// numericStorageBackedRange returns the exact two's-complement bounds of the
+// fixed-width integer type InterBase actually selects to back a
+// NUMERIC/DECIMAL declaration of the given precision. Live-verified against
+// interbase_reference: CAST(10000 AS NUMERIC(4,0)) succeeds -- SMALLINT's
+// ±32767 range, not the ±9999 that 4 decimal digits alone would imply --
+// CAST(32768 AS NUMERIC(4,0)) overflows, and CAST(327.67 AS NUMERIC(4,2))
+// succeeds, exactly SMALLINT's max scaled by 10^-2. Grounded in
+// interbase-go/schema/ddl.go's dialect1NumericStorageCompatible and the
+// precision switch inside sqlTypePartsWithRenderer.
+//
+// The precision buckets are the same for Dialect 1 and Dialect 3 for
+// precision 1-9 (1-4 -> SMALLINT, 5-9 -> INTEGER); they diverge for
+// precision 10-18: Dialect 3 backs it with an exact BIGINT, but Dialect 1
+// backs it with DOUBLE PRECISION -- an approximate type with no exact range
+// at all (dialect1NumericStorageCompatible's fieldTypeDouble case).
+// approximate is true only in that Dialect 1, precision 10-18 case; callers
+// (exactNumericRange) must not fabricate exact bounds when it is true -- see
+// doc/interbase-diagnostic-semantics.md's I2 entry.
+func numericStorageBackedRange(precision int, dv dialect.DriverVariant) (min, max *big.Int, approximate bool) {
+	switch {
+	case precision >= 1 && precision <= 4:
+		return big.NewInt(-32768), big.NewInt(32767), false
+	case precision >= 5 && precision <= 9:
+		return big.NewInt(-2147483648), big.NewInt(2147483647), false
+	case precision >= 10 && precision <= 18:
+		if dv.Variant.InterBaseSQLDialect() == 1 {
+			return nil, nil, true
+		}
+		return big.NewInt(math.MinInt64), big.NewInt(math.MaxInt64), false
+	default:
+		return nil, nil, false
+	}
+}
+
+// exactNumericRange computes NUMERIC(precision, scale)'s two independent
+// value ranges -- see sqlType's DeclaredMin/StorageMin field docs for what
+// each represents and why both exist. When the storage InterBase actually
+// selects for this precision is itself approximate (Dialect 1, precision
+// 10-18 -- see numericStorageBackedRange), this returns familyApproximate
+// with no fabricated exact bounds at all, rather than a familyExactNumeric
+// carrying an invented storage range.
+func exactNumericRange(precision, scale int, dv dialect.DriverVariant) sqlType {
+	storageMinInt, storageMaxInt, approximate := numericStorageBackedRange(precision, dv)
+	if approximate {
+		return sqlType{Family: familyApproximate}
+	}
+
 	scaleDivisor := pow10(scale)
-	max := new(big.Rat).SetFrac(unscaledMax, scaleDivisor)
-	min := new(big.Rat).Neg(max)
-	return sqlType{Family: familyExactNumeric, Precision: precision, Scale: scale, Min: min, Max: max}
+	declaredUnscaledMax := new(big.Int).Sub(pow10(precision), big.NewInt(1))
+	declaredMax := new(big.Rat).SetFrac(declaredUnscaledMax, scaleDivisor)
+	declaredMin := new(big.Rat).Neg(declaredMax)
+
+	storageMin := new(big.Rat).SetFrac(storageMinInt, scaleDivisor)
+	storageMax := new(big.Rat).SetFrac(storageMaxInt, scaleDivisor)
+
+	return sqlType{
+		Family:      familyExactNumeric,
+		Precision:   precision,
+		Scale:       scale,
+		DeclaredMin: declaredMin,
+		DeclaredMax: declaredMax,
+		StorageMin:  storageMin,
+		StorageMax:  storageMax,
+	}
+}
+
+// hasExtraFractionalDigits reports whether value, expressed exactly, carries
+// more fractional decimal digits than scale allows -- i.e. whether storing
+// it in a scale-digit fixed-point destination requires InterBase to round
+// it. Live-verified: CAST(1.5 AS INTEGER) (scale 0) returns 2;
+// CAST(1.235 AS NUMERIC(4,2)) (scale 2) returns 1.24.
+func hasExtraFractionalDigits(value *big.Rat, scale int) bool {
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt(pow10(scale)))
+	return !scaled.IsInt()
 }
 
 // stripTypeSuffixes cuts a rendered type string at the first CHARACTER SET
@@ -200,9 +311,13 @@ func parseCharacterType(s string) (sqlType, bool) {
 // The renderer always writes ", " with one space after the comma; this
 // parser instead trims whitespace independently around each operand, which
 // tolerates incidental spacing variation at no cost to correctness -- the
-// comma itself, and both operands being plain non-negative integers, are
-// still required.
-func parseNumericType(s string) (sqlType, bool) {
+// comma itself, and both operands being plain integers with 1 <= precision
+// <= 18 and 0 <= scale <= precision (interbase-go/schema/ddl.go's
+// validNumericDeclaration bounds), are still required. dv resolves which
+// fixed-width storage type this precision selects -- see
+// numericStorageBackedRange -- since that selection is itself
+// dialect-sensitive for precision 10-18 (I2).
+func parseNumericType(s string, dv dialect.DriverVariant) (sqlType, bool) {
 	upper := strings.ToUpper(s)
 	for _, keyword := range [...]string{"NUMERIC", "DECIMAL"} {
 		prefix := keyword + "("
@@ -216,10 +331,10 @@ func parseNumericType(s string) (sqlType, bool) {
 		}
 		precision, err1 := strconv.Atoi(strings.TrimSpace(parts[0]))
 		scale, err2 := strconv.Atoi(strings.TrimSpace(parts[1]))
-		if err1 != nil || err2 != nil || precision <= 0 || scale < 0 {
+		if err1 != nil || err2 != nil || precision < 1 || precision > 18 || scale < 0 || scale > precision {
 			return sqlType{}, false
 		}
-		return exactNumericRange(precision, scale), true
+		return exactNumericRange(precision, scale, dv), true
 	}
 	return sqlType{}, false
 }
@@ -261,7 +376,7 @@ func parseBaseSQLType(s string, dv dialect.DriverVariant) (sqlType, bool) {
 	if t, ok := parseCharacterType(s); ok {
 		return t, true
 	}
-	if t, ok := parseNumericType(s); ok {
+	if t, ok := parseNumericType(s, dv); ok {
 		return t, true
 	}
 	return sqlType{}, false
@@ -413,18 +528,25 @@ func assignmentCompatibility(source expressionFact, destination sqlType, dv dial
 		return compatibility{Outcome: outcomeUnknown, Reason: "destination type could not be determined"}
 	}
 
-	if source.Value != nil && destination.Min != nil && destination.Max != nil {
-		if source.Value.Cmp(destination.Min) < 0 || source.Value.Cmp(destination.Max) > 0 {
+	if source.Value != nil && destination.StorageMin != nil && destination.StorageMax != nil {
+		if source.Value.Cmp(destination.StorageMin) < 0 || source.Value.Cmp(destination.StorageMax) > 0 {
 			return compatibility{
 				Outcome: outcomeDefinitelyInvalid,
-				Reason: fmt.Sprintf("literal %s is outside the %s destination's exact range [%s, %s]",
-					source.Value.RatString(), destination.Family, destination.Min.RatString(), destination.Max.RatString()),
+				Reason: fmt.Sprintf("literal %s is outside the %s destination's engine-enforced storage range [%s, %s]",
+					source.Value.RatString(), destination.Family, destination.StorageMin.RatString(), destination.StorageMax.RatString()),
+			}
+		}
+		if hasExtraFractionalDigits(source.Value, destination.Scale) {
+			return compatibility{
+				Outcome: outcomePossibleLoss,
+				Reason: fmt.Sprintf("literal %s has more fractional digits than the destination's scale %d and will be rounded",
+					source.Value.RatString(), destination.Scale),
 			}
 		}
 		return compatibility{
 			Outcome: outcomeSafe,
-			Reason: fmt.Sprintf("literal %s is within the %s destination's exact range [%s, %s]",
-				source.Value.RatString(), destination.Family, destination.Min.RatString(), destination.Max.RatString()),
+			Reason: fmt.Sprintf("literal %s is within the %s destination's engine-enforced storage range [%s, %s] with no rounding at scale %d",
+				source.Value.RatString(), destination.Family, destination.StorageMin.RatString(), destination.StorageMax.RatString(), destination.Scale),
 		}
 	}
 
@@ -433,18 +555,35 @@ func assignmentCompatibility(source expressionFact, destination sqlType, dv dial
 	}
 	src := source.Type
 
-	if src.Min != nil && src.Max != nil && destination.Min != nil && destination.Max != nil {
-		if src.Min.Cmp(destination.Min) >= 0 && src.Max.Cmp(destination.Max) <= 0 {
+	if src.StorageMin != nil && src.StorageMax != nil && destination.StorageMin != nil && destination.StorageMax != nil {
+		rangeFits := src.StorageMin.Cmp(destination.StorageMin) >= 0 && src.StorageMax.Cmp(destination.StorageMax) <= 0
+		scaleFits := src.Scale <= destination.Scale
+		if rangeFits && scaleFits {
 			return compatibility{
 				Outcome: outcomeSafe,
-				Reason: fmt.Sprintf("source's exact range [%s, %s] fits entirely within destination's exact range [%s, %s]",
-					src.Min.RatString(), src.Max.RatString(), destination.Min.RatString(), destination.Max.RatString()),
+				Reason: fmt.Sprintf("source's storage range [%s, %s] at scale %d fits entirely within destination's storage range [%s, %s] at scale %d",
+					src.StorageMin.RatString(), src.StorageMax.RatString(), src.Scale,
+					destination.StorageMin.RatString(), destination.StorageMax.RatString(), destination.Scale),
 			}
 		}
-		return compatibility{
-			Outcome: outcomePossibleLoss,
-			Reason: fmt.Sprintf("source's exact range [%s, %s] exceeds destination's exact range [%s, %s] for some values",
-				src.Min.RatString(), src.Max.RatString(), destination.Min.RatString(), destination.Max.RatString()),
+		switch {
+		case !rangeFits && !scaleFits:
+			return compatibility{
+				Outcome: outcomePossibleLoss,
+				Reason: fmt.Sprintf("source's storage range [%s, %s] exceeds destination's [%s, %s], and source's scale %d exceeds destination's scale %d",
+					src.StorageMin.RatString(), src.StorageMax.RatString(), destination.StorageMin.RatString(), destination.StorageMax.RatString(), src.Scale, destination.Scale),
+			}
+		case !rangeFits:
+			return compatibility{
+				Outcome: outcomePossibleLoss,
+				Reason: fmt.Sprintf("source's storage range [%s, %s] exceeds destination's storage range [%s, %s] for some values",
+					src.StorageMin.RatString(), src.StorageMax.RatString(), destination.StorageMin.RatString(), destination.StorageMax.RatString()),
+			}
+		default: // !scaleFits
+			return compatibility{
+				Outcome: outcomePossibleLoss,
+				Reason:  fmt.Sprintf("source's scale %d exceeds destination's scale %d and will be rounded", src.Scale, destination.Scale),
+			}
 		}
 	}
 
@@ -463,12 +602,19 @@ func assignmentCompatibility(source expressionFact, destination sqlType, dv dial
 		if src.CharacterWidth <= destination.CharacterWidth {
 			return compatibility{
 				Outcome: outcomeSafe,
-				Reason:  fmt.Sprintf("source's maximum width %d fits within destination's declared width %d", src.CharacterWidth, destination.CharacterWidth),
+				Reason:  fmt.Sprintf("source's maximum declared width %d fits within destination's declared width %d", src.CharacterWidth, destination.CharacterWidth),
 			}
 		}
+		// I3: CharacterWidth is not reliably a character count -- it can be
+		// an RDB$FIELD_LENGTH byte-count fallback (see sqlType's own doc).
+		// This codebase cannot tell from the rendered string alone whether
+		// a narrower destination genuinely means less room, so it does not
+		// assert outcomePossibleLoss here: doing so risks a false positive
+		// whenever either side's width is actually a byte count rather than
+		// a character count.
 		return compatibility{
-			Outcome: outcomePossibleLoss,
-			Reason:  fmt.Sprintf("source's maximum width %d exceeds destination's declared width %d", src.CharacterWidth, destination.CharacterWidth),
+			Outcome: outcomeUnknown,
+			Reason:  fmt.Sprintf("source's declared width %d exceeds destination's declared width %d, but CharacterWidth may be a byte count rather than a character count for either side", src.CharacterWidth, destination.CharacterWidth),
 		}
 	case familyDateOnly, familyDateTime, familyTime, familyBoolean:
 		return compatibility{

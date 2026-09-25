@@ -39,16 +39,24 @@ func TestParseDiagnosticTypeExactIntegers(t *testing.T) {
 			if got.Family != familyExactInteger {
 				t.Fatalf("Family = %v, want familyExactInteger", got.Family)
 			}
-			if got.Min == nil || got.Min.Cmp(big.NewRat(tt.min, 1)) != 0 {
-				t.Fatalf("Min = %v, want %d", got.Min, tt.min)
+			if got.StorageMin == nil || got.StorageMin.Cmp(big.NewRat(tt.min, 1)) != 0 {
+				t.Fatalf("StorageMin = %v, want %d", got.StorageMin, tt.min)
 			}
-			if got.Max == nil || got.Max.Cmp(big.NewRat(tt.max, 1)) != 0 {
-				t.Fatalf("Max = %v, want %d", got.Max, tt.max)
+			if got.StorageMax == nil || got.StorageMax.Cmp(big.NewRat(tt.max, 1)) != 0 {
+				t.Fatalf("StorageMax = %v, want %d", got.StorageMax, tt.max)
+			}
+			if got.DeclaredMin != nil || got.DeclaredMax != nil {
+				t.Fatalf("DeclaredMin/DeclaredMax = %v/%v, want nil/nil for familyExactInteger", got.DeclaredMin, got.DeclaredMax)
 			}
 		})
 	}
 }
 
+// TestParseDiagnosticTypeNumericRoundTrip checks NUMERIC/DECIMAL comma-space
+// tolerance and precision/scale round-tripping, and that DeclaredMin/
+// DeclaredMax hold the pure digit-count-implied range (never the
+// engine-enforced range -- see TestParseDiagnosticTypeNumericStorageWidth for
+// StorageMin/StorageMax, the C1-corrected bounds).
 func TestParseDiagnosticTypeNumericRoundTrip(t *testing.T) {
 	tests := []struct {
 		declaration      string
@@ -74,11 +82,87 @@ func TestParseDiagnosticTypeNumericRoundTrip(t *testing.T) {
 			}
 			wantMin := big.NewRat(tt.minNum, tt.minDen)
 			wantMax := big.NewRat(tt.maxNum, tt.maxDen)
-			if got.Min == nil || got.Min.Cmp(wantMin) != 0 {
-				t.Fatalf("Min = %v, want %v", got.Min, wantMin)
+			if got.DeclaredMin == nil || got.DeclaredMin.Cmp(wantMin) != 0 {
+				t.Fatalf("DeclaredMin = %v, want %v", got.DeclaredMin, wantMin)
 			}
-			if got.Max == nil || got.Max.Cmp(wantMax) != 0 {
-				t.Fatalf("Max = %v, want %v", got.Max, wantMax)
+			if got.DeclaredMax == nil || got.DeclaredMax.Cmp(wantMax) != 0 {
+				t.Fatalf("DeclaredMax = %v, want %v", got.DeclaredMax, wantMax)
+			}
+		})
+	}
+}
+
+// TestParseDiagnosticTypeNumericStorageWidth is the C1 regression: InterBase
+// selects a fixed storage width from precision alone and enforces THAT
+// range, not the declared digit count. Live-verified against
+// interbase_reference: CAST(10000 AS NUMERIC(4,0)) succeeds (SMALLINT
+// storage, ±32767, not ±9999); CAST(327.67 AS NUMERIC(4,2)) succeeds
+// (SMALLINT's max 32767 scaled by 10^-2); precision 9 selects INTEGER;
+// precision 10-18 selects BIGINT under Dialect 3 (see the companion Dialect
+// 1 test below for how 10-18 differs there -- I2).
+func TestParseDiagnosticTypeNumericStorageWidth(t *testing.T) {
+	tests := []struct {
+		declaration   string
+		storageMinNum int64
+		storageMinDen int64
+		storageMaxNum int64
+		storageMaxDen int64
+	}{
+		{"NUMERIC(4, 0)", -32768, 1, 32767, 1},
+		{"NUMERIC(4, 2)", -32768, 100, 32767, 100},
+		{"NUMERIC(9, 0)", -2147483648, 1, 2147483647, 1},
+		{"NUMERIC(18, 0)", -9223372036854775808, 1, 9223372036854775807, 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.declaration, func(t *testing.T) {
+			got := mustParseDiagnosticType(t, tt.declaration, dialect3Variant(), nil)
+			if got.Family != familyExactNumeric {
+				t.Fatalf("Family = %v, want familyExactNumeric", got.Family)
+			}
+			wantMin := big.NewRat(tt.storageMinNum, tt.storageMinDen)
+			wantMax := big.NewRat(tt.storageMaxNum, tt.storageMaxDen)
+			if got.StorageMin == nil || got.StorageMin.Cmp(wantMin) != 0 {
+				t.Fatalf("StorageMin = %v, want %v", got.StorageMin, wantMin)
+			}
+			if got.StorageMax == nil || got.StorageMax.Cmp(wantMax) != 0 {
+				t.Fatalf("StorageMax = %v, want %v", got.StorageMax, wantMax)
+			}
+		})
+	}
+}
+
+// TestParseDiagnosticTypeNumericStorageWidthDialectSensitive is the required
+// Dialect 1/3 table-driven coverage for I2: precision 1-9 selects the same
+// SMALLINT/INTEGER storage in both dialects, but precision 10-18 diverges --
+// Dialect 3 backs it with an exact BIGINT, Dialect 1 backs it with DOUBLE
+// PRECISION (approximate), per interbase-go/schema/ddl.go's
+// dialect1NumericStorageCompatible.
+func TestParseDiagnosticTypeNumericStorageWidthDialectSensitive(t *testing.T) {
+	tests := []struct {
+		name        string
+		declaration string
+		dv          dialect.DriverVariant
+		wantFamily  sqlTypeFamily
+	}{
+		{"dialect 1 precision 4 is exact (SMALLINT-backed)", "NUMERIC(4, 0)", dialect1Variant(), familyExactNumeric},
+		{"dialect 3 precision 4 is exact (SMALLINT-backed)", "NUMERIC(4, 0)", dialect3Variant(), familyExactNumeric},
+		{"dialect 1 precision 9 is exact (INTEGER-backed)", "NUMERIC(9, 0)", dialect1Variant(), familyExactNumeric},
+		{"dialect 3 precision 9 is exact (INTEGER-backed)", "NUMERIC(9, 0)", dialect3Variant(), familyExactNumeric},
+		{"dialect 1 precision 12 is approximate (DOUBLE PRECISION-backed)", "NUMERIC(12, 2)", dialect1Variant(), familyApproximate},
+		{"dialect 3 precision 12 is exact (BIGINT-backed)", "NUMERIC(12, 2)", dialect3Variant(), familyExactNumeric},
+		{"dialect 1 precision 18 is approximate (DOUBLE PRECISION-backed)", "NUMERIC(18, 0)", dialect1Variant(), familyApproximate},
+		{"dialect 3 precision 18 is exact (BIGINT-backed)", "NUMERIC(18, 0)", dialect3Variant(), familyExactNumeric},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mustParseDiagnosticType(t, tt.declaration, tt.dv, nil)
+			if got.Family != tt.wantFamily {
+				t.Fatalf("Family = %v, want %v", got.Family, tt.wantFamily)
+			}
+			if tt.wantFamily == familyApproximate {
+				if got.StorageMin != nil || got.StorageMax != nil {
+					t.Fatalf("StorageMin/StorageMax = %v/%v, want nil/nil for an approximate-backed declaration (no fabricated exact bounds)", got.StorageMin, got.StorageMax)
+				}
 			}
 		})
 	}
@@ -197,8 +281,8 @@ func TestParseDiagnosticTypeDomainResolution(t *testing.T) {
 	if got.Family != familyExactInteger {
 		t.Fatalf("Family = %v, want familyExactInteger (resolved through domain D_AGE)", got.Family)
 	}
-	if got.Max == nil || got.Max.Cmp(big.NewRat(32767, 1)) != 0 {
-		t.Fatalf("Max = %v, want 32767", got.Max)
+	if got.StorageMax == nil || got.StorageMax.Cmp(big.NewRat(32767, 1)) != 0 {
+		t.Fatalf("StorageMax = %v, want 32767", got.StorageMax)
 	}
 }
 
@@ -215,8 +299,8 @@ func TestParseDiagnosticTypeDomainOfDomain(t *testing.T) {
 	if got.Family != familyExactInteger {
 		t.Fatalf("Family = %v, want familyExactInteger (resolved through D_OUTER -> D_INNER -> INTEGER)", got.Family)
 	}
-	if got.Max == nil || got.Max.Cmp(big.NewRat(2147483647, 1)) != 0 {
-		t.Fatalf("Max = %v, want 2147483647", got.Max)
+	if got.StorageMax == nil || got.StorageMax.Cmp(big.NewRat(2147483647, 1)) != 0 {
+		t.Fatalf("StorageMax = %v, want 2147483647", got.StorageMax)
 	}
 }
 
@@ -299,6 +383,93 @@ func TestAssignmentCompatibilityRequiredFixtures(t *testing.T) {
 	}
 }
 
+// TestAssignmentCompatibilityNumericStorageWidthLiveVerified is the C1
+// regression, pinned to the reviewer's exact live-verified CAST probe
+// results against interbase_reference.
+func TestAssignmentCompatibilityNumericStorageWidthLiveVerified(t *testing.T) {
+	dv := dialect3Variant()
+	numeric40 := mustParseDiagnosticType(t, "NUMERIC(4, 0)", dv, nil)
+	numeric42 := mustParseDiagnosticType(t, "NUMERIC(4, 2)", dv, nil)
+
+	tests := []struct {
+		name        string
+		value       *big.Rat
+		destination sqlType
+		want        compatibilityOutcome
+	}{
+		// CAST(10000 AS NUMERIC(4,0)) succeeds live: SMALLINT storage
+		// (±32767), not the ±9999 that 4 declared digits alone would imply.
+		{"NUMERIC(4,0) <- 10000: safe (SMALLINT-backed, not ±9999)", big.NewRat(10000, 1), numeric40, outcomeSafe},
+		// CAST(32768 AS NUMERIC(4,0)) overflows live: exceeds SMALLINT's
+		// actual ±32767 storage range.
+		{"NUMERIC(4,0) <- 32768: definitely invalid (exceeds SMALLINT storage)", big.NewRat(32768, 1), numeric40, outcomeDefinitelyInvalid},
+		// CAST(327.67 AS NUMERIC(4,2)) succeeds live: 327.67 * 100 = 32767,
+		// exactly SMALLINT's max.
+		{"NUMERIC(4,2) <- 327.67: safe (SMALLINT max scaled by 10^-2)", big.NewRat(32767, 100), numeric42, outcomeSafe},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := assignmentCompatibility(expressionFact{Value: tt.value}, tt.destination, dv)
+			if got.Outcome != tt.want {
+				t.Fatalf("Outcome = %v, want %v (reason: %q)", got.Outcome, tt.want, got.Reason)
+			}
+		})
+	}
+}
+
+// TestAssignmentCompatibilityScaleLossLiteral is the I1 regression: a
+// literal that would require rounding to fit the destination's declared
+// scale is outcomePossibleLoss, never outcomeSafe, even when it is within
+// the destination's storage range. Live-verified: CAST(1.5 AS INTEGER)
+// returns 2 (rounds); CAST(1.235 AS NUMERIC(4,2)) returns 1.24 (rounds).
+func TestAssignmentCompatibilityScaleLossLiteral(t *testing.T) {
+	dv := dialect3Variant()
+	integer := mustParseDiagnosticType(t, "INTEGER", dv, nil)
+	numeric42 := mustParseDiagnosticType(t, "NUMERIC(4, 2)", dv, nil)
+
+	tests := []struct {
+		name        string
+		value       *big.Rat
+		destination sqlType
+		want        compatibilityOutcome
+	}{
+		{"INTEGER <- 1.5: possible loss (rounds to 2)", big.NewRat(3, 2), integer, outcomePossibleLoss},
+		{"INTEGER <- 2: safe (no fractional digits)", big.NewRat(2, 1), integer, outcomeSafe},
+		{"NUMERIC(4,2) <- 1.234: possible loss (rounds to 1.23)", big.NewRat(1234, 1000), numeric42, outcomePossibleLoss},
+		{"NUMERIC(4,2) <- 1.23: safe (matches scale exactly)", big.NewRat(123, 100), numeric42, outcomeSafe},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := assignmentCompatibility(expressionFact{Value: tt.value}, tt.destination, dv)
+			if got.Outcome != tt.want {
+				t.Fatalf("Outcome = %v, want %v (reason: %q)", got.Outcome, tt.want, got.Reason)
+			}
+		})
+	}
+}
+
+// TestAssignmentCompatibilityScaleLossReference is the I1 reference-source
+// case: NUMERIC(18,2) <- NUMERIC(9,4) reference. The source's storage range
+// fits entirely within the destination's, but the source's scale (4) exceeds
+// the destination's declared scale (2), so a value with nonzero digits past
+// the second decimal place would be rounded -- this must not be reported
+// safe merely because the magnitude fits.
+func TestAssignmentCompatibilityScaleLossReference(t *testing.T) {
+	dv := dialect3Variant()
+	numeric18_2 := mustParseDiagnosticType(t, "NUMERIC(18, 2)", dv, nil)
+	numeric9_4 := mustParseDiagnosticType(t, "NUMERIC(9, 4)", dv, nil)
+
+	got := assignmentCompatibility(expressionFact{Type: numeric9_4}, numeric18_2, dv)
+	if got.Outcome != outcomePossibleLoss {
+		t.Fatalf("NUMERIC(18,2) <- NUMERIC(9,4) reference: Outcome = %v, want outcomePossibleLoss (reason: %q)", got.Outcome, got.Reason)
+	}
+}
+
+// TestAssignmentCompatibilityCharacterWidth also pins the I3 hedge: since
+// CharacterWidth may be a byte-length fallback rather than a genuine
+// character count (see sqlType's own doc), a narrower destination is
+// reported outcomeUnknown, not outcomePossibleLoss -- this codebase cannot
+// be reasonably confident a narrowing finding here is real.
 func TestAssignmentCompatibilityCharacterWidth(t *testing.T) {
 	dv := interBaseVariant()
 	short := mustParseDiagnosticType(t, "VARCHAR(5)", dv, nil)
@@ -307,8 +478,8 @@ func TestAssignmentCompatibilityCharacterWidth(t *testing.T) {
 	if got := assignmentCompatibility(expressionFact{Type: short}, long, dv); got.Outcome != outcomeSafe {
 		t.Fatalf("short into long: Outcome = %v, want outcomeSafe (reason: %q)", got.Outcome, got.Reason)
 	}
-	if got := assignmentCompatibility(expressionFact{Type: long}, short, dv); got.Outcome != outcomePossibleLoss {
-		t.Fatalf("long into short: Outcome = %v, want outcomePossibleLoss (reason: %q)", got.Outcome, got.Reason)
+	if got := assignmentCompatibility(expressionFact{Type: long}, short, dv); got.Outcome != outcomeUnknown {
+		t.Fatalf("long into short: Outcome = %v, want outcomeUnknown (I3: width may be a byte count, not flagged as possible loss) (reason: %q)", got.Outcome, got.Reason)
 	}
 }
 

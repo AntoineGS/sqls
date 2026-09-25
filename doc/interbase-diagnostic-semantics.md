@@ -30,41 +30,96 @@ been confirmed against a running engine.
 - **Live-probe status:** NOT VERIFIED — no live database available this
   session.
 
-### 2. NUMERIC(p, s) / DECIMAL(p, s) exact value range, derived from declared precision/scale alone
+### 2. NUMERIC(p, s) / DECIMAL(p, s) exact value range: storage-width-backed, corrected in Fix round 1 (C1)
 
-- **Rule:** a NUMERIC(p, s)/DECIMAL(p, s) declaration's exact value range is
-  `-(10^p - 1)/10^s .. (10^p - 1)/10^s` — the range provable from the decimal
-  arithmetic of a p-digit number with s fractional digits, independent of
-  whatever fixed-width storage the engine actually chose for the field.
-- **Dialect(s):** both (not dialect-sensitive). The identical rendered string
-  form also covers the legacy Dialect-1 case where DOUBLE PRECISION carries a
-  scaled NUMERIC/DECIMAL declaration (see rule 5 below); this task cannot and
-  does not distinguish that case from a genuinely fixed-point field, so both
-  are modeled identically as `familyExactNumeric`.
-- **Authoritative source:**
-  `internal/database/interbase_catalog.go:134-159` (`interBaseNumericType`)
-  is the exact renderer this parser targets: `fmt.Sprintf("%s(%d, %d)",
-  numericName, precision, scale)` at line 158. The explicit warning this
-  task was given — **do not silently infer NUMERIC storage limits from
-  decimal precision alone** — is honored by deriving the range from
-  precision/scale arithmetic directly rather than from `naturalPrecision`
-  (lines 147-150), which `interBaseNumericType`'s own comment documents as a
-  *display* default only, never a storage-width signal
-  (`internal/database/interbase_catalog.go:134-150`).
-- **Test fixture:** `TestParseDiagnosticTypeNumericRoundTrip`.
-- **Live-probe status:** NOT VERIFIED — no live database available this
-  session.
+- **Original rule (WRONG, superseded by this entry):** the initial version of
+  this ledger claimed a NUMERIC(p,s)/DECIMAL(p,s) declaration's exact value
+  range was `-(10^p - 1)/10^s .. (10^p - 1)/10^s` — the range implied purely
+  by the declared digit count. **This was live-verified to be factually
+  wrong** by a reviewer with read-only access to `interbase_reference`:
+  `CAST(10000 AS NUMERIC(4,0))` succeeds and returns `10000`, even though
+  10000 has 5 digits and exceeds the ±9999 the declared-precision rule
+  would allow.
+- **Corrected rule:** InterBase selects a **fixed storage width** from the
+  declared precision alone, and enforces THAT storage type's exact
+  two's-complement range, not a range derived from the digit count:
+  - precision 1-4 → SMALLINT-backed, engine range ±32767 (scaled by
+    `10^-scale`)
+  - precision 5-9 → INTEGER-backed, engine range ±2147483647 (scaled)
+  - precision 10-18, Dialect 3 → BIGINT-backed, engine range
+    ±9223372036854775807 (scaled)
+  - precision 10-18, Dialect 1 → **DOUBLE PRECISION-backed (approximate,
+    not exact at all)** — see rule 9 (I2) below.
+  - Live-verified: `CAST(32768 AS NUMERIC(4,0))` → numeric overflow (exceeds
+    SMALLINT's ±32767, not because it exceeds 4 declared digits);
+    `CAST(327.67 AS NUMERIC(4,2))` → succeeds, returns `327.67` (327.67 *
+    100 = 32767, exactly SMALLINT's max, proving SMALLINT storage backs a
+    4-digit, scale-2 NUMERIC).
+- **`sqlType` now carries two independent bound pairs** for
+  `familyExactNumeric`, precisely to keep the (wrong) declared-digit-count
+  range and the (correct, engine-enforced) storage-width range distinct
+  rather than conflating them again:
+  - `DeclaredMin`/`DeclaredMax`: the range implied purely by `p` decimal
+    digits — informational only, never used by `assignmentCompatibility`'s
+    safe/definitely-invalid judgment.
+  - `StorageMin`/`StorageMax`: the actual engine-enforced range, computed by
+    `numericStorageBackedRange`. `assignmentCompatibility` always uses these
+    for the safe/definitely-invalid boundary.
+- **Dialect(s):** the storage-width **selection** is dialect-sensitive for
+  precision 10-18 only (see rule 9 / I2); the SMALLINT/INTEGER buckets
+  (precision 1-9) are identical across Dialect 1 and Dialect 3.
+- **Authoritative source:** `interbase-go/schema/ddl.go`'s
+  `dialect1NumericStorageCompatible` (lines 476-487) gives the exact
+  precision→storage-type mapping this rule reuses, cross-checked against the
+  reviewer's live `CAST(...)` probe results against `interbase_reference`
+  quoted above. `internal/database/interbase_catalog.go:134-159`
+  (`interBaseNumericType`) remains the exact string-rendering form this
+  parser targets (`fmt.Sprintf("%s(%d, %d)", numericName, precision,
+  scale)`), unchanged by this correction — only the *range this codebase
+  derives* from that rendered string changed, not the string grammar.
+- **Test fixture:** `TestParseDiagnosticTypeNumericRoundTrip` (DeclaredMin/
+  DeclaredMax round-trip), `TestParseDiagnosticTypeNumericStorageWidth`
+  (StorageMin/StorageMax per precision bucket),
+  `TestAssignmentCompatibilityNumericStorageWidthLiveVerified` (the exact
+  live-verified `10000`/`32768`/`327.67` values from the reviewer's probes).
+- **Live-probe status:** VERIFIED by the reviewer's own read-only
+  `CAST(...) FROM RDB$DATABASE` probes against `interbase_reference` (cited
+  above); this is the one rule in this ledger with actual live confirmation,
+  not merely a codebase-rendering citation.
 
-### 3. CHAR(n) / VARCHAR(n) / CSTRING(n) declared character width
+### 3. CHAR(n) / VARCHAR(n) / CSTRING(n) declared width — honest limitation corrected in Fix round 1 (I3)
 
-- **Rule:** the parenthesized integer is the type's declared maximum
-  character count (not a byte length).
+- **Rule:** the parenthesized integer is the number this codebase's own
+  catalog renderer wrote inside `CHAR(n)`/`VARCHAR(n)`/`CSTRING(n)`'s
+  parentheses.
+- **Corrected claim (was overclaimed in the original ledger):** this ledger
+  previously stated the integer is definitely "a character count (not a
+  byte length)." That is **not always true**: `interBaseCharacterLength`
+  (`internal/database/interbase_catalog.go:121-132`) falls back to
+  `domain.FieldLength` — a **byte** count from `RDB$FIELD_LENGTH` — whenever
+  `domain.CharacterLength` (`RDB$CHARACTER_LENGTH`) is `NULL`, and that byte
+  count is written into the identical `CHAR(n)`/`VARCHAR(n)` rendered
+  position with no marker distinguishing it from a genuine character count.
+  This parser cannot tell the two cases apart from the rendered string
+  alone, so `sqlType.CharacterWidth` may overstate (for a multi-byte
+  charset) or otherwise misrepresent a column's actual character capacity.
+- **How `assignmentCompatibility` hedges around this:** a
+  `familyCharacter`-into-`familyCharacter` assignment where the source's
+  width fits the destination's width is still reported `outcomeSafe` (a
+  narrower-or-equal count is safe regardless of which count it actually is).
+  A source that appears *wider* than the destination is reported
+  `outcomeUnknown`, not `outcomePossibleLoss` — asserting a narrowing
+  finding here risks a false positive whenever either side's width is
+  actually a byte count rather than a character count for a multi-byte
+  charset column.
 - **Dialect(s):** both.
 - **Authoritative source:** `internal/database/interbase_catalog.go:89`,
   `:109`, `:111` (`fmt.Sprintf("CHAR(%d)", ...)`, `"VARCHAR(%d)"`,
-  `"CSTRING(%d)"`, via `interBaseCharacterLength`, lines 121-132).
+  `"CSTRING(%d)"`, via `interBaseCharacterLength`, lines 121-132 — including
+  its `FieldLength` byte-count fallback at those same lines).
 - **Test fixture:** `TestParseDiagnosticTypeCharacterWidth`,
-  `TestAssignmentCompatibilityCharacterWidth`.
+  `TestAssignmentCompatibilityCharacterWidth` (now also pins the
+  outcomeUnknown hedge for a narrower destination).
 - **Live-probe status:** NOT VERIFIED — no live database available this
   session.
 
@@ -102,12 +157,19 @@ been confirmed against a running engine.
   RDB$FIELD_TYPE 35 (the timestamp-under-Dialect-1 case,
   `internal/database/interbase_catalog.go:33-34`). The rendered string alone
   cannot distinguish which RDB$FIELD_TYPE produced it. This parser resolves
-  the ambiguity toward the wider interpretation (`familyDateTime`), which is
-  safe-direction only: it can cause a genuinely date-only Dialect 1 column to
-  be treated as if it also carried a time component (suppressing a
-  would-be-found narrowing case), but it can never fabricate a false
-  "safe"/"invalid" verdict about a value that does not fit. This is
-  documented, not silently omitted, per the task's completeness discipline.
+  the ambiguity toward the wider interpretation (`familyDateTime`).
+- **Corrected scope claim (Fix round 1, I4):** the original ledger and
+  `sqlType`'s own doc comment stated this choice "can never fabricate a
+  false safe verdict," which overstated what is actually guaranteed. The
+  accurate, narrower claim is: field type 35 uniformly means date+time under
+  Dialect 1, so a same-dialect Dialect-1-DATE-into-Dialect-1-DATE assignment
+  is genuinely type-compatible on that basis, and this choice can only
+  *suppress* a would-be narrowing finding within the narrowing checks this
+  task enables (by treating a genuinely date-only column as if it also had a
+  time component) — it never *asserts* a false narrowing finding. This is
+  not a blanket guarantee that no rule in this file can ever produce a false
+  "safe" outcome for any other reason; it describes only the specific,
+  narrow effect of this one dialect-ambiguity choice.
 - **Dialect(s):** Dialect 1 and Dialect 3 (this is the rule's entire reason
   for existing).
 - **Authoritative source:** `internal/database/interbase_catalog.go:20-21`,
@@ -175,19 +237,49 @@ been confirmed against a running engine.
 - **Live-probe status:** NOT VERIFIED — no live database available this
   session.
 
+### 9. Dialect 1 NUMERIC/DECIMAL precision 10-18 is DOUBLE PRECISION-backed (approximate), not exact (added in Fix round 1, I2)
+
+- **Rule:** InterBase's precision→storage-type selection for NUMERIC/DECIMAL
+  is itself dialect-sensitive for precision 10-18: Dialect 3 backs it with an
+  exact BIGINT (see rule 2), but Dialect 1 backs it with DOUBLE PRECISION —
+  an *approximate* binary floating-point type with no exact range at all.
+  `parseDiagnosticType` is therefore dialect-aware for NUMERIC/DECIMAL
+  parsing, not only for DATE/TIMESTAMP (rule 5): under a Dialect 1 variant
+  with precision 10-18, it produces `familyApproximate` (no fabricated exact
+  bounds) instead of `familyExactNumeric`.
+- **Dialect(s):** Dialect 1 and Dialect 3 diverge only for precision 10-18;
+  precision 1-9 selects the identical SMALLINT/INTEGER storage in both
+  dialects.
+- **Authoritative source:** `interbase-go/schema/ddl.go`'s
+  `dialect1NumericStorageCompatible` (lines 476-487): `fieldTypeDouble`
+  (DOUBLE PRECISION) is the only storage type the function accepts for
+  precision 10-18 under Dialect 1, while `fieldTypeBigint`-backed precision
+  10-18 is what Dialect 3 accepts elsewhere in the same file (the ordinary,
+  non-dialect-1-specific precision switch in `sqlTypePartsWithRenderer`).
+- **Test fixture:**
+  `TestParseDiagnosticTypeNumericStorageWidthDialectSensitive` (the required
+  Dialect 1/3 table-driven coverage — precision 4 and 9 identical across
+  dialects, precision 12 and 18 diverge to `familyApproximate` under
+  Dialect 1 only).
+- **Live-probe status:** NOT VERIFIED — no live database available this
+  session (grounded in `interbase-go/schema/ddl.go`'s source, not a live
+  probe, unlike rule 2's C1 correction).
+
 ## Rules left disabled/unknown (inconclusive or out of scope)
 
 - **FLOAT / DOUBLE PRECISION exact range or float-to-exact-numeric
   conversion.** No exact range is asserted for `familyApproximate`
-  (`sqlType.Min`/`Max` are always `nil`), and any conversion into or out of
-  `familyApproximate` — including into an exact numeric or another
-  approximate declaration — reports `outcomeUnknown` unconditionally
-  (`assignmentCompatibility`'s `default` switch branch). This is
-  deliberate: proving a specific FLOAT/DOUBLE PRECISION runtime value fits
-  an exact numeric range requires knowing that specific value, which is
-  usually unavailable for a non-literal expression, and this task found no
-  narrow, citable InterBase rule that would let it assert more than that
-  without guessing. **UNVERIFIED — treated as unknown, not enabled.**
+  (`sqlType.StorageMin`/`StorageMax`/`DeclaredMin`/`DeclaredMax` are always
+  `nil`, including for the Dialect 1 precision-10-18 NUMERIC case from rule
+  9), and any conversion into or out of `familyApproximate` — including into
+  an exact numeric or another approximate declaration — reports
+  `outcomeUnknown` unconditionally (`assignmentCompatibility`'s `default`
+  switch branch). This is deliberate: proving a specific FLOAT/DOUBLE
+  PRECISION runtime value fits an exact numeric range requires knowing that
+  specific value, which is usually unavailable for a non-literal expression,
+  and this task found no narrow, citable InterBase rule that would let it
+  assert more than that without guessing. **UNVERIFIED — treated as unknown,
+  not enabled.**
 - **TIMESTAMP-into-DATE and DATE-into-TIMESTAMP conversions (Dialect 3).**
   Even though both are date/time-related families with a plausible
   "truncate the time part" / "assume midnight" real-engine behavior, this
@@ -217,19 +309,29 @@ been confirmed against a running engine.
   domain name, returns `ok=false`. No array-specific parsing was
   implemented; this is an explicit scope limitation, not a silent gap.
   **UNVERIFIED — treated as unknown, not enabled.**
-- **NUMERIC(p, s) storage-width-based range (e.g., assuming NUMERIC(4,0) is
-  bounded by SMALLINT's ±32767 because 4 is SMALLINT's natural display
-  precision).** Explicitly rejected per the brief's own instruction; see
-  rule 2 above for why the precision/scale-derived range is used instead.
-  **Not a rule this task enables in any form.**
+- **NUMERIC(p, s) storage-width-based range — SUPERSEDED, this entry was
+  itself wrong.** The original version of this ledger listed the
+  storage-width-based range as a rule this task explicitly rejected,
+  reasoning that "4 is SMALLINT's natural display precision" was an
+  unverified assumption. Fix round 1's C1 correction (rule 2 above)
+  live-verifies that the storage-width-based range is in fact exactly what
+  InterBase enforces, and it is now the rule `assignmentCompatibility` uses
+  for its safe/definitely-invalid boundary. This entry is retained only so a
+  reader of this file's history understands why the wording changed: do not
+  read rule 2 as reintroducing something this task once said was unsafe to
+  assume — the live probes in Fix round 1 are what changed, not the
+  reasoning standard.
 
 ## Dialect-sensitivity coverage note
 
-The only rule with verified InterBase-specific dialect-sensitive grounding
-found during this task is rule 5 (DATE/TIMESTAMP). No additional
-dialect-sensitive numeric or string rule was found with a citation strong
-enough to enable; in particular, this task did **not** invent a
-dialect-specific NUMERIC/DECIMAL precision rule, a dialect-specific
-CHAR/VARCHAR width rule, or a dialect-specific integer range rule — none of
-those are dialect-sensitive in this codebase's own rendering logic, and none
-are asserted to be so here.
+Two rules have verified InterBase-specific dialect-sensitive grounding:
+rule 5 (DATE/TIMESTAMP) and rule 9 (NUMERIC/DECIMAL precision 10-18 storage
+selection, added in Fix round 1 / I2). No additional dialect-sensitive
+numeric or string rule was found with a citation strong enough to enable;
+in particular, this task did **not** invent a dialect-specific CHAR/VARCHAR
+width rule or a dialect-specific plain-integer (SMALLINT/INTEGER/BIGINT)
+range rule — neither is dialect-sensitive in this codebase's own rendering
+logic, and neither is asserted to be so here. The NUMERIC/DECIMAL
+storage-width selection (rule 2) itself IS dialect-sensitive for precision
+10-18 specifically (rule 9), even though the exact-numeric range formula
+that applies once a storage type is selected is not.
