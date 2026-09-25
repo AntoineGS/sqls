@@ -268,7 +268,9 @@ func TestDetailDialectOnlyDifferenceDoesNotReload(t *testing.T) {
 // calls against concurrent Refreshes and proves the cache handed to Load
 // always corresponds to the exact snapshot whose Status was confirmed
 // terminal for the required categories -- never a newer, incomplete
-// generation's cache paired with an older check. Before the fix, Detail
+// generation's cache paired with an older check. Render also checks the
+// generation-specific relation name against its cache, catching accidental
+// use of a newer loader snapshot after acquisition. Before the fix, Detail
 // read the category-terminal snapshot once (for the check) and then read
 // loader.Snapshot()/loader.Cache() again, separately, to capture the
 // generation and the cache handed to Load; a Refresh landing in that gap
@@ -288,6 +290,12 @@ func TestDetailCacheMatchesCategoryCheckUnderConcurrentRefresh(t *testing.T) {
 	}
 	defer lease.Release()
 	waitReadyOrFatal(t, lease)
+	// Force one successful Render before racing refreshes so a zero-render
+	// schedule cannot make the assertion vacuous. Subsequent calls exercise
+	// the snapshot-bound renderer under concurrent generation replacement.
+	if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "BASE"}, Facet: "source", Consistency: metadata.Committed}); err != nil {
+		t.Fatalf("preflight Detail before refresh race: %v", err)
+	}
 
 	// Both loops are independently bounded (rather than one spinning
 	// unbounded until the other finishes): an unthrottled tight Refresh
@@ -334,21 +342,28 @@ func TestDetailCacheMatchesCategoryCheckUnderConcurrentRefresh(t *testing.T) {
 	if v := p.violations.Load(); v != 0 {
 		t.Fatalf("%d Load calls ran against a cache where the checked-terminal category was not actually merged in", v)
 	}
+	if got := p.renders.Load(); got == 0 {
+		t.Fatal("refresh race test never reached Render; generation-consistency path was not exercised")
+	}
 }
 
 // consistencyProvider's relations job always succeeds immediately; its
 // DetailPlan.Load asserts the cache it receives genuinely has relations
 // merged in (Metadata[MetadataRelations] == MetadataReady and SchemaTables
-// populated) every time it runs, recording a violation otherwise.
+// populated), while Render asserts it receives that same generation's cache.
+// Violations in either stage are recorded.
 type consistencyProvider struct {
 	violations atomic.Int64
+	plans      atomic.Int64
+	renders    atomic.Int64
 }
 
 func (p *consistencyProvider) Plan() catalog.MetadataPlan {
+	name := fmt.Sprintf("T-gen-%d", p.plans.Add(1))
 	return catalog.MetadataPlan{Parallelism: 1, Jobs: []catalog.MetadataJob{{
 		Kind: catalog.MetadataRelations,
 		Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			return catalog.MetadataPatch{Cache: &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}}, Count: 1}, nil
+			return catalog.MetadataPatch{Cache: &catalog.Cache{SchemaTables: map[string][]string{"": {name}}}, Count: 1}, nil
 		},
 	}}}
 }
@@ -361,7 +376,14 @@ func (p *consistencyProvider) DetailPlan(req metadata.Request) (metadata.DetailP
 			if cache == nil || cache.Metadata[catalog.MetadataRelations] != catalog.MetadataReady || len(cache.SchemaTables[""]) == 0 {
 				p.violations.Add(1)
 			}
-			return metadata.Detail{Text: "ok"}, nil
+			return metadata.Detail{Text: cache.SchemaTables[""][0]}, nil
+		},
+		Render: func(cache *catalog.Cache, acquired metadata.Detail, _ metadata.Request) (metadata.Detail, error) {
+			p.renders.Add(1)
+			if cache == nil || len(cache.SchemaTables[""]) != 1 || cache.SchemaTables[""][0] != acquired.Text {
+				p.violations.Add(1)
+			}
+			return acquired, nil
 		},
 	}, nil
 }
@@ -374,25 +396,43 @@ func (p *consistencyProvider) Factory(context.Context) (metadata.Provider, error
 // and Render, for tests needing a real (non-nil) Render function.
 type renderingProvider struct {
 	cache     *catalog.Cache
+	gate      <-chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
 	load      func(context.Context) (metadata.Detail, error)
 	render    func(*catalog.Cache, metadata.Detail, metadata.Request) (metadata.Detail, error)
+	coverage  func(*catalog.Cache) (string, error)
 	loadCalls int
 	mu        sync.Mutex
 }
 
 func (p *renderingProvider) Plan() catalog.MetadataPlan {
+	p.mu.Lock()
+	cache := p.cache
+	p.mu.Unlock()
 	return catalog.MetadataPlan{Parallelism: 1, Jobs: []catalog.MetadataJob{{
 		Kind: catalog.MetadataRelations,
-		Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
-			return catalog.MetadataPatch{Cache: p.cache, Count: len(p.cache.SchemaTables[""])}, nil
+		Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
+			if p.entered != nil {
+				p.enterOnce.Do(func() { close(p.entered) })
+			}
+			if p.gate != nil {
+				select {
+				case <-p.gate:
+				case <-ctx.Done():
+					return catalog.MetadataPatch{}, ctx.Err()
+				}
+			}
+			return catalog.MetadataPatch{Cache: cache, Count: len(cache.SchemaTables[""])}, nil
 		},
 	}}}
 }
 
 func (p *renderingProvider) DetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
 	return metadata.DetailPlan{
-		Requires: []catalog.MetadataKind{catalog.MetadataRelations},
-		Coverage: req.Object.Key() + "\x00" + req.Facet,
+		Requires:         []catalog.MetadataKind{catalog.MetadataRelations},
+		Coverage:         req.Object.Key() + "\x00" + req.Facet,
+		CoverageForCache: p.coverage,
 		Load: func(ctx context.Context, cache *catalog.Cache) (metadata.Detail, error) {
 			p.mu.Lock()
 			p.loadCalls++
@@ -406,3 +446,124 @@ func (p *renderingProvider) DetailPlan(req metadata.Request) (metadata.DetailPla
 func (p *renderingProvider) Close() error { return nil }
 
 func (p *renderingProvider) Factory(context.Context) (metadata.Provider, error) { return p, nil }
+
+func TestDetailCoverageCallbackUsesReadySnapshotAndFencesRefresh(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+	oldCache := &catalog.Cache{SchemaTables: map[string][]string{"": {"OLD"}}}
+	newCache := &catalog.Cache{SchemaTables: map[string][]string{"": {"NEW"}}}
+	var lease *metadata.Lease
+	var callbackCalls, renderCalls int
+	var callbackCache *catalog.Cache
+	var p *renderingProvider
+	p = &renderingProvider{
+		cache: oldCache,
+		load: func(context.Context) (metadata.Detail, error) {
+			return metadata.Detail{Text: "loaded"}, nil
+		},
+		coverage: func(cache *catalog.Cache) (string, error) {
+			callbackCalls++
+			callbackCache = cache
+			if cache.Metadata[catalog.MetadataRelations] != catalog.MetadataReady || cache.SchemaTables[""][0] != "OLD" {
+				return "", fmt.Errorf("coverage callback did not receive ready captured cache: %#v", cache)
+			}
+			p.mu.Lock()
+			p.cache = newCache
+			p.mu.Unlock()
+			if err := lease.Refresh(ctx); err != nil {
+				return "", err
+			}
+			return "canonical", nil
+		},
+		render: func(cache *catalog.Cache, acquired metadata.Detail, _ metadata.Request) (metadata.Detail, error) {
+			renderCalls++
+			if cache != callbackCache {
+				return metadata.Detail{}, fmt.Errorf("Render cache = %p, want the same captured cache passed to coverage %p", cache, callbackCache)
+			}
+			return acquired, nil
+		},
+	}
+	var err error
+	lease, err = r.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "ib://host/detail-coverage-refresh"}, metadata.Scope{Principal: "U"}, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	waitReadyOrFatal(t, lease)
+
+	_, err = lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "old"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	})
+	if !errors.Is(err, metadata.ErrStale) {
+		t.Fatalf("Detail after callback-triggered Refresh error = %v, want ErrStale", err)
+	}
+	if callbackCache == nil || callbackCache.SchemaTables[""][0] != "OLD" || callbackCalls != 1 {
+		t.Fatalf("coverage callback cache/calls = %v/%d, want captured ready OLD cache /1", callbackCache, callbackCalls)
+	}
+	if p.loadCalls != 0 || renderCalls != 0 {
+		t.Fatalf("stale-generation Load/Render calls = %d/%d, want 0/0", p.loadCalls, renderCalls)
+	}
+}
+
+func TestDetailCoverageCallbackWaitsForReadinessAndHonorsCallerCancellation(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var callbackCalls atomic.Int64
+	p := &renderingProvider{
+		cache:   &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}},
+		gate:    gate,
+		entered: entered,
+		load: func(context.Context) (metadata.Detail, error) {
+			return metadata.Detail{Text: "loaded"}, nil
+		},
+		coverage: func(cache *catalog.Cache) (string, error) {
+			callbackCalls.Add(1)
+			if cache.Metadata[catalog.MetadataRelations] != catalog.MetadataReady {
+				return "", fmt.Errorf("coverage callback ran before Relations was ready")
+			}
+			return "canonical", nil
+		},
+	}
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+	lease, err := r.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "ib://host/detail-coverage-cancel"}, metadata.Scope{Principal: "U"}, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relations category did not enter its gate")
+	}
+
+	requestCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() {
+		_, err := lease.Detail(requestCtx, metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "t"}, Facet: "ddl", Consistency: metadata.Committed})
+		done <- err
+	}()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Detail canceled while waiting for Relations = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled Detail did not return")
+	}
+	if got := callbackCalls.Load(); got != 0 {
+		t.Fatalf("coverage callback calls before category readiness = %d, want 0", got)
+	}
+	close(gate)
+	waitReadyOrFatal(t, lease)
+	if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "t"}, Facet: "ddl", Consistency: metadata.Committed}); err != nil {
+		t.Fatal(err)
+	}
+	if got := callbackCalls.Load(); got != 1 {
+		t.Fatalf("coverage callback calls after ready Detail = %d, want 1", got)
+	}
+}

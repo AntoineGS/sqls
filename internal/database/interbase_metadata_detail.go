@@ -461,23 +461,32 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 		}, nil
 	case ObjectKindTable:
 		// schema.Table needs to fetch constraints/indexes/triggers and its DDL
-		// is dialect-specific. Keep the rendered text in a coverage key that
-		// includes the effective source dialect, rather than sharing it under
-		// the otherwise dialect-agnostic object/facet key.
+		// is dialect-specific. Canonicalize the request using the ready cache
+		// in CoverageForCache, then include the effective source dialect in
+		// the retained key so equivalent spellings coalesce without sharing
+		// text across dialect variants.
 		dialect := interBaseSourceDialect(db)
-		coverage := detailCoverage(req.Object, "ddl") + "\x00source-dialect:" + fmt.Sprint(dialect)
 		return metadata.DetailPlan{
 			Requires: []MetadataKind{MetadataRelations},
-			Coverage: coverage,
+			Coverage: detailCoverage(req.Object, "ddl"),
+			CoverageForCache: func(cache *catalog.Cache) (string, error) {
+				name, err := interBaseResolveRelationName(cache, req.Object)
+				if err != nil {
+					return "", err
+				}
+				canonicalObject := catalog.ObjectID{Kind: req.Object.Kind, Name: name}
+				return detailCoverage(canonicalObject, "ddl") + "\x00source-dialect:" + fmt.Sprint(dialect), nil
+			},
 			Load: func(ctx context.Context, cache *DBCache) (metadata.Detail, error) {
 				name, err := interBaseResolveRelationName(cache, req.Object)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
+				canonicalObject := catalog.ObjectID{Kind: req.Object.Kind, Name: name}
 				if db == nil || db.Conn == nil {
 					return metadata.Detail{}, fmt.Errorf("interbase: database connection is nil")
 				}
-				table, err := schema.New(db.Conn).Table(ctx, name)
+				table, err := schema.New(db.Conn).Table(ctx, canonicalObject.Name)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -488,7 +497,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
-				return metadata.Detail{Object: req.Object, Text: ddl, Provenance: "interbase:table-ddl"}, nil
+				return metadata.Detail{Object: canonicalObject, Text: ddl, Provenance: "interbase:table-ddl"}, nil
 			},
 		}, nil
 	default:

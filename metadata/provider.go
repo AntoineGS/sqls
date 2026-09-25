@@ -68,8 +68,14 @@ type Detail struct {
 type DetailPlan struct {
 	Requires []catalog.MetadataKind
 	Coverage string
-	Load     func(context.Context, *catalog.Cache) (Detail, error)
-	Render   func(*catalog.Cache, Detail, Request) (Detail, error)
+	// CoverageForCache optionally derives the store's acquisition key from
+	// the exact ready cache snapshot whose categories were checked by Lease.
+	// It must be pure and read-only: it may resolve canonical object identity,
+	// but must not perform I/O or mutate cache state. When nil, Coverage is
+	// used unchanged for backwards compatibility.
+	CoverageForCache func(*catalog.Cache) (string, error)
+	Load             func(context.Context, *catalog.Cache) (Detail, error)
+	Render           func(*catalog.Cache, Detail, Request) (Detail, error)
 }
 
 // Provider is one engine's catalog-plan and detail-plan source for one

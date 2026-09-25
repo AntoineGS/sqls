@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -499,11 +500,11 @@ func TestInterBaseTableDDLCoalescesAcrossLeases(t *testing.T) {
 		t.Fatalf("first lease table DDL: %v", err)
 	}
 	reads := count()
-	if reads == 0 {
-		t.Fatal("first table DDL issued no fixture queries")
+	if reads != 11 {
+		t.Fatalf("first table DDL prepared %d statements, want the bounded schema.Table read of 11", reads)
 	}
 	t.Logf("first table DDL provider read prepared %d statements; the equivalent second lease prepared zero additional statements", reads)
-	definition, err := secondLease.Detail(ctx, metadata.Request{Object: object, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	definition, err := secondLease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "parent"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
 	if err != nil {
 		t.Fatalf("second lease table DDL: %v", err)
 	}
@@ -512,6 +513,93 @@ func TestInterBaseTableDDLCoalescesAcrossLeases(t *testing.T) {
 	}
 	if definition.Text != hover.Text || definition.Provenance != "interbase:table-ddl" {
 		t.Fatalf("second detail = (%q, %q), want same DDL and table provenance", definition.Text, definition.Provenance)
+	}
+	if hover.Object.Name != "PARENT" || definition.Object.Name != "PARENT" {
+		t.Fatalf("canonical Detail.Object names = %q, %q; want PARENT for both spellings", hover.Object.Name, definition.Object.Name)
+	}
+}
+
+func TestInterBaseTableDDLEquivalentSpellingJoinsInFlightLoad(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	closeRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	var matches atomic.Int64
+	entered := make(chan struct{}, 1)
+	fault := &interBaseFixtureFault{match: "__not_gated_until_ready__", stage: "gate", gate: release, entered: entered, matches: &matches}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 3}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	registry := metadata.NewRegistry(ctx, metadata.Options{MaxHostJobs: 6, MaxStoreJobs: 3, MaxDetailBytes: 64 << 20})
+	t.Cleanup(func() { closeRelease(); _ = registry.Close(context.Background()) })
+	factory := func(context.Context) (metadata.Provider, error) { return &interBaseTestProvider{db: repo}, nil }
+	key := metadata.Key{Engine: "interbase", URL: "test://" + t.Name()}
+	scope := metadata.Scope{Principal: "TESTER"}
+	a, err := registry.Acquire(ctx, key, scope, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.Release)
+	b, err := registry.Acquire(ctx, key, scope, factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(b.Release)
+	if err := metadatatest.WaitReady(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	fault.match = "RDB$RELATION_CONSTRAINTS"
+
+	firstDone := make(chan metadata.Detail, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		value, err := a.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		firstDone <- value
+		firstErr <- err
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		t.Fatalf("first table DDL did not enter gated provider query: %v", ctx.Err())
+	}
+	if got := matches.Load(); got != 1 {
+		closeRelease()
+		t.Fatalf("gated query matches before alias request = %d, want 1", got)
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan metadata.Detail, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		close(secondStarted)
+		value, err := b.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "parent"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		secondDone <- value
+		secondErr <- err
+	}()
+	<-secondStarted
+	select {
+	case <-secondDone:
+		closeRelease()
+		t.Fatal("equivalent-spelling Detail returned while the shared table DDL load remained gated")
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := matches.Load(); got != 1 {
+		closeRelease()
+		t.Fatalf("equivalent-spelling request started %d table-detail queries while first was gated, want one", got)
+	}
+	closeRelease()
+	first, second := <-firstDone, <-secondDone
+	if err := <-firstErr; err != nil {
+		t.Fatalf("first table DDL: %v", err)
+	}
+	if err := <-secondErr; err != nil {
+		t.Fatalf("equivalent-spelling table DDL: %v", err)
+	}
+	if first.Object.Name != "PARENT" || second.Object.Name != "PARENT" || first.Text != second.Text {
+		t.Fatalf("coalesced details not canonical/equal: first=%+v second=%+v", first.Object, second.Object)
+	}
+	if got := matches.Load(); got != 3 {
+		t.Fatalf("provider table-detail matched query count = %d, want three schema.Table statements in one Load", got)
 	}
 }
 
@@ -528,9 +616,13 @@ func TestInterBaseTableDDLUsesExactNameAndRejectsAmbiguity(t *testing.T) {
 	if !strings.Contains(got.Text, `CREATE TABLE "Foo"`) || strings.Contains(got.Text, `UPPER_FOO_ONLY_COLUMN`) {
 		t.Fatalf("Foo DDL = %q, want exact Foo table only", got.Text)
 	}
+	count := interBaseFixtureCountPrepares(t)
 	_, err = lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "foo"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
 	if !errors.Is(err, catalog.ErrAmbiguous) {
 		t.Fatalf("ambiguous folded table DDL error = %v, want catalog.ErrAmbiguous", err)
+	}
+	if got := count(); got != 0 {
+		t.Fatalf("ambiguous table name triggered %d fixture queries, want no provider read", got)
 	}
 }
 
@@ -583,8 +675,17 @@ func TestInterBaseTableDDLCoverageIncludesSourceDialect(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dialect1Plan.Coverage == dialect3Plan.Coverage {
-		t.Fatalf("source dialect variants share coverage %q; rendered text would be cached under a dialect-agnostic key", dialect1Plan.Coverage)
+	cache := &catalog.Cache{SchemaTables: map[string][]string{"": {"PARENT"}}}
+	dialect1Coverage, err := dialect1Plan.CoverageForCache(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialect3Coverage, err := dialect3Plan.CoverageForCache(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dialect1Coverage == dialect3Coverage {
+		t.Fatalf("source dialect variants share coverage %q; rendered text would be cached under a dialect-agnostic key", dialect1Coverage)
 	}
 	var rendered []string
 	for _, tc := range []struct {
