@@ -25,10 +25,11 @@ import (
 // is the descriptor's verbatim catalog text, carried along because it is the
 // body used when the catalog cannot reproduce executable DDL.
 type snapshotTarget struct {
-	kind   database.ObjectKind
-	name   string
-	source sql.NullString
-	column *sqlsymbol.Name
+	kind       database.ObjectKind
+	name       string
+	source     sql.NullString
+	column     *sqlsymbol.Name
+	provenance string
 }
 
 // resolveSnapshotTarget classifies the identifier under the cursor against the
@@ -195,6 +196,10 @@ func renderSnapshot(target snapshotTarget, sc snapshotContext, now time.Time, bo
 		singleLine(sc.label), now.UTC().Format(time.RFC3339))
 	b.WriteString("-- Editing this file does not change the database.\n")
 	bannerLines := 3
+	if target.provenance != "" {
+		fmt.Fprintf(&b, "-- provenance: %s\n", singleLine(target.provenance))
+		bannerLines++
+	}
 
 	if note != "" {
 		commented := commentLines(note)

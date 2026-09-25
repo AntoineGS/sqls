@@ -27,6 +27,69 @@ func TestNavigationDefinitionPrefersLocalAlias(t *testing.T) {
 	}
 }
 
+func TestNavigationCallableDefinitionUsesUniqueVisibleAlias(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		pos  int
+		want *language.Range
+	}{
+		{name: "visible alias", text: "SELECT f() FROM t AS f", pos: 7, want: &language.Range{Start: language.Position{Line: 0, UTF16Column: 21}, End: language.Position{Line: 0, UTF16Column: 22}}},
+		{name: "no matching alias", text: "SELECT f() FROM t AS x", pos: 7},
+		{name: "ambiguous same scope", text: "SELECT f() FROM t AS f, u AS f", pos: 7},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := navRequest(tc.text, dialect.DatabaseDriverInterBase)
+			got, err := language.NewService().Definition(context.Background(), req, language.Position{Line: 0, UTF16Column: tc.pos})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == nil {
+				if len(got.Value) != 0 {
+					t.Fatalf("Definition = %#v, want no location", got.Value)
+				}
+				return
+			}
+			if len(got.Value) != 1 || got.Value[0].URI != req.Document.URI || got.Value[0].Range != *tc.want || got.Value[0].Source != nil {
+				t.Fatalf("Definition = %#v, want local alias range %+v", got.Value, *tc.want)
+			}
+		})
+	}
+}
+
+func TestNavigationMalformedQualifiedAliasRecoveryIsStatementLocal(t *testing.T) {
+	tests := []struct {
+		name, text string
+		pos        language.Position
+		want       *language.Range
+	}{
+		{name: "emoji prefixed malformed SQL", text: "😀ci.ID FROM city AS ci", pos: language.Position{Line: 0, UTF16Column: 2}, want: &language.Range{Start: language.Position{Line: 0, UTF16Column: 21}, End: language.Position{Line: 0, UTF16Column: 23}}},
+		{name: "declaration only in other statement", text: "😀ci.ID FROM city; SELECT id FROM t AS ci", pos: language.Position{Line: 0, UTF16Column: 2}},
+		{name: "ambiguous same statement declarations", text: "😀ci.ID FROM city AS ci, other AS ci", pos: language.Position{Line: 0, UTF16Column: 2}},
+		{name: "half surrogate cursor", text: "😀ci.ID FROM city AS ci", pos: language.Position{Line: 0, UTF16Column: 1}},
+		{name: "out of line cursor", text: "😀ci.ID FROM city AS ci", pos: language.Position{Line: 1, UTF16Column: 0}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := navRequest(tc.text, dialect.DatabaseDriverInterBase)
+			got, err := language.NewService().Definition(context.Background(), req, tc.pos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == nil {
+				if len(got.Value) != 0 {
+					t.Fatalf("Definition = %#v, want no location", got.Value)
+				}
+				return
+			}
+			if len(got.Value) != 1 || got.Value[0].URI != req.Document.URI || got.Value[0].Range != *tc.want || got.Value[0].Source != nil {
+				t.Fatalf("Definition = %#v, want local alias range %+v", got.Value, *tc.want)
+			}
+		})
+	}
+}
+
 func TestNavigationProcedureLocalReferencesAndRename(t *testing.T) {
 	text := "ALTER PROCEDURE p AS\nDECLARE VARIABLE v INTEGER;\nBEGIN\nv = 0;\nv = :v + 1; -- v\nSELECT 'v' FROM t;\nEND"
 	req := navRequest(text, dialect.DatabaseDriverInterBase)

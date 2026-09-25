@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/ast"
@@ -10,7 +11,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/internal/sqlsymbol"
+	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
@@ -30,66 +31,52 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 	if err != nil {
 		return nil, err
 	}
-	text, dv := snapshot.Text, snapshot.Variant
-	var analysis *sqlsymbol.Analysis
-	var offset int
-	if dv.Driver == dialect.DatabaseDriverInterBase {
-		var valid bool
-		offset, valid = symbolOffset(text, params.Position)
-		if !valid {
+	request := languageRequest(snapshot)
+	detailCtx, cancel := context.WithTimeout(ctx, definitionDDLTimeout)
+	defer cancel()
+	languageResult, serviceErr := language.NewService().Definition(detailCtx, request, languagePosition(params.Position))
+	if ctx.Err() != nil {
+		return nil, language.ErrCanceled
+	}
+	if serviceErr != nil {
+		// Definition is a navigation affordance. Detail transport/cache failures
+		// must not become JSON-RPC errors or stale source publications.
+		if errors.Is(serviceErr, language.ErrCanceled) && ctx.Err() != nil {
+			return nil, language.ErrCanceled
+		}
+		return []lsp.Location{}, nil
+	}
+	if err := s.navigationResultCurrent(ctx, snapshot, languageResult.Stamp); err != nil {
+		if errors.Is(err, language.ErrCanceled) && ctx.Err() != nil {
+			return nil, language.ErrCanceled
+		}
+		return []lsp.Location{}, nil
+	}
+	locations := make([]lsp.Location, 0, len(languageResult.Value))
+	for _, location := range languageResult.Value {
+		if location.Source == nil {
+			locations = append(locations, lsp.Location{URI: location.URI, Range: lspRange(location.Range)})
+			continue
+		}
+		if s.snapshots == nil {
 			return []lsp.Location{}, nil
 		}
-		analysis, err = sqlsymbol.Analyze(text, dv)
-		if err != nil {
-			return nil, err
+		source := location.Source
+		target := snapshotTarget{kind: database.ObjectKind(source.Object.Kind), name: source.Object.Name, provenance: source.Provenance}
+		content, bannerLines := renderSnapshot(target, snapshot.SourceContext, s.snapshots.now(), source.Text, source.Note)
+		path, published, writeErr := s.publishDefinitionCandidate(ctx, snapshot, languageResult.Stamp, string(target.kind), target.name, content)
+		if writeErr != nil || !published {
+			if ctx.Err() != nil {
+				return nil, language.ErrCanceled
+			}
+			return []lsp.Location{}, nil
 		}
+		rng := location.Range
+		rng.Start.Line += bannerLines
+		rng.End.Line += bannerLines
+		locations = append(locations, lsp.Location{URI: snapshotURI(path), Range: lspRange(rng)})
 	}
-	var local lsp.Definition
-	var handled bool
-	if analysis != nil {
-		local, handled, err = localDefinitionWithAnalysis(params.TextDocument.URI, text, offset, analysis)
-	} else {
-		local, handled, err = localDefinition(params.TextDocument.URI, text, params.Position, dv)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if handled {
-		return local, nil
-	}
-	var contextual bool
-	if analysis != nil {
-		contextual, err = contextualSQLTargetWithAnalysis(text, params.Position, analysis)
-	} else {
-		contextual, err = contextualSQLTarget(text, params.Position, dv)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if contextual {
-		if snapshot.Repository == nil {
-			return nil, nil
-		}
-		repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
-		return s.interBaseContextualDefinitionWithSnapshot(ctx, repo, snapshot.Cache, text, params.Position, dv, analysis, snapshot.SourceContext)
-	}
-
-	res, err := definitionWithDriverVariant(params.TextDocument.URI, text, params, snapshot.Cache, dv)
-	if err != nil {
-		return nil, err
-	}
-	// In-document aliases and subqueries win outright, for every driver.
-	if len(res) > 0 {
-		return res, nil
-	}
-
-	// Not having a repository is not a definition failure: for every driver
-	// without a catalog, the alias path above is the whole feature.
-	if snapshot.Repository == nil {
-		return nil, nil
-	}
-	repo := wrapRepositoryWithLease(snapshot.Repository, snapshot.MetadataLease, snapshot.Variant)
-	return s.interBaseDefinitionWithSnapshot(ctx, repo, snapshot.Cache, params, text, dv, snapshot.SourceContext)
+	return locations, nil
 }
 
 func definition(url, text string, params lsp.DefinitionParams, dbCache *database.DBCache) (lsp.Definition, error) {

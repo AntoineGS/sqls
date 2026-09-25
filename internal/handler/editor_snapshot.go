@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"context"
 	"fmt"
 
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
+	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
 )
 
@@ -51,7 +53,12 @@ type editorSnapshot struct {
 func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
+	return s.captureEditorSnapshotLocked(uri)
+}
 
+// captureEditorSnapshotLocked is the stateMu-held form used by publication
+// fences. It must not acquire stateMu itself.
+func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error) {
 	file := s.files[uri]
 	if file == nil {
 		return editorSnapshot{}, fmt.Errorf("document not found: %s", uri)
@@ -116,6 +123,49 @@ func (s *Server) captureEditorSnapshot(uri string) (editorSnapshot, error) {
 		}
 	}
 	return snapshot, nil
+}
+
+// publishDefinitionCandidate writes privately, then validates and publishes
+// the candidate at one stateMu linearization point. A stale attempt can only
+// remove its own unique candidate directory.
+func (s *Server) publishDefinitionCandidate(ctx context.Context, captured editorSnapshot, stamp language.Stamp, kind, name, content string) (string, bool, error) {
+	candidate, err := s.snapshots.writeCandidate(captured.SourceContext, kind, name, content)
+	if err != nil {
+		return "", false, err
+	}
+	s.stateMu.RLock()
+	current, captureErr := s.captureEditorSnapshotLocked(captured.URI)
+	valid := ctx.Err() == nil && captureErr == nil &&
+		current.Revision == captured.Revision && current.Text == captured.Text &&
+		current.Version == captured.Version && current.Variant == captured.Variant &&
+		current.DialectResolved == captured.DialectResolved &&
+		current.Generation == captured.Generation &&
+		current.SourceContext == captured.SourceContext &&
+		current.MetadataIncarnation == captured.MetadataIncarnation &&
+		current.MetadataGeneration == captured.MetadataGeneration &&
+		metadataRevision(current) == metadataRevision(captured) &&
+		metadataKeyEqual(current, captured) &&
+		language.Current(stamp, languageRequest(current).Document, languageRequest(current).Context)
+	s.stateMu.RUnlock()
+	if !valid {
+		candidate.remove()
+		return "", false, nil
+	}
+	return candidate.path, true, nil
+}
+
+func metadataKeyEqual(a, b editorSnapshot) bool {
+	if a.MetadataLease == nil || b.MetadataLease == nil {
+		return a.MetadataLease == nil && b.MetadataLease == nil
+	}
+	return a.MetadataLease.Key() == b.MetadataLease.Key()
+}
+
+func metadataRevision(snapshot editorSnapshot) uint64 {
+	if snapshot.Metadata == nil {
+		return 0
+	}
+	return snapshot.Metadata.Revision
 }
 
 func (s *Server) snapshotGenerationCurrent(generation int) bool {

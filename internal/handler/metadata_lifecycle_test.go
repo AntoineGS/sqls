@@ -511,14 +511,10 @@ func (p *procedureDDLDetailProvider) DetailPlan(req metadata.Request) (metadata.
 
 func (p *procedureDDLDetailProvider) Close() error { return nil }
 
-// TestHoverAndDefinitionShareObjectLoad proves the production hover handler
-// and the legacy private Definition helper can reuse one Detail load through
-// the same metadata lease. Definition is intentionally still invoked through
-// interBaseDefinition here; B3c3 must wire the standalone production Definition
-// route before this test can claim host-to-host production coverage.
+// TestHoverAndDefinitionShareObjectLoad proves the production hover and
+// Definition handlers reuse one Detail load through the same metadata lease.
 func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 	server := newDefinitionServer(t)
-	cache := definitionCatalog()
 	const wantDDL = "CREATE PROCEDURE \"MYPROC\" AS\nBEGIN\n  SUSPEND;\nEND"
 	provider := &procedureDDLDetailProvider{ddl: wantDDL}
 
@@ -544,12 +540,7 @@ func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 	leaseCache.Catalog.TriggersByID = map[string]*catalog.TriggerDesc{}
 	leaseCache.Catalog.RebuildObjects(strings.ToUpper)
 
-	// The production route must obtain Detail through languageRequest's lease,
-	// not through the raw repository or a handler-specific memo.
-	rawRepo := newStubDDLRepository(func(context.Context, database.ObjectKind, string) (string, error) {
-		t.Fatal("ObjectDDL called on the raw repository; want the shared lease Detail load instead")
-		return "", nil
-	})
+	// Production Definition and Hover must obtain Detail through the same lease.
 
 	text := "execute procedure myproc"
 	hoverParams := lsp.HoverParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
@@ -583,10 +574,9 @@ func TestHoverAndDefinitionShareObjectLoad(t *testing.T) {
 		t.Fatalf("repeated hover = %#v, want the cached DDL appendix", value)
 	}
 
-	repo := wrapRepositoryWithLease(rawRepo, lease, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
-	got, err := server.interBaseDefinition(context.Background(), repo, cache, definitionParamsAt(20), text)
+	got, err := invokeDefinition(server, text, 20)
 	if err != nil {
-		t.Fatal("interBaseDefinition:", err)
+		t.Fatal("production Definition handler:", err)
 	}
 	if len(got) != 1 {
 		t.Fatalf("definition locations = %d, want 1", len(got))

@@ -27,12 +27,19 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 		return Result[[]Location]{Value: local, Stamp: stampFor(req)}, nil
 	}
 	role := sqlsymbol.Outside
+	var resolution sqlsymbol.Resolution
+	var err error
 	if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase {
-		_, resolution, _, err := localAnalysis(req, position)
+		_, resolution, _, err = localAnalysis(req, position)
 		if err != nil {
 			return Result[[]Location]{}, err
 		}
 		role = resolution.Role
+	}
+	if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase && role == sqlsymbol.Callable {
+		if alias, ok := visibleCallableAlias(req, resolution); ok {
+			return Result[[]Location]{Value: []Location{alias}, Stamp: stampFor(req)}, nil
+		}
 	}
 	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase || role == sqlsymbol.Alias {
 		if alias, ok, err := aliasDefinition(req, position); err != nil {
@@ -348,7 +355,7 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 		if resolution.Role != sqlsymbol.Alias {
 			return Location{}, false, nil
 		}
-		return interBaseAliasDefinition(req, resolution)
+		return interBaseAliasDefinition(req, resolution, position)
 	}
 	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
 	if err != nil {
@@ -406,36 +413,90 @@ func aliasDefinition(req Request, position Position) (Location, bool, error) {
 	return Location{}, false, nil
 }
 
-func interBaseAliasDefinition(req Request, resolution sqlsymbol.Resolution) (Location, bool, error) {
-	if resolution.SQL == nil {
+func interBaseAliasDefinition(req Request, resolution sqlsymbol.Resolution, position Position) (Location, bool, error) {
+	if resolution.SQL != nil {
+		for _, scope := range resolution.SQL.Scopes { // SQL scopes are nearest-first.
+			matches := make([]sqlsymbol.RelationRef, 0, 1)
+			for _, relation := range scope {
+				if relation.Alias != nil && relation.Alias.Key() == resolution.SQL.Name.Key() {
+					matches = append(matches, relation)
+				}
+			}
+			if len(matches) == 0 {
+				continue
+			}
+			// The nearest matching scope owns this name. Ambiguous or malformed
+			// bindings do not fall through to an outer same-spelled declaration.
+			if len(matches) != 1 {
+				return Location{}, false, nil
+			}
+			span := matches[0].AliasDeclaration
+			if span.Start < 0 || span.End <= span.Start || span.End > len(req.Document.Text) {
+				return Location{}, false, nil
+			}
+			rng, ok := navigationSpanRange(req.Document.Text, span)
+			if !ok {
+				return Location{}, false, nil
+			}
+			return Location{URI: req.Document.URI, Range: rng}, true, nil
+		}
+		if len(resolution.SQL.Scopes) != 0 || !qualifiedAliasToken(req.Document.Text, resolution.Span) {
+			return Location{}, false, nil
+		}
+	} else if !qualifiedAliasToken(req.Document.Text, resolution.Span) {
 		return Location{}, false, nil
 	}
-	for _, scope := range resolution.SQL.Scopes { // SQL scopes are nearest-first.
-		matches := make([]sqlsymbol.RelationRef, 0, 1)
-		for _, relation := range scope {
-			if relation.Alias != nil && relation.Alias.Key() == resolution.SQL.Name.Key() {
-				matches = append(matches, relation)
+	// Narrow malformed-fragment recovery: only a proven Alias role with no
+	// SQL ownership scopes and a qualifier-before-dot may use the parser's
+	// same-statement alias lookup. Other roles never enter this branch.
+	parserRequest := req
+	parserRequest.Context.Variant = dialect.DriverVariant{}
+	return aliasDefinition(parserRequest, position)
+}
+
+func qualifiedAliasToken(text string, span sqlsymbol.Span) bool {
+	if span.Start < 0 || span.End <= span.Start || span.End > len(text) {
+		return false
+	}
+	for i := span.End; i < len(text); i++ {
+		switch text[i] {
+		case ' ', '\t', '\r', '\n':
+			continue
+		default:
+			return text[i] == '.'
+		}
+	}
+	return false
+}
+
+func visibleCallableAlias(req Request, resolution sqlsymbol.Resolution) (Location, bool) {
+	if resolution.SQL == nil {
+		return Location{}, false
+	}
+	for _, scope := range resolution.SQL.Scopes { // nearest-first; shadowing is authoritative
+		var matches []sqlsymbol.RelationRef
+		for _, binding := range scope {
+			if binding.Alias != nil && binding.Alias.Key() == resolution.SQL.Name.Key() {
+				matches = append(matches, binding)
 			}
 		}
 		if len(matches) == 0 {
 			continue
 		}
-		// The nearest matching scope owns this name. Ambiguous or malformed
-		// bindings do not fall through to an outer same-spelled declaration.
 		if len(matches) != 1 {
-			return Location{}, false, nil
+			return Location{}, false
 		}
 		span := matches[0].AliasDeclaration
 		if span.Start < 0 || span.End <= span.Start || span.End > len(req.Document.Text) {
-			return Location{}, false, nil
+			return Location{}, false
 		}
 		rng, ok := navigationSpanRange(req.Document.Text, span)
 		if !ok {
-			return Location{}, false, nil
+			return Location{}, false
 		}
-		return Location{URI: req.Document.URI, Range: rng}, true, nil
+		return Location{URI: req.Document.URI, Range: rng}, true
 	}
-	return Location{}, false, nil
+	return Location{}, false
 }
 
 func findContainingStatement(root ast.Node, text string, offset int, best *ast.Node) {
