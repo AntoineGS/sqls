@@ -202,6 +202,73 @@ func TestDefinitionNativeViewColumnUsesOnlyDeclaredColumnSpan(t *testing.T) {
 	}
 }
 
+func TestDefinitionNativeHeaderlessViewSourceUsesStartRangeOnlyForViewName(t *testing.T) {
+	cache := readyNavigationCache()
+	cache.Catalog.Views["DUP"].ViewSource = sql.NullString{String: "SELECT ID FROM CITY", Valid: true}
+	view := cache.Catalog.ViewsByID[(catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key()]
+	view.ViewSource = cache.Catalog.Views["DUP"].ViewSource
+	viewColumn := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "A", Table: "DUP", Name: "ID"}}
+	cache.Catalog.Views["DUP"].Columns = []*catalog.ColumnDesc{viewColumn}
+	view.Columns = []*catalog.ColumnDesc{viewColumn}
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":    {err: database.ErrUnsupportedDDL},
+		"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: "SELECT ID FROM CITY", Provenance: "interbase:view-source"}},
+	}}
+	req := facetNavigationRequest("SELECT * FROM DUP", details)
+	req.Context.Snapshot.Cache = cache
+	location := detailLocation(t, req, "DUP")
+	if location.Source == nil || location.Source.Text != "SELECT ID FROM CITY" {
+		t.Fatalf("headerless native view source = %#v, want one source location", location.Source)
+	}
+	if location.Range != (language.Range{}) {
+		t.Fatalf("headerless view-name range = %#v, want start-of-body (0,0)", location.Range)
+	}
+
+	columnDetails := &facetDetails{results: map[string]detailResult{
+		"ddl":    {err: database.ErrUnsupportedDDL},
+		"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: "SELECT ID FROM CITY", Provenance: "interbase:view-source"}},
+	}}
+	columnReq := facetNavigationRequest("SELECT ID FROM DUP", columnDetails)
+	columnReq.Context.Snapshot.Cache = cache
+	if location := detailLocation(t, columnReq, "ID"); location.Source != nil {
+		t.Fatalf("headerless native view column published without a declaration: %#v", location)
+	}
+}
+
+func TestDefinitionHeaderlessProcedureAndTriggerSourcesUseBodyStart(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		kind   catalog.ObjectKind
+		query  string
+		marker string
+	}{
+		{name: "procedure", kind: catalog.ObjectKindProcedure, query: "EXECUTE PROCEDURE DUP", marker: "DUP"},
+		{name: "trigger", kind: catalog.ObjectKindTrigger, query: "DUP", marker: "DUP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := readyNavigationCache()
+			if tc.kind == catalog.ObjectKindTrigger {
+				delete(cache.Catalog.Procedures, "DUP")
+				delete(cache.Catalog.ProceduresByID, (catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}).Key())
+				delete(cache.Catalog.Views, "DUP")
+				delete(cache.Catalog.ViewsByID, (catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key())
+				cache.Catalog.RebuildObjects(strings.ToUpper)
+			}
+			body := "AS BEGIN END"
+			details := &facetDetails{results: map[string]detailResult{
+				"ddl":    {err: database.ErrUnsupportedDDL},
+				"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: tc.kind, Name: "DUP"}, Text: body, Provenance: "interbase:native-source"}},
+			}}
+			req := facetNavigationRequest(tc.query, details)
+			req.Context.Snapshot.Cache = cache
+			location := detailLocation(t, req, tc.marker)
+			if location.Source == nil || location.Range != (language.Range{}) {
+				t.Fatalf("headerless %s source navigation = %#v, want body-start location", tc.name, location)
+			}
+		})
+	}
+}
+
 func TestDefinitionRequiresDDLDeclarationNotCommentOrLiteralName(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -242,6 +309,28 @@ func TestDefinitionRejectsNameWithoutDDLDeclaration(t *testing.T) {
 	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
 	if location := detailLocation(t, req, "DUP"); location.Source != nil {
 		t.Fatalf("comment/literal identifier published as declaration: %#v", location)
+	}
+}
+
+func TestDefinitionRejectsPunctuationBetweenCreateAndKind(t *testing.T) {
+	body := "CREATE; PROCEDURE DUP AS BEGIN END"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: body, Provenance: "interbase:procedure-ddl",
+	}}}}
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+	if location := detailLocation(t, req, "DUP"); location.Source != nil {
+		t.Fatalf("punctuation-separated false declaration published: %#v", location)
+	}
+}
+
+func TestDefinitionDoesNotTreatMalformedCreateAsHeaderlessNativeSource(t *testing.T) {
+	details := &facetDetails{results: map[string]detailResult{
+		"ddl":    {err: database.ErrUnsupportedDDL},
+		"source": {detail: metadata.Detail{Object: catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "DUP"}, Text: "CREATE; PROCEDURE DUP AS BEGIN END", Provenance: "interbase:procedure-source"}},
+	}}
+	req := facetNavigationRequest("EXECUTE PROCEDURE DUP", details)
+	if location := detailLocation(t, req, "DUP"); location.Source != nil {
+		t.Fatalf("malformed CREATE header got native body-start fallback: %#v", location)
 	}
 }
 

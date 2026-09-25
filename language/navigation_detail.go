@@ -96,7 +96,15 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 	if source.Object != object || source.Text == "" {
 		return navigationDetail{unsupported: true}, true, nil
 	}
-	rng, hasRange := detailBodyRange(source.Text, object, selectedNavigationColumn(req, object, position))
+	column := selectedNavigationColumn(req, object, position)
+	rng, hasRange := detailBodyRange(source.Text, object, column)
+	if !hasRange && column == nil && (object.Kind == catalog.ObjectKindView || object.Kind == catalog.ObjectKindProcedure || object.Kind == catalog.ObjectKindTrigger) && !ddlCreateTokenExists(source.Text) {
+		// Handler snapshotRange historically returned (0,0) when a native body
+		// omitted the catalog object's name. Preserve that safe body-start
+		// location only when the body has no CREATE token; never use it for a
+		// selected column or malformed/mismatched declaration-like text.
+		rng, hasRange = Range{}, true
+	}
 	return navigationDetail{source: &Source{Object: source.Object, Text: source.Text, Provenance: source.Provenance, Note: unsupportedDDLNote(unsupportedErr)}, range_: rng, hasRange: hasRange, unsupported: true}, true, nil
 }
 
@@ -212,17 +220,11 @@ func ddlDeclarationNameRange(body string, object catalog.ObjectID) (Range, bool)
 		if !declarationWord(tokens[i], "CREATE") {
 			continue
 		}
-		j := i + 1
-		if j+1 < len(tokens) && declarationWord(tokens[j], "OR") && (declarationWord(tokens[j+1], "ALTER") || declarationWord(tokens[j+1], "REPLACE")) {
-			j += 2
-		}
-		if j+1 < len(tokens) && declarationWord(tokens[j], "GLOBAL") && declarationWord(tokens[j+1], "TEMPORARY") {
-			j += 2
-		}
-		if j >= len(tokens) || !declarationWord(tokens[j], strings.ToUpper(string(object.Kind))) || j+1 >= len(tokens) {
+		kindIndex, ok := declarationKindIndex(tokens, i, object.Kind)
+		if !ok || kindIndex+1 >= len(tokens) {
 			continue
 		}
-		nameIndex := j + 1
+		nameIndex := kindIndex + 1
 		if nameIndex+2 < len(tokens) && tokens[nameIndex+1].text == "." && tokens[nameIndex+2].ident {
 			nameIndex += 2
 		}
@@ -233,6 +235,29 @@ func ddlDeclarationNameRange(body string, object catalog.ObjectID) (Range, bool)
 		return byteSpanRange(body, name.start, name.start)
 	}
 	return Range{}, false
+}
+
+func ddlCreateTokenExists(body string) bool {
+	for _, token := range declarationTokens(body) {
+		if declarationWord(token, "CREATE") {
+			return true
+		}
+	}
+	return false
+}
+
+func declarationKindIndex(tokens []declarationToken, createIndex int, kind catalog.ObjectKind) (int, bool) {
+	j := createIndex + 1
+	if j+1 < len(tokens) && declarationWord(tokens[j], "OR") && (declarationWord(tokens[j+1], "ALTER") || declarationWord(tokens[j+1], "REPLACE")) {
+		j += 2
+	}
+	if j+1 < len(tokens) && declarationWord(tokens[j], "GLOBAL") && declarationWord(tokens[j+1], "TEMPORARY") {
+		j += 2
+	}
+	if j >= len(tokens) || !declarationWord(tokens[j], strings.ToUpper(string(kind))) {
+		return 0, false
+	}
+	return j, true
 }
 
 func declarationWord(token declarationToken, word string) bool {
@@ -259,6 +284,7 @@ func declarationTokens(text string) []declarationToken {
 				i += 2
 			}
 		case text[i] == '\'':
+			start := i
 			i++
 			for i < len(text) {
 				if text[i] == '\'' {
@@ -271,6 +297,7 @@ func declarationTokens(text string) []declarationToken {
 				}
 				i++
 			}
+			tokens = append(tokens, declarationToken{text: text[start:i]})
 		case text[i] == '"':
 			start := i
 			i++
@@ -301,9 +328,7 @@ func declarationTokens(text string) []declarationToken {
 			}
 			tokens = append(tokens, declarationToken{text: text[start:i], start: start, ident: true})
 		default:
-			if text[i] == '.' {
-				tokens = append(tokens, declarationToken{text: ".", start: i})
-			}
+			tokens = append(tokens, declarationToken{text: string(text[i]), start: i})
 			i++
 		}
 	}
