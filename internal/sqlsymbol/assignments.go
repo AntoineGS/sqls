@@ -12,6 +12,20 @@ type widthDestination struct {
 	span     Span
 	typeName string
 	label    string
+
+	// relation and relationAt identify, for a destination whose typeName
+	// came from a catalog column lookup (UPDATE/INSERT's relation-column
+	// targets), the target relation's own Name and the item index its
+	// reference was found at -- enough for a caller to check
+	// diagnosticModel.DDLInvalidated/Unsupported before trusting typeName.
+	// widthDiagnostics (string-truncation) never reads these fields; they
+	// exist solely for diagnostic_assignments.go's assignmentFindings.
+	// relation.Key() == "" (the zero value) marks a destination with no
+	// relation to invalidate at all -- a procedure-local or SELECT ... INTO
+	// local variable write, whose type comes from its own DECLARE, not from
+	// a catalog lookup that a later DDL statement could make stale.
+	relation   Name
+	relationAt int
 }
 
 // assignmentEdge pairs one source expression's own lexemes with the
@@ -133,7 +147,7 @@ func (a *Analysis) updateEdges(items []lexeme, c Catalog) []assignmentEdge {
 		}
 		for _, assignment := range assignments {
 			eq := topLevelTokenIndex(assignment, token.Eq)
-			destination, ok := updateDestination(a.Text, assignment[:eq], target, c)
+			destination, ok := updateDestination(a.Text, assignment[:eq], target, targetIndex, c)
 			if !ok {
 				continue
 			}
@@ -143,7 +157,7 @@ func (a *Analysis) updateEdges(items []lexeme, c Catalog) []assignmentEdge {
 	return edges
 }
 
-func updateDestination(text string, items []lexeme, target RelationRef, c Catalog) (widthDestination, bool) {
+func updateDestination(text string, items []lexeme, target RelationRef, targetIndex int, c Catalog) (widthDestination, bool) {
 	var nameItem lexeme
 	var name Name
 	switch len(items) {
@@ -173,9 +187,11 @@ func updateDestination(text string, items []lexeme, target RelationRef, c Catalo
 		return widthDestination{}, false
 	}
 	return widthDestination{
-		span:     nameItem.Span,
-		typeName: typeName,
-		label:    target.Name.Text + "." + name.Text,
+		span:       nameItem.Span,
+		typeName:   typeName,
+		label:      target.Name.Text + "." + name.Text,
+		relation:   target.Name,
+		relationAt: targetIndex,
 	}, true
 }
 
@@ -229,9 +245,11 @@ func (a *Analysis) parseInsertEdges(items []lexeme, start, end int, depths []int
 		}
 		typeName, known := catalogColumnType(c, target.Name, name)
 		columns[i] = widthDestination{
-			span:     part[0].Span,
-			typeName: typeName,
-			label:    target.Name.Text + "." + name.Text,
+			span:       part[0].Span,
+			typeName:   typeName,
+			label:      target.Name.Text + "." + name.Text,
+			relation:   target.Name,
+			relationAt: targetIndex,
 		}
 		if !known {
 			columns[i].typeName = ""

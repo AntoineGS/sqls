@@ -69,9 +69,93 @@ func (m *diagnosticModel) invalidAssignmentFinding(edge assignmentEdge) *Finding
 	if len(edge.source) == 0 || !balancedExpression(edge.source) {
 		return nil
 	}
+	// A destination sourced from a catalog column lookup (UPDATE/INSERT's
+	// relation-column targets) is only safe to trust when the owning
+	// relation's metadata has not since been invalidated by an earlier
+	// CREATE/ALTER/DROP in this same document, and the reference itself
+	// does not fall in a deliberately unsupported region -- the same two
+	// checks procedureInputEdges/triggerNewFieldEdges already apply to
+	// their own catalog-sourced destinations. A procedure-local or
+	// SELECT ... INTO local write has no relation to invalidate at all
+	// (relation.Key() == "") and always proceeds.
+	if edge.destination.relation.Key() != "" {
+		if m.Unsupported(edge.destination.relationAt) || m.DDLInvalidated(edge.destination.relationAt, edge.destination.relation) {
+			return nil
+		}
+	}
 	span := Span{Start: edge.source[0].Span.Start, End: edge.source[len(edge.source)-1].Span.End}
+	if f := m.castLocalFinding(edge.source, span); f != nil {
+		return f
+	}
 	fact := m.expressionFact(span)
 	return m.invalidAssignmentVerdict(fact, edge.destination.typeName, span, edge.destination.label)
+}
+
+// castLocalFinding recognizes when edge's whole source span is, as its
+// outermost syntactic form, an explicit CAST(<inner> AS <type>) -- not a
+// CAST nested arbitrarily deep inside a larger expression, which is left
+// unaddressed (see this function's own recognition helper,
+// wholeCastExpression) -- and judges the CAST's own conversion: the inner
+// expression's natural value against the CAST's own declared type,
+// independent of the edge's real destination. Per the brief, when the
+// CAST's own conversion is proven outcomeDefinitelyInvalid, that is the one
+// finding for this edge, reported at the CAST's own span (span, which here
+// is identical to the whole source span); the caller must skip the outer
+// destination check entirely in that case, since the CAST would fail
+// before the assignment ever ran. Returning nil covers every other case --
+// not a whole CAST, or the CAST's own conversion is safe/possible-loss/
+// unknown -- and the caller falls back to the ordinary outer check
+// unaffected.
+func (m *diagnosticModel) castLocalFinding(source []lexeme, span Span) *Finding {
+	inner, typeSpan, ok := wholeCastExpression(source)
+	if !ok {
+		return nil
+	}
+	text := m.analysis.Text
+	castType, ok := parseDiagnosticType(text[typeSpan.Start:typeSpan.End], m.analysis.Variant, m.catalog)
+	if !ok {
+		return nil
+	}
+	innerSpan := Span{Start: inner[0].Span.Start, End: inner[len(inner)-1].Span.End}
+	innerFact := m.expressionFact(innerSpan)
+	verdict := assignmentCompatibility(innerFact, castType, m.analysis.Variant)
+	if verdict.Outcome != outcomeDefinitelyInvalid {
+		return nil
+	}
+	return &Finding{
+		Span:     span,
+		Code:     codeInvalidAssignment,
+		Message:  fmt.Sprintf("invalid CAST: %s", verdict.Reason),
+		Severity: 1,
+	}
+}
+
+// wholeCastExpression reports whether items, trimmed of any wrapping
+// parentheses, is shaped exactly like CAST(<inner> AS <type>) spanning its
+// entire length -- mirroring callFact's own CAST shape recognition
+// (diagnostic_expressions.go, read-only for this task) so a source
+// expression's outermost form can be identified the same way, without
+// evaluating it as an expressionFact first. ok is false for anything else,
+// including a CAST that is only part of a larger expression (for example
+// CAST(...) + 1): items in that case is never shaped like CAST(...AS...)
+// end to end, since the trailing "+ 1" falls outside the matched
+// parentheses.
+func wholeCastExpression(items []lexeme) (inner []lexeme, typeSpan Span, ok bool) {
+	items = trimExpressionParens(items)
+	if len(items) < 3 || !isWord(items[0], "CAST") || items[1].Token.Kind != token.LParen {
+		return nil, Span{}, false
+	}
+	close, matched := matchingExpressionParen(items, 1)
+	if !matched || close != len(items)-1 {
+		return nil, Span{}, false
+	}
+	arguments := items[2:close]
+	as := topLevelWordIndex(arguments, "AS")
+	if as <= 0 || as >= len(arguments)-1 || topLevelWordIndex(arguments[as+1:], "AS") >= 0 {
+		return nil, Span{}, false
+	}
+	typeSpan = Span{Start: arguments[as+1].Span.Start, End: arguments[len(arguments)-1].Span.End}
+	return arguments[:as], typeSpan, true
 }
 
 // invalidAssignmentVerdict is the shared destination-resolution and

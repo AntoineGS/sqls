@@ -48,8 +48,11 @@ func TestDiagnosticInvalidAssignmentPossibleLossNeverFires(t *testing.T) {
 		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
 }
 
-// --- explicit CAST: valid stays silent, invalid fires exactly once (not
-// duplicated between the inner CAST and the outer assignment) ---
+// --- explicit CAST: valid stays silent, a cast that is valid on its own
+// terms but overflows the OUTER destination fires once at the edge's own
+// span (not duplicated), and a cast that is invalid on its OWN terms fires
+// once at that same span with a CAST-local message, never evaluating the
+// outer destination at all ---
 
 func TestDiagnosticInvalidAssignmentExplicitCastValid(t *testing.T) {
 	requireCodeCount(t,
@@ -57,7 +60,13 @@ func TestDiagnosticInvalidAssignmentExplicitCastValid(t *testing.T) {
 		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
 }
 
-func TestDiagnosticInvalidAssignmentExplicitCastInvalidNotDuplicated(t *testing.T) {
+// TestDiagnosticInvalidAssignmentValidCastFlowsToOuterCheck proves a CAST
+// that is valid on its own terms (99999 fits INTEGER) still lets the outer
+// assignment's own check run and fire, when the outer destination (a
+// narrower SMALLINT local) cannot hold the CAST's resulting value -- and
+// that this still produces exactly one finding, at the edge's own full
+// source span, not a second one duplicated from the CAST itself.
+func TestDiagnosticInvalidAssignmentValidCastFlowsToOuterCheck(t *testing.T) {
 	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = CAST(99999 AS INTEGER); END;"
 	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
 
@@ -78,6 +87,45 @@ func TestDiagnosticInvalidAssignmentExplicitCastInvalidNotDuplicated(t *testing.
 	wantSpan := markerSpan(t, text, "CAST(99999 AS INTEGER)", 0)
 	if found.Span != wantSpan {
 		t.Fatalf("Span = %+v, want the edge's own full source span %+v (never the inner CAST span alone, never the outer local write span)", found.Span, wantSpan)
+	}
+}
+
+// TestDiagnosticInvalidAssignmentInvalidCastReportedOnceAtCastSpan proves an
+// invalid CAST (99999 overflows the CAST's own declared SMALLINT type) is
+// reported once, at the edge's own span, with a message describing the
+// CAST's own failure -- even though the OUTER destination (a wider INTEGER
+// local, which would happily accept 99999) would otherwise stay silent.
+// The outer destination check must never even run for this edge: reporting
+// it too would be either evaluating a value the CAST never actually
+// produces at runtime, or a redundant duplicate of the same finding.
+func TestDiagnosticInvalidAssignmentInvalidCastReportedOnceAtCastSpan(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(99999 AS SMALLINT); END;"
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *Finding
+	for _, f := range a.Diagnostics(newDiagnosticFixtureCatalog()) {
+		if f.Code == codeInvalidAssignment {
+			f := f
+			found = &f
+		}
+	}
+	if found == nil {
+		t.Fatal("expected exactly one interbase-invalid-assignment finding")
+	}
+	wantSpan := markerSpan(t, text, "CAST(99999 AS SMALLINT)", 0)
+	if found.Span != wantSpan {
+		t.Fatalf("Span = %+v, want the CAST's own span %+v, not the outer local write span", found.Span, wantSpan)
+	}
+	// The Reason cites the CAST's own declared range (SMALLINT's
+	// [-32768, 32767]), never the outer INTEGER destination's much wider
+	// range: a compatibility.Reason for an INTEGER destination would never
+	// mention 32767.
+	if !strings.Contains(found.Message, "32767") {
+		t.Fatalf("message %q does not describe the CAST's own SMALLINT range, not the outer INTEGER destination", found.Message)
 	}
 }
 
@@ -194,6 +242,43 @@ func TestDiagnosticInvalidAssignmentTriggerOldNeverAnAssignmentTarget(t *testing
 	requireCodeCount(t,
 		"CREATE TRIGGER TRG1 FOR T BEFORE UPDATE AS BEGIN IF (OLD.N = 99999) THEN NEW.N = 1; END;",
 		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- stale-catalog withholding: a catalog-sourced destination (UPDATE/
+// INSERT's relation-column target) must never be judged against metadata an
+// earlier DDL statement in the same document has already invalidated ---
+
+func TestDiagnosticInvalidAssignmentWithheldAfterAlterTableRedefinesColumn(t *testing.T) {
+	// ALTER TABLE widens N to INTEGER; the pre-ALTER SMALLINT range must not
+	// be used to judge the later UPDATE against it.
+	requireCodeCount(t,
+		"ALTER TABLE T ALTER COLUMN N TYPE INTEGER; UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+func TestDiagnosticInvalidAssignmentWithheldAfterDropCreateBeforeInsert(t *testing.T) {
+	requireCodeCount(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N INTEGER); INSERT INTO T (ID, N) VALUES (1, 99999);",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+func TestDiagnosticInvalidAssignmentWithheldAfterDropCreateBeforeUpdate(t *testing.T) {
+	requireCodeCount(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N INTEGER); UPDATE T SET N = 99999;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// TestDiagnosticInvalidAssignmentDDLInvalidationDoesNotOverSuppress proves
+// the withholding above is scoped to the actual invalidated relation: DDL
+// against an unrelated table (U) must not suppress a genuine finding
+// against T, and an UPDATE with no preceding DDL at all must still fire
+// exactly as before.
+func TestDiagnosticInvalidAssignmentDDLInvalidationDoesNotOverSuppress(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCount(t,
+		"ALTER TABLE U ALTER COLUMN V TYPE INTEGER; UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
 }
 
 // --- severity ---
