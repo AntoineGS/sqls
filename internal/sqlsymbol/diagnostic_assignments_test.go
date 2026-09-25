@@ -360,27 +360,40 @@ func TestDiagnosticLossyAssignmentExplicitDefaultLevelStaysOff(t *testing.T) {
 		DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "default"}}, codeLossyAssignment, 0)
 }
 
-// --- explicit CAST suppresses this rule entirely at the edge's own span,
-// even when the CAST's own conversion is itself possible-loss or invalid --
-// codeInvalidAssignment's own castLocalFinding behavior must stay unaffected ---
+// --- a CAST source is judged like any other expression here, from
+// expressionFact's own CAST-produced type/value (Task 9) -- there is no
+// special-casing for a CAST source in this rule, unlike codeInvalidAssignment's
+// separate castLocalFinding, which is unaffected by any of this ---
 
-func TestDiagnosticLossyAssignmentExplicitCastSuppressesEvenWhenLossy(t *testing.T) {
-	withCast := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(100.5 AS INTEGER); END;"
-	requireCodeCountWithOptions(t, withCast, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
-	// Task 10 unaffected: the CAST's own conversion is possible-loss, not
-	// invalid, so castLocalFinding still reports nothing for it either.
-	requireCodeCount(t, withCast, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+// TestDiagnosticLossyAssignmentCastNarrowingIntoUnrelatedDestinationFires
+// proves a CAST does NOT, by itself, excuse narrowing into a destination
+// its own declared type says nothing about: CAST(A AS INTEGER) converts A
+// to INTEGER, a type unrelated to (and wider than) the real destination V
+// (SMALLINT) -- this fires exactly like a bare "V = A" would.
+func TestDiagnosticLossyAssignmentCastNarrowingIntoUnrelatedDestinationFires(t *testing.T) {
+	text := "CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE V SMALLINT; BEGIN V = CAST(A AS INTEGER); END;"
+	requireCodeCountWithOptions(t, text, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	// Task 10 unaffected: the CAST's own conversion (A -> INTEGER) is safe
+	// on its own terms, and the resulting Value-less INTEGER fact against
+	// SMALLINT is possible-loss, not proven invalid -- castLocalFinding and
+	// invalidAssignmentVerdict both still report nothing here.
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
 
-	withoutCast := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = 100.5; END;"
-	requireCodeCountWithOptions(t, withoutCast, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	bareText := "CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE V SMALLINT; BEGIN V = A; END;"
+	requireCodeCountWithOptions(t, bareText, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
 }
 
-func TestDiagnosticLossyAssignmentSuppressedWhenCastIsInvalid(t *testing.T) {
+// TestDiagnosticLossyAssignmentCastOwnInvalidityDoesNotSuppressOuterCheck
+// proves this rule never special-cases a CAST source: even when the CAST's
+// own conversion is itself proven invalid (Task 10's own concern, judged
+// independently by castLocalFinding), this rule still evaluates the CAST's
+// produced fact -- Type SMALLINT, Value 99999 unclamped (Task 9's own
+// rounding-without-bounds-checking) -- against the real destination V
+// (INTEGER), where 99999 fits with no rounding at all: naturally safe, not
+// withheld by any suppression.
+func TestDiagnosticLossyAssignmentCastOwnInvalidityDoesNotSuppressOuterCheck(t *testing.T) {
 	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(99999 AS SMALLINT); END;"
-	// Task 10 unaffected: the CAST's own conversion is still proven invalid.
 	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
-	// This rule's whole-cast suppression withholds it regardless of the
-	// CAST's own outcome -- it never even reaches lossyAssignmentVerdict.
 	requireCodeCountWithOptions(t, text, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
 }
 
@@ -403,13 +416,15 @@ func TestDiagnosticLossyAssignmentLiteralRoundingWithinRangeFires(t *testing.T) 
 		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
 }
 
-// --- a non-literal source whose storage range exceeds its destination's,
-// for some (not necessarily this) value, is this rule's other core case ---
-
-func TestDiagnosticLossyAssignmentNonLiteralStorageRangeNarrowingFires(t *testing.T) {
+// TestDiagnosticLossyAssignmentInRangeLiteralIntoNarrowerDestinationIsSilent
+// proves narrowing alone is not enough: a literal that fits its narrower
+// destination's storage range exactly, with no rounding needed at its
+// scale, is genuinely safe -- distinct from TestDiagnosticLossyAssignmentSafeWideningNeverFires,
+// which never narrows at all.
+func TestDiagnosticLossyAssignmentInRangeLiteralIntoNarrowerDestinationIsSilent(t *testing.T) {
 	requireCodeCountWithOptions(t,
-		"CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE B SMALLINT; BEGIN B = A; END;",
-		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = 5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
 }
 
 // --- one fixture per assignment context, mirroring codeInvalidAssignment's
@@ -478,9 +493,28 @@ func TestDiagnosticLossyAssignmentUnknownDestinationTypeWithheld(t *testing.T) {
 // --- DDL invalidation withholds this rule too, the same guard
 // invalidAssignmentFinding already relies on ---
 
+// TestDiagnosticLossyAssignmentWithheldAfterAlterTableLiteralSource uses a
+// literal source (1.25), which resolves to a full expressionFact from the
+// document text alone regardless of any catalog/DDL state. The destination
+// (N) is always resolved from the external fixture catalog's own SMALLINT
+// declaration -- catalogColumnType never consults this document's own
+// ALTER/CREATE text -- so this ALTER has no effect on what type N would
+// otherwise be judged against; only staleCatalogDestination's own guard can
+// be responsible for withholding here. Without it, 1.25 against SMALLINT
+// (scale 0) rounds to 1, in range: an obvious possible-loss finding.
+func TestDiagnosticLossyAssignmentWithheldAfterAlterTableLiteralSource(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"ALTER TABLE T ALTER COLUMN N TYPE NUMERIC(9,2); UPDATE T SET N = 1.25;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// TestDiagnosticLossyAssignmentWithheldAfterDropCreateBeforeUpdate keeps the
+// DROP/CREATE fixture from Task 10's own style, but a bare column source
+// ("ID") is not enough on its own to prove the destination-staleness guard
+// is doing the work: after DROP TABLE T, the source reference could also
+// fail to resolve for unrelated reasons. See the literal-sourced test above
+// for the guard's own isolated proof.
 func TestDiagnosticLossyAssignmentWithheldAfterDropCreateBeforeUpdate(t *testing.T) {
-	// Without the DDL-invalidation guard this would obviously fire: the
-	// freshly (re)declared N is SMALLINT, narrower than ID's INTEGER.
 	requireCodeCountWithOptions(t,
 		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N SMALLINT); UPDATE T SET N = ID;",
 		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
@@ -530,29 +564,41 @@ func TestDiagnosticLossyAssignmentSeverityOverrideError(t *testing.T) {
 // rule can even judge the edge at all (see parseDiagnosticType's own
 // dialect-sensitive NUMERIC precision thresholds) ---
 
+// TestDiagnosticLossyAssignmentDialectSensitiveNumericPrecision uses a
+// literal source (1.234), whose expressionFact carries only a bare Value at
+// familyUnknown (see TestDiagnosticExpressionDecimalLiteral) and is never
+// itself dialect-sensitive. Only the destination V's own declared type
+// (NUMERIC(12,2), precision 12 -- the 10-18 bucket where the two dialects
+// diverge, see numericStorageBackedRange) differs by dialect: this isolates
+// the dialect threading to this rule's own parseDiagnosticType(destinationType,
+// m.analysis.Variant, ...) call inside lossyAssignmentVerdict, unlike the
+// old version of this test where the difference came entirely from the
+// source expression's own identifier lookup.
 func TestDiagnosticLossyAssignmentDialectSensitiveNumericPrecision(t *testing.T) {
-	text := "CREATE PROCEDURE X AS DECLARE VARIABLE A NUMERIC(12,2); DECLARE VARIABLE B NUMERIC(9,2); BEGIN B = A; END;"
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V NUMERIC(12,2); BEGIN V = 1.234; END;"
 
-	// Dialect 3: both NUMERIC(12,2) and NUMERIC(9,2) are exact (BIGINT- and
-	// INTEGER-backed respectively), so the storage-range comparison applies
-	// and A's wider range exceeds B's for some values -- possible loss.
+	// Dialect 1: NUMERIC(12,2) at precision 12 is approximate (DOUBLE
+	// PRECISION-backed, no storage range at all), so assignmentCompatibility
+	// falls through to "destination type could not be determined" territory
+	// before ever reaching the literal-rounding branch -- outcomeUnknown,
+	// not outcomePossibleLoss.
+	a1, err := AnalyzeDiagnostics(text, dialect1Variant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findByCode(a1.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found != nil {
+		t.Fatalf("Dialect 1: expected no interbase-lossy-assignment finding (approximate destination), got %+v", found)
+	}
+
+	// Dialect 3: NUMERIC(12,2) at precision 12 is exact (BIGINT-backed), so
+	// the literal 1.234 is rounded to scale 2 (1.23) and compared against
+	// the destination's storage range -- rounding occurred, in range --
+	// outcomePossibleLoss.
 	a3, err := AnalyzeDiagnostics(text, dialect3Variant())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if found := findByCode(a3.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found == nil {
 		t.Fatal("Dialect 3: expected an interbase-lossy-assignment finding")
-	}
-
-	// Dialect 1: NUMERIC(12,2) is approximate (DOUBLE PRECISION-backed)
-	// while NUMERIC(9,2) is still exact (INTEGER-backed) -- the families no
-	// longer match, so assignmentCompatibility returns outcomeUnknown, not
-	// outcomePossibleLoss, and this rule withholds entirely.
-	a1, err := AnalyzeDiagnostics(text, dialect1Variant())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if found := findByCode(a1.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found != nil {
-		t.Fatalf("Dialect 1: expected no interbase-lossy-assignment finding (family mismatch), got %+v", found)
 	}
 }

@@ -29,8 +29,8 @@ absent or set to `default`.
 | `interbase-ambiguous-column` | `error` | An unqualified column reference matched by more than one relation in the innermost scope. |
 | `interbase-target-count` | `error` | A mismatch between a statement's own target list (`INSERT` column list, `SELECT ... INTO` targets, a `UNION` arm's projection, or an `EXECUTE PROCEDURE RETURNING_VALUES` list) and the number of values/columns/outputs it is matched against. |
 | `interbase-procedure-arity` | `error` | A mismatch between the number of arguments supplied to a procedure call and its known declared input count. |
-| `interbase-invalid-assignment` | `error` | An assignment (procedure local, `UPDATE`/`INSERT` target, `SELECT ... INTO`, `EXECUTE PROCEDURE` input/`RETURNING_VALUES` target, or trigger `NEW.<col>` write) whose source is proven to never fit its destination's engine-enforced storage range. |
-| `interbase-lossy-assignment` | `off` | Same assignment contexts as `interbase-invalid-assignment`, but for a source proven to be *accepted* while still narrowing, rounding, or truncating some value of its own declared range or scale. Off by default; enable it with an explicit `diagnostics.rules` entry. |
+| `interbase-invalid-assignment` | `error` | An assignment (procedure local, `UPDATE`/`INSERT` target, `SELECT ... INTO`, `EXECUTE PROCEDURE` input, or trigger `NEW.<col>` write) whose source is proven to never fit its destination's engine-enforced storage range. Also reports an explicit `CAST(... AS type)` whose own inner conversion is proven invalid, at the `CAST`'s own span, even when the assignment's outer destination would otherwise accept the `CAST`'s result. `RETURNING_VALUES` targets are listed among this rule's contexts structurally but can never actually produce a finding for it: a procedure's declared `OUTPUT` type has no source expression of its own to judge (see `interbase-lossy-assignment`, which can and does fire there). |
+| `interbase-lossy-assignment` | `off` | Same eight assignment contexts as `interbase-invalid-assignment` (including `RETURNING_VALUES` targets, where this rule -- unlike `interbase-invalid-assignment` -- can and does fire), but for a source proven to be *accepted* while still narrowing, rounding, or truncating some value of its own declared range or scale. A `CAST(...)` source is judged like any other expression here, using the `CAST`'s own declared type/value as its result -- there is no suppression for an explicit `CAST`. Off by default; enable it with an explicit `diagnostics.rules` entry. |
 
 Every check withholds a finding rather than guessing: a code is reported
 only when the relevant catalog metadata has finished loading and proves the
@@ -48,10 +48,14 @@ requires rounding to fit its destination's scale but still lands in range
 (for example `100.5` into an `INTEGER` column), fires
 `interbase-lossy-assignment` once enabled, never
 `interbase-invalid-assignment`. Wrapping the source in an explicit `CAST`
-always suppresses `interbase-lossy-assignment` at that assignment's own
-span, since the `CAST` already states the narrowing is intentional --
-`interbase-invalid-assignment` still judges the `CAST`'s own conversion
-independently of this suppression.
+does not suppress `interbase-lossy-assignment`: the `CAST` result is
+checked against the real destination exactly like any other expression,
+using the `CAST`'s own declared type as its type/value -- for example
+`CAST(A AS INTEGER)` assigned into a narrower `SMALLINT` destination still
+fires, because the `CAST` converted to `INTEGER`, a type unrelated to (and
+wider than) the actual destination. `interbase-invalid-assignment`'s own
+`CAST` handling is separate: it judges the `CAST`'s own inner conversion
+independently, at the `CAST`'s own span.
 
 Both assignment rules withhold entirely, rather than guess, whenever a
 destination or source type cannot be resolved to a known InterBase storage

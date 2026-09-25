@@ -243,6 +243,20 @@ func TestDiagnosticsInvalidAssignmentProcedureLocalSurvivesPartialMetadata(t *te
 		t.Fatalf("start metadata: %v", err)
 	}
 
+	deadline := time.After(5 * time.Second)
+	for {
+		snapshot := tx.server.metadata.Snapshot()
+		if snapshot != nil && snapshot.Status[database.MetadataRelations].State == database.MetadataReady {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("relations did not settle while columns remained gated")
+		default:
+			runtime.Gosched()
+		}
+	}
+
 	// Columns are still gated (not ready) here, yet this finding needs no
 	// catalog lookup at all -- it must keep appearing, not disappear behind
 	// a "wait for metadata" fence that only interbase-unknown-column needs.

@@ -22,10 +22,13 @@ const codeInvalidAssignment = "interbase-invalid-assignment"
 // source's own declared range or scale -- compatibilityOutcome ==
 // outcomePossibleLoss. Unlike every other code in diagnosticRegistry, this
 // one defaults to off (diagnosticDefaultOff): it fires across the exact
-// same eight assignment contexts as codeInvalidAssignment, but an explicit
-// CAST always suppresses it at the outer assignment boundary (the CAST
-// already states the narrowing is intentional; see lossyAssignmentFinding),
-// whereas codeInvalidAssignment's own inner-CAST check is unaffected.
+// same eight assignment contexts as codeInvalidAssignment. A CAST(...)
+// source is judged like any other expression here: expressionFact already
+// gives it the CAST's own declared type/value (Task 9), so the outer
+// assignment check naturally sees whatever the CAST actually produces --
+// there is no special-casing for a CAST source, unlike codeInvalidAssignment's
+// separate castLocalFinding, which judges the CAST's own inner conversion
+// independently and is unaffected by this rule.
 const codeLossyAssignment = "interbase-lossy-assignment"
 
 // assignmentFindings reports every proven-invalid assignment across six
@@ -81,19 +84,8 @@ func (m *diagnosticModel) invalidAssignmentFinding(edge assignmentEdge) *Finding
 	if len(edge.source) == 0 || !balancedExpression(edge.source) {
 		return nil
 	}
-	// A destination sourced from a catalog column lookup (UPDATE/INSERT's
-	// relation-column targets) is only safe to trust when the owning
-	// relation's metadata has not since been invalidated by an earlier
-	// CREATE/ALTER/DROP in this same document, and the reference itself
-	// does not fall in a deliberately unsupported region -- the same two
-	// checks procedureInputEdges/triggerNewFieldEdges already apply to
-	// their own catalog-sourced destinations. A procedure-local or
-	// SELECT ... INTO local write has no relation to invalidate at all
-	// (relation.Key() == "") and always proceeds.
-	if edge.destination.relation.Key() != "" {
-		if m.Unsupported(edge.destination.relationAt) || m.DDLInvalidated(edge.destination.relationAt, edge.destination.relation) {
-			return nil
-		}
+	if m.staleCatalogDestination(edge) {
+		return nil
 	}
 	span := Span{Start: edge.source[0].Span.Start, End: edge.source[len(edge.source)-1].Span.End}
 	if f := m.castLocalFinding(edge.source, span); f != nil {
@@ -101,6 +93,24 @@ func (m *diagnosticModel) invalidAssignmentFinding(edge assignmentEdge) *Finding
 	}
 	fact := m.expressionFact(span)
 	return m.invalidAssignmentVerdict(fact, edge.destination.typeName, span, edge.destination.label)
+}
+
+// staleCatalogDestination reports whether edge's destination is sourced
+// from a catalog column lookup (UPDATE/INSERT's relation-column targets,
+// procedureInputEdges/triggerNewFieldEdges's own catalog-sourced
+// destinations) whose owning relation's metadata is not safe to trust here
+// -- either because it has since been invalidated by an earlier
+// CREATE/ALTER/DROP in this same document, or the reference itself falls in
+// a deliberately unsupported region. Shared by invalidAssignmentFinding and
+// lossyAssignmentFinding, the two per-edge judges that both apply this same
+// guard before evaluating anything. A procedure-local or SELECT ... INTO
+// local write has no relation to invalidate at all (relation.Key() == "")
+// and is never stale.
+func (m *diagnosticModel) staleCatalogDestination(edge assignmentEdge) bool {
+	if edge.destination.relation.Key() == "" {
+		return false
+	}
+	return m.Unsupported(edge.destination.relationAt) || m.DDLInvalidated(edge.destination.relationAt, edge.destination.relation)
 }
 
 // castLocalFinding recognizes when edge's whole source span is, as its
@@ -216,24 +226,19 @@ func (m *diagnosticModel) lossyAssignmentVerdict(source expressionFact, destinat
 }
 
 // lossyAssignmentFinding is codeLossyAssignment's own counterpart to
-// invalidAssignmentFinding, sharing the same shape/DDL-invalidation guard,
-// but an edge whose whole source span is, as its outermost syntactic form,
-// an explicit CAST(<inner> AS <type>) is always suppressed here (unlike
-// invalidAssignmentFinding's castLocalFinding, which judges the CAST's own
-// conversion instead): the CAST already states the narrowing is
-// intentional, so this rule -- unlike codeInvalidAssignment, which still
-// proves the CAST itself invalid when it is -- has nothing further to warn
-// about at this edge.
+// invalidAssignmentFinding, sharing the same shape/staleCatalogDestination
+// guard. Unlike invalidAssignmentFinding, there is no CAST-local special
+// case here: a CAST(...) source is judged exactly like any other source
+// expression, from expressionFact's own CAST-produced type/value (Task 9)
+// against the edge's real destination. A CAST does not, by itself, justify
+// narrowing into a destination unrelated to the CAST's own declared type --
+// for example CAST(A AS INTEGER) assigned into a SMALLINT destination is
+// still exactly as lossy as a bare A would be.
 func (m *diagnosticModel) lossyAssignmentFinding(edge assignmentEdge) *Finding {
 	if len(edge.source) == 0 || !balancedExpression(edge.source) {
 		return nil
 	}
-	if edge.destination.relation.Key() != "" {
-		if m.Unsupported(edge.destination.relationAt) || m.DDLInvalidated(edge.destination.relationAt, edge.destination.relation) {
-			return nil
-		}
-	}
-	if _, _, ok := wholeCastExpression(edge.source); ok {
+	if m.staleCatalogDestination(edge) {
 		return nil
 	}
 	span := Span{Start: edge.source[0].Span.Start, End: edge.source[len(edge.source)-1].Span.End}
@@ -343,7 +348,9 @@ func (m *diagnosticModel) procedureInputEdges(matching map[int]int) []assignment
 // own pairing against its procedure's declared OUTPUT column, shared by
 // procedureOutputFindings (codeInvalidAssignment) and
 // procedureOutputLossyFindings (codeLossyAssignment) so the RETURNING_VALUES
-// discovery/pairing walk itself is parsed once, not once per rule.
+// discovery/pairing walk itself is written once, not duplicated once per
+// rule -- each rule still calls procedureOutputPairs independently, once per
+// DiagnosticsWithOptions call that has it turned on.
 type procedureOutputPair struct {
 	source           expressionFact
 	destinationType  string
