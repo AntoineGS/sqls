@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"database/sql"
 	"strings"
 	"testing"
@@ -82,8 +83,9 @@ func TestSingletonDiagnosticCatalogAndRanges(t *testing.T) {
 				tt.mutate(cache)
 			}
 			text := "/*😀*/ CREATE PROCEDURE P RETURNS (RESULT INTEGER) AS BEGIN SELECT ID FROM ORDERS WHERE " + tt.where + " INTO :RESULT; END"
-			found := diagnosticsForSnapshot(documentDiagnosticsSnapshot{
-				text: text, variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, cacheSnapshot: snapshotDiagnosticCatalog(cache),
+			found := diagnosticsForSnapshot(context.Background(), documentDiagnosticsSnapshot{
+				text: text, variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, dialectResolved: true,
+				metadata: &database.MetadataSnapshot{Cache: cache},
 			})
 			want := 0
 			if tt.warn {
@@ -103,19 +105,6 @@ func TestSingletonDiagnosticCatalogAndRanges(t *testing.T) {
 	}
 }
 
-func TestSingletonDiagnosticSnapshotOwnsKeys(t *testing.T) {
-	cache := singletonDiagnosticCache()
-	catalog := snapshotDiagnosticCatalog(cache)
-	cache.Catalog.Indexes["PK_ORDERS"].Columns[1] = "ID"
-	text := "CREATE PROCEDURE P RETURNS (RESULT INTEGER) AS BEGIN SELECT ID FROM ORDERS WHERE ID = 1 INTO :RESULT; END"
-	found := diagnosticsForSnapshot(documentDiagnosticsSnapshot{
-		text: text, variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}, cacheSnapshot: catalog,
-	})
-	if len(found) != 1 || diagnosticCode(found[0]) != "interbase-singleton-select" {
-		t.Fatalf("catalog mutation changed snapshot diagnostic: %+v", found)
-	}
-}
-
 func TestPublishSingletonDiagnosticClearsOnEdit(t *testing.T) {
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
 	uri := "file:///singleton.sql"
@@ -126,8 +115,8 @@ func TestPublishSingletonDiagnosticClearsOnEdit(t *testing.T) {
 	if !ok {
 		t.Fatal("missing document snapshot")
 	}
-	snapshot.cacheSnapshot = snapshotDiagnosticCatalog(singletonDiagnosticCache())
-	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, snapshot, diagnosticsForSnapshot(snapshot))
+	snapshot.metadata = &database.MetadataSnapshot{Cache: singletonDiagnosticCache()}
+	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, snapshot, diagnosticsForSnapshot(tx.ctx, snapshot))
 	n := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
 	if len(n.Diagnostics) != 1 || diagnosticCode(n.Diagnostics[0]) != "interbase-singleton-select" {
 		t.Fatalf("missing singleton warning: %+v", n)
@@ -137,8 +126,8 @@ func TestPublishSingletonDiagnosticClearsOnEdit(t *testing.T) {
 	tx.change(t, uri, safe, 2)
 	tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 2 })
 	snapshot, _ = tx.server.diagnosticsSnapshot(uri)
-	snapshot.cacheSnapshot = snapshotDiagnosticCatalog(singletonDiagnosticCache())
-	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, snapshot, diagnosticsForSnapshot(snapshot))
+	snapshot.metadata = &database.MetadataSnapshot{Cache: singletonDiagnosticCache()}
+	tx.server.publishDiagnosticsSnapshot(tx.ctx, tx.serverConn, snapshot, diagnosticsForSnapshot(tx.ctx, snapshot))
 	n = tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 2 })
 	if len(n.Diagnostics) != 0 {
 		t.Fatalf("singleton warning not cleared: %+v", n)

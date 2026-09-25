@@ -3,8 +3,8 @@ package completer
 import (
 	"strings"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser/parseutil"
 )
@@ -58,14 +58,14 @@ func (c *Completer) SelectableProcedureCandidates() []lsp.CompletionItem {
 	return candidates
 }
 
-func procedureCandidate(desc *database.ProcedureDesc, detail string) lsp.CompletionItem {
+func procedureCandidate(desc *catalog.ProcedureDesc, detail string) lsp.CompletionItem {
 	return lsp.CompletionItem{
 		Label:  desc.Name,
 		Kind:   lsp.MethodCompletion,
 		Detail: detail,
 		Documentation: &lsp.MarkupContent{
 			Kind:  lsp.Markdown,
-			Value: database.ProcedureDoc(desc),
+			Value: catalog.ProcedureDoc(desc),
 		},
 	}
 }
@@ -93,14 +93,14 @@ func (c *Completer) ViewCandidates(parent *completionParent) []lsp.CompletionIte
 	return candidates
 }
 
-func viewCandidate(desc *database.ViewDesc) lsp.CompletionItem {
+func viewCandidate(desc *catalog.ViewDesc) lsp.CompletionItem {
 	return lsp.CompletionItem{
 		Label:  desc.Name,
 		Kind:   lsp.ClassCompletion,
 		Detail: "view",
 		Documentation: &lsp.MarkupContent{
 			Kind:  lsp.Markdown,
-			Value: database.ViewDoc(desc),
+			Value: catalog.ViewDoc(desc),
 		},
 	}
 }
@@ -121,7 +121,7 @@ func (c *Completer) GeneratorCandidates() []lsp.CompletionItem {
 			Detail: "generator",
 			Documentation: &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.GeneratorDoc(desc),
+				Value: catalog.GeneratorDoc(desc),
 			},
 		})
 	}
@@ -147,7 +147,7 @@ func (c *Completer) ExternalFunctionCandidates() []lsp.CompletionItem {
 			Detail: "external function",
 			Documentation: &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.FunctionDoc(desc),
+				Value: catalog.FunctionDoc(desc),
 			},
 		})
 	}
@@ -174,7 +174,7 @@ func (c *Completer) procedureColumnCandidates(tableName string) []lsp.Completion
 			Detail: columnDetail(desc.Name),
 			Documentation: &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.ParameterDoc(param),
+				Value: catalog.ParameterDoc(param),
 			},
 		})
 	}

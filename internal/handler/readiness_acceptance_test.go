@@ -118,7 +118,13 @@ func readinessRPCWithEvents(t *testing.T, s *Server) (*jsonrpc2.Conn, <-chan str
 	return client, events
 }
 
-func waitForDiagnosticMemo(t *testing.T, s *Server, events <-chan string, want *database.DBCache) {
+// waitForDiagnosticsCache waits for a diagnostics publication and confirms
+// the document's diagnostics pipeline is, by then, reading from want: there
+// is no separate diagnostic memo to inspect (diagnosticsForSnapshot builds
+// its catalog view on demand from whatever cache the current snapshot
+// carries), so the pipeline's own current cache pointer is the observable
+// proof that a connection-generation switch has taken effect.
+func waitForDiagnosticsCache(t *testing.T, s *Server, uri string, events <-chan string, want *database.DBCache) {
 	t.Helper()
 	deadline := time.NewTimer(2 * time.Second)
 	defer deadline.Stop()
@@ -128,10 +134,7 @@ func waitForDiagnosticMemo(t *testing.T, s *Server, events <-chan string, want *
 			if method != publishDiagnosticsMethod {
 				continue
 			}
-			s.diagnosticCatalogMu.Lock()
-			current := s.diagnosticCache
-			s.diagnosticCatalogMu.Unlock()
-			if current == want {
+			if snapshot, ok := s.diagnosticsSnapshot(uri); ok && snapshot.cache == want {
 				return
 			}
 		case <-deadline.C:
@@ -459,7 +462,7 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 		}
 	}
 	oldCache := currentLeaseCacheForTest(s)
-	waitForDiagnosticMemo(t, s, events, oldCache)
+	waitForDiagnosticsCache(t, s, uri, events, oldCache)
 	if err := switchCall("2"); err != nil {
 		t.Fatal(err)
 	}
@@ -495,13 +498,10 @@ func TestReadinessAcceptanceRPCSwitchDrainsSlowOldMetadata(t *testing.T) {
 		t.Fatal("stale old-generation procedure leaked into replacement cache")
 	}
 	currentCache := currentLeaseCacheForTest(s)
-	waitForDiagnosticMemo(t, s, events, currentCache)
-	s.diagnosticCatalogMu.Lock()
-	if s.diagnosticCache != currentCache || s.diagnosticCache == oldCache || s.derivedCatalog == nil {
-		s.diagnosticCatalogMu.Unlock()
-		t.Fatal("diagnostic memo retained a retired-generation cache")
+	waitForDiagnosticsCache(t, s, uri, events, currentCache)
+	if snapshot, ok := s.diagnosticsSnapshot(uri); !ok || snapshot.cache != currentCache || snapshot.cache == oldCache {
+		t.Fatal("diagnostics pipeline retained a retired-generation cache")
 	}
-	s.diagnosticCatalogMu.Unlock()
 	releaseOld()
 	waitCurrentMetadataSettledForTest(t, context.Background(), s)
 	if got := peak.Load(); got > 3 {
@@ -542,17 +542,15 @@ func TestReadinessAcceptanceDiagnosticMemoTracksOneHundredRPCRefreshes(t *testin
 		if !cache.MetadataReady(database.MetadataColumnsCurrent) {
 			t.Fatalf("refresh %d did not publish columns", generation)
 		}
-		waitForDiagnosticMemo(t, s, events, cache)
-		s.diagnosticCatalogMu.Lock()
-		memoCache, memoCatalog := s.diagnosticCache, s.derivedCatalog
-		s.diagnosticCatalogMu.Unlock()
-		if memoCache != cache || memoCatalog == nil {
-			t.Fatalf("refresh %d diagnostic memo = cache:%p catalog:%v, want cache:%p nonnil", generation, memoCache, memoCatalog != nil, cache)
+		waitForDiagnosticsCache(t, s, uri, events, cache)
+		snapshot, ok := s.diagnosticsSnapshot(uri)
+		if !ok || snapshot.cache != cache {
+			t.Fatalf("refresh %d diagnostics pipeline cache = %p, want %p", generation, snapshot.cache, cache)
 		}
-		if previous != nil && previous == memoCache {
+		if previous != nil && previous == snapshot.cache {
 			t.Fatalf("refresh %d retained prior generation cache pointer", generation)
 		}
-		previous = memoCache
+		previous = snapshot.cache
 	}
 }
 

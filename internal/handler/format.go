@@ -5,9 +5,8 @@ import (
 	"encoding/json"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"github.com/sqls-server/sqls/internal/config"
-	"github.com/sqls-server/sqls/internal/formatter"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 )
 
 func (s *Server) handleTextDocumentFormatting(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
@@ -24,11 +23,20 @@ func (s *Server) handleTextDocumentFormatting(ctx context.Context, conn *jsonrpc
 	if err != nil {
 		return nil, err
 	}
-	textEdits, err := formatter.FormatWithDriverVariant(snapshot.Text, params, &config.Config{LowercaseKeywords: snapshot.LowercaseKeywords}, snapshot.Variant)
+	options := language.FormatOptions{
+		TabSize:           int(params.Options.TabSize),
+		InsertSpaces:      params.Options.InsertSpaces,
+		UppercaseKeywords: !snapshot.LowercaseKeywords,
+	}
+	res, err := language.NewService().Format(ctx, languageRequest(snapshot), options)
 	if err != nil {
 		return nil, err
 	}
-	if len(textEdits) > 0 {
+	if len(res.Value) > 0 {
+		textEdits := make([]lsp.TextEdit, len(res.Value))
+		for i, edit := range res.Value {
+			textEdits[i] = lspTextEdit(edit)
+		}
 		return textEdits, nil
 	}
 	return nil, nil

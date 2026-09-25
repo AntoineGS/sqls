@@ -224,15 +224,15 @@ func TestInterBaseLiveLegacyCatalogSingleton(t *testing.T) {
 	if variant.Driver != dialect.DatabaseDriverInterBase {
 		t.Fatal("opened connection does not report InterBase")
 	}
-	cacheSnapshot := snapshotDiagnosticCatalog(cache)
-	found := diagnosticsForSnapshot(documentDiagnosticsSnapshot{text: text, variant: variant, cacheSnapshot: cacheSnapshot})
+	metadataSnapshot := &database.MetadataSnapshot{Cache: cache}
+	found := diagnosticsForSnapshot(ctx, documentDiagnosticsSnapshot{text: text, variant: variant, dialectResolved: true, metadata: metadataSnapshot})
 	if !hasSingletonDiagnosticAtRange(found, expectedRange) {
 		t.Fatalf("expected interbase-singleton-select diagnostic absent at range %+v", expectedRange)
 	}
 	t.Logf("full-document interbase-singleton-select diagnostic verified at one-based line %d", line+1)
 
 	corrected := strings.Replace(text, "config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS'", "config_name = 'WEB_IMPORT_ALLOW_NO_PAYMENTS' AND BRANCHID = '00'", 1)
-	correctedFound := diagnosticsForSnapshot(documentDiagnosticsSnapshot{text: corrected, variant: variant, cacheSnapshot: cacheSnapshot})
+	correctedFound := diagnosticsForSnapshot(ctx, documentDiagnosticsSnapshot{text: corrected, variant: variant, dialectResolved: true, metadata: metadataSnapshot})
 	if hasSingletonDiagnosticAtRange(correctedFound, expectedRange) {
 		t.Fatalf("interbase-singleton-select diagnostic remained at target statement after adding BRANCHID predicate")
 	}

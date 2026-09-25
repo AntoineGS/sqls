@@ -2,7 +2,6 @@ package handler
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"net"
 	"strings"
@@ -18,36 +17,6 @@ import (
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
-
-func TestDiagnosticsSnapshotWaitsForColumnsReadyBeforeCatalogBuild(t *testing.T) {
-	s := NewServer()
-	defer s.Stop()
-	s.stateMu.Lock()
-	s.connGeneration = 1
-	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
-	s.files["file:///catalog.sql"] = &File{Text: "SELECT * FROM T"}
-	s.stateMu.Unlock()
-	repo := readinessPlanRepository{DBRepository: &database.MockDBRepository{}, plan: database.MetadataPlan{Parallelism: 1}}
-	lease := bindMetadataRepoForTest(t, s, 1, repo)
-	waitMetadataSettledForTest(t, context.Background(), lease)
-	before, ok := s.diagnosticsSnapshot("file:///catalog.sql")
-	if !ok {
-		t.Fatal("snapshot missing for open document")
-	}
-	if before.cacheSnapshot != nil {
-		t.Fatalf("catalog built before columns ready: %#v", before.cacheSnapshot)
-	}
-	// The published snapshot's Cache pointer is stable until the next
-	// publish (Loader.Snapshot returns the same object), so mutating it in
-	// place is visible to the next captureEditorSnapshot read — the same
-	// trick the pre-registry test used directly against the loader's cache.
-	cache := lease.Snapshot().Cache
-	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
-	after, ok := s.diagnosticsSnapshot("file:///catalog.sql")
-	if !ok || after.cacheSnapshot == nil {
-		t.Fatal("catalog was not captured after ColumnsReady became true")
-	}
-}
 
 type diagnosticsNotification struct {
 	URI            string           `json:"uri"`
@@ -241,53 +210,6 @@ func diagnosticCode(diagnostic lsp.Diagnostic) string {
 		return ""
 	}
 	return *diagnostic.Code
-}
-
-func TestDiagnosticUniqueKeysRequiresCompleteCatalogInputs(t *testing.T) {
-	cache := &database.DBCache{
-		Catalog: &database.CatalogCache{
-			Views: map[string]*database.ViewDesc{},
-			Indexes: map[string]*database.IndexDesc{
-				"UQ_T": {Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}},
-			},
-			IndexesByTable: map[string][]*database.IndexDesc{"T": {{Name: "UQ_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}}}},
-		},
-		Metadata: map[database.MetadataKind]database.MetadataState{
-			database.MetadataColumnsCurrent: database.MetadataReady,
-			database.MetadataViews:          database.MetadataLoading,
-			database.MetadataIndexes:        database.MetadataReady,
-		},
-	}
-	columns := []sqlsymbol.ColumnType{{Name: "ID", Type: "INTEGER"}}
-	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
-		t.Fatal("incomplete view classification cannot prove table keys")
-	}
-	cache.Metadata[database.MetadataViews] = database.MetadataReady
-	cache.Metadata[database.MetadataIndexes] = database.MetadataLoading
-	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
-		t.Fatal("loading indexes cannot prove a complete unique-key set")
-	}
-	cache.Metadata[database.MetadataIndexes] = database.MetadataReady
-	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
-	if _, known := diagnosticUniqueKeys(cache, "T", columns); known {
-		t.Fatal("failed columns cannot prove a complete unique-key set")
-	}
-	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataReady
-	keys, known := diagnosticUniqueKeys(cache, "T", columns)
-	if !known || len(keys) != 1 || len(keys[0]) != 1 || keys[0][0] != "ID" {
-		t.Fatalf("complete catalog keys = %v, known=%v; want [[ID]], true", keys, known)
-	}
-	cache.Catalog.Indexes = map[string]*database.IndexDesc{}
-	cache.Catalog.IndexesByTable = map[string][]*database.IndexDesc{}
-	keys, known = diagnosticUniqueKeys(cache, "T", columns)
-	if !known || len(keys) != 0 {
-		t.Fatalf("ready-empty indexes keys = %v, known=%v; want empty, true", keys, known)
-	}
-	cache.Metadata[database.MetadataColumnsCurrent] = database.MetadataFailed
-	cache.Metadata[database.MetadataColumnsAll] = database.MetadataReady
-	if _, known := diagnosticUniqueKeys(cache, "T", columns); !known {
-		t.Fatal("all-columns readiness should satisfy the columns requirement")
-	}
 }
 
 func diagnosticSource(diagnostic lsp.Diagnostic) string {
@@ -524,10 +446,11 @@ BEGIN UNUSED = 'x'; END`
 		t.Fatal("navigation analysis must retain its strict parse-error behavior")
 	}
 
-	got := diagnosticsForSnapshot(documentDiagnosticsSnapshot{
-		uri:     "file:///malformed-and-valid.sql",
-		text:    text,
-		variant: variant,
+	got := diagnosticsForSnapshot(context.Background(), documentDiagnosticsSnapshot{
+		uri:             "file:///malformed-and-valid.sql",
+		text:            text,
+		variant:         variant,
+		dialectResolved: true,
 	})
 	if len(got) != 1 {
 		t.Fatalf("diagnostics = %+v, want the valid procedure's unused hint", got)
@@ -559,7 +482,7 @@ func TestPublishDiagnosticsDoesNotSendDelayedOlderVersion(t *testing.T) {
 	if !ok {
 		t.Fatal("could not snapshot open document")
 	}
-	oldDiagnostics := diagnosticsForSnapshot(oldSnapshot)
+	oldDiagnostics := diagnosticsForSnapshot(tx.ctx, oldSnapshot)
 	fixed := "CREATE PROCEDURE P AS DECLARE VARIABLE UNUSED VARCHAR(10); BEGIN UNUSED = UNUSED; END"
 	tx.change(t, uri, fixed, 4)
 	latest := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
@@ -603,7 +526,7 @@ func TestPublishDiagnosticsDoesNotSendPriorConnectionGeneration(t *testing.T) {
 	if !ok {
 		t.Fatal("could not snapshot open document")
 	}
-	oldDiagnostics := diagnosticsForSnapshot(oldSnapshot)
+	oldDiagnostics := diagnosticsForSnapshot(tx.ctx, oldSnapshot)
 
 	// Model the fenced state transition used by the coordinator. The new
 	// attachment is non-InterBase, so republishing must clear its old findings.

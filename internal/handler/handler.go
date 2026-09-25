@@ -15,7 +15,6 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/internal/sqlsymbol"
 	"github.com/sqls-server/sqls/metadata"
 )
 
@@ -46,9 +45,6 @@ type Server struct {
 	// publication from the previous attachment cannot follow the switch's
 	// clearing/recompute notification.
 	diagnosticsPublishMu sync.Mutex
-	diagnosticCatalogMu  sync.Mutex
-	diagnosticCache      *database.DBCache
-	derivedCatalog       sqlsymbol.Catalog
 	diagnosticWorkMu     sync.Mutex
 	diagnosticDocuments  map[string]struct{}
 	diagnosticAllOpen    bool

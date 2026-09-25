@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"github.com/sqls-server/sqls/internal/completer"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 )
 
 func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc2.Conn, req *jsonrpc2.Request) (result interface{}, err error) {
@@ -24,13 +24,51 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 	if err != nil {
 		return nil, err
 	}
-	c := completer.NewCompleter(snapshot.Cache)
-	c.Driver, c.Variant = snapshot.Variant.Driver, snapshot.Variant.Variant
-	completionItems, err := c.Complete(snapshot.Text, params, snapshot.LowercaseKeywords)
+	res, err := language.NewService().Complete(ctx, languageRequest(snapshot), languagePosition(params.Position))
 	if err != nil {
 		return nil, err
 	}
-	return lsp.CompletionList{Items: completionItems, IsIncomplete: completionMetadataIncomplete(snapshot)}, nil
+	return lsp.CompletionList{
+		Items:        lspCompletionItems(res.Value.Items),
+		IsIncomplete: completionMetadataIncomplete(snapshot),
+	}, nil
+}
+
+func lspCompletionItems(items []language.CompletionItem) []lsp.CompletionItem {
+	out := make([]lsp.CompletionItem, len(items))
+	for i, item := range items {
+		out[i] = lspCompletionItem(item)
+	}
+	return out
+}
+
+func lspCompletionItem(item language.CompletionItem) lsp.CompletionItem {
+	out := lsp.CompletionItem{
+		Label:      item.Label,
+		Kind:       lsp.CompletionItemKind(item.Kind),
+		Detail:     item.Detail,
+		SortText:   item.SortText,
+		FilterText: item.FilterText,
+		InsertText: item.InsertText,
+	}
+	if item.Documentation != "" {
+		out.Documentation = &lsp.MarkupContent{Kind: lsp.Markdown, Value: item.Documentation}
+	}
+	if item.Snippet {
+		out.InsertTextFormat = lsp.SnippetTextFormat
+	}
+	if item.Edit != nil {
+		edit := lspTextEdit(*item.Edit)
+		out.TextEdit = &edit
+	}
+	if item.AdditionalEdits != nil {
+		additional := make([]lsp.TextEdit, len(item.AdditionalEdits))
+		for i, e := range item.AdditionalEdits {
+			additional[i] = lspTextEdit(e)
+		}
+		out.AdditionalTextEdits = additional
+	}
+	return out
 }
 
 func completionMetadataIncomplete(snapshot editorSnapshot) bool {

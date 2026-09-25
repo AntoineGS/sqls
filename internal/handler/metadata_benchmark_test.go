@@ -82,37 +82,6 @@ func benchmarkMetadataCatalog(tb testing.TB) *database.DBCache {
 	return cache
 }
 
-func BenchmarkMetadataDiagnosticCatalogReuse(b *testing.B) {
-	s := NewServer()
-	defer s.Stop()
-	cache := benchmarkMetadataCatalog(b)
-	assertBenchmarkMetadataCatalog(b, cache)
-	b.Run("same-cache", func(b *testing.B) {
-		b.StopTimer()
-		if got := s.diagnosticCatalogFor(cache); got == nil {
-			b.Fatal("prewarming derived catalog returned nil")
-		}
-		b.ReportAllocs()
-		b.ResetTimer()
-		b.StartTimer()
-		for i := 0; i < b.N; i++ {
-			if got := s.diagnosticCatalogFor(cache); got == nil {
-				b.Fatal("missing derived catalog")
-			}
-		}
-	})
-	b.Run("new-cache-conversion", func(b *testing.B) {
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			newCache := *cache // maps are immutable and shared; the snapshot pointer is new
-			if got := s.diagnosticCatalogFor(&newCache); got == nil {
-				b.Fatal("missing derived catalog")
-			}
-		}
-	})
-}
-
 type benchmarkPlanRepository struct {
 	database.DBRepository
 	plan database.MetadataPlan

@@ -10,7 +10,7 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/internal/sqlsymbol"
+	"github.com/sqls-server/sqls/language"
 )
 
 const publishDiagnosticsMethod = "textDocument/publishDiagnostics"
@@ -32,119 +32,8 @@ type documentDiagnosticsSnapshot struct {
 	variant         dialect.DriverVariant
 	generation      int
 	cache           *database.DBCache
-	cacheSnapshot   sqlsymbol.Catalog
+	metadata        *database.MetadataSnapshot
 	dialectResolved bool
-}
-
-type diagnosticCatalog struct {
-	columns map[string][]sqlsymbol.ColumnType
-	keys    map[string][][]string
-}
-
-func (c *diagnosticCatalog) Columns(table sqlsymbol.Name) ([]sqlsymbol.ColumnType, bool) {
-	if c == nil {
-		return nil, false
-	}
-	columns, ok := c.columns[table.Key()]
-	if !ok {
-		return nil, false
-	}
-	return append([]sqlsymbol.ColumnType(nil), columns...), true
-}
-
-func (c *diagnosticCatalog) UniqueKeys(table sqlsymbol.Name) ([][]string, bool) {
-	if c == nil {
-		return nil, false
-	}
-	keys, ok := c.keys[table.Key()]
-	result := make([][]string, len(keys))
-	for i, key := range keys {
-		result[i] = append([]string(nil), key...)
-	}
-	return result, ok
-}
-
-// snapshotDiagnosticCatalog copies the cache metadata used by analysis. The
-// DBCache is copy-on-write, but copying names, types, and their available order
-// keeps this analysis independent of subsequent metadata publications.
-func snapshotDiagnosticCatalog(cache *database.DBCache) sqlsymbol.Catalog {
-	if cache == nil {
-		return nil
-	}
-	catalog := &diagnosticCatalog{
-		columns: make(map[string][]sqlsymbol.ColumnType),
-		keys:    make(map[string][][]string),
-	}
-	for _, table := range cache.SortedTables() {
-		descriptions, ok := cache.ColumnDescs(table)
-		if !ok {
-			continue
-		}
-		columns := make([]sqlsymbol.ColumnType, 0, len(descriptions))
-		for _, description := range descriptions {
-			if description == nil {
-				continue
-			}
-			columns = append(columns, sqlsymbol.ColumnType{Name: description.Name, Type: description.Type})
-		}
-		// Catalog metadata preserves the database's actual spelling. Quoted
-		// names therefore match exactly; unquoted InterBase names naturally
-		// match the upper-case names returned by its catalog.
-		catalog.columns[table] = columns
-		if keys, known := diagnosticUniqueKeys(cache, table, columns); known {
-			catalog.keys[table] = keys
-		}
-	}
-	return catalog
-}
-
-// Primary-key and UNIQUE-constraint enforcing indexes are present alongside
-// standalone unique indexes in the extended catalog. Wait for that complete
-// catalog: column primary-key flags alone cannot rule out other unique keys.
-func diagnosticUniqueKeys(cache *database.DBCache, table string, columns []sqlsymbol.ColumnType) ([][]string, bool) {
-	if !cache.HasCatalog() || !cache.ColumnsReady() || !cache.MetadataReady(database.MetadataViews, database.MetadataIndexes) {
-		return nil, false
-	}
-	for _, view := range cache.Catalog.Views {
-		if view != nil && view.Name == table {
-			return nil, false
-		}
-	}
-	var keys [][]string
-	for _, index := range cache.IndexesForTable(table) {
-		// The cache lookup folds case, but quoted relation identities do not.
-		if index == nil || index.RelationName != table {
-			continue
-		}
-		if !index.Unique.Valid {
-			return nil, false
-		}
-		if !index.Unique.Bool {
-			continue
-		}
-		if !index.Active.Valid {
-			return nil, false
-		}
-		if !index.Active.Bool {
-			continue
-		}
-		if index.Expression.Valid || len(index.Columns) == 0 {
-			return nil, false
-		}
-		for _, segment := range index.Columns {
-			matches := 0
-			for _, column := range columns {
-				if column.Name == segment {
-					matches++
-				}
-			}
-			if matches != 1 {
-				return nil, false
-			}
-		}
-		keys = append(keys, append([]string(nil), index.Columns...))
-	}
-	return keys, true
 }
 
 func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, bool) {
@@ -152,7 +41,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 	if err != nil {
 		return documentDiagnosticsSnapshot{}, false
 	}
-	snapshot := documentDiagnosticsSnapshot{
+	return documentDiagnosticsSnapshot{
 		uri:             editor.URI,
 		text:            editor.Text,
 		version:         editor.Version,
@@ -160,16 +49,9 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		generation:      editor.Generation,
 		variant:         editor.Variant,
 		cache:           editor.Cache,
+		metadata:        editor.Metadata,
 		dialectResolved: editor.DialectResolved,
-	}
-	if snapshot.CacheReadyForDiagnostics() {
-		snapshot.cacheSnapshot = s.diagnosticCatalogFor(snapshot.cache)
-	}
-	return snapshot, true
-}
-
-func (snapshot documentDiagnosticsSnapshot) CacheReadyForDiagnostics() bool {
-	return snapshot.cache != nil && snapshot.variant.Driver == dialect.DatabaseDriverInterBase && snapshot.cache.ColumnsReady()
+	}, true
 }
 
 func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot) bool {
@@ -234,56 +116,38 @@ func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.
 		if s.diagnosticAnalyzer != nil {
 			diagnostics = s.diagnosticAnalyzer(snapshot)
 		} else {
-			diagnostics = diagnosticsForSnapshot(snapshot)
+			diagnostics = diagnosticsForSnapshot(ctx, snapshot)
 		}
 	}
 	s.publishDiagnosticsSnapshot(ctx, conn, snapshot, diagnostics)
 }
 
-func diagnosticsForSnapshot(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
-	diagnostics := make([]lsp.Diagnostic, 0)
-	if snapshot.variant.Driver != dialect.DatabaseDriverInterBase {
-		return diagnostics
+func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+	req := language.Request{
+		Document: language.Document{URI: snapshot.uri, Text: snapshot.text, Version: int64(snapshot.version), Binding: uint64(snapshot.generation)},
+		Context: language.Context{
+			Snapshot:        snapshot.metadata,
+			Variant:         snapshot.variant,
+			DialectResolved: snapshot.dialectResolved,
+		},
 	}
-	analysis, err := sqlsymbol.AnalyzeDiagnostics(snapshot.text, snapshot.variant)
+	res, err := language.NewService().Diagnostics(ctx, req)
 	if err != nil {
-		// In-progress malformed SQL must not fail didOpen/didChange. The
-		// analyzer's conservative failure means no finding is currently proven.
+		// In-progress malformed SQL must not fail didOpen/didChange. A
+		// canceled request means no finding is currently proven.
 		log.Printf("sqls: static diagnostics skipped for %s: %v", snapshot.uri, err)
-		return diagnostics
+		return []lsp.Diagnostic{}
 	}
-
-	found := analysis.Diagnostics(snapshot.cacheSnapshot)
-	sort.SliceStable(found, func(i, j int) bool {
-		left, right := found[i], found[j]
-		if left.Span.Start != right.Span.Start {
-			return left.Span.Start < right.Span.Start
-		}
-		if left.Span.End != right.Span.End {
-			return left.Span.End < right.Span.End
-		}
-		if left.Code != right.Code {
-			return left.Code < right.Code
-		}
-		if left.Message != right.Message {
-			return left.Message < right.Message
-		}
-		return left.Severity < right.Severity
-	})
-	for _, finding := range found {
-		rangeValue, ok := symbolRange(snapshot.text, finding.Span)
-		if !ok {
-			continue
-		}
-		code := finding.Code
-		source := "sqls"
-		diagnostics = append(diagnostics, lsp.Diagnostic{
-			Range:    rangeValue,
-			Severity: finding.Severity,
+	diagnostics := make([]lsp.Diagnostic, len(res.Value))
+	for i, d := range res.Value {
+		code, source := d.Code, d.Source
+		diagnostics[i] = lsp.Diagnostic{
+			Range:    lspRange(d.Range),
+			Severity: d.Severity,
 			Code:     &code,
 			Source:   &source,
-			Message:  finding.Message,
-		})
+			Message:  d.Message,
+		}
 	}
 	return diagnostics
 }
@@ -349,24 +213,6 @@ func (s *Server) republishOpenDiagnostics(ctx context.Context) {
 		}
 		s.publishDocumentDiagnostics(ctx, conn, uri)
 	}
-}
-
-// diagnosticCatalogFor memoizes the immutable diagnostic projection for the
-// current copy-on-write cache. Metadata status-only revisions retain the same
-// cache pointer; data changes publish a new one and replace this single entry.
-func (s *Server) diagnosticCatalogFor(cache *database.DBCache) sqlsymbol.Catalog {
-	s.diagnosticCatalogMu.Lock()
-	defer s.diagnosticCatalogMu.Unlock()
-	if cache == nil {
-		s.diagnosticCache = nil
-		s.derivedCatalog = nil
-		return nil
-	}
-	if s.diagnosticCache != cache {
-		s.derivedCatalog = snapshotDiagnosticCatalog(cache)
-		s.diagnosticCache = cache
-	}
-	return s.derivedCatalog
 }
 
 // signalDiagnostics coalesces refresh requests into one bounded wake. Dirty

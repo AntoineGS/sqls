@@ -9,8 +9,8 @@ import (
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
@@ -73,14 +73,14 @@ func (ct completionType) String() string {
 }
 
 type Completer struct {
-	DBCache *database.DBCache
+	DBCache *catalog.Cache
 	Driver  dialect.DatabaseDriver
 	// Variant is the server-side SQL variant resolved for the active
 	// connection. The empty variant selects the driver's default.
 	Variant dialect.SQLVariant
 }
 
-func NewCompleter(dbCache *database.DBCache) *Completer {
+func NewCompleter(dbCache *catalog.Cache) *Completer {
 	return &Completer{
 		DBCache: dbCache,
 	}

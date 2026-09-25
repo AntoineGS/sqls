@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 )
 
@@ -180,21 +179,3 @@ func TestDiagnosticsStopCancelsRemainingAllOpenAnalysis(t *testing.T) {
 	}
 }
 
-func TestDiagnosticsCatalogReuseByCurrentCachePointer(t *testing.T) {
-	s := NewServer()
-	defer s.Stop()
-
-	cache := &database.DBCache{}
-	first := s.diagnosticCatalogFor(cache)
-	if first == nil {
-		t.Fatal("nil cache conversion")
-	}
-	// Metadata status revisions may reuse their data cache pointer.
-	statusOnlyRevision := cache
-	if got := s.diagnosticCatalogFor(statusOnlyRevision); got != first {
-		t.Fatal("status-only revision rebuilt the derived catalog")
-	}
-	if got := s.diagnosticCatalogFor(&database.DBCache{}); got == first {
-		t.Fatal("new cache pointer reused the prior derived catalog")
-	}
-}

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/parser/parseutil"
 )
@@ -86,7 +86,7 @@ func (c *Completer) columnCandidates(targetTables []*parseutil.TableInfo, parent
 	return candidates
 }
 
-func generateColumnCandidates(tableName string, columns []*database.ColumnDesc) []lsp.CompletionItem {
+func generateColumnCandidates(tableName string, columns []*catalog.ColumnDesc) []lsp.CompletionItem {
 	candidates := []lsp.CompletionItem{}
 	for _, column := range columns {
 		candidate := lsp.CompletionItem{
@@ -95,7 +95,7 @@ func generateColumnCandidates(tableName string, columns []*database.ColumnDesc) 
 			Detail: columnDetail(tableName),
 			Documentation: &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.ColumnDoc(tableName, column),
+				Value: catalog.ColumnDoc(tableName, column),
 			},
 		}
 		candidates = append(candidates, candidate)
@@ -175,7 +175,7 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 	for _, t := range targetTables {
 		tMap[t.Name] = t
 	}
-	fkMap := make(map[string][][]*database.ForeignKey)
+	fkMap := make(map[string][][]*catalog.ForeignKey)
 	if lastTable == nil {
 		for t := range tMap {
 			for k, v := range c.foreignKeysForTable(t) {
@@ -221,7 +221,7 @@ func (c *Completer) joinCandidates(lastTable *parseutil.TableInfo,
 	return candidates
 }
 
-func (c *Completer) foreignKeysForTable(tableName string) map[string][]*database.ForeignKey {
+func (c *Completer) foreignKeysForTable(tableName string) map[string][]*catalog.ForeignKey {
 	foreignKeys, ok := c.DBCache.ForeignKeys[tableName]
 	if ok || c.Driver != dialect.DatabaseDriverInterBase {
 		return foreignKeys
@@ -253,7 +253,7 @@ func tableNamesEqual(left, right string, caseInsensitive bool) bool {
 	return left == right || (caseInsensitive && strings.EqualFold(left, right))
 }
 
-func resolveTables(t *parseutil.TableInfo, cache *database.DBCache) []*parseutil.TableInfo {
+func resolveTables(t *parseutil.TableInfo, cache *catalog.Cache) []*parseutil.TableInfo {
 	if _, ok := cache.ColumnDescs(t.Name); ok {
 		return []*parseutil.TableInfo{t}
 	}
@@ -288,7 +288,7 @@ func generateTableAlias(target string,
 func generateForeignKeyCandidate(target string,
 	tMap map[string]*parseutil.TableInfo,
 	aliases map[string]interface{},
-	fk *database.ForeignKey,
+	fk *catalog.ForeignKey,
 	joinOn, lowercaseKeywords, caseInsensitive bool) lsp.CompletionItem {
 	var tAlias string
 	if joinOn {
@@ -386,7 +386,7 @@ func escapeSnippetLiteral(value string, escape bool) string {
 	return strings.ReplaceAll(value, `}`, `\}`)
 }
 
-func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.CompletionItem {
+func generateTableCandidates(tables []string, dbCache *catalog.Cache) []lsp.CompletionItem {
 	candidates := []lsp.CompletionItem{}
 	for _, tableName := range tables {
 		candidate := lsp.CompletionItem{
@@ -403,7 +403,7 @@ func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.C
 			candidate.Detail = "view"
 			candidate.Documentation = &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.ViewDoc(view),
+				Value: catalog.ViewDoc(view),
 			}
 			candidates = append(candidates, candidate)
 			continue
@@ -412,7 +412,7 @@ func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.C
 		if ok {
 			candidate.Documentation = &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.TableDoc(tableName, cols),
+				Value: catalog.TableDoc(tableName, cols),
 			}
 		}
 		candidates = append(candidates, candidate)
@@ -420,7 +420,7 @@ func generateTableCandidates(tables []string, dbCache *database.DBCache) []lsp.C
 	return candidates
 }
 
-func generateTableCandidatesByInfos(tables []*parseutil.TableInfo, dbCache *database.DBCache) []lsp.CompletionItem {
+func generateTableCandidatesByInfos(tables []*parseutil.TableInfo, dbCache *catalog.Cache) []lsp.CompletionItem {
 	candidates := []lsp.CompletionItem{}
 	for _, table := range tables {
 		name := table.Name
@@ -441,7 +441,7 @@ func generateTableCandidatesByInfos(tables []*parseutil.TableInfo, dbCache *data
 		if ok {
 			candidate.Documentation = &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.TableDoc(table.Name, cols),
+				Value: catalog.TableDoc(table.Name, cols),
 			}
 		}
 		candidates = append(candidates, candidate)
@@ -458,7 +458,7 @@ func (c *Completer) SubQueryCandidates(infos []*parseutil.SubQueryInfo) []lsp.Co
 			Detail: "subquery",
 			Documentation: &lsp.MarkupContent{
 				Kind:  lsp.Markdown,
-				Value: database.SubqueryDoc(info.Name, info.Views, c.DBCache),
+				Value: catalog.SubqueryDoc(info.Name, info.Views, c.DBCache),
 			},
 		}
 		candidates = append(candidates, candidate)
@@ -483,7 +483,7 @@ func (c *Completer) SubQueryColumnCandidates(infos []*parseutil.SubQueryInfo) []
 							Detail: subQueryColumnDetail(info.Name),
 							Documentation: &lsp.MarkupContent{
 								Kind:  lsp.Markdown,
-								Value: database.SubqueryColumnDoc(tableCol.Name, info.Views, c.DBCache),
+								Value: catalog.SubqueryColumnDoc(tableCol.Name, info.Views, c.DBCache),
 							},
 						}
 						candidates = append(candidates, candidate)
@@ -495,7 +495,7 @@ func (c *Completer) SubQueryColumnCandidates(infos []*parseutil.SubQueryInfo) []
 						Detail: subQueryColumnDetail(info.Name),
 						Documentation: &lsp.MarkupContent{
 							Kind:  lsp.Markdown,
-							Value: database.SubqueryColumnDoc(col.DisplayName(), info.Views, c.DBCache),
+							Value: catalog.SubqueryColumnDoc(col.DisplayName(), info.Views, c.DBCache),
 						},
 					}
 					candidates = append(candidates, candidate)
