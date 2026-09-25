@@ -8,10 +8,14 @@ import (
 
 func TestDiagnosticOptionsValidateAcceptsKnownCodesAndLevels(t *testing.T) {
 	options := DiagnosticOptions{Rules: map[string]string{
-		codeUnknownVariable: "error",
-		codeNullComparison:  "warning",
-		codeAmbiguousColumn: "default",
-		codeUnused:          "off",
+		codeUnknownVariable:      "error",
+		codeNullComparison:       "warning",
+		codeAmbiguousColumn:      "default",
+		codeUnused:               "off",
+		codeReadBeforeAssignment: "warning",
+		codeOutputNotAssigned:    "warning",
+		codeDeadStore:            "hint",
+		codeUnreachable:          "hint",
 	}}
 	if err := options.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil for known codes/levels", err)
@@ -225,6 +229,7 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 		codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
 		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment,
+		codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable,
 	}
 	for _, code := range codes {
 		if _, ok := diagnosticRegistry[code]; !ok {

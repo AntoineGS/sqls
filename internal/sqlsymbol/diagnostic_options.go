@@ -6,7 +6,7 @@ import "fmt"
 // how to configure, together with the severity it reports today when no
 // explicit level override applies -- copied from each rule's own Finding
 // literal, not invented here. Every code here is on by default except those
-// listed in diagnosticDefaultOff (currently only codeLossyAssignment): "off"
+// listed in diagnosticDefaultOff (codeLossyAssignment and procedural-flow advisories): "off"
 // is a level any code's caller may choose, but it is also the default level
 // for a default-off code even when no explicit entry names it.
 var diagnosticRegistry = map[string]int{
@@ -24,17 +24,25 @@ var diagnosticRegistry = map[string]int{
 	codeProcedureArity:       1,
 	codeInvalidAssignment:    1,
 	codeLossyAssignment:      2,
+	codeReadBeforeAssignment: 2,
+	codeOutputNotAssigned:    2,
+	codeDeadStore:            4,
+	codeUnreachable:          4,
 }
 
 // diagnosticDefaultOff lists every registered code whose default level (an
 // absent Rules entry, or an explicit "default" override) is "off" rather
-// than "on". codeLossyAssignment is, as of this task, the only such code:
+// than "on". codeLossyAssignment and procedural-flow advisories default off;
 // every other registered code defaults to on. off() consults this set so a
 // default-off code stays off both when Rules has no entry for it at all and
 // when a caller explicitly writes "default" for it -- "default" always
 // means whatever this code's own default is, never a way to force it on.
 var diagnosticDefaultOff = map[string]bool{
-	codeLossyAssignment: true,
+	codeLossyAssignment:      true,
+	codeReadBeforeAssignment: true,
+	codeOutputNotAssigned:    true,
+	codeDeadStore:            true,
+	codeUnreachable:          true,
 }
 
 // diagnosticLevelSeverity maps every level that overrides a finding's
@@ -175,10 +183,14 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 	if options.anyOn(codeNullComparison) {
 		findings = append(findings, applyDiagnosticOptions(a.nullComparisonFindings(), options)...)
 	}
-	if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration,
+	if options.anyOn(codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable,
+		codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
 		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment) {
 		m := a.diagnosticModel(c)
+		if options.anyOn(codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable) {
+			findings = append(findings, applyDiagnosticOptions(m.flowFindings(options), options)...)
+		}
 		if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration) {
 			findings = append(findings, applyDiagnosticOptions(m.localFindings(), options)...)
 		}

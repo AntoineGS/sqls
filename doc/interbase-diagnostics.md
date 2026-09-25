@@ -31,6 +31,19 @@ absent or set to `default`.
 | `interbase-procedure-arity` | `error` | A mismatch between the number of arguments supplied to a procedure call and its known declared input count. |
 | `interbase-invalid-assignment` | `error` | An assignment (procedure local, `UPDATE`/`INSERT` target, `SELECT ... INTO`, `EXECUTE PROCEDURE` input, or trigger `NEW.<col>` write) whose source is proven to never fit its destination's engine-enforced storage range. Also reports an explicit `CAST(... AS type)` whose own inner conversion is proven invalid, at the `CAST`'s own span, even when the assignment's outer destination would otherwise accept the `CAST`'s result. `RETURNING_VALUES` targets are listed among this rule's contexts structurally but can never actually produce a finding for it: a procedure's declared `OUTPUT` type has no source expression of its own to judge (see `interbase-lossy-assignment`, which can and does fire there). |
 | `interbase-lossy-assignment` | `off` | Same eight assignment contexts as `interbase-invalid-assignment` (including `RETURNING_VALUES` targets, where this rule -- unlike `interbase-invalid-assignment` -- can and does fire), but for a source proven to be *accepted* while still narrowing, rounding, or truncating some value of its own declared range or scale. A `CAST(...)` source is judged like any other expression here, using the `CAST`'s own declared type/value as its result -- there is no suppression for an explicit `CAST`. Off by default; enable it with an explicit `diagnostics.rules` entry. |
+| `interbase-read-before-assignment` | `off` | A procedural local is read before any explicit assignment (or verified declaration default). Its initial value is known SQL `NULL`, not undefined memory; the advisory means that this initial `NULL` may be unintended. Explicit `V = NULL` counts as an assignment. |
+| `interbase-output-not-assigned` | `off` | A procedure output reaches `SUSPEND`, `EXIT`, or procedure completion on a modeled path without an explicit assignment. This does not assert that the value is necessarily `NULL`; a prior output value can be carried across `SUSPEND`. |
+| `interbase-dead-store` | `off` | A modeled assignment is overwritten before its value is read or, for procedure outputs, observed at `SUSPEND`/exit. Reports only within proven straight-line statement runs. |
+| `interbase-unreachable` | `off` | A statement follows an unconditional `EXIT` on every modeled incoming path. |
+
+Procedural-flow rules are opt-in and deliberately conservative. Supported
+`BEGIN`/`END`, assignment, `IF`/`ELSE`, `WHILE`, `FOR SELECT`, `EXIT`, and
+`SUSPEND` paths are analyzed with zero-iteration loop edges and a bounded
+fixed point. Unsupported statements and unknown function effects invalidate
+flow facts; malformed or over-budget procedures produce no flow conclusions.
+Exception handlers are treated as unknown-effect edges until their semantics
+are modeled. Diagnostics use only source/binding facts and perform no database
+I/O.
 
 Every check withholds a finding rather than guessing: a code is reported
 only when the relevant catalog metadata has finished loading and proves the
