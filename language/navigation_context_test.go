@@ -160,6 +160,98 @@ func TestNavigationDefinitionKeepsProcedureViewTriggerPrecedence(t *testing.T) {
 	}
 }
 
+func TestNavigationQuotedCatalogNamesRequireExactIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind catalog.ObjectKind
+		text string
+	}{
+		{name: "view relation", kind: catalog.ObjectKindView, text: `SELECT * FROM "foo"`},
+		{name: "procedure identifier", kind: catalog.ObjectKindProcedure, text: `EXECUTE PROCEDURE "foo"`},
+		{name: "trigger identifier", kind: catalog.ObjectKindTrigger, text: `"foo"`},
+	} {
+		t.Run(tc.name+" folded miss", func(t *testing.T) {
+			cache := readyNavigationCacheWithFoldNames(tc.kind, "FOO")
+			req := navigationRequest(tc.text, cache)
+			pos := testPosition(tc.text, strings.Index(tc.text, `"foo"`)+2)
+			if calls := definitionDetails(t, req, pos); len(calls) != 0 {
+				t.Fatalf("quoted miss requested folded catalog target: %#v", calls)
+			}
+		})
+		t.Run(tc.name+" exact among fold collision", func(t *testing.T) {
+			cache := readyNavigationCacheWithFoldNames(tc.kind, "FOO", "foo")
+			req := navigationRequest(tc.text, cache)
+			pos := testPosition(tc.text, strings.Index(tc.text, `"foo"`)+2)
+			calls := definitionDetails(t, req, pos)
+			want := catalog.ObjectID{Kind: tc.kind, Name: "foo"}
+			if len(calls) != 1 || calls[0].Object != want {
+				t.Fatalf("quoted exact identity requests = %#v, want %#v", calls, want)
+			}
+		})
+	}
+}
+
+func TestNavigationUnquotedCatalogNamesRejectFoldCollisions(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind catalog.ObjectKind
+		text string
+	}{
+		{name: "view relation", kind: catalog.ObjectKindView, text: "SELECT * FROM FOO"},
+		{name: "procedure identifier", kind: catalog.ObjectKindProcedure, text: "EXECUTE PROCEDURE FOO"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cache := readyNavigationCacheWithFoldNames(tc.kind, "FOO", "foo")
+			req := navigationRequest(tc.text, cache)
+			pos := testPosition(tc.text, strings.LastIndex(tc.text, "FOO"))
+			if calls := definitionDetails(t, req, pos); len(calls) != 0 {
+				t.Fatalf("ambiguous unquoted lookup requested detail: %#v", calls)
+			}
+		})
+	}
+}
+
+func readyNavigationCacheWithFoldNames(kind catalog.ObjectKind, names ...string) *catalog.Cache {
+	cache := readyNavigationCache()
+	for _, name := range names {
+		cache.Catalog.Objects.Insert(catalog.ObjectID{Kind: kind, Name: name})
+	}
+	return cache
+}
+
+func TestNavigationColumnDefinitionDoesNotBecomeRelationReferencesOrRename(t *testing.T) {
+	text := "SELECT ID FROM T"
+	req := navigationRequest(text, readyNavigationCache())
+	pos := testPosition(text, strings.Index(text, "ID"))
+	service := language.NewService()
+
+	definition, err := service.Definition(context.Background(), req, pos)
+	if err != nil {
+		t.Fatalf("Definition: %v", err)
+	}
+	if details := req.Context.Details.(*recordingDetails).requests; len(details) != 1 || details[0].Object != (catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}) {
+		t.Fatalf("column Definition details = %#v, want proven owner T", details)
+	}
+	if len(definition.Value) != 1 || definition.Value[0].Source == nil {
+		t.Fatalf("column Definition = %#v, want owner source", definition.Value)
+	}
+
+	references, err := service.References(context.Background(), req, pos, true)
+	if err != nil {
+		t.Fatalf("References: %v", err)
+	}
+	if len(references.Value) != 0 {
+		t.Fatalf("column References became relation edits: %#v", references.Value)
+	}
+	rename, err := service.Rename(context.Background(), req, pos, "RENAMED")
+	if err != nil {
+		t.Fatalf("Rename: %v", err)
+	}
+	if len(rename.Value) != 0 {
+		t.Fatalf("column Rename became relation edits: %#v", rename.Value)
+	}
+}
+
 func TestNavigationDefinitionDoesNotRequestForCommentsLiteralsOrProcedureLocals(t *testing.T) {
 	cases := []struct {
 		name, text, marker string

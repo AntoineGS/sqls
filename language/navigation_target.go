@@ -65,7 +65,7 @@ func navigationTargetAt(req Request, position Position) (catalog.ObjectID, Range
 		return catalog.ObjectID{}, Range{}, false, nil
 	}
 	for _, kind := range []catalog.ObjectKind{catalog.ObjectKindProcedure, catalog.ObjectKindView, catalog.ObjectKindTrigger} {
-		resolved, found, ambiguous := cache.ResolveObjectName(kind, sqlsymbol.Name{Text: name, Quoted: quoted}.Key())
+		resolved, found, ambiguous := resolveCatalogObjectName(kind, sqlsymbol.Name{Text: name, Quoted: quoted}, cache)
 		if len(ambiguous) != 0 {
 			return catalog.ObjectID{}, Range{}, false, nil
 		}
@@ -95,7 +95,7 @@ func resolveCatalogRelation(name sqlsymbol.Name, cache *catalog.Cache) (catalog.
 		return catalog.ObjectID{}, false
 	}
 	if cache.HasCatalog() {
-		view, found, ambiguous := cache.ResolveObjectName(catalog.ObjectKindView, name.Key())
+		view, found, ambiguous := resolveCatalogObjectName(catalog.ObjectKindView, name, cache)
 		if len(ambiguous) > 0 {
 			return catalog.ObjectID{}, false
 		}
@@ -115,6 +115,28 @@ func resolveCatalogRelation(name sqlsymbol.Name, cache *catalog.Cache) (catalog.
 		return catalog.ObjectID{}, false
 	}
 	return catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: matches[0]}, true
+}
+
+func resolveCatalogObjectName(kind catalog.ObjectKind, name sqlsymbol.Name, cache *catalog.Cache) (string, bool, []catalog.ObjectID) {
+	if cache == nil || !cache.HasCatalog() || cache.Catalog.Objects == nil {
+		return "", false, nil
+	}
+	if name.Quoted {
+		id, found := cache.Catalog.Objects.Lookup(catalog.ObjectID{Kind: kind, Name: name.Text})
+		if !found {
+			return "", false, nil
+		}
+		return id.Name, true, nil
+	}
+	matches := cache.Catalog.Objects.LookupUnquoted(kind, name.Text)
+	switch len(matches) {
+	case 0:
+		return "", false, nil
+	case 1:
+		return matches[0].Name, true, nil
+	default:
+		return "", false, matches
+	}
 }
 
 func resolveCatalogColumn(ref sqlsymbol.SQLReference, cache *catalog.Cache) (catalog.ObjectID, bool) {
@@ -260,23 +282,11 @@ func relationAt(req Request, position Position) (catalog.ObjectID, Range, bool, 
 			return catalog.ObjectID{}, Range{}, false, err
 		}
 		r := a.Resolve(offset)
-		if r.Role != sqlsymbol.Relation && r.Role != sqlsymbol.Column || r.SQL == nil {
+		if r.Role != sqlsymbol.Relation || r.SQL == nil {
 			return catalog.ObjectID{}, Range{}, false, nil
 		}
-		id, span, ok, err := contextualTargetOnly(req, r)
-		return id, span, ok, err
+		id, ok := resolveCatalogRelation(r.SQL.Name, req.Context.SnapshotCache())
+		return id, rangeForResolution(req.Document.Text, r), ok, nil
 	}
 	return legacyRelationAt(req, position)
-}
-
-func contextualTargetOnly(req Request, resolution sqlsymbol.Resolution) (catalog.ObjectID, Range, bool, error) {
-	cache := req.Context.SnapshotCache()
-	var target catalog.ObjectID
-	var ok bool
-	if resolution.Role == sqlsymbol.Relation {
-		target, ok = resolveCatalogRelation(resolution.SQL.Name, cache)
-	} else {
-		target, ok = resolveCatalogColumn(*resolution.SQL, cache)
-	}
-	return target, rangeForResolution(req.Document.Text, resolution), ok, nil
 }
