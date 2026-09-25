@@ -299,3 +299,260 @@ func TestDiagnosticInvalidAssignmentSeverityIsError(t *testing.T) {
 	}
 	t.Fatal("expected an interbase-invalid-assignment finding")
 }
+
+// === codeLossyAssignment (Task 11): opt-in, default-off === //
+
+// lossyOn turns codeLossyAssignment on at its registry severity (warning),
+// the level every requireCodeCountWithOptions call below uses unless a test
+// is specifically about severity override.
+var lossyOn = DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "warning"}}
+
+// --- brief's required literal fixture: off by default, on when configured ---
+
+func TestDiagnosticLossyAssignmentOptIn(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(), codeLossyAssignment, 0)
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(),
+		DiagnosticOptions{Rules: map[string]string{"interbase-lossy-assignment": "warning"}}, codeLossyAssignment, 1)
+}
+
+// --- default-off must skip computation, not merely filter it: leaving
+// codeLossyAssignment unconfigured (its "default" is off) while every other
+// code the shared model group can produce is explicitly off must never even
+// call into the catalog for the assignment scan ---
+
+func TestDiagnosticsWithOptionsSkipsLossyAssignmentComputationByDefault(t *testing.T) {
+	text := "UPDATE T SET N = ID;"
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &callCountingCatalog{diagnosticFixtureCatalog: newDiagnosticFixtureCatalog()}
+	options := DiagnosticOptions{Rules: map[string]string{
+		codeStringTruncation:     "off",
+		codeSingletonSelect:      "off",
+		codeUnknownVariable:      "off",
+		codeDuplicateDeclaration: "off",
+		codeUnknownRelation:      "off",
+		codeUnknownColumn:        "off",
+		codeUnknownQualifier:     "off",
+		codeAmbiguousColumn:      "off",
+		codeTargetCount:          "off",
+		codeProcedureArity:       "off",
+		codeInvalidAssignment:    "off",
+		// codeLossyAssignment intentionally absent: its own default is off,
+		// so this whole shared-model group must be skipped exactly as if it
+		// had also been written "off" explicitly.
+	}}
+	got := a.DiagnosticsWithOptions(catalog, options)
+	if catalog.columnsCalls != 0 {
+		t.Errorf("Columns() called %d times, want 0 with every producible code off (including codeLossyAssignment's own default)", catalog.columnsCalls)
+	}
+	if len(got) != 0 {
+		t.Fatalf("findings = %+v, want none", got)
+	}
+}
+
+// An explicit "default" for codeLossyAssignment must behave identically to
+// leaving it unconfigured: both mean "this code's own default", which for
+// codeLossyAssignment is off.
+func TestDiagnosticLossyAssignmentExplicitDefaultLevelStaysOff(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(),
+		DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "default"}}, codeLossyAssignment, 0)
+}
+
+// --- explicit CAST suppresses this rule entirely at the edge's own span,
+// even when the CAST's own conversion is itself possible-loss or invalid --
+// codeInvalidAssignment's own castLocalFinding behavior must stay unaffected ---
+
+func TestDiagnosticLossyAssignmentExplicitCastSuppressesEvenWhenLossy(t *testing.T) {
+	withCast := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(100.5 AS INTEGER); END;"
+	requireCodeCountWithOptions(t, withCast, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+	// Task 10 unaffected: the CAST's own conversion is possible-loss, not
+	// invalid, so castLocalFinding still reports nothing for it either.
+	requireCodeCount(t, withCast, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+
+	withoutCast := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = 100.5; END;"
+	requireCodeCountWithOptions(t, withoutCast, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentSuppressedWhenCastIsInvalid(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(99999 AS SMALLINT); END;"
+	// Task 10 unaffected: the CAST's own conversion is still proven invalid.
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	// This rule's whole-cast suppression withholds it regardless of the
+	// CAST's own outcome -- it never even reaches lossyAssignmentVerdict.
+	requireCodeCountWithOptions(t, text, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- safe widening must never fire, exactly like codeInvalidAssignment ---
+
+func TestDiagnosticLossyAssignmentSafeWideningNeverFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X (A SMALLINT) AS DECLARE VARIABLE B INTEGER; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+	requireCodeCountWithOptions(t, "UPDATE T SET V = 100 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- a literal that only requires rounding to fit the destination's scale,
+// but still lands in range, is exactly this rule's own concern ---
+
+func TestDiagnosticLossyAssignmentLiteralRoundingWithinRangeFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = 1.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// --- a non-literal source whose storage range exceeds its destination's,
+// for some (not necessarily this) value, is this rule's other core case ---
+
+func TestDiagnosticLossyAssignmentNonLiteralStorageRangeNarrowingFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE B SMALLINT; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// --- one fixture per assignment context, mirroring codeInvalidAssignment's
+// own eight contexts ---
+
+func TestDiagnosticLossyAssignmentProcedureLocal(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE B SMALLINT; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentUpdateSet(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = V WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentInsertValues(t *testing.T) {
+	requireCodeCountWithOptions(t, "INSERT INTO T (ID, N) VALUES (1, 100.5);",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentInsertSelectCrossRelation(t *testing.T) {
+	requireCodeCountWithOptions(t, "INSERT INTO T (N) SELECT V FROM U;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentSelectInto(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE N SMALLINT; BEGIN SELECT V INTO :N FROM T; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentProcedureInputArgument(t *testing.T) {
+	requireCodeCountWithOptions(t, "EXECUTE PROCEDURE P(1.5, 2);",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// TestDiagnosticLossyAssignmentReturningValuesFires is the "live" case
+// procedureOutputLossyFindings' own doc comment describes: unlike
+// codeInvalidAssignment, this context can actually fire here, since
+// outcomePossibleLoss's storage-range/scale branch reads the procedure's
+// declared OUTPUT type, not any literal Value.
+func TestDiagnosticLossyAssignmentReturningValuesFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN EXECUTE PROCEDURE P(1, 2) RETURNING_VALUES :V; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentTriggerNewField(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 100.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	requireCodeCountWithOptions(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 100; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- incomplete domain metadata: withheld entirely, same as codeInvalidAssignment ---
+
+func TestDiagnosticLossyAssignmentUnknownDestinationTypeWithheld(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V UNKNOWN_DOMAIN; BEGIN V = 100.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- DDL invalidation withholds this rule too, the same guard
+// invalidAssignmentFinding already relies on ---
+
+func TestDiagnosticLossyAssignmentWithheldAfterDropCreateBeforeUpdate(t *testing.T) {
+	// Without the DDL-invalidation guard this would obviously fire: the
+	// freshly (re)declared N is SMALLINT, narrower than ID's INTEGER.
+	requireCodeCountWithOptions(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N SMALLINT); UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+func TestDiagnosticLossyAssignmentDDLInvalidationDoesNotOverSuppress(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	requireCodeCountWithOptions(t,
+		"ALTER TABLE U ALTER COLUMN V TYPE INTEGER; UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// --- severity: registry default is warning, overridable like any other code ---
+
+func TestDiagnosticLossyAssignmentSeverityDefaultIsWarning(t *testing.T) {
+	a, err := AnalyzeDiagnostics("UPDATE T SET N = ID;", interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := findByCode(a.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment)
+	if found == nil {
+		t.Fatal("missing interbase-lossy-assignment finding")
+	}
+	if found.Severity != 2 {
+		t.Fatalf("Severity = %d, want 2 (warning, the registry default)", found.Severity)
+	}
+}
+
+func TestDiagnosticLossyAssignmentSeverityOverrideError(t *testing.T) {
+	a, err := AnalyzeDiagnostics("UPDATE T SET N = ID;", interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "error"}}
+	found := findByCode(a.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), options), codeLossyAssignment)
+	if found == nil {
+		t.Fatal("missing interbase-lossy-assignment finding")
+	}
+	if found.Severity != 1 {
+		t.Fatalf("Severity = %d, want 1 (error, per rule override)", found.Severity)
+	}
+}
+
+// --- dialect threading: the exact same declared types must resolve to
+// different families under Dialect 1 vs Dialect 3, changing whether this
+// rule can even judge the edge at all (see parseDiagnosticType's own
+// dialect-sensitive NUMERIC precision thresholds) ---
+
+func TestDiagnosticLossyAssignmentDialectSensitiveNumericPrecision(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE A NUMERIC(12,2); DECLARE VARIABLE B NUMERIC(9,2); BEGIN B = A; END;"
+
+	// Dialect 3: both NUMERIC(12,2) and NUMERIC(9,2) are exact (BIGINT- and
+	// INTEGER-backed respectively), so the storage-range comparison applies
+	// and A's wider range exceeds B's for some values -- possible loss.
+	a3, err := AnalyzeDiagnostics(text, dialect3Variant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findByCode(a3.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found == nil {
+		t.Fatal("Dialect 3: expected an interbase-lossy-assignment finding")
+	}
+
+	// Dialect 1: NUMERIC(12,2) is approximate (DOUBLE PRECISION-backed)
+	// while NUMERIC(9,2) is still exact (INTEGER-backed) -- the families no
+	// longer match, so assignmentCompatibility returns outcomeUnknown, not
+	// outcomePossibleLoss, and this rule withholds entirely.
+	a1, err := AnalyzeDiagnostics(text, dialect1Variant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findByCode(a1.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found != nil {
+		t.Fatalf("Dialect 1: expected no interbase-lossy-assignment finding (family mismatch), got %+v", found)
+	}
+}

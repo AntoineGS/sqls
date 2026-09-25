@@ -16,6 +16,18 @@ import (
 // finding at all.
 const codeInvalidAssignment = "interbase-invalid-assignment"
 
+// codeLossyAssignment marks an assignment whose source is proven, by Task
+// 8's assignmentCompatibility, to be accepted by the engine but to narrow,
+// round, or truncate some (not necessarily this specific) value of the
+// source's own declared range or scale -- compatibilityOutcome ==
+// outcomePossibleLoss. Unlike every other code in diagnosticRegistry, this
+// one defaults to off (diagnosticDefaultOff): it fires across the exact
+// same eight assignment contexts as codeInvalidAssignment, but an explicit
+// CAST always suppresses it at the outer assignment boundary (the CAST
+// already states the narrowing is intentional; see lossyAssignmentFinding),
+// whereas codeInvalidAssignment's own inner-CAST check is unaffected.
+const codeLossyAssignment = "interbase-lossy-assignment"
+
 // assignmentFindings reports every proven-invalid assignment across six
 // contexts: the four assignmentEdges already shares with widthDiagnostics
 // (procedure locals, UPDATE ... SET, INSERT ... VALUES/SELECT, SELECT ...
@@ -182,6 +194,89 @@ func (m *diagnosticModel) invalidAssignmentVerdict(source expressionFact, destin
 	}
 }
 
+// lossyAssignmentVerdict is codeLossyAssignment's own counterpart to
+// invalidAssignmentVerdict, sharing the same destination-resolution and
+// message-building shape but checking compatibilityOutcome ==
+// outcomePossibleLoss instead.
+func (m *diagnosticModel) lossyAssignmentVerdict(source expressionFact, destinationType string, span Span, destinationLabel string) *Finding {
+	destination, ok := parseDiagnosticType(destinationType, m.analysis.Variant, m.catalog)
+	if !ok {
+		return nil
+	}
+	verdict := assignmentCompatibility(source, destination, m.analysis.Variant)
+	if verdict.Outcome != outcomePossibleLoss {
+		return nil
+	}
+	return &Finding{
+		Span:     span,
+		Code:     codeLossyAssignment,
+		Message:  fmt.Sprintf("%s: %s", destinationLabel, verdict.Reason),
+		Severity: 2,
+	}
+}
+
+// lossyAssignmentFinding is codeLossyAssignment's own counterpart to
+// invalidAssignmentFinding, sharing the same shape/DDL-invalidation guard,
+// but an edge whose whole source span is, as its outermost syntactic form,
+// an explicit CAST(<inner> AS <type>) is always suppressed here (unlike
+// invalidAssignmentFinding's castLocalFinding, which judges the CAST's own
+// conversion instead): the CAST already states the narrowing is
+// intentional, so this rule -- unlike codeInvalidAssignment, which still
+// proves the CAST itself invalid when it is -- has nothing further to warn
+// about at this edge.
+func (m *diagnosticModel) lossyAssignmentFinding(edge assignmentEdge) *Finding {
+	if len(edge.source) == 0 || !balancedExpression(edge.source) {
+		return nil
+	}
+	if edge.destination.relation.Key() != "" {
+		if m.Unsupported(edge.destination.relationAt) || m.DDLInvalidated(edge.destination.relationAt, edge.destination.relation) {
+			return nil
+		}
+	}
+	if _, _, ok := wholeCastExpression(edge.source); ok {
+		return nil
+	}
+	span := Span{Start: edge.source[0].Span.Start, End: edge.source[len(edge.source)-1].Span.End}
+	fact := m.expressionFact(span)
+	return m.lossyAssignmentVerdict(fact, edge.destination.typeName, span, edge.destination.label)
+}
+
+// lossyAssignmentFindings is codeLossyAssignment's own counterpart to
+// assignmentFindings, reusing the exact same edge sources across the same
+// eight assignment contexts, but judging each edge with
+// lossyAssignmentFinding/procedureOutputLossyFindings instead.
+func (m *diagnosticModel) lossyAssignmentFindings() []Finding {
+	if m == nil || m.analysis == nil || len(m.items) == 0 {
+		return nil
+	}
+	a := m.analysis
+	items := m.items
+	_, matching := sqlDepths(items)
+
+	var findings []Finding
+	for _, edge := range a.assignmentEdges(items, m.catalog) {
+		if f := m.lossyAssignmentFinding(edge); f != nil {
+			findings = append(findings, *f)
+		}
+	}
+	for _, edge := range m.procedureInputEdges(matching) {
+		if f := m.lossyAssignmentFinding(edge); f != nil {
+			findings = append(findings, *f)
+		}
+	}
+	findings = append(findings, m.procedureOutputLossyFindings(matching)...)
+	for _, trg := range discoverTriggers(a.Text, items) {
+		for _, edge := range m.triggerNewFieldEdges(trg, items) {
+			if f := m.lossyAssignmentFinding(edge); f != nil {
+				findings = append(findings, *f)
+			}
+		}
+	}
+
+	sort.SliceStable(findings, func(i, j int) bool { return findings[i].Span.Start < findings[j].Span.Start })
+	return findings
+}
+
 // procedureInputEdges pairs an EXECUTE PROCEDURE call's own supplied
 // argument expressions against name's known declared input types, mirroring
 // diagnostic_shape.go's executeProcedureFindings scan (EXECUTE is never a
@@ -244,9 +339,22 @@ func (m *diagnosticModel) procedureInputEdges(matching map[int]int) []assignment
 	return edges
 }
 
-// procedureOutputFindings judges an EXECUTE PROCEDURE call's own
-// RETURNING_VALUES targets. Unlike every other context, the direction here
-// is reversed: the procedure's declared OUTPUT column is the source (a
+// procedureOutputPair is one EXECUTE PROCEDURE ... RETURNING_VALUES target's
+// own pairing against its procedure's declared OUTPUT column, shared by
+// procedureOutputFindings (codeInvalidAssignment) and
+// procedureOutputLossyFindings (codeLossyAssignment) so the RETURNING_VALUES
+// discovery/pairing walk itself is parsed once, not once per rule.
+type procedureOutputPair struct {
+	source           expressionFact
+	destinationType  string
+	span             Span
+	destinationLabel string
+}
+
+// procedureOutputPairs walks every EXECUTE PROCEDURE call's own
+// RETURNING_VALUES targets, pairing each against its procedure's declared
+// OUTPUT column. Unlike every other context, the direction here is
+// reversed: the procedure's declared OUTPUT column is the source (a
 // type-only fact -- a called procedure's output has no literal value or
 // expression text of its own in this document to build an expressionFact
 // span from) and the RETURNING_VALUES local variable is the destination.
@@ -254,13 +362,13 @@ func (m *diagnosticModel) procedureInputEdges(matching map[int]int) []assignment
 // procedure's known output count, mirroring procedureInputEdges; ruling I4
 // (diagnostic_shape.go's executeReturningValuesFindings) withholds a single
 // parenthesized target group the same way here.
-func (m *diagnosticModel) procedureOutputFindings(matching map[int]int) []Finding {
+func (m *diagnosticModel) procedureOutputPairs(matching map[int]int) []procedureOutputPair {
 	if m.semantic == nil {
 		return nil
 	}
 	a := m.analysis
 	items := m.items
-	var findings []Finding
+	var pairs []procedureOutputPair
 	for i := 0; i < len(items); i++ {
 		if !isWord(items[i], "EXECUTE") || i+1 >= len(items) || !isWord(items[i+1], "PROCEDURE") {
 			continue
@@ -321,10 +429,42 @@ func (m *diagnosticModel) procedureOutputFindings(matching map[int]int) []Findin
 			if !ok {
 				continue
 			}
-			sourceFact := expressionFact{Type: sourceType}
-			if f := m.invalidAssignmentVerdict(sourceFact, resolution.Symbol.Type, resolution.Span, resolution.Symbol.Name.Text); f != nil {
-				findings = append(findings, *f)
-			}
+			pairs = append(pairs, procedureOutputPair{
+				source:           expressionFact{Type: sourceType},
+				destinationType:  resolution.Symbol.Type,
+				span:             resolution.Span,
+				destinationLabel: resolution.Symbol.Name.Text,
+			})
+		}
+	}
+	return pairs
+}
+
+// procedureOutputFindings judges every procedureOutputPairs pairing for
+// codeInvalidAssignment (outcomeDefinitelyInvalid).
+func (m *diagnosticModel) procedureOutputFindings(matching map[int]int) []Finding {
+	var findings []Finding
+	for _, pair := range m.procedureOutputPairs(matching) {
+		if f := m.invalidAssignmentVerdict(pair.source, pair.destinationType, pair.span, pair.destinationLabel); f != nil {
+			findings = append(findings, *f)
+		}
+	}
+	return findings
+}
+
+// procedureOutputLossyFindings judges every procedureOutputPairs pairing for
+// codeLossyAssignment (outcomePossibleLoss). Unlike codeInvalidAssignment's
+// own procedureOutputFindings, this is a live, exercisable case rather than
+// a structurally dead path: outcomePossibleLoss's storage-range/scale branch
+// (assignmentCompatibility, diagnostic_types.go lines ~593-622) reads
+// source.Type, not source.Value, so it can fire for this type-only fact --
+// for example a NUMERIC(9,2) procedure output paired against a narrower
+// SMALLINT RETURNING_VALUES local.
+func (m *diagnosticModel) procedureOutputLossyFindings(matching map[int]int) []Finding {
+	var findings []Finding
+	for _, pair := range m.procedureOutputPairs(matching) {
+		if f := m.lossyAssignmentVerdict(pair.source, pair.destinationType, pair.span, pair.destinationLabel); f != nil {
+			findings = append(findings, *f)
 		}
 	}
 	return findings

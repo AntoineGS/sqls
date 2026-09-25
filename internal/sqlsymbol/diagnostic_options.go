@@ -5,8 +5,10 @@ import "fmt"
 // diagnosticRegistry lists every finding code DiagnosticsWithOptions knows
 // how to configure, together with the severity it reports today when no
 // explicit level override applies -- copied from each rule's own Finding
-// literal, not invented here. No code is off by default: "off" is a level a
-// caller may choose, not a current default for any rule.
+// literal, not invented here. Every code here is on by default except those
+// listed in diagnosticDefaultOff (currently only codeLossyAssignment): "off"
+// is a level any code's caller may choose, but it is also the default level
+// for a default-off code even when no explicit entry names it.
 var diagnosticRegistry = map[string]int{
 	codeUnused:               4,
 	codeStringTruncation:     2,
@@ -21,6 +23,18 @@ var diagnosticRegistry = map[string]int{
 	codeTargetCount:          1,
 	codeProcedureArity:       1,
 	codeInvalidAssignment:    1,
+	codeLossyAssignment:      2,
+}
+
+// diagnosticDefaultOff lists every registered code whose default level (an
+// absent Rules entry, or an explicit "default" override) is "off" rather
+// than "on". codeLossyAssignment is, as of this task, the only such code:
+// every other registered code defaults to on. off() consults this set so a
+// default-off code stays off both when Rules has no entry for it at all and
+// when a caller explicitly writes "default" for it -- "default" always
+// means whatever this code's own default is, never a way to force it on.
+var diagnosticDefaultOff = map[string]bool{
+	codeLossyAssignment: true,
 }
 
 // diagnosticLevelSeverity maps every level that overrides a finding's
@@ -37,9 +51,11 @@ var diagnosticLevelSeverity = map[string]int{
 // to a level:
 //
 //   - "default" (or an absent entry): report at the registry's built-in
-//     severity for that code.
+//     severity for that code, unless the code is one of the few registered
+//     in diagnosticDefaultOff, whose "default" means off.
 //   - "off": never compute or report that code's findings.
-//   - "error"/"warning"/"information"/"hint": report at that severity.
+//   - "error"/"warning"/"information"/"hint": report at that severity,
+//     turning the code on even when its own default level is off.
 type DiagnosticOptions struct {
 	Rules map[string]string
 }
@@ -79,9 +95,18 @@ func (o DiagnosticOptions) level(code string) string {
 	return "default"
 }
 
-// off reports whether code is disabled entirely under o.
+// off reports whether code is disabled entirely under o: either because the
+// caller explicitly wrote "off", or because the caller wrote nothing (or
+// explicitly wrote "default") for a code whose own default level is off
+// (diagnosticDefaultOff). An explicit "error"/"warning"/"information"/"hint"
+// override always turns a default-off code on at that severity -- only
+// "off" and "default"/absent keep it off.
 func (o DiagnosticOptions) off(code string) bool {
-	return o.level(code) == "off"
+	level := o.level(code)
+	if level == "off" {
+		return true
+	}
+	return level == "default" && diagnosticDefaultOff[code]
 }
 
 // severity resolves the severity a produced finding for code must carry
@@ -152,7 +177,7 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 	}
 	if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
-		codeTargetCount, codeProcedureArity, codeInvalidAssignment) {
+		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment) {
 		m := a.diagnosticModel(c)
 		if options.anyOn(codeUnknownVariable, codeDuplicateDeclaration) {
 			findings = append(findings, applyDiagnosticOptions(m.localFindings(), options)...)
@@ -165,6 +190,9 @@ func (a *Analysis) DiagnosticsWithOptions(c Catalog, options DiagnosticOptions) 
 		}
 		if options.anyOn(codeInvalidAssignment) {
 			findings = append(findings, applyDiagnosticOptions(m.assignmentFindings(), options)...)
+		}
+		if options.anyOn(codeLossyAssignment) {
+			findings = append(findings, applyDiagnosticOptions(m.lossyAssignmentFindings(), options)...)
 		}
 	}
 	return findings

@@ -190,6 +190,81 @@ func TestDiagnosticsMetadataCategoryOrderingGatesUnknownColumnFinding(t *testing
 	}
 }
 
+// --- a local-type-only finding (Task 10's interbase-invalid-assignment on a
+// procedure local, which needs no catalog metadata at all: a DECLARE
+// VARIABLE's own type is known from the document text alone) must appear
+// immediately and survive metadata staying only partially loaded, unlike
+// interbase-unknown-column above ---
+
+func TestDiagnosticsInvalidAssignmentProcedureLocalSurvivesPartialMetadata(t *testing.T) {
+	const uri = "file:///invalid-assignment-partial-metadata.sql"
+	// V is used (assigned) but never read, so interbase-unused also fires
+	// alongside interbase-invalid-assignment -- both need no catalog lookup.
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = 99999; END;"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	tx.open(t, uri, text, 1)
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && hasDiagnosticCode(n.Diagnostics, "interbase-invalid-assignment")
+	})
+	if !hasDiagnosticCode(initial.Diagnostics, "interbase-invalid-assignment") {
+		t.Fatalf("initial diagnostics = %+v, want interbase-invalid-assignment before any metadata category is ready", initial.Diagnostics)
+	}
+
+	columnsGate := make(chan struct{})
+	var columnsGateClosed atomic.Bool
+	closeColumnsGate := func() {
+		if columnsGateClosed.CompareAndSwap(false, true) {
+			close(columnsGate)
+		}
+	}
+	t.Cleanup(closeColumnsGate)
+
+	plan := readinessPlanRepository{
+		DBRepository: &database.MockDBRepository{},
+		plan: database.MetadataPlan{Parallelism: 2, Jobs: []database.MetadataJob{
+			{Kind: database.MetadataRelations, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+				return database.MetadataPatch{Cache: &database.DBCache{SchemaTables: map[string][]string{}}}, nil
+			}},
+			{Kind: database.MetadataColumnsCurrent, Run: func(context.Context, *database.DBCache) (database.MetadataPatch, error) {
+				<-columnsGate
+				return database.MetadataPatch{Cache: &database.DBCache{}}, nil
+			}},
+		}},
+	}
+
+	tx.server.diagnosticsPublishMu.Lock()
+	tx.server.stateMu.Lock()
+	tx.server.connGeneration++
+	generation := tx.server.connGeneration
+	tx.server.metadata.Reset(uint64(generation))
+	tx.server.stateMu.Unlock()
+	tx.server.diagnosticsPublishMu.Unlock()
+	if _, err := tx.server.metadata.Start(tx.ctx, uint64(generation), plan); err != nil {
+		t.Fatalf("start metadata: %v", err)
+	}
+
+	// Columns are still gated (not ready) here, yet this finding needs no
+	// catalog lookup at all -- it must keep appearing, not disappear behind
+	// a "wait for metadata" fence that only interbase-unknown-column needs.
+	tx.server.republishOpenDiagnostics(tx.ctx)
+	stillFound := tx.client.next(t, uri, func(n diagnosticsNotification) bool {
+		return n.Version != nil && *n.Version == 1 && hasDiagnosticCode(n.Diagnostics, "interbase-invalid-assignment")
+	})
+	if !hasDiagnosticCode(stillFound.Diagnostics, "interbase-invalid-assignment") {
+		t.Fatalf("diagnostics while columns metadata is still gated = %+v, want interbase-invalid-assignment", stillFound.Diagnostics)
+	}
+	closeColumnsGate()
+}
+
+func hasDiagnosticCode(diagnostics []lsp.Diagnostic, code string) bool {
+	for _, d := range diagnostics {
+		if diagnosticCode(d) == code {
+			return true
+		}
+	}
+	return false
+}
+
 // --- a rule-policy change requeues open documents and changes published severity ---
 
 func TestDiagnosticsConfigChangeRequeuesAndChangesPublishedSeverity(t *testing.T) {

@@ -224,7 +224,7 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 		codeUnused, codeStringTruncation, codeSingletonSelect, codeNullComparison,
 		codeUnknownVariable, codeDuplicateDeclaration,
 		codeUnknownRelation, codeUnknownColumn, codeUnknownQualifier, codeAmbiguousColumn,
-		codeTargetCount, codeProcedureArity, codeInvalidAssignment,
+		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment,
 	}
 	for _, code := range codes {
 		if _, ok := diagnosticRegistry[code]; !ok {
