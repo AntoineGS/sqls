@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"unicode/utf16"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/sourcegraph/jsonrpc2"
@@ -22,8 +25,11 @@ type task5DefinitionSentinelRepository struct {
 	calls int
 }
 
-func (r *task5DefinitionSentinelRepository) ObjectDDL(context.Context, database.ObjectKind, string) (string, error) {
+func (r *task5DefinitionSentinelRepository) ObjectDDL(_ context.Context, kind database.ObjectKind, _ string) (string, error) {
 	r.calls++
+	if kind == database.ObjectKindTable {
+		return "CREATE TABLE DATABASEID (\n    DBID INTEGER\n)", nil
+	}
 	return "CREATE PROCEDURE MYPROC AS BEGIN END", nil
 }
 
@@ -367,6 +373,109 @@ func TestDefinitionDispatchStopsAmbiguousLocalBeforeCatalogFallback(t *testing.T
 	}
 	if task5DefinitionSentinel.calls != 0 {
 		t.Fatalf("catalog fallback called ObjectDDL %d times, want zero", task5DefinitionSentinel.calls)
+	}
+}
+
+func TestDefinitionNavigatesAmbiguousLocalToProvenColumn(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.Stop()
+	task5DefinitionSentinel.calls = 0
+	backend := installStubBackend(t)
+	backend.setProcedures([]*database.ProcedureDesc{{Name: "CATALOG_READY_SENTINEL"}})
+	backend.setDefinitionCatalog(map[string][]string{"WORLD": {"DATABASEID"}}, []*database.ColumnDesc{{
+		ColumnBase: database.ColumnBase{Schema: "WORLD", Table: "DATABASEID", Name: "DBID"}, Type: "INTEGER",
+	}})
+	tx.addWorkspaceConfig(t, stubInterBaseConnections("catalog"))
+	waitForCatalog(t, tx.server)
+	tx.server.snapshots = newTestSnapshotStore(t)
+	tx.server.stateMu.Lock()
+	tx.server.curDBCfg = &database.DBConfig{Driver: task5DefinitionSentinelDriver}
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.stateMu.Unlock()
+
+	text := "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID;\r\nDBID = :DBID;\r\nEND"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	queryPrefix := "SELECT /*😀*/ "
+	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 3, Character: len(utf16.Encode([]rune(queryPrefix)))},
+	}}
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].URI == testFileURI {
+		t.Fatalf("ambiguous local definition = %#v, want one catalog DDL column location", got)
+	}
+	if task5DefinitionSentinel.calls != 1 {
+		t.Fatalf("proven column invoked ObjectDDL %d times, want one", task5DefinitionSentinel.calls)
+	}
+	parsed, err := url.Parse(got[0].URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ddlText, err := os.ReadFile(parsed.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(ddlText), "\n")
+	if got[0].Range.Start.Line != got[0].Range.End.Line || got[0].Range.Start.Line < 0 || got[0].Range.Start.Line >= len(lines) {
+		t.Fatalf("definition range = %+v, want one valid DDL line", got[0].Range)
+	}
+	line := lines[got[0].Range.Start.Line]
+	if got[0].Range.Start.Character < 0 || got[0].Range.End.Character > len(line) || line[got[0].Range.Start.Character:got[0].Range.End.Character] != "DBID" {
+		t.Fatalf("definition range %+v selects %q, want exact DBID column span", got[0].Range, line[got[0].Range.Start.Character:got[0].Range.End.Character])
+	}
+	for _, character := range []int{0, len("DBID = "), len("DBID = ") + 1} {
+		params.Position = lsp.Position{Line: 4, Character: character}
+		got = nil
+		if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
+			t.Fatal(err)
+		}
+		if len(got) != 1 || got[0].URI != testFileURI || got[0].Range.Start != (lsp.Position{Line: 1, Character: len("DECLARE VARIABLE ")}) || got[0].Range.End != (lsp.Position{Line: 1, Character: len("DECLARE VARIABLE DBID")}) {
+			t.Fatalf("local cursor character %d resolved to %#v, want declaration on line 1", character, got)
+		}
+	}
+	if task5DefinitionSentinel.calls != 1 {
+		t.Fatalf("local definition invoked ObjectDDL; calls=%d want unchanged 1", task5DefinitionSentinel.calls)
+	}
+}
+
+func TestDefinitionDoesNotMaterializeAmbiguousLocalWithoutColumnProof(t *testing.T) {
+	tx := newTestContext()
+	tx.setup(t)
+	defer tx.tearDown()
+	defer tx.server.Stop()
+	task5DefinitionSentinel.calls = 0
+	backend := installStubBackend(t)
+	backend.setProcedures([]*database.ProcedureDesc{{Name: "CATALOG_READY_SENTINEL"}})
+	backend.setDefinitionCatalog(map[string][]string{"WORLD": {"DATABASEID"}}, []*database.ColumnDesc{{
+		ColumnBase: database.ColumnBase{Schema: "WORLD", Table: "DATABASEID", Name: "OTHER"}, Type: "INTEGER",
+	}})
+	tx.addWorkspaceConfig(t, stubInterBaseConnections("catalog"))
+	waitForCatalog(t, tx.server)
+	tx.server.snapshots = newTestSnapshotStore(t)
+	tx.server.stateMu.Lock()
+	tx.server.curDBCfg = &database.DBConfig{Driver: task5DefinitionSentinelDriver}
+	tx.server.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase}
+	tx.server.stateMu.Unlock()
+	text := "ALTER PROCEDURE P AS\nDECLARE VARIABLE DBID INTEGER;\nBEGIN\nSELECT DBID FROM DATABASEID;\nEND"
+	tx.textDocumentDidOpen(t, testFileURI, text)
+	params := lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Line: 3, Character: len("SELECT ")},
+	}}
+	var got lsp.Definition
+	if err := tx.conn.Call(tx.ctx, "textDocument/definition", params, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("unproven column returned definition %#v, want empty", got)
+	}
+	if task5DefinitionSentinel.calls != 0 {
+		t.Fatalf("unproven column called ObjectDDL %d times, want zero", task5DefinitionSentinel.calls)
 	}
 }
 

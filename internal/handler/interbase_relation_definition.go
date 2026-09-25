@@ -206,6 +206,10 @@ func (s *Server) interBaseRelationDefinitionWithSnapshot(ctx context.Context, re
 	if !ok {
 		return nil, nil
 	}
+	return s.materializeRelationTargetWithSnapshot(ctx, ddlRepo, repo, target, sc)
+}
+
+func (s *Server) materializeRelationTargetWithSnapshot(ctx context.Context, ddlRepo database.DDLRepository, repo database.DBRepository, target snapshotTarget, sc snapshotContext) (lsp.Definition, error) {
 	ddlCtx, cancel := context.WithTimeout(ctx, definitionDDLTimeout)
 	defer cancel()
 	ddl, ddlErr := ddlRepo.ObjectDDL(ddlCtx, target.kind, target.name)
@@ -228,6 +232,7 @@ func (s *Server) interBaseRelationDefinitionWithSnapshot(ctx context.Context, re
 		}
 	}
 	var span sqlsymbol.Span
+	var ok bool
 	if descriptionSpan != nil {
 		span = *descriptionSpan
 		ok = true
@@ -252,6 +257,49 @@ func (s *Server) interBaseRelationDefinitionWithSnapshot(ctx context.Context, re
 		return nil, nil
 	}
 	return []lsp.Location{{URI: snapshotURI(path), Range: rangeValue}}, nil
+}
+
+func provenDefinitionTarget(proof sqlsymbol.DefinitionColumn, cache *database.DBCache) (snapshotTarget, bool) {
+	if cache == nil || !cache.MetadataReady(database.MetadataViews) {
+		return snapshotTarget{}, false
+	}
+	target, ok := relationTarget(proof.Relation, cache)
+	if !ok {
+		return snapshotTarget{}, false
+	}
+	var columns []string
+	if target.kind == database.ObjectKindView {
+		view, exists := cache.View(target.name)
+		if !exists || view.Columns == nil {
+			return snapshotTarget{}, false
+		}
+		for _, column := range view.Columns {
+			if column != nil {
+				columns = append(columns, column.Name)
+			}
+		}
+	} else {
+		if !cache.ColumnsReady() {
+			return snapshotTarget{}, false
+		}
+		var complete bool
+		target, columns, complete = relationColumns(proof.Relation, cache)
+		if !complete {
+			return snapshotTarget{}, false
+		}
+	}
+	matches := 0
+	for _, column := range columns {
+		if proof.Column.MatchesCatalogName(column) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return snapshotTarget{}, false
+	}
+	column := proof.Column
+	target.column = &column
+	return target, true
 }
 
 func unsupportedTableDescription(ctx context.Context, repo database.DBRepository, target snapshotTarget) (body, note string, span *sqlsymbol.Span, ok bool) {

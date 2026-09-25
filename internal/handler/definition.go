@@ -55,6 +55,15 @@ func (s *Server) handleDefinition(ctx context.Context, conn *jsonrpc2.Conn, req 
 		return nil, err
 	}
 	if handled {
+		if len(local) == 0 && analysis != nil && snapshot.Repository != nil && s.snapshots != nil {
+			if ddlRepo, ok := snapshot.Repository.(database.DDLRepository); ok {
+				if proof, proven := analysis.ProvenDefinitionColumn(offset, snapshotDiagnosticCatalog(snapshot.Cache)); proven {
+					if target, ready := provenDefinitionTarget(proof, snapshot.Cache); ready {
+						return s.materializeRelationTargetWithSnapshot(ctx, ddlRepo, snapshot.Repository, target, snapshot.SourceContext)
+					}
+				}
+			}
+		}
 		return local, nil
 	}
 	var contextual bool

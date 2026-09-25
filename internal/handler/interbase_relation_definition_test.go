@@ -86,6 +86,44 @@ func TestResolveRelationTargetWaitsForViewsBeforeTableFallback(t *testing.T) {
 	}
 }
 
+func TestProvenDefinitionTargetRequiresCompleteMetadata(t *testing.T) {
+	proof := sqlsymbol.DefinitionColumn{Relation: sqlsymbol.Name{Text: "DATABASEID"}, Column: sqlsymbol.Name{Text: "DBID"}}
+	column := &database.ColumnDesc{ColumnBase: database.ColumnBase{Table: "DATABASEID", Name: "DBID"}}
+	base := func(viewState, columnState database.MetadataState, descriptors []*database.ColumnDesc) *database.DBCache {
+		return &database.DBCache{
+			SchemaTables:      map[string][]string{"": {"DATABASEID"}},
+			ColumnsWithParent: map[string][]*database.ColumnDesc{"\tDATABASEID": descriptors},
+			Metadata: map[database.MetadataKind]database.MetadataState{
+				database.MetadataViews: viewState, database.MetadataColumnsCurrent: columnState,
+			},
+		}
+	}
+	tests := []struct {
+		name  string
+		cache *database.DBCache
+		want  bool
+	}{
+		{name: "complete table", cache: base(database.MetadataReady, database.MetadataReady, []*database.ColumnDesc{column}), want: true},
+		{name: "loading with partial positive descriptor", cache: base(database.MetadataReady, database.MetadataLoading, []*database.ColumnDesc{column})},
+		{name: "failed with partial positive descriptor", cache: base(database.MetadataReady, database.MetadataFailed, []*database.ColumnDesc{column})},
+		{name: "missing column", cache: base(database.MetadataReady, database.MetadataReady, []*database.ColumnDesc{{ColumnBase: database.ColumnBase{Table: "DATABASEID", Name: "OTHER"}}})},
+		{name: "view category incomplete", cache: &database.DBCache{Catalog: &database.CatalogCache{Views: map[string]*database.ViewDesc{"V": {Name: "V", Columns: []*database.ColumnDesc{column}}}}, Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataLoading}}},
+		{name: "view columns incomplete", cache: &database.DBCache{Catalog: &database.CatalogCache{Views: map[string]*database.ViewDesc{"V": {Name: "V"}}}, Metadata: map[database.MetadataKind]database.MetadataState{database.MetadataViews: database.MetadataReady}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			candidate := proof
+			if strings.HasPrefix(tt.name, "view") {
+				candidate.Relation = sqlsymbol.Name{Text: "V"}
+			}
+			_, got := provenDefinitionTarget(candidate, tt.cache)
+			if got != tt.want {
+				t.Fatalf("provenDefinitionTarget = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestInterBaseRelationDefinitionWritesColumnSnapshotRange(t *testing.T) {
 	server := newDefinitionServer(t)
 	ddl := `CREATE TABLE "CUSTOMERINVOICE" ("AMOUNTPAID" NUMERIC(15,2) /* normalized legacy scaled DOUBLE */, "BALANCE" INTEGER, "INVOICE" INTEGER)`
