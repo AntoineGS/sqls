@@ -22,7 +22,7 @@ type navigationDetail struct {
 	unsupported bool
 }
 
-func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object catalog.ObjectID, position Position) (navigationDetail, bool, error) {
+func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object catalog.ObjectID, position Position, provenColumn *sqlsymbol.Name) (navigationDetail, bool, error) {
 	if req.Context.Details == nil {
 		return navigationDetail{}, false, nil
 	}
@@ -35,7 +35,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if detail.Object != object || detail.Text == "" {
 			return navigationDetail{}, false, nil
 		}
-		rng, hasRange := detailBodyRange(detail.Text, object, selectedNavigationColumn(req, object, position))
+		rng, hasRange := detailBodyRange(detail.Text, object, navigationColumn(req, object, position, provenColumn))
 		return navigationDetail{source: &Source{Object: detail.Object, Text: detail.Text, Provenance: detail.Provenance}, range_: rng, hasRange: hasRange, executable: true}, true, nil
 	}
 	if ctx.Err() != nil {
@@ -69,7 +69,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if description.Object != object || description.Description.Body == "" {
 			return navigationDetail{}, true, nil
 		}
-		span, ok := descriptionSpanFor(description.Description, object.Name, selectedNavigationColumn(req, object, position))
+		span, ok := descriptionSpanFor(description.Description, object.Name, navigationColumn(req, object, position, provenColumn))
 		if !ok {
 			return navigationDetail{}, true, nil
 		}
@@ -96,7 +96,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 	if source.Object != object || source.Text == "" {
 		return navigationDetail{unsupported: true}, true, nil
 	}
-	column := selectedNavigationColumn(req, object, position)
+	column := navigationColumn(req, object, position, provenColumn)
 	rng, hasRange := detailBodyRange(source.Text, object, column)
 	if !hasRange && column == nil && (object.Kind == catalog.ObjectKindView || object.Kind == catalog.ObjectKindProcedure || object.Kind == catalog.ObjectKindTrigger) && !ddlCreateTokenExists(source.Text) {
 		// Handler snapshotRange historically returned (0,0) when a native body
@@ -106,6 +106,14 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		rng, hasRange = Range{}, true
 	}
 	return navigationDetail{source: &Source{Object: source.Object, Text: source.Text, Provenance: source.Provenance, Note: unsupportedDDLNote(unsupportedErr)}, range_: rng, hasRange: hasRange, unsupported: true}, true, nil
+}
+
+func navigationColumn(req Request, object catalog.ObjectID, position Position, proven *sqlsymbol.Name) *sqlsymbol.Name {
+	if proven != nil {
+		column := *proven
+		return &column
+	}
+	return selectedNavigationColumn(req, object, position)
 }
 
 func unsupportedDDLNote(err error) string {
