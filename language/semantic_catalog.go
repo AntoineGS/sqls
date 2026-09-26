@@ -284,7 +284,12 @@ func (c snapshotSemanticCatalog) RelationInfo(name sqlsymbol.Name) (sqlsymbol.Re
 	if !namespaceReady(s, catalog.MetadataRelations, catalog.MetadataViews, catalog.MetadataProcedures) {
 		return sqlsymbol.RelationFact{}, sqlsymbol.Unknown
 	}
-	if _, proc := c.ProcedureInfo(name); proc != sqlsymbol.Missing {
+	if _, proc := c.ProcedureInfo(name); proc == sqlsymbol.Present {
+		// Selectable procedures can appear in relation positions even though
+		// they do not have table columns. Preserve their exact identity as a
+		// present relation instead of degrading a known object to Unknown.
+		return sqlsymbol.RelationFact{}, sqlsymbol.Present
+	} else if proc == sqlsymbol.Unknown {
 		return sqlsymbol.RelationFact{}, sqlsymbol.Unknown
 	}
 	return sqlsymbol.RelationFact{}, sqlsymbol.Missing

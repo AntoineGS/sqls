@@ -134,6 +134,24 @@ func TestPublicDiagnosticsKeepsOptionalRuleDefaultOff(t *testing.T) {
 			t.Fatalf("default-off lossy assignment emitted %+v", diagnostic)
 		}
 	}
+	request.Policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-lossy-assignment": "error"}}
+	enabled, err := language.NewService().Diagnostics(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Diagnostics() with explicit lossy-assignment policy error = %v", err)
+	}
+	found := false
+	for _, diagnostic := range enabled.Value {
+		if diagnostic.Code != "interbase-lossy-assignment" {
+			continue
+		}
+		if diagnostic.Severity != 1 {
+			t.Fatalf("explicitly enabled lossy-assignment severity=%d, want error severity 1", diagnostic.Severity)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatalf("explicit error policy did not enable interbase-lossy-assignment: %+v", enabled.Value)
+	}
 	if details.calls != 0 {
 		t.Fatalf("diagnostic request performed %d provider detail calls", details.calls)
 	}

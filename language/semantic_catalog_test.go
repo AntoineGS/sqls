@@ -21,22 +21,65 @@ func readySnapshot(states map[catalog.MetadataKind]catalog.MetadataState, cc *ca
 }
 
 func TestSemanticSnapshotRequiresCompleteCompositeRelationNamespace(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		states map[catalog.MetadataKind]catalog.MetadataState
-		want   sqlsymbol.Knowledge
-	}{
-		{"views pending", map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataLoading, catalog.MetadataProcedures: catalog.MetadataReady}, sqlsymbol.Unknown},
-		{"procedures failed", map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataFailed}, sqlsymbol.Unknown},
-		{"all namespaces complete and empty", map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady}, sqlsymbol.Missing},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, knowledge := (snapshotSemanticCatalog{snapshot: readySnapshot(tc.states, &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}, ProceduresByID: map[string]*catalog.ProcedureDesc{}})}).RelationInfo(sqlsymbol.Name{Text: "ABSENT"})
-			if knowledge != tc.want {
-				t.Fatalf("RelationInfo knowledge=%v want %v (fact %+v)", knowledge, tc.want, got)
+	for _, kind := range []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataViews, catalog.MetadataProcedures} {
+		for _, state := range []catalog.MetadataState{catalog.MetadataPending, catalog.MetadataLoading, catalog.MetadataFailed} {
+			t.Run(string(kind)+"/"+string(state), func(t *testing.T) {
+				states := map[catalog.MetadataKind]catalog.MetadataState{
+					catalog.MetadataRelations:  catalog.MetadataReady,
+					catalog.MetadataViews:      catalog.MetadataReady,
+					catalog.MetadataProcedures: catalog.MetadataReady,
+				}
+				states[kind] = state
+				view := snapshotSemanticCatalog{snapshot: readySnapshot(states, &catalog.CatalogCache{
+					ViewsByID: map[string]*catalog.ViewDesc{}, ProceduresByID: map[string]*catalog.ProcedureDesc{},
+				})}
+				if _, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "ABSENT"}); knowledge != sqlsymbol.Unknown {
+					t.Fatalf("incomplete %s namespace (%s) knowledge=%v, want Unknown", kind, state, knowledge)
+				}
+			})
+		}
+		t.Run(string(kind)+"/ready-empty with sibling namespaces pending", func(t *testing.T) {
+			states := map[catalog.MetadataKind]catalog.MetadataState{
+				catalog.MetadataRelations:  catalog.MetadataPending,
+				catalog.MetadataViews:      catalog.MetadataPending,
+				catalog.MetadataProcedures: catalog.MetadataPending,
+			}
+			states[kind] = catalog.MetadataReady
+			view := snapshotSemanticCatalog{snapshot: readySnapshot(states, &catalog.CatalogCache{
+				ViewsByID: map[string]*catalog.ViewDesc{}, ProceduresByID: map[string]*catalog.ProcedureDesc{},
+			})}
+			if _, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "ABSENT"}); knowledge != sqlsymbol.Unknown {
+				t.Fatalf("ready-empty %s namespace with pending siblings knowledge=%v, want Unknown", kind, knowledge)
 			}
 		})
 	}
+	t.Run("all namespaces ready-empty", func(t *testing.T) {
+		states := map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataRelations:  catalog.MetadataReady,
+			catalog.MetadataViews:      catalog.MetadataReady,
+			catalog.MetadataProcedures: catalog.MetadataReady,
+		}
+		view := snapshotSemanticCatalog{snapshot: readySnapshot(states, &catalog.CatalogCache{
+			ViewsByID: map[string]*catalog.ViewDesc{}, ProceduresByID: map[string]*catalog.ProcedureDesc{},
+		})}
+		if _, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "ABSENT"}); knowledge != sqlsymbol.Missing {
+			t.Fatalf("complete empty relation namespace knowledge=%v, want Missing", knowledge)
+		}
+	})
+	t.Run("known selectable procedure is a present relation", func(t *testing.T) {
+		procKey := catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "SEL_PROC"}.Key()
+		view := snapshotSemanticCatalog{snapshot: readySnapshot(map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataRelations:  catalog.MetadataReady,
+			catalog.MetadataViews:      catalog.MetadataReady,
+			catalog.MetadataProcedures: catalog.MetadataReady,
+		}, &catalog.CatalogCache{
+			ViewsByID:      map[string]*catalog.ViewDesc{},
+			ProceduresByID: map[string]*catalog.ProcedureDesc{procKey: {Name: "SEL_PROC"}},
+		})}
+		if fact, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "SEL_PROC"}); knowledge != sqlsymbol.Present {
+			t.Fatalf("known selectable procedure relation fact=%+v knowledge=%v, want Present", fact, knowledge)
+		}
+	})
 }
 
 func TestSemanticSnapshotQuotedAndFoldedIdentityStayDistinct(t *testing.T) {
