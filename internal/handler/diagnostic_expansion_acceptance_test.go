@@ -13,6 +13,7 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/metadata"
 )
 
 func TestDiagnosticsRejectOldResultAfterStatusOnlyRevision(t *testing.T) {
@@ -108,6 +109,113 @@ func TestDiagnosticsRejectOldResultAfterStatusOnlyRevision(t *testing.T) {
 		t.Fatalf("current readiness diagnostics = %+v, want one unknown-column finding", notification.Diagnostics)
 	}
 }
+
+func TestDiagnosticExpansionFailedColumnRefreshKeepsOnlyTextFinding(t *testing.T) {
+	const uri = "file:///diagnostic-column-refresh-failure.sql"
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	provider := &failedColumnRefreshProvider{}
+	key := metadata.Key{Engine: "interbase", URL: "fixture://failed-column-refresh"}
+	cfg := &database.DBConfig{
+		Driver: dialect.DatabaseDriverInterBase, DataSourceName: "fixture://failed-column-refresh", Dialect: 3,
+		InterBase: &database.InterBaseConfig{Role: "DIAGNOSTIC_ROLE"},
+	}
+	tx.server.openConnection = func(context.Context, *database.DBConfig) (*database.DBConnection, error) {
+		return &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}, nil
+	}
+	tx.server.stateMu.Lock()
+	tx.server.metadataFactoryOverride = func(*database.DBConfig) (metadata.Key, metadata.Scope, metadata.Factory, bool) {
+		return key, metadata.Scope{Principal: "diagnostic-user", Role: "DIAGNOSTIC_ROLE"}, func(context.Context) (metadata.Provider, error) {
+			return provider, nil
+		}, true
+	}
+	tx.server.stateMu.Unlock()
+	if err := awaitConnectionIntent(context.Background(), tx.server.coordinator.RequestExplicit(context.Background(), cfg, 0, "")); err != nil {
+		t.Fatalf("initial attach: %v", err)
+	}
+	waitCurrentMetadataSettledForTest(t, context.Background(), tx.server)
+	lease := currentLeaseForTest(tx.server)
+	if err := tx.clientConn.Call(tx.ctx, "textDocument/didOpen", lsp.DidOpenTextDocumentParams{TextDocument: lsp.TextDocumentItem{
+		URI: uri, LanguageID: "sql", Version: 1, Text: "SELECT MISSING_COL FROM T WHERE V = NULL;",
+	}}, nil); err != nil {
+		t.Fatalf("open document: %v", err)
+	}
+	initial := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if !hasDiagnosticCode(initial.Diagnostics, "interbase-unknown-column") || !hasDiagnosticCode(initial.Diagnostics, "interbase-null-comparison") {
+		t.Fatalf("initial ready-catalog findings = %+v, want unknown-column and null-comparison", initial.Diagnostics)
+	}
+	initialGeneration := lease.Snapshot().Generation
+	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
+		t.Fatal("send pre-refresh barrier:", err)
+	}
+	select {
+	case <-tx.client.barrier:
+	case <-time.After(time.Second):
+		t.Fatal("pre-refresh notification barrier timed out")
+	}
+	tx.server.stateMu.Lock()
+	tx.server.notificationConn = nil // Assert the final serialized publication explicitly below.
+	tx.server.stateMu.Unlock()
+	if err := awaitConnectionIntent(context.Background(), tx.server.coordinator.RequestExplicit(context.Background(), cfg, 0, "")); err != nil {
+		t.Fatalf("same-target refresh: %v", err)
+	}
+	waitCurrentMetadataSettledForTest(t, context.Background(), tx.server)
+	if currentLeaseForTest(tx.server) != lease {
+		t.Fatal("same-target refresh replaced the active registry lease")
+	}
+	refreshed := lease.Snapshot()
+	if refreshed.Generation <= initialGeneration || refreshed.Status[catalog.MetadataRelations].State != catalog.MetadataReady ||
+		refreshed.Status[catalog.MetadataViews].State != catalog.MetadataReady || refreshed.Status[catalog.MetadataProcedures].State != catalog.MetadataReady ||
+		refreshed.Status[catalog.MetadataColumnsCurrent].State != catalog.MetadataFailed {
+		t.Fatalf("refresh categories/generation = %d %+v; want ready namespaces, failed columns, generation > %d", refreshed.Generation, refreshed.Status, initialGeneration)
+	}
+	tx.server.publishDocumentDiagnostics(tx.ctx, tx.serverConn, uri)
+	final := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if len(final.Diagnostics) != 1 || diagnosticCode(final.Diagnostics[0]) != "interbase-null-comparison" {
+		t.Fatalf("final diagnostics after failed column refresh = %+v, want only independent text finding", final.Diagnostics)
+	}
+}
+
+func hasDiagnosticCode(diagnostics []lsp.Diagnostic, want string) bool {
+	for _, diagnostic := range diagnostics {
+		if diagnosticCode(diagnostic) == want {
+			return true
+		}
+	}
+	return false
+}
+
+type failedColumnRefreshProvider struct{ plans atomic.Int32 }
+
+func (p *failedColumnRefreshProvider) Plan() catalog.MetadataPlan {
+	refresh := p.plans.Add(1) > 1
+	return catalog.MetadataPlan{Parallelism: 3, Jobs: []catalog.MetadataJob{
+		{Kind: catalog.MetadataRelations, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			return catalog.MetadataPatch{Cache: &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}}}, nil
+		}},
+		{Kind: catalog.MetadataViews, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Views: map[string]*catalog.ViewDesc{}}}}, nil
+		}},
+		{Kind: catalog.MetadataProcedures, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Procedures: map[string]*catalog.ProcedureDesc{}}}}, nil
+		}},
+		{Kind: catalog.MetadataColumnsCurrent, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+			if refresh {
+				return catalog.MetadataPatch{}, errors.New("simulated columns refresh failure")
+			}
+			column := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Table: "T", Name: "ID"}, Type: "INTEGER", Null: "NO"}
+			return catalog.MetadataPatch{Cache: &catalog.Cache{
+				ColumnsByID:       map[string][]*catalog.ColumnDesc{catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key(): {column}},
+				ColumnsWithParent: map[string][]*catalog.ColumnDesc{catalog.ColumnDatabaseKey("", "T"): {column}},
+			}}, nil
+		}},
+	}}
+}
+
+func (*failedColumnRefreshProvider) DetailPlan(metadata.Request) (metadata.DetailPlan, error) {
+	return metadata.DetailPlan{}, metadata.ErrUnsupported
+}
+
+func (*failedColumnRefreshProvider) Close() error { return nil }
 
 func waitForStatusRevision(t *testing.T, lease interface {
 	Snapshot() *catalog.MetadataSnapshot
