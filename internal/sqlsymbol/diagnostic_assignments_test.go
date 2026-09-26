@@ -1,0 +1,609 @@
+package sqlsymbol
+
+import (
+	"strings"
+	"testing"
+)
+
+// --- brief's required literal fixtures: UPDATE, INSERT VALUES, procedure local ---
+
+func TestDiagnosticInvalidAssignmentUpdateOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+func TestDiagnosticInvalidAssignmentInsertValuesOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t, "INSERT INTO T (ID, N) VALUES (1, 99999);",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+func TestDiagnosticInvalidAssignmentProcedureLocalOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = 99999; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+// --- safe coercion must never fire ---
+
+func TestDiagnosticInvalidAssignmentSafeCoercionDoesNotFire(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X (A SMALLINT) AS DECLARE VARIABLE B INTEGER; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+	requireCodeCount(t, "UPDATE T SET V = 100 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- outcomePossibleLoss must never produce this code, anywhere ---
+
+func TestDiagnosticInvalidAssignmentPossibleLossNeverFires(t *testing.T) {
+	// INTEGER reference into a narrower SMALLINT destination is
+	// outcomePossibleLoss (Task 11's concern), never outcomeDefinitelyInvalid.
+	requireCodeCount(t,
+		"CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE B SMALLINT; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+	// A literal that only requires rounding to fit the destination's scale
+	// (but still lands in range) is outcomePossibleLoss, not invalid.
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = 1.5; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- explicit CAST: valid stays silent, a cast that is valid on its own
+// terms but overflows the OUTER destination fires once at the edge's own
+// span (not duplicated), and a cast that is invalid on its OWN terms fires
+// once at that same span with a CAST-local message, never evaluating the
+// outer destination at all ---
+
+func TestDiagnosticInvalidAssignmentExplicitCastValid(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(100 AS INTEGER); END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// TestDiagnosticInvalidAssignmentValidCastFlowsToOuterCheck proves a CAST
+// that is valid on its own terms (99999 fits INTEGER) still lets the outer
+// assignment's own check run and fire, when the outer destination (a
+// narrower SMALLINT local) cannot hold the CAST's resulting value -- and
+// that this still produces exactly one finding, at the edge's own full
+// source span, not a second one duplicated from the CAST itself.
+func TestDiagnosticInvalidAssignmentValidCastFlowsToOuterCheck(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = CAST(99999 AS INTEGER); END;"
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *Finding
+	for _, f := range a.Diagnostics(newDiagnosticFixtureCatalog()) {
+		if f.Code == codeInvalidAssignment {
+			f := f
+			found = &f
+		}
+	}
+	if found == nil {
+		t.Fatal("expected exactly one interbase-invalid-assignment finding")
+	}
+	wantSpan := markerSpan(t, text, "CAST(99999 AS INTEGER)", 0)
+	if found.Span != wantSpan {
+		t.Fatalf("Span = %+v, want the edge's own full source span %+v (never the inner CAST span alone, never the outer local write span)", found.Span, wantSpan)
+	}
+}
+
+// TestDiagnosticInvalidAssignmentInvalidCastReportedOnceAtCastSpan proves an
+// invalid CAST (99999 overflows the CAST's own declared SMALLINT type) is
+// reported once, at the edge's own span, with a message describing the
+// CAST's own failure -- even though the OUTER destination (a wider INTEGER
+// local, which would happily accept 99999) would otherwise stay silent.
+// The outer destination check must never even run for this edge: reporting
+// it too would be either evaluating a value the CAST never actually
+// produces at runtime, or a redundant duplicate of the same finding.
+func TestDiagnosticInvalidAssignmentInvalidCastReportedOnceAtCastSpan(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(99999 AS SMALLINT); END;"
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found *Finding
+	for _, f := range a.Diagnostics(newDiagnosticFixtureCatalog()) {
+		if f.Code == codeInvalidAssignment {
+			f := f
+			found = &f
+		}
+	}
+	if found == nil {
+		t.Fatal("expected exactly one interbase-invalid-assignment finding")
+	}
+	wantSpan := markerSpan(t, text, "CAST(99999 AS SMALLINT)", 0)
+	if found.Span != wantSpan {
+		t.Fatalf("Span = %+v, want the CAST's own span %+v, not the outer local write span", found.Span, wantSpan)
+	}
+	// The Reason cites the CAST's own declared range (SMALLINT's
+	// [-32768, 32767]), never the outer INTEGER destination's much wider
+	// range: a compatibility.Reason for an INTEGER destination would never
+	// mention 32767.
+	if !strings.Contains(found.Message, "32767") {
+		t.Fatalf("message %q does not describe the CAST's own SMALLINT range, not the outer INTEGER destination", found.Message)
+	}
+}
+
+// --- message must cite compatibility.Reason plus a destination label,
+// never interpolate the full source SQL text ---
+
+func TestDiagnosticInvalidAssignmentMessageOmitsFullSourceText(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = CAST(99999 AS INTEGER); END;"
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var message string
+	for _, f := range a.Diagnostics(newDiagnosticFixtureCatalog()) {
+		if f.Code == codeInvalidAssignment {
+			message = f.Message
+		}
+	}
+	if message == "" {
+		t.Fatal("expected an interbase-invalid-assignment finding with a message")
+	}
+	if !strings.Contains(message, "V") {
+		t.Fatalf("message %q does not identify destination label V", message)
+	}
+	if strings.Contains(message, "CAST(99999 AS INTEGER)") {
+		t.Fatalf("message %q must not interpolate the full source SQL text", message)
+	}
+}
+
+// --- unknown/undomained destination type: withheld entirely ---
+
+func TestDiagnosticInvalidAssignmentUnknownDestinationTypeWithheld(t *testing.T) {
+	// Local variable typed by a domain name absent from a complete domain
+	// namespace: parseDiagnosticType returns ok=false, so the edge is
+	// skipped entirely -- no finding, not even a guessed one.
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V UNKNOWN_DOMAIN; BEGIN V = 99999; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+
+	// A column whose rendered type is the catalog's own unrenderable
+	// "TYPE(n)" fallback: same withholding rule, reached through
+	// updateDestination/catalogColumnType instead of a local's own
+	// DECLARE VARIABLE type.
+	c := testCatalog{columns: map[string][]ColumnType{
+		"Z": {{Name: "COL", Type: "TYPE(23)"}, {Name: "ID", Type: "INTEGER"}},
+	}}
+	requireCodeCount(t, "UPDATE Z SET COL = 99999 WHERE ID = 1;", c, codeInvalidAssignment, 0)
+}
+
+// --- qualified UPDATE target ---
+
+func TestDiagnosticInvalidAssignmentQualifiedUpdateTarget(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET T.N = 99999 WHERE T.ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+// --- INSERT SELECT with source from a different relation than the target ---
+
+func TestDiagnosticInvalidAssignmentInsertSelectCrossRelation(t *testing.T) {
+	requireCodeCount(t, "INSERT INTO T (N) SELECT 100 FROM U;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+	requireCodeCount(t, "INSERT INTO T (N) SELECT 99999 FROM U;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+// --- SELECT ... INTO (InterBase's INTO-before-FROM singleton-select form,
+// the same order assignmentEdges' own selectIntoEdges recognizes) ---
+
+func TestDiagnosticInvalidAssignmentSelectIntoOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN SELECT 99999 INTO :V FROM T; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN SELECT 100 INTO :V FROM T; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- EXECUTE PROCEDURE input arguments ---
+
+func TestDiagnosticInvalidAssignmentProcedureInputOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t, "EXECUTE PROCEDURE P(2147483648, 1);",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCount(t, "EXECUTE PROCEDURE P(1, 2);",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- EXECUTE PROCEDURE ... RETURNING_VALUES output targets: wired, but
+// structurally unable to ever reach outcomeDefinitelyInvalid, since the
+// procedure's declared OUTPUT type is always a type-only expressionFact (no
+// Value) here -- assignmentCompatibility's literal-based invalid-range
+// branch is only reachable when source.Value != nil. A range-narrowing
+// RETURNING_VALUES pairing is therefore outcomePossibleLoss (or safe/
+// unknown), never outcomeDefinitelyInvalid, under current Task 8 semantics.
+func TestDiagnosticInvalidAssignmentReturningValuesNeverDefinitelyInvalid(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN EXECUTE PROCEDURE P(1, 2) RETURNING_VALUES :V; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- trigger NEW.<col> = <expr> write-position assignments ---
+
+func TestDiagnosticInvalidAssignmentTriggerNewFieldOutOfRangeLiteral(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 99999; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCount(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 100; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// OLD is always read-only: it is never a legal assignment target, so no
+// trigger-body scan should ever treat "OLD.<col> = <expr>" as an edge.
+func TestDiagnosticInvalidAssignmentTriggerOldNeverAnAssignmentTarget(t *testing.T) {
+	requireCodeCount(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE UPDATE AS BEGIN IF (OLD.N = 99999) THEN NEW.N = 1; END;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// --- stale-catalog withholding: a catalog-sourced destination (UPDATE/
+// INSERT's relation-column target) must never be judged against metadata an
+// earlier DDL statement in the same document has already invalidated ---
+
+func TestDiagnosticInvalidAssignmentWithheldAfterAlterTableRedefinesColumn(t *testing.T) {
+	// ALTER TABLE widens N to INTEGER; the pre-ALTER SMALLINT range must not
+	// be used to judge the later UPDATE against it.
+	requireCodeCount(t,
+		"ALTER TABLE T ALTER COLUMN N TYPE INTEGER; UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+func TestDiagnosticInvalidAssignmentWithheldAfterDropCreateBeforeInsert(t *testing.T) {
+	requireCodeCount(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N INTEGER); INSERT INTO T (ID, N) VALUES (1, 99999);",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+func TestDiagnosticInvalidAssignmentWithheldAfterDropCreateBeforeUpdate(t *testing.T) {
+	requireCodeCount(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N INTEGER); UPDATE T SET N = 99999;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+}
+
+// TestDiagnosticInvalidAssignmentDDLInvalidationDoesNotOverSuppress proves
+// the withholding above is scoped to the actual invalidated relation: DDL
+// against an unrelated table (U) must not suppress a genuine finding
+// against T, and an UPDATE with no preceding DDL at all must still fire
+// exactly as before.
+func TestDiagnosticInvalidAssignmentDDLInvalidationDoesNotOverSuppress(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCount(t,
+		"ALTER TABLE U ALTER COLUMN V TYPE INTEGER; UPDATE T SET N = 99999 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+}
+
+// --- severity ---
+
+func TestDiagnosticInvalidAssignmentSeverityIsError(t *testing.T) {
+	text := "UPDATE T SET N = 99999 WHERE ID = 1;"
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range a.Diagnostics(newDiagnosticFixtureCatalog()) {
+		if f.Code == codeInvalidAssignment {
+			if f.Severity != 1 {
+				t.Fatalf("Severity = %d, want 1 (Error)", f.Severity)
+			}
+			return
+		}
+	}
+	t.Fatal("expected an interbase-invalid-assignment finding")
+}
+
+// === codeLossyAssignment (Task 11): opt-in, default-off === //
+
+// lossyOn turns codeLossyAssignment on at its registry severity (warning),
+// the level every requireCodeCountWithOptions call below uses unless a test
+// is specifically about severity override.
+var lossyOn = DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "warning"}}
+
+// --- brief's required literal fixture: off by default, on when configured ---
+
+func TestDiagnosticLossyAssignmentOptIn(t *testing.T) {
+	requireCodeCount(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(), codeLossyAssignment, 0)
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(),
+		DiagnosticOptions{Rules: map[string]string{"interbase-lossy-assignment": "warning"}}, codeLossyAssignment, 1)
+}
+
+func TestLossyAssignmentWithholdsStaleCatalogWidthAfterDDL(t *testing.T) {
+	sql := "ALTER TABLE T ALTER COLUMN NAME TYPE VARCHAR(100); UPDATE T SET NAME = 'abcdefghijklmnop';"
+	requireCodeCount(t, sql, newDiagnosticFixtureCatalog(), codeStringTruncation, 0)
+}
+
+// --- default-off must skip computation, not merely filter it: leaving
+// codeLossyAssignment unconfigured (its "default" is off) while every other
+// code the shared model group can produce is explicitly off must never even
+// call into the catalog for the assignment scan ---
+
+func TestDiagnosticsWithOptionsSkipsLossyAssignmentComputationByDefault(t *testing.T) {
+	text := "UPDATE T SET N = ID;"
+	a, err := AnalyzeDiagnostics(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := &callCountingCatalog{diagnosticFixtureCatalog: newDiagnosticFixtureCatalog()}
+	options := DiagnosticOptions{Rules: map[string]string{
+		codeStringTruncation:     "off",
+		codeSingletonSelect:      "off",
+		codeUnknownVariable:      "off",
+		codeDuplicateDeclaration: "off",
+		codeUnknownRelation:      "off",
+		codeUnknownColumn:        "off",
+		codeUnknownQualifier:     "off",
+		codeAmbiguousColumn:      "off",
+		codeTargetCount:          "off",
+		codeProcedureArity:       "off",
+		codeInvalidAssignment:    "off",
+		// codeLossyAssignment intentionally absent: its own default is off,
+		// so this whole shared-model group must be skipped exactly as if it
+		// had also been written "off" explicitly.
+	}}
+	got := a.DiagnosticsWithOptions(catalog, options)
+	if catalog.columnsCalls != 0 {
+		t.Errorf("Columns() called %d times, want 0 with every producible code off (including codeLossyAssignment's own default)", catalog.columnsCalls)
+	}
+	if len(got) != 0 {
+		t.Fatalf("findings = %+v, want none", got)
+	}
+}
+
+// An explicit "default" for codeLossyAssignment must behave identically to
+// leaving it unconfigured: both mean "this code's own default", which for
+// codeLossyAssignment is off.
+func TestDiagnosticLossyAssignmentExplicitDefaultLevelStaysOff(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;", newDiagnosticFixtureCatalog(),
+		DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "default"}}, codeLossyAssignment, 0)
+}
+
+// --- a CAST source is judged like any other expression here, from
+// expressionFact's own CAST-produced type/value (Task 9) -- there is no
+// special-casing for a CAST source in this rule, unlike codeInvalidAssignment's
+// separate castLocalFinding, which is unaffected by any of this ---
+
+// TestDiagnosticLossyAssignmentCastNarrowingIntoUnrelatedDestinationFires
+// proves a CAST does NOT, by itself, excuse narrowing into a destination
+// its own declared type says nothing about: CAST(A AS INTEGER) converts A
+// to INTEGER, a type unrelated to (and wider than) the real destination V
+// (SMALLINT) -- this fires exactly like a bare "V = A" would.
+func TestDiagnosticLossyAssignmentCastNarrowingIntoUnrelatedDestinationFires(t *testing.T) {
+	text := "CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE V SMALLINT; BEGIN V = CAST(A AS INTEGER); END;"
+	requireCodeCountWithOptions(t, text, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	// Task 10 unaffected: the CAST's own conversion (A -> INTEGER) is safe
+	// on its own terms, and the resulting Value-less INTEGER fact against
+	// SMALLINT is possible-loss, not proven invalid -- castLocalFinding and
+	// invalidAssignmentVerdict both still report nothing here.
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 0)
+
+	bareText := "CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE V SMALLINT; BEGIN V = A; END;"
+	requireCodeCountWithOptions(t, bareText, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// TestDiagnosticLossyAssignmentCastOwnInvalidityDoesNotSuppressOuterCheck
+// proves this rule never special-cases a CAST source: even when the CAST's
+// own conversion is itself proven invalid (Task 10's own concern, judged
+// independently by castLocalFinding), this rule still evaluates the CAST's
+// produced fact -- Type SMALLINT, Value 99999 unclamped (Task 9's own
+// rounding-without-bounds-checking) -- against the real destination V
+// (INTEGER), where 99999 fits with no rounding at all: naturally safe, not
+// withheld by any suppression.
+func TestDiagnosticLossyAssignmentCastOwnInvalidityDoesNotSuppressOuterCheck(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = CAST(99999 AS SMALLINT); END;"
+	requireCodeCount(t, text, newDiagnosticFixtureCatalog(), codeInvalidAssignment, 1)
+	requireCodeCountWithOptions(t, text, newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- safe widening must never fire, exactly like codeInvalidAssignment ---
+
+func TestDiagnosticLossyAssignmentSafeWideningNeverFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X (A SMALLINT) AS DECLARE VARIABLE B INTEGER; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+	requireCodeCountWithOptions(t, "UPDATE T SET V = 100 WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- a literal that only requires rounding to fit the destination's scale,
+// but still lands in range, is exactly this rule's own concern ---
+
+func TestDiagnosticLossyAssignmentLiteralRoundingWithinRangeFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V INTEGER; BEGIN V = 1.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// TestDiagnosticLossyAssignmentInRangeLiteralIntoNarrowerDestinationIsSilent
+// proves narrowing alone is not enough: a literal that fits its narrower
+// destination's storage range exactly, with no rounding needed at its
+// scale, is genuinely safe -- distinct from TestDiagnosticLossyAssignmentSafeWideningNeverFires,
+// which never narrows at all.
+func TestDiagnosticLossyAssignmentInRangeLiteralIntoNarrowerDestinationIsSilent(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN V = 5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- one fixture per assignment context, mirroring codeInvalidAssignment's
+// own eight contexts ---
+
+func TestDiagnosticLossyAssignmentProcedureLocal(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X (A INTEGER) AS DECLARE VARIABLE B SMALLINT; BEGIN B = A; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentUpdateSet(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = V WHERE ID = 1;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentInsertValues(t *testing.T) {
+	requireCodeCountWithOptions(t, "INSERT INTO T (ID, N) VALUES (1, 100.5);",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentInsertSelectCrossRelation(t *testing.T) {
+	requireCodeCountWithOptions(t, "INSERT INTO T (N) SELECT V FROM U;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentSelectInto(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE N SMALLINT; BEGIN SELECT V INTO :N FROM T; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentProcedureInputArgument(t *testing.T) {
+	requireCodeCountWithOptions(t, "EXECUTE PROCEDURE P(1.5, 2);",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// TestDiagnosticLossyAssignmentReturningValuesFires is the "live" case
+// procedureOutputLossyFindings' own doc comment describes: unlike
+// codeInvalidAssignment, this context can actually fire here, since
+// outcomePossibleLoss's storage-range/scale branch reads the procedure's
+// declared OUTPUT type, not any literal Value.
+func TestDiagnosticLossyAssignmentReturningValuesFires(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V SMALLINT; BEGIN EXECUTE PROCEDURE P(1, 2) RETURNING_VALUES :V; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+func TestDiagnosticLossyAssignmentTriggerNewField(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 100.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	requireCodeCountWithOptions(t,
+		"CREATE TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN NEW.N = 100; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- incomplete domain metadata: withheld entirely, same as codeInvalidAssignment ---
+
+func TestDiagnosticLossyAssignmentUnknownDestinationTypeWithheld(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"CREATE PROCEDURE X AS DECLARE VARIABLE V UNKNOWN_DOMAIN; BEGIN V = 100.5; END;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// --- DDL invalidation withholds this rule too, the same guard
+// invalidAssignmentFinding already relies on ---
+
+// TestDiagnosticLossyAssignmentWithheldAfterAlterTableLiteralSource uses a
+// literal source (1.25), which resolves to a full expressionFact from the
+// document text alone regardless of any catalog/DDL state. The destination
+// (N) is always resolved from the external fixture catalog's own SMALLINT
+// declaration -- catalogColumnType never consults this document's own
+// ALTER/CREATE text -- so this ALTER has no effect on what type N would
+// otherwise be judged against; only staleCatalogDestination's own guard can
+// be responsible for withholding here. Without it, 1.25 against SMALLINT
+// (scale 0) rounds to 1, in range: an obvious possible-loss finding.
+func TestDiagnosticLossyAssignmentWithheldAfterAlterTableLiteralSource(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"ALTER TABLE T ALTER COLUMN N TYPE NUMERIC(9,2); UPDATE T SET N = 1.25;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+// TestDiagnosticLossyAssignmentWithheldAfterDropCreateBeforeUpdate keeps the
+// DROP/CREATE fixture from Task 10's own style, but a bare column source
+// ("ID") is not enough on its own to prove the destination-staleness guard
+// is doing the work: after DROP TABLE T, the source reference could also
+// fail to resolve for unrelated reasons. See the literal-sourced test above
+// for the guard's own isolated proof.
+func TestDiagnosticLossyAssignmentWithheldAfterDropCreateBeforeUpdate(t *testing.T) {
+	requireCodeCountWithOptions(t,
+		"DROP TABLE T; CREATE TABLE T (ID INTEGER, N SMALLINT); UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 0)
+}
+
+func TestDiagnosticLossyAssignmentDDLInvalidationDoesNotOverSuppress(t *testing.T) {
+	requireCodeCountWithOptions(t, "UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+	requireCodeCountWithOptions(t,
+		"ALTER TABLE U ALTER COLUMN V TYPE INTEGER; UPDATE T SET N = ID;",
+		newDiagnosticFixtureCatalog(), lossyOn, codeLossyAssignment, 1)
+}
+
+// --- severity: registry default is warning, overridable like any other code ---
+
+func TestDiagnosticLossyAssignmentSeverityDefaultIsWarning(t *testing.T) {
+	a, err := AnalyzeDiagnostics("UPDATE T SET N = ID;", interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := findByCode(a.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment)
+	if found == nil {
+		t.Fatal("missing interbase-lossy-assignment finding")
+	}
+	if found.Severity != 2 {
+		t.Fatalf("Severity = %d, want 2 (warning, the registry default)", found.Severity)
+	}
+}
+
+func TestDiagnosticLossyAssignmentSeverityOverrideError(t *testing.T) {
+	a, err := AnalyzeDiagnostics("UPDATE T SET N = ID;", interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "error"}}
+	found := findByCode(a.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), options), codeLossyAssignment)
+	if found == nil {
+		t.Fatal("missing interbase-lossy-assignment finding")
+	}
+	if found.Severity != 1 {
+		t.Fatalf("Severity = %d, want 1 (error, per rule override)", found.Severity)
+	}
+}
+
+// --- dialect threading: the exact same declared types must resolve to
+// different families under Dialect 1 vs Dialect 3, changing whether this
+// rule can even judge the edge at all (see parseDiagnosticType's own
+// dialect-sensitive NUMERIC precision thresholds) ---
+
+// TestDiagnosticLossyAssignmentDialectSensitiveNumericPrecision uses a
+// literal source (1.234), whose expressionFact carries only a bare Value at
+// familyUnknown (see TestDiagnosticExpressionDecimalLiteral) and is never
+// itself dialect-sensitive. Only the destination V's own declared type
+// (NUMERIC(12,2), precision 12 -- the 10-18 bucket where the two dialects
+// diverge, see numericStorageBackedRange) differs by dialect: this isolates
+// the dialect threading to this rule's own parseDiagnosticType(destinationType,
+// m.analysis.Variant, ...) call inside lossyAssignmentVerdict, unlike the
+// old version of this test where the difference came entirely from the
+// source expression's own identifier lookup.
+func TestDiagnosticLossyAssignmentDialectSensitiveNumericPrecision(t *testing.T) {
+	text := "CREATE PROCEDURE X AS DECLARE VARIABLE V NUMERIC(12,2); BEGIN V = 1.234; END;"
+
+	// Dialect 1: NUMERIC(12,2) at precision 12 is approximate (DOUBLE
+	// PRECISION-backed, no storage range at all), so assignmentCompatibility
+	// falls through to "destination type could not be determined" territory
+	// before ever reaching the literal-rounding branch -- outcomeUnknown,
+	// not outcomePossibleLoss.
+	a1, err := AnalyzeDiagnostics(text, dialect1Variant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findByCode(a1.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found != nil {
+		t.Fatalf("Dialect 1: expected no interbase-lossy-assignment finding (approximate destination), got %+v", found)
+	}
+
+	// Dialect 3: NUMERIC(12,2) at precision 12 is exact (BIGINT-backed), so
+	// the literal 1.234 is rounded to scale 2 (1.23) and compared against
+	// the destination's storage range -- rounding occurred, in range --
+	// outcomePossibleLoss.
+	a3, err := AnalyzeDiagnostics(text, dialect3Variant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found := findByCode(a3.DiagnosticsWithOptions(newDiagnosticFixtureCatalog(), lossyOn), codeLossyAssignment); found == nil {
+		t.Fatal("Dialect 3: expected an interbase-lossy-assignment finding")
+	}
+}

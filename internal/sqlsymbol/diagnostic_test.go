@@ -40,6 +40,7 @@ func TestDiagnosticUnused(t *testing.T) {
 			name:         "ambiguous same-name declarations",
 			text:         "CREATE PROCEDURE P AS DECLARE VARIABLE DUP VARCHAR(20); DECLARE VARIABLE DUP VARCHAR(30); BEGIN END",
 			declarations: []string{"DUP", "DUP"},
+			wantFindings: []Finding{{Code: codeDuplicateDeclaration, Message: "DUP is already declared in this procedure", Severity: 1}},
 		},
 		{
 			name:         "SQL occurrence is not proven local",
@@ -59,6 +60,9 @@ func TestDiagnosticUnused(t *testing.T) {
 			copy(want, tt.wantFindings)
 			for i := range want {
 				start := strings.Index(tt.text, tt.declarations[i])
+				if want[i].Code == codeDuplicateDeclaration {
+					start = strings.LastIndex(tt.text, tt.declarations[i])
+				}
 				if start < 0 {
 					t.Fatalf("declaration %q not found", tt.declarations[i])
 				}

@@ -28,6 +28,8 @@ type RelationRef struct {
 	Name             Name
 	Alias            *Name
 	AliasDeclaration Span
+	source           int // diagnostics-only relation occurrence identity when attached by diagnosticModel
+	sourceKnown      bool
 }
 
 // SQLReference identifies an identifier occurring in a SQL statement.
@@ -44,6 +46,10 @@ type Resolution struct {
 	InProcedure bool
 	Symbol      *Symbol
 	SQL         *SQLReference
+	// DefinitionColumnCandidate is a definition-only hint for an unprefixed
+	// SQL value reference that collides with exactly one local declaration.
+	// The symbol remains Ambiguous for rename, references, and diagnostics.
+	DefinitionColumnCandidate bool
 }
 
 type indexedResolution struct {
@@ -167,6 +173,11 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 		}
 		procIndex := a.procedureAt[i]
 		role, symbol, sqlRef, prefix, blocked := classifyName(a, items, i, name, a.contexts[i], procIndex)
+		definitionColumnCandidate := false
+		if role == Ambiguous && a.contexts[i].kind == contextSQL && !a.contexts[i].outputTarget {
+			candidate, duplicate := symbolFor(a, procIndex, name)
+			definitionColumnCandidate = candidate != nil && !duplicate
+		}
 		if role == Outside {
 			continue
 		}
@@ -174,11 +185,12 @@ func bindOccurrences(a *Analysis, items []lexeme) {
 			symbol.RenameBlocked = blocked
 		}
 		resolution := Resolution{
-			Role:        role,
-			Span:        item.Span,
-			InProcedure: procIndex >= 0,
-			Symbol:      symbol,
-			SQL:         sqlRef,
+			Role:                      role,
+			Span:                      item.Span,
+			InProcedure:               procIndex >= 0,
+			Symbol:                    symbol,
+			SQL:                       sqlRef,
+			DefinitionColumnCandidate: definitionColumnCandidate,
 		}
 		a.addResolution(resolution, prefix)
 		if role == Local && symbol != nil {
