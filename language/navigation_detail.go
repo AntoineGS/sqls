@@ -147,12 +147,14 @@ func selectedNavigationColumn(req Request, object catalog.ObjectID, position Pos
 func detailBodyRange(body string, object catalog.ObjectID, column *sqlsymbol.Name) (Range, bool) {
 	var span sqlsymbol.Span
 	var ok bool
-	if object.Kind == catalog.ObjectKindTable || object.Kind == catalog.ObjectKindView && column != nil {
+	if object.Kind == catalog.ObjectKindTable {
 		if column != nil {
-			span, ok = sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, *column)
+			span, ok = provenTableColumnDeclaration(body, object, *column)
 		} else {
 			span, ok = sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true})
 		}
+	} else if object.Kind == catalog.ObjectKindView && column != nil {
+		span, ok = sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, *column)
 	} else {
 		return ddlDeclarationNameRange(body, object)
 	}
@@ -160,6 +162,26 @@ func detailBodyRange(body string, object catalog.ObjectID, column *sqlsymbol.Nam
 		return Range{}, false
 	}
 	return byteSpanRange(body, span.Start, span.End)
+}
+
+func provenTableColumnDeclaration(body string, object catalog.ObjectID, column sqlsymbol.Name) (sqlsymbol.Span, bool) {
+	table, ok := sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true})
+	if !ok {
+		return sqlsymbol.Span{}, false
+	}
+	selected, ok := sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, column)
+	if !ok || selected.Start < table.End {
+		return sqlsymbol.Span{}, false
+	}
+	// ColumnDeclaration also supports explicit CREATE VIEW columns. A separate
+	// CREATE declaration between the matched TABLE name and selected column
+	// means the column did not come from that TABLE declaration.
+	for _, token := range declarationTokens(body) {
+		if declarationWord(token, "CREATE") && token.start > table.End && token.start < selected.Start {
+			return sqlsymbol.Span{}, false
+		}
+	}
+	return selected, true
 }
 
 func descriptionSpanFor(description catalog.TableDescription, table string, column *sqlsymbol.Name) (sqlsymbol.Span, bool) {

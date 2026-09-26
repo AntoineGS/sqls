@@ -13,7 +13,7 @@ import (
 	"github.com/sqls-server/sqls/metadata"
 )
 
-const ambiguousLocalColumnSQL = "ALTER PROCEDURE P AS\nDECLARE VARIABLE DBID INTEGER;\nBEGIN\nSELECT DBID FROM DATABASEID INTO :DBID;\nEND"
+const ambiguousLocalColumnSQL = "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID INTO :DBID;\r\nEND"
 
 func provenColumnRequest(text string, details language.DetailReader) language.Request {
 	cache := readyNavigationCache()
@@ -30,7 +30,7 @@ func provenColumnRequest(text string, details language.DetailReader) language.Re
 
 func provenColumnPosition(t *testing.T, text string) language.Position {
 	t.Helper()
-	pos, err := language.PositionAt(text, strings.Index(text, "SELECT DBID")+len("SELECT "))
+	pos, err := language.PositionAt(text, strings.Index(text, "DBID FROM"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,18 +95,83 @@ func TestProvenDefinitionNavigatesAmbiguousLocalToColumnDeclaration(t *testing.T
 					t.Fatalf("detail call %d = %#v, want %s for exact base table", i, details.calls[i], facet)
 				}
 			}
-			into := testPosition(ambiguousLocalColumnSQL, strings.Index(ambiguousLocalColumnSQL, ":DBID")+1)
-			local, err := language.NewService().Definition(context.Background(), req, into)
-			if err != nil {
-				t.Fatalf("INTO local Definition: %v", err)
-			}
-			if len(local.Value) != 1 || local.Value[0].URI != req.Document.URI || local.Value[0].Range.Start.Line != 1 {
-				t.Fatalf("INTO local Definition = %#v, want declaration of local DBID", local.Value)
-			}
-			if len(details.calls) != len(wantFacets) {
-				t.Fatalf("INTO local cursor loaded source details: %#v", details.calls)
+			colon := strings.Index(ambiguousLocalColumnSQL, ":DBID")
+			for _, offset := range []int{colon, colon + 1} {
+				into, err := language.PositionAt(ambiguousLocalColumnSQL, offset)
+				if err != nil {
+					t.Fatal(err)
+				}
+				local, err := language.NewService().Definition(context.Background(), req, into)
+				if err != nil {
+					t.Fatalf("INTO local Definition at byte %d: %v", offset, err)
+				}
+				if len(local.Value) != 1 || local.Value[0].URI != req.Document.URI || local.Value[0].Range.Start.Line != 1 {
+					t.Fatalf("INTO local Definition at byte %d = %#v, want declaration of local DBID", offset, local.Value)
+				}
+				if len(details.calls) != len(wantFacets) {
+					t.Fatalf("INTO local cursor loaded source details: %#v", details.calls)
+				}
 			}
 		})
+	}
+}
+
+func TestProvenTableColumnRejectsViewOrMixedDDLDeclarations(t *testing.T) {
+	for _, body := range []struct {
+		name string
+		text string
+	}{
+		{name: "view declaration only", text: "CREATE VIEW DATABASEID (DBID) AS SELECT 1 FROM RDB$DATABASE"},
+		{name: "table header and view column are different declarations", text: "CREATE TABLE DATABASEID (OTHER INTEGER); CREATE VIEW DATABASEID (DBID) AS SELECT 1 FROM RDB$DATABASE"},
+	} {
+		t.Run(body.name, func(t *testing.T) {
+			id := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "DATABASEID"}
+			details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{Object: id, Text: body.text, Provenance: "generated-ddl"}}}}
+			req := provenColumnRequest(ambiguousLocalColumnSQL, details)
+			result, err := language.NewService().Definition(context.Background(), req, provenColumnPosition(t, ambiguousLocalColumnSQL))
+			if err != nil {
+				t.Fatalf("Definition: %v", err)
+			}
+			if len(result.Value) != 0 {
+				t.Fatalf("mismatched table DDL returned location %#v, want no range", result.Value)
+			}
+			if len(details.calls) != 1 || details.calls[0].Facet != "ddl" {
+				t.Fatalf("detail calls = %#v, want only one DDL read", details.calls)
+			}
+		})
+	}
+}
+
+func TestDDLViewColumnNavigationRemainsSupported(t *testing.T) {
+	cache := readyNavigationCache()
+	viewColumn := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Table: "DUP", Name: "ID"}, Type: "INTEGER"}
+	cache.Catalog.Views["DUP"].Columns = []*catalog.ColumnDesc{viewColumn}
+	cache.Catalog.ViewsByID[(catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}).Key()].Columns = []*catalog.ColumnDesc{viewColumn}
+	cache.Catalog.RebuildObjects(strings.ToUpper)
+	body := "CREATE VIEW DUP (ID) AS SELECT 1 FROM RDB$DATABASE"
+	details := &facetDetails{results: map[string]detailResult{"ddl": {detail: metadata.Detail{
+		Object: catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "DUP"}, Text: body, Provenance: "interbase:view-ddl",
+	}}}}
+	req := navigationRequest("SELECT ID FROM DUP", cache)
+	req.Context.Details = details
+	result, err := language.NewService().Definition(context.Background(), req, testPosition(req.Document.Text, strings.Index(req.Document.Text, "ID")))
+	if err != nil {
+		t.Fatalf("Definition: %v", err)
+	}
+	if len(result.Value) != 1 || result.Value[0].Source == nil || result.Value[0].Source.Object.Kind != catalog.ObjectKindView {
+		t.Fatalf("view-column Definition = %#v, want one view source location", result.Value)
+	}
+	start := strings.Index(body, "ID")
+	wantStart, err := language.PositionAt(body, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantEnd, err := language.PositionAt(body, start+len("ID"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Value[0].Range != (language.Range{Start: wantStart, End: wantEnd}) {
+		t.Fatalf("view column range = %#v, want exact ID declaration", result.Value[0].Range)
 	}
 }
 

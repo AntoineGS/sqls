@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"github.com/sourcegraph/jsonrpc2"
 	"github.com/sqls-server/sqls/catalog"
@@ -69,20 +70,26 @@ func readyProvenNavigationLease(t *testing.T, s *Server, key string, provider *p
 	return lease
 }
 
+func provenDefinitionRequestParams(text string) json.RawMessage {
+	line := strings.Split(text, "\n")[3]
+	line = strings.TrimSuffix(line, "\r")
+	character := len(utf16.Encode([]rune(line[:strings.Index(line, "DBID FROM")])))
+	params, _ := json.Marshal(lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 3, Character: character},
+	}})
+	return json.RawMessage(params)
+}
+
 func TestDefinitionProvenColumnUsesLeaseDetailAndPublishesColumnRange(t *testing.T) {
 	s := newDefinitionServer(t)
 	provider := &provenNavigationProvider{}
 	lease := readyProvenNavigationLease(t, s, "proven-column", provider)
-	const text = "ALTER PROCEDURE P AS\nDECLARE VARIABLE DBID INTEGER;\nBEGIN\nSELECT DBID FROM DATABASEID INTO :DBID;\nEND"
+	const text = "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID INTO :DBID;\r\nEND"
 	s.files[testFileURI] = &File{Text: text, Version: 1, Revision: 1}
 	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, lease
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
-	character := strings.Index(strings.Split(text, "\n")[3], "DBID")
 	for attempt := 0; attempt < 2; attempt++ {
-		params, _ := json.Marshal(lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-			TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 3, Character: character},
-		}})
-		raw := json.RawMessage(params)
+		raw := provenDefinitionRequestParams(text)
 		value, err := s.handleDefinition(context.Background(), nil, &jsonrpc2.Request{Params: &raw})
 		if err != nil {
 			t.Fatalf("handleDefinition: %v", err)
@@ -112,15 +119,11 @@ func TestDefinitionProvenColumnCancellationWhileDetailBlockedPublishesNothing(t 
 	gate := provenDetailGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
 	provider := &provenNavigationProvider{gate: &gate}
 	lease := readyProvenNavigationLease(t, s, "proven-column-cancel", provider)
-	const text = "ALTER PROCEDURE P AS\nDECLARE VARIABLE DBID INTEGER;\nBEGIN\nSELECT DBID FROM DATABASEID INTO :DBID;\nEND"
+	const text = "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID INTO :DBID;\r\nEND"
 	s.files[testFileURI] = &File{Text: text, Version: 1, Revision: 1}
 	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, lease
 	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
-	line := strings.Split(text, "\n")[3]
-	params, _ := json.Marshal(lsp.DefinitionParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
-		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI}, Position: lsp.Position{Line: 3, Character: strings.Index(line, "DBID")},
-	}})
-	raw := json.RawMessage(params)
+	raw := provenDefinitionRequestParams(text)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	answer := make(chan struct {
@@ -147,5 +150,49 @@ func TestDefinitionProvenColumnCancellationWhileDetailBlockedPublishesNothing(t 
 	}
 	if !snapshotRootIsEmpty(t, s.snapshots) {
 		t.Fatal("canceled proven-column source was published")
+	}
+}
+
+func TestDefinitionProvenColumnBlockedOldBindingCannotPublish(t *testing.T) {
+	s := newDefinitionServer(t)
+	oldGate := provenDetailGate{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	oldProvider := &provenNavigationProvider{gate: &oldGate}
+	oldLease := readyProvenNavigationLease(t, s, "proven-column-old-binding", oldProvider)
+	newProvider := &provenNavigationProvider{}
+	newLease := readyProvenNavigationLease(t, s, "proven-column-new-binding", newProvider)
+	const text = "ALTER PROCEDURE P AS\r\nDECLARE VARIABLE DBID INTEGER;\r\nBEGIN\r\nSELECT /*😀*/ DBID FROM DATABASEID INTO :DBID;\r\nEND"
+	s.files[testFileURI] = &File{Text: text, Version: 1, Revision: 1}
+	s.stateMu.Lock()
+	s.connGeneration, s.metaBoundGeneration, s.metaLease = 1, 1, oldLease
+	s.dbConn = &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
+	s.stateMu.Unlock()
+	raw := provenDefinitionRequestParams(text)
+	answer := make(chan struct {
+		value interface{}
+		err   error
+	}, 1)
+	go func() {
+		value, err := s.handleDefinition(context.Background(), nil, &jsonrpc2.Request{Params: &raw})
+		answer <- struct {
+			value interface{}
+			err   error
+		}{value, err}
+	}()
+	select {
+	case <-oldGate.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old-binding proven definition did not enter lease detail load")
+	}
+	s.stateMu.Lock()
+	s.connGeneration, s.metaBoundGeneration, s.metaLease = 2, 2, newLease
+	s.stateMu.Unlock()
+	close(oldGate.release)
+	got := <-answer
+	locations, ok := got.value.([]lsp.Location)
+	if got.err != nil || !ok || len(locations) != 0 {
+		t.Fatalf("old-binding proven definition = (%#v, %v), want no result", got.value, got.err)
+	}
+	if !snapshotRootIsEmpty(t, s.snapshots) {
+		t.Fatal("old-binding proven-column source candidate was published")
 	}
 }
