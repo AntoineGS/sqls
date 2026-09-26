@@ -43,9 +43,10 @@ func TestSemanticSnapshotQuotedAndFoldedIdentityStayDistinct(t *testing.T) {
 	quoted := catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "Orders"}.Key()
 	upper := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key()
 	cache := &catalog.Cache{
-		Catalog:     &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{quoted: {Name: "Orders", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "CustomerId", Table: "Orders"}, Type: "INTEGER", Null: "NO"}}}}},
-		ColumnsByID: map[string][]*catalog.ColumnDesc{upper: {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "ORDERS"}, Type: "INTEGER", Null: "NO"}}},
-		Metadata:    map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataColumnsCurrent: catalog.MetadataReady, catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady},
+		Catalog:      &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{quoted: {Name: "Orders", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "CustomerId", Table: "Orders"}, Type: "INTEGER", Null: "NO"}}}}},
+		ColumnsByID:  map[string][]*catalog.ColumnDesc{upper: {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "ORDERS"}, Type: "INTEGER", Null: "NO"}}},
+		SchemaTables: map[string][]string{"": {"Orders", "ORDERS"}},
+		Metadata:     map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataColumnsCurrent: catalog.MetadataReady, catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady},
 	}
 	view := snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}
 	quotedFact, quotedKnowledge := view.RelationInfo(sqlsymbol.Name{Text: "Orders", Quoted: true})
@@ -55,8 +56,9 @@ func TestSemanticSnapshotQuotedAndFoldedIdentityStayDistinct(t *testing.T) {
 	if _, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "orders"}); knowledge != sqlsymbol.Present {
 		t.Fatalf("folded ORDERS knowledge=%v, want Present", knowledge)
 	}
-	if _, ok := view.Columns(sqlsymbol.Name{Text: "Orders", Quoted: true}); ok {
-		t.Fatal("quoted Orders borrowed ORDERS columns from folded identity")
+	quotedColumns, ok := view.Columns(sqlsymbol.Name{Text: "Orders", Quoted: true})
+	if !ok || len(quotedColumns) != 1 || quotedColumns[0].Name != "CustomerId" {
+		t.Fatalf("quoted view columns=%v ok=%v, want exact view columns", quotedColumns, ok)
 	}
 }
 
@@ -82,11 +84,22 @@ func TestSemanticSnapshotIncompleteViewOrColumnCategoryWithholdsFacts(t *testing
 		{"columns failed", map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady, catalog.MetadataColumnsCurrent: catalog.MetadataFailed}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cache := &catalog.Cache{Catalog: &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{viewID: {Name: "V", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "V"}}}}}}, Metadata: tc.states}
-			fact, knowledge := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).RelationInfo(sqlsymbol.Name{Text: "V"})
+			cache := &catalog.Cache{Catalog: &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}}, Metadata: tc.states}
+			name := sqlsymbol.Name{Text: "V"}
 			if tc.name == "views pending" {
-				if knowledge != sqlsymbol.Unknown {
-					t.Fatalf("pending view knowledge=%v", knowledge)
+				cache.Catalog.ViewsByID[viewID] = &catalog.ViewDesc{Name: "V", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "V"}}}}
+				cache.SchemaTables = map[string][]string{"": {"V"}}
+				cache.ColumnsByID = map[string][]*catalog.ColumnDesc{catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "V"}.Key(): {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "V"}}}}
+			} else {
+				cache.Catalog.ViewsByID = map[string]*catalog.ViewDesc{}
+				cache.SchemaTables = map[string][]string{"": {"T"}}
+				cache.ColumnsByID = map[string][]*catalog.ColumnDesc{catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key(): {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "T"}}}}
+				name = sqlsymbol.Name{Text: "T"}
+			}
+			fact, knowledge := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).RelationInfo(name)
+			if tc.name == "views pending" {
+				if knowledge != sqlsymbol.Present || fact.ColumnsKnown {
+					t.Fatalf("pending view kind provided table-only proof: fact=%+v knowledge=%v", fact, knowledge)
 				}
 				return
 			}
@@ -101,8 +114,10 @@ func TestSemanticSnapshotExactEmptyColumnsDoNotBorrowFoldedNeighbor(t *testing.T
 	exact := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "Orders"}.Key()
 	upper := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "ORDERS"}.Key()
 	cache := &catalog.Cache{
+		Catalog:           &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}},
 		ColumnsByID:       map[string][]*catalog.ColumnDesc{exact: {}, upper: {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "ORDERS"}, Type: "INTEGER"}}},
 		ColumnsWithParent: map[string][]*catalog.ColumnDesc{"\tORDERS": {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "ORDERS"}, Type: "INTEGER"}}},
+		SchemaTables:      map[string][]string{"": {"Orders", "ORDERS"}},
 		Metadata:          map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataColumnsCurrent: catalog.MetadataReady, catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady},
 	}
 	view := snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}
@@ -113,6 +128,191 @@ func TestSemanticSnapshotExactEmptyColumnsDoNotBorrowFoldedNeighbor(t *testing.T
 	fact, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "Orders", Quoted: true})
 	if knowledge != sqlsymbol.Present || !fact.ColumnsKnown || len(fact.Columns) != 0 {
 		t.Fatalf("quoted empty relation fact=%+v knowledge=%v", fact, knowledge)
+	}
+}
+
+func TestSemanticSnapshotViewKindPreventsTableColumnsByIDProof(t *testing.T) {
+	viewColumnsID := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "V"}.Key()
+	viewID := catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "V"}.Key()
+	for _, viewState := range []catalog.MetadataState{catalog.MetadataLoading, catalog.MetadataFailed} {
+		t.Run(string(viewState), func(t *testing.T) {
+			cache := &catalog.Cache{
+				SchemaTables: map[string][]string{"": {"V"}},
+				ColumnsByID: map[string][]*catalog.ColumnDesc{
+					viewColumnsID: {{ColumnBase: catalog.ColumnBase{Table: "V", Name: "VIEW_COL"}, Type: "INTEGER"}},
+				},
+				Catalog: &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{viewID: {Name: "V", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Table: "V", Name: "VIEW_COL"}, Type: "INTEGER"}}}}},
+				Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+					catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: viewState,
+					catalog.MetadataColumnsCurrent: catalog.MetadataReady,
+				},
+			}
+			fact, knowledge := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).RelationInfo(sqlsymbol.Name{Text: "V"})
+			if knowledge == sqlsymbol.Present && fact.ColumnsKnown {
+				t.Fatalf("view's table-kind ColumnsByID entry proved base-table columns: %+v", fact)
+			}
+			if knowledge == sqlsymbol.Missing {
+				t.Fatal("listed relation became Missing while view kind was unresolved")
+			}
+		})
+	}
+}
+
+func TestSemanticSnapshotQuotedRelationExistenceDoesNotRequireColumns(t *testing.T) {
+	cache := &catalog.Cache{
+		SchemaTables: map[string][]string{"": {"Orders"}},
+		Catalog:      &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}, ProceduresByID: map[string]*catalog.ProcedureDesc{}},
+		Metadata:     map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataProcedures: catalog.MetadataReady},
+	}
+	fact, knowledge := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).RelationInfo(sqlsymbol.Name{Text: "Orders", Quoted: true})
+	if knowledge != sqlsymbol.Present || fact.ColumnsKnown {
+		t.Fatalf("quoted listed relation without columns = %+v, %v; want Present with unknown columns", fact, knowledge)
+	}
+}
+
+func TestSemanticSnapshotQuotedLegacyDescriptorsRequireExactSpelling(t *testing.T) {
+	legacyView := &catalog.ViewDesc{Name: "Orders", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "ViewColumn", Table: "Orders"}, Type: "INTEGER"}}}
+	legacyProc := &catalog.ProcedureDesc{Name: "ProcCase", InputParameters: []*catalog.ProcedureParameterDesc{{Name: "P", Type: "INTEGER"}}}
+	legacyDomain := &catalog.DomainDesc{Name: "DomainCase", Type: "INTEGER", Nullable: sql.NullBool{Bool: false, Valid: true}}
+	cache := &catalog.Cache{
+		Catalog: &catalog.CatalogCache{
+			Views:      map[string]*catalog.ViewDesc{"ORDERS": legacyView},
+			Procedures: map[string]*catalog.ProcedureDesc{"PROCCASE": legacyProc},
+			Domains:    map[string]*catalog.DomainDesc{"DOMAINCASE": legacyDomain},
+		},
+		SchemaTables: map[string][]string{},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady,
+			catalog.MetadataProcedures: catalog.MetadataReady, catalog.MetadataDomains: catalog.MetadataReady,
+			catalog.MetadataColumnsCurrent: catalog.MetadataReady,
+		},
+	}
+	view := snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}
+	if fact, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "Orders", Quoted: true}); knowledge != sqlsymbol.Present || !fact.ColumnsKnown || fact.Columns[0].Name != "ViewColumn" {
+		t.Fatalf("quoted legacy view=%+v knowledge=%v", fact, knowledge)
+	}
+	if fact, knowledge := view.ProcedureInfo(sqlsymbol.Name{Text: "ProcCase", Quoted: true}); knowledge != sqlsymbol.Present || len(fact.Inputs) != 1 {
+		t.Fatalf("quoted legacy procedure=%+v knowledge=%v", fact, knowledge)
+	}
+	if fact, knowledge := view.DomainInfo(sqlsymbol.Name{Text: "DomainCase", Quoted: true}); knowledge != sqlsymbol.Present || fact.Type != "INTEGER" {
+		t.Fatalf("quoted legacy domain=%+v knowledge=%v", fact, knowledge)
+	}
+	if _, knowledge := view.ProcedureInfo(sqlsymbol.Name{Text: "ProcCaseX", Quoted: true}); knowledge != sqlsymbol.Missing {
+		t.Fatalf("complete category with no exact legacy name = %v, want Missing", knowledge)
+	}
+	if _, knowledge := view.ProcedureInfo(sqlsymbol.Name{Text: "PROCCASE", Quoted: true}); knowledge != sqlsymbol.Unknown {
+		t.Fatalf("colliding legacy procedure spelling = %v, want Unknown", knowledge)
+	}
+	if _, knowledge := view.DomainInfo(sqlsymbol.Name{Text: "DOMAINCASE", Quoted: true}); knowledge != sqlsymbol.Unknown {
+		t.Fatalf("colliding legacy domain spelling = %v, want Unknown", knowledge)
+	}
+	cache.Catalog.Views["ORDERS"] = &catalog.ViewDesc{Name: "ORDERS"}
+	if _, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "Orders", Quoted: true}); knowledge == sqlsymbol.Present {
+		t.Fatal("folded legacy neighbor falsely proved quoted view identity")
+	}
+}
+
+func TestSemanticSnapshotViewColumnsUseViewCategoryAlone(t *testing.T) {
+	viewID := catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "V"}.Key()
+	cache := &catalog.Cache{
+		Catalog:  &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{viewID: {Name: "V", Columns: []*catalog.ColumnDesc{{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "V"}, Type: "INTEGER"}}}}},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataColumnsCurrent: catalog.MetadataFailed},
+	}
+	fact, knowledge := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).RelationInfo(sqlsymbol.Name{Text: "V"})
+	if knowledge != sqlsymbol.Present || !fact.ColumnsKnown || len(fact.Columns) != 1 {
+		t.Fatalf("complete view descriptor blocked by unrelated table columns category: %+v %v", fact, knowledge)
+	}
+}
+
+func TestSemanticSnapshotQuotedLegacyIndexesAndNonUniqueUnknownActive(t *testing.T) {
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "Orders"}.Key()
+	nonUnique := &catalog.IndexDesc{Name: "NON_UNIQUE", RelationName: "Orders", Unique: sql.NullBool{Bool: false, Valid: true}}
+	unique := &catalog.IndexDesc{Name: "UNIQUE", RelationName: "Orders", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}}
+	cache := &catalog.Cache{
+		SchemaTables: map[string][]string{"": {"Orders"}},
+		ColumnsByID:  map[string][]*catalog.ColumnDesc{key: {{ColumnBase: catalog.ColumnBase{Table: "Orders", Name: "ID"}, Type: "INTEGER"}}},
+		Catalog: &catalog.CatalogCache{
+			Views:          map[string]*catalog.ViewDesc{},
+			Indexes:        map[string]*catalog.IndexDesc{"NON_UNIQUE": nonUnique, "UNIQUE": unique},
+			IndexesByTable: map[string][]*catalog.IndexDesc{"ORDERS": {nonUnique, unique}},
+			IndexesByID:    map[string]*catalog.IndexDesc{},
+		},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataViews: catalog.MetadataReady, catalog.MetadataIndexes: catalog.MetadataReady,
+			catalog.MetadataColumnsCurrent: catalog.MetadataReady, catalog.MetadataRelations: catalog.MetadataReady,
+		},
+	}
+	keys, known := (snapshotSemanticCatalog{snapshot: &catalog.MetadataSnapshot{Cache: cache}}).UniqueKeys(sqlsymbol.Name{Text: "Orders", Quoted: true})
+	if !known || len(keys) != 1 || len(keys[0]) != 1 || keys[0][0] != "ID" {
+		t.Fatalf("legacy quoted indexes yielded keys=%v known=%v; want [[ID]] despite unknown Active on non-unique index", keys, known)
+	}
+}
+
+func TestSemanticSnapshotColumnReadinessUsesSnapshotStatus(t *testing.T) {
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key()
+	cache := &catalog.Cache{
+		ColumnsByID:  map[string][]*catalog.ColumnDesc{key: {{ColumnBase: catalog.ColumnBase{Table: "T", Name: "ID"}, Type: "INTEGER"}}},
+		Catalog:      &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}},
+		SchemaTables: map[string][]string{"": {"T"}},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataColumnsCurrent: catalog.MetadataReady,
+			catalog.MetadataRelations:      catalog.MetadataReady,
+			catalog.MetadataViews:          catalog.MetadataReady,
+		},
+	}
+	snapshot := &catalog.MetadataSnapshot{Cache: cache, Status: map[catalog.MetadataKind]catalog.MetadataStatus{catalog.MetadataColumnsCurrent: {State: catalog.MetadataFailed}}}
+	if _, ok := (snapshotSemanticCatalog{snapshot: snapshot}).Columns(sqlsymbol.Name{Text: "T"}); ok {
+		t.Fatal("cached-ready columns overrode failed snapshot status")
+	}
+	cache.Metadata[catalog.MetadataColumnsCurrent] = catalog.MetadataFailed
+	snapshot.Status[catalog.MetadataColumnsCurrent] = catalog.MetadataStatus{State: catalog.MetadataFailed}
+	snapshot.Status[catalog.MetadataColumnsAll] = catalog.MetadataStatus{State: catalog.MetadataReady}
+	if _, ok := (snapshotSemanticCatalog{snapshot: snapshot}).Columns(sqlsymbol.Name{Text: "T"}); !ok {
+		t.Fatal("ready all-columns status did not satisfy column readiness")
+	}
+}
+
+func TestSemanticSnapshotUniqueKeysRequireCompleteInputs(t *testing.T) {
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key()
+	index := &catalog.IndexDesc{Name: "PK_T", RelationName: "T", Columns: []string{"ID"}, Unique: sql.NullBool{Bool: true, Valid: true}, Active: sql.NullBool{Bool: true, Valid: true}}
+	cache := &catalog.Cache{
+		SchemaTables: map[string][]string{"": {"T"}},
+		ColumnsByID:  map[string][]*catalog.ColumnDesc{key: {{ColumnBase: catalog.ColumnBase{Table: "T", Name: "ID"}, Type: "INTEGER"}}},
+		Catalog: &catalog.CatalogCache{
+			ViewsByID:      map[string]*catalog.ViewDesc{},
+			Indexes:        map[string]*catalog.IndexDesc{"PK_T": index},
+			IndexesByTable: map[string][]*catalog.IndexDesc{"T": {index}},
+		},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+			catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady,
+			catalog.MetadataColumnsCurrent: catalog.MetadataReady, catalog.MetadataIndexes: catalog.MetadataReady,
+		},
+	}
+	snapshot := &catalog.MetadataSnapshot{Cache: cache}
+	view := snapshotSemanticCatalog{snapshot: snapshot}
+	if _, known := view.UniqueKeys(sqlsymbol.Name{Text: "T"}); !known {
+		t.Fatal("complete table/view/column/index metadata did not prove key set")
+	}
+	snapshot.Status = map[catalog.MetadataKind]catalog.MetadataStatus{catalog.MetadataIndexes: {State: catalog.MetadataFailed}}
+	if _, known := view.UniqueKeys(sqlsymbol.Name{Text: "T"}); known {
+		t.Fatal("cache-ready index map overrode failed snapshot index status")
+	}
+	snapshot.Status = map[catalog.MetadataKind]catalog.MetadataStatus{catalog.MetadataColumnsCurrent: {State: catalog.MetadataLoading}}
+	if _, known := view.UniqueKeys(sqlsymbol.Name{Text: "T"}); known {
+		t.Fatal("cache-ready columns overrode loading snapshot column status")
+	}
+	snapshot.Status = nil
+	cache.Metadata[catalog.MetadataIndexes] = catalog.MetadataReady
+	cache.Catalog.Indexes = map[string]*catalog.IndexDesc{}
+	cache.Catalog.IndexesByTable = map[string][]*catalog.IndexDesc{}
+	keys, known := view.UniqueKeys(sqlsymbol.Name{Text: "T"})
+	if !known || len(keys) != 0 {
+		t.Fatalf("complete empty unique-key set=%v known=%v; want empty,true", keys, known)
+	}
+	cache.Metadata[catalog.MetadataColumnsCurrent] = catalog.MetadataFailed
+	cache.Metadata[catalog.MetadataColumnsAll] = catalog.MetadataReady
+	if _, known := view.UniqueKeys(sqlsymbol.Name{Text: "T"}); !known {
+		t.Fatal("ready all-columns category did not satisfy key metadata input")
 	}
 }
 

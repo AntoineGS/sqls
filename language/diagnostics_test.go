@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
@@ -136,4 +137,30 @@ func TestPublicDiagnosticsKeepsOptionalRuleDefaultOff(t *testing.T) {
 	if details.calls != 0 {
 		t.Fatalf("diagnostic request performed %d provider detail calls", details.calls)
 	}
+}
+
+func TestPublicDiagnosticsReportsTooManyProcedureArgumentsWhenMinimumIsUnknown(t *testing.T) {
+	procedureKey := catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "P"}.Key()
+	snapshot := &catalog.MetadataSnapshot{Cache: &catalog.Cache{
+		Catalog: &catalog.CatalogCache{ProceduresByID: map[string]*catalog.ProcedureDesc{
+			procedureKey: {Name: "P", InputParameters: []*catalog.ProcedureParameterDesc{{Name: "A", Type: "INTEGER"}, {Name: "B", Type: "INTEGER"}}},
+		}},
+		Metadata: map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataProcedures: catalog.MetadataReady},
+	}}
+	request := language.Request{
+		Document: language.Document{URI: "memory:arity", Text: "EXECUTE PROCEDURE P(1, 2, 3);"},
+		Context: language.Context{
+			Snapshot: snapshot, Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}, DialectResolved: true,
+		},
+	}
+	result, err := language.NewService().Diagnostics(context.Background(), request)
+	if err != nil {
+		t.Fatalf("Diagnostics() error = %v", err)
+	}
+	for _, diagnostic := range result.Value {
+		if diagnostic.Code == "interbase-procedure-arity" {
+			return
+		}
+	}
+	t.Fatalf("too-many-arguments finding missing; diagnostics=%+v", result.Value)
 }
