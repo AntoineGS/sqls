@@ -48,9 +48,21 @@ func TestLanguageParserBoundaryUsesUTF16Positions(t *testing.T) {
 		}
 	})
 
-	t.Run("signature active argument after CRLF", func(t *testing.T) {
+	t.Run("signature active argument before CRLF", func(t *testing.T) {
 		text := "execute procedure myproc('😀', 45,\r\n  6)"
 		position := language.Position{Line: 0, UTF16Column: len("execute procedure myproc('") + 2 + len("', 45")}
+		got, err := service.SignatureHelp(context.Background(), signatureRequest(signatureProcedureCache(), text), position)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Value.Signatures) != 1 || got.Value.ActiveParameter != 1 {
+			t.Fatalf("signature help = %+v, want one signature with active argument 1", got.Value)
+		}
+	})
+
+	t.Run("signature active argument on CRLF continuation line", func(t *testing.T) {
+		text := "execute procedure myproc('😀',\r\n  45)"
+		position := language.Position{Line: 1, UTF16Column: 4}
 		got, err := service.SignatureHelp(context.Background(), signatureRequest(signatureProcedureCache(), text), position)
 		if err != nil {
 			t.Fatal(err)
@@ -134,5 +146,20 @@ func TestFormatEditRangeUsesUTF16AcrossEmojiAndCRLF(t *testing.T) {
 	want := "select\n  '😀',\n  ID\nfrom\n  CITY\nwhere\n  ID = '😀'"
 	if formatted != want {
 		t.Fatalf("applied formatted edit = %q, want %q", formatted, want)
+	}
+}
+
+func TestDirectFormatterAcceptsLoneCRLineBreak(t *testing.T) {
+	text := "select x\rfrom t"
+	edits, err := formatter.FormatWithDriverVariant(text, lsp.DocumentFormattingParams{Options: lsp.FormattingOptions{TabSize: 2, InsertSpaces: true}}, &config.Config{LowercaseKeywords: true}, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3})
+	if err != nil {
+		t.Fatalf("FormatWithDriverVariant(%q): %v", text, err)
+	}
+	end, err := language.PositionAt(text, len(text))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(edits) != 1 || edits[0].Range.Start != (lsp.Position{Line: 0, Character: 0}) || edits[0].Range.End != (lsp.Position{Line: end.Line, Character: end.UTF16Column}) {
+		t.Fatalf("direct formatter edits = %#v, want full AST range ending at %+v", edits, end)
 	}
 }

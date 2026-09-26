@@ -74,18 +74,15 @@ func parserPositionToUTF16(text string, pos token.Pos) (lsp.Position, error) {
 	}
 	lineStart := 0
 	for line := 0; line < pos.Line; line++ {
-		i := strings.IndexByte(text[lineStart:], '\n')
-		if i < 0 {
+		delim, delimLen := nextLineBreak(text, lineStart)
+		if delim < 0 {
 			return lsp.Position{}, errors.New("invalid parser position")
 		}
-		lineStart += i + 1
+		lineStart = delim + delimLen
 	}
 	lineEnd := len(text)
-	if i := strings.IndexByte(text[lineStart:], '\n'); i >= 0 {
-		lineEnd = lineStart + i
-	}
-	if lineEnd > lineStart && text[lineEnd-1] == '\r' {
-		lineEnd--
+	if delim, _ := nextLineBreak(text, lineStart); delim >= 0 {
+		lineEnd = delim
 	}
 	codePointColumn := 0
 	utf16Column := 0
@@ -108,6 +105,23 @@ func parserPositionToUTF16(text string, pos token.Pos) (lsp.Position, error) {
 		return lsp.Position{}, errors.New("invalid parser position")
 	}
 	return lsp.Position{Line: pos.Line, Character: utf16Column}, nil
+}
+
+// nextLineBreak matches the lexer's supported line endings: LF, CRLF and a
+// lone CR. The delimiter is excluded from AST line columns.
+func nextLineBreak(text string, from int) (int, int) {
+	for i := from; i < len(text); i++ {
+		switch text[i] {
+		case '\n':
+			return i, 1
+		case '\r':
+			if i+1 < len(text) && text[i+1] == '\n' {
+				return i, 2
+			}
+			return i, 1
+		}
+	}
+	return -1, 0
 }
 
 type formatEnvironment struct {
