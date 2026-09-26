@@ -11,6 +11,7 @@ import (
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/language"
+	"github.com/sqls-server/sqls/metadata"
 )
 
 const publishDiagnosticsMethod = "textDocument/publishDiagnostics"
@@ -25,15 +26,21 @@ func isServerNotification(method string) bool {
 }
 
 type documentDiagnosticsSnapshot struct {
-	uri             string
-	text            string
-	version         int
-	revision        uint64
-	variant         dialect.DriverVariant
-	generation      int
-	cache           *database.DBCache
-	metadata        *database.MetadataSnapshot
-	dialectResolved bool
+	uri                 string
+	text                string
+	version             int
+	revision            uint64
+	variant             dialect.DriverVariant
+	generation          int
+	cache               *database.DBCache
+	metadata            *database.MetadataSnapshot
+	dialectResolved     bool
+	policy              language.DiagnosticPolicy
+	policyRevision      uint64
+	metadataLease       *metadata.Lease
+	metadataKey         metadata.Key
+	metadataIncarnation uint64
+	metadataGeneration  uint64
 }
 
 func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, bool) {
@@ -42,15 +49,21 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		return documentDiagnosticsSnapshot{}, false
 	}
 	return documentDiagnosticsSnapshot{
-		uri:             editor.URI,
-		text:            editor.Text,
-		version:         editor.Version,
-		revision:        editor.Revision,
-		generation:      editor.Generation,
-		variant:         editor.Variant,
-		cache:           editor.Cache,
-		metadata:        editor.Metadata,
-		dialectResolved: editor.DialectResolved,
+		uri:                 editor.URI,
+		text:                editor.Text,
+		version:             editor.Version,
+		revision:            editor.Revision,
+		generation:          editor.Generation,
+		variant:             editor.Variant,
+		cache:               editor.Cache,
+		metadata:            editor.Metadata,
+		dialectResolved:     editor.DialectResolved,
+		policy:              editor.DiagnosticPolicy,
+		policyRevision:      editor.PolicyRevision,
+		metadataLease:       editor.MetadataLease,
+		metadataKey:         editor.MetadataKey,
+		metadataIncarnation: editor.MetadataIncarnation,
+		metadataGeneration:  editor.MetadataGeneration,
 	}, true
 }
 
@@ -58,7 +71,7 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 	s.stateMu.RLock()
 	file, open := s.files[snapshot.uri]
 	current := open && file.Version == snapshot.version && file.Revision == snapshot.revision &&
-		s.connGeneration == snapshot.generation
+		s.connGeneration == snapshot.generation && s.policyRevision == snapshot.policyRevision
 	if s.dbConn == nil {
 		cfg := cloneConnectionConfig(s.curDBCfg)
 		if cfg == nil {
@@ -70,18 +83,32 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 		current = current && s.dbConn.DriverVariant() == snapshot.variant
 	}
 	lease, bound := s.metaLease, s.metaBoundGeneration
+	key, incarnation := s.metaKey, uint64(0)
+	if lease != nil {
+		incarnation = lease.Incarnation()
+	}
 	s.stateMu.RUnlock()
 	if !current {
 		return false
 	}
-	if lease == nil || snapshot.generation != bound {
+	if snapshot.generation != bound {
+		return false
+	}
+	if lease == nil {
+		// Before a connection has acquired a metadata lease, text-only
+		// diagnostics still have a coherent nil-catalog binding.
+		return snapshot.metadataLease == nil && snapshot.metadata == nil &&
+			snapshot.metadataKey == (metadata.Key{}) && snapshot.metadataIncarnation == 0 &&
+			snapshot.metadataGeneration == 0
+	}
+	if lease != snapshot.metadataLease || key != snapshot.metadataKey || incarnation != snapshot.metadataIncarnation {
 		// The active lease was rebound (a connection switch) since this
 		// diagnostic snapshot was captured: a late-arriving old-generation
 		// result must never publish against the new connection's state.
 		return false
 	}
 	meta := lease.Snapshot()
-	return meta != nil && meta.Cache == snapshot.cache
+	return meta != nil && meta.Cache == snapshot.cache && meta.Generation == snapshot.metadataGeneration
 }
 
 // configuredDriverVariant mirrors the pre-attachment parser selection used by
@@ -123,14 +150,14 @@ func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.
 }
 
 func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
-	req := language.Request{
-		Document: language.Document{URI: snapshot.uri, Text: snapshot.text, Version: int64(snapshot.version), Binding: uint64(snapshot.generation)},
-		Context: language.Context{
-			Snapshot:        snapshot.metadata,
-			Variant:         snapshot.variant,
-			DialectResolved: snapshot.dialectResolved,
-		},
-	}
+	editor := editorSnapshot{URI: snapshot.uri, Text: snapshot.text, Version: snapshot.version,
+		Revision: snapshot.revision, Generation: snapshot.generation, Variant: snapshot.variant,
+		DialectResolved: snapshot.dialectResolved, Metadata: snapshot.metadata,
+		MetadataKey:   snapshot.metadataKey,
+		MetadataLease: snapshot.metadataLease, MetadataIncarnation: snapshot.metadataIncarnation,
+		MetadataGeneration: snapshot.metadataGeneration, DiagnosticPolicy: snapshot.policy,
+		PolicyRevision: snapshot.policyRevision}
+	req := languageRequest(editor)
 	res, err := language.NewService().Diagnostics(ctx, req)
 	if err != nil {
 		// In-progress malformed SQL must not fail didOpen/didChange. A

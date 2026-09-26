@@ -1,0 +1,3 @@
+diagnostics:
+  rules:
+    interbase-null-comparison: fatal

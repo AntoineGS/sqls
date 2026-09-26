@@ -163,6 +163,13 @@ publication against their live state.
   values and the lease as `Context.Details` into that request. Do not use a
   package-global “current connection”; two editors bound to different targets
   must remain independently routable even when focus changes.
+- Capture the key, incarnation, snapshot, scope-specific detail reader and
+  editor binding from the **same authorized lease** under the host's binding
+  synchronization boundary. A same-URL rebind to another role/visibility scope
+  is a new binding even when both stores happen to report the same metadata
+  generation. Never combine a snapshot captured before rebind with details or
+  provenance read from the replacement lease; fence diagnostics and source
+  materialization against the binding again immediately before publication.
 - The sample provider has an empty metadata plan and unsupported detail by
   design. A production engine provider performs attachment and catalog reads
   only through host-selected adapters and the registry lifecycle. Merely
