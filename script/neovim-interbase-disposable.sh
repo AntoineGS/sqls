@@ -12,6 +12,11 @@ cid=''
 cleanup() {
   local rc=$?
   trap - EXIT
+  # docker may write its cidfile before `docker run --detach` returns (or times out).
+  if [[ -z "$cid" && -f "$root/container.cid" ]]; then
+    cid="$(cat -- "$root/container.cid")"
+  fi
+  if [[ ! "$cid" =~ ^[[:xdigit:]]{12,64}$ ]]; then cid=''; fi
   if [[ -n "$cid" ]]; then docker rm -f -- "$cid" >/dev/null 2>&1 || :; fi
   rm -rf -- "$root"
   exit "$rc"
@@ -21,7 +26,7 @@ trap cleanup EXIT
 printf '%s\n' 'IB_SYSDBA_USER=SYSDBA' 'IB_SYSDBA_PASSWORD=masterkey' \
   'IB_DATA_DIR=/var/lib/interbase/data' 'IB_BACKUP_DIR=/var/lib/interbase/backups' \
   'IB_LOG_DIR=/var/lib/interbase/logs' 'IB_BACKUP_DATABASES=' > "$root/server.env"
-cid="$(timeout 30s docker run --pull=never --detach --publish '127.0.0.1::3050' \
+cid="$(timeout 30s docker run --pull=never --detach --cidfile="$root/container.cid" --publish '127.0.0.1::3050' \
   --mount 'type=tmpfs,destination=/var/lib/interbase' --env-file "$root/server.env" "$IMAGE")"
 [[ "$cid" =~ ^[[:xdigit:]]{12,64}$ ]] || { echo 'Invalid disposable container ID.' >&2; exit 1; }
 port="$(docker port "$cid" 3050/tcp | sed 's/.*://')"

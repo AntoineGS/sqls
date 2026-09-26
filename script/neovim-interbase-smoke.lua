@@ -63,6 +63,7 @@ local function run()
     "native table DDL missing; snapshot body=" .. vim.inspect(body:sub(1, 650)))
   local query = request("workspace/executeCommand", { command = "executeQuery", arguments = { uri } })
   check(type(query) == "string" and query:find("B4_NATIVE_MARKER", 1, true) ~= nil
+      and query:find("SECOND_MARKER", 1, true) ~= nil
       and query:find("2 rows in set", 1, true) ~= nil,
     "native query did not return fixture rows: " .. vim.inspect(query))
   local plan = request("workspace/executeCommand", { command = "explainQuery", arguments = { uri } })
