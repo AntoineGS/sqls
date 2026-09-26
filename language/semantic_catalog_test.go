@@ -66,7 +66,7 @@ func TestSemanticSnapshotRequiresCompleteCompositeRelationNamespace(t *testing.T
 			t.Fatalf("complete empty relation namespace knowledge=%v, want Missing", knowledge)
 		}
 	})
-	t.Run("known selectable procedure is a present relation", func(t *testing.T) {
+	t.Run("known selectable procedure is not missing as a relation", func(t *testing.T) {
 		procKey := catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "SEL_PROC"}.Key()
 		view := snapshotSemanticCatalog{snapshot: readySnapshot(map[catalog.MetadataKind]catalog.MetadataState{
 			catalog.MetadataRelations:  catalog.MetadataReady,
@@ -76,8 +76,8 @@ func TestSemanticSnapshotRequiresCompleteCompositeRelationNamespace(t *testing.T
 			ViewsByID:      map[string]*catalog.ViewDesc{},
 			ProceduresByID: map[string]*catalog.ProcedureDesc{procKey: {Name: "SEL_PROC"}},
 		})}
-		if fact, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "SEL_PROC"}); knowledge != sqlsymbol.Present {
-			t.Fatalf("known selectable procedure relation fact=%+v knowledge=%v, want Present", fact, knowledge)
+		if fact, knowledge := view.RelationInfo(sqlsymbol.Name{Text: "SEL_PROC"}); knowledge != sqlsymbol.Unknown {
+			t.Fatalf("known selectable procedure relation fact=%+v knowledge=%v, want Unknown (not Missing)", fact, knowledge)
 		}
 	})
 }
