@@ -192,7 +192,15 @@ func (s *Service) hoverCached(ctx context.Context, req Request, position Positio
 	}
 
 	text := req.Document.Text
-	pos := token.Pos{Line: position.Line, Col: position.UTF16Column + 1}
+	offset, err := ByteOffset(text, position)
+	if err != nil {
+		return Result[Hover]{}, err
+	}
+	parserPos, err := parserPositionAt(text, offset)
+	if err != nil {
+		return Result[Hover]{}, err
+	}
+	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column + 1}
 	parsed, err := parser.ParseWithDriverVariant(text, req.Context.Variant)
 	if err != nil {
 		return Result[Hover]{}, err
@@ -244,11 +252,19 @@ func (s *Service) hoverCached(ctx context.Context, req Request, position Positio
 	if ident == nil && memIdent != nil {
 		posIdent = memIdent
 	}
+	start, err := parserPositionToUTF16(text, posIdent.Pos())
+	if err != nil {
+		return Result[Hover]{}, err
+	}
+	end, err := parserPositionToUTF16(text, posIdent.End())
+	if err != nil {
+		return Result[Hover]{}, err
+	}
 	res := Hover{
 		Markdown: hoverContent,
 		Range: &Range{
-			Start: Position{Line: posIdent.Pos().Line, UTF16Column: posIdent.Pos().Col},
-			End:   Position{Line: posIdent.End().Line, UTF16Column: posIdent.End().Col},
+			Start: start,
+			End:   end,
 		},
 	}
 	return Result[Hover]{Value: res, Stamp: stampFor(req)}, nil

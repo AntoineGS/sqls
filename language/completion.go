@@ -125,12 +125,20 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 	eng := &completionEngine{cache: cache, driver: req.Context.Variant.Driver, variant: req.Context.Variant.Variant}
 
 	text := req.Document.Text
+	offset, err := ByteOffset(text, position)
+	if err != nil {
+		return Result[CompletionList]{}, err
+	}
 	parsed, err := parser.ParseWithDriverVariant(text, eng.driverVariant())
 	if err != nil {
 		return Result[CompletionList]{}, err
 	}
 
-	pos := token.Pos{Line: position.Line, Col: position.UTF16Column}
+	parserPos, err := parserPositionAt(text, offset)
+	if err != nil {
+		return Result[CompletionList]{}, err
+	}
+	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column}
 
 	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
 	completionCtx := getCompletionTypes(nodeWalker)

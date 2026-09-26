@@ -3,6 +3,7 @@ package formatter
 import (
 	"errors"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
@@ -36,13 +37,13 @@ func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *co
 		return nil, err
 	}
 
-	st := lsp.Position{
-		Line:      parsed.Pos().Line,
-		Character: parsed.Pos().Col,
+	st, err := parserPositionToUTF16(text, parsed.Pos())
+	if err != nil {
+		return nil, err
 	}
-	en := lsp.Position{
-		Line:      parsed.End().Line,
-		Character: parsed.End().Col,
+	en, err := parserPositionToUTF16(text, parsed.End())
+	if err != nil {
+		return nil, err
 	}
 	env := &formatEnvironment{
 		options: params.Options,
@@ -62,6 +63,51 @@ func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *co
 		},
 	}
 	return res, nil
+}
+
+// parserPositionToUTF16 converts an AST's rune-based position into the UTF-16
+// code-unit coordinates required by LSP. It is used here so direct formatter
+// callers receive the same edit range as callers through language.Service.
+func parserPositionToUTF16(text string, pos token.Pos) (lsp.Position, error) {
+	if pos.Line < 0 || pos.Col < 0 {
+		return lsp.Position{}, errors.New("invalid parser position")
+	}
+	lineStart := 0
+	for line := 0; line < pos.Line; line++ {
+		i := strings.IndexByte(text[lineStart:], '\n')
+		if i < 0 {
+			return lsp.Position{}, errors.New("invalid parser position")
+		}
+		lineStart += i + 1
+	}
+	lineEnd := len(text)
+	if i := strings.IndexByte(text[lineStart:], '\n'); i >= 0 {
+		lineEnd = lineStart + i
+	}
+	if lineEnd > lineStart && text[lineEnd-1] == '\r' {
+		lineEnd--
+	}
+	codePointColumn := 0
+	utf16Column := 0
+	for offset := lineStart; offset < lineEnd; {
+		if codePointColumn == pos.Col {
+			break
+		}
+		r, size := utf8.DecodeRuneInString(text[offset:lineEnd])
+		if r == utf8.RuneError && size == 1 {
+			return lsp.Position{}, errors.New("invalid UTF-8 in parser source")
+		}
+		codePointColumn++
+		utf16Column++
+		if r > 0xFFFF {
+			utf16Column++
+		}
+		offset += size
+	}
+	if pos.Col > codePointColumn {
+		return lsp.Position{}, errors.New("invalid parser position")
+	}
+	return lsp.Position{Line: pos.Line, Character: utf16Column}, nil
 }
 
 type formatEnvironment struct {

@@ -28,12 +28,20 @@ func (s *Service) SignatureHelp(ctx context.Context, req Request, position Posit
 	}
 
 	text := req.Document.Text
+	offset, err := ByteOffset(text, position)
+	if err != nil {
+		return Result[SignatureHelp]{}, err
+	}
 	parsed, err := parser.ParseWithDriverVariant(text, req.Context.Variant)
 	if err != nil {
 		return Result[SignatureHelp]{}, err
 	}
 
-	pos := token.Pos{Line: position.Line, Col: position.UTF16Column}
+	parserPos, err := parserPositionAt(text, offset)
+	if err != nil {
+		return Result[SignatureHelp]{}, err
+	}
+	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column}
 	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
 	types := getSignatureHelpTypes(nodeWalker)
 

@@ -549,11 +549,19 @@ func astRange(text string, node ast.Node) (Range, error) {
 }
 
 func legacyRelationAt(req Request, position Position) (catalog.ObjectID, Range, bool, error) {
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return catalog.ObjectID{}, Range{}, false, err
+	}
 	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return catalog.ObjectID{}, Range{}, false, err
 	}
-	pos := token.Pos{Line: position.Line, Col: position.UTF16Column + 1}
+	parserPos, err := parserPositionAt(req.Document.Text, offset)
+	if err != nil {
+		return catalog.ObjectID{}, Range{}, false, err
+	}
+	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column + 1}
 	nw := parseutil.NewNodeWalker(parsed, pos)
 	m := astutil.NodeMatcher{NodeTypes: []ast.NodeType{ast.TypeMemberIdentifier, ast.TypeIdentifier}}
 	nodes := nw.CurNodeMatches(m)

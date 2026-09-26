@@ -1,6 +1,12 @@
 package language
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/sqls-server/sqls/catalog"
+	"github.com/sqls-server/sqls/dialect"
+)
 
 // TestCodePointColumnToUTF16 exercises the token.Tokenizer.Col -> UTF16Column
 // conversion directly: the tokenizer counts one column per Unicode code
@@ -21,6 +27,34 @@ func TestCodePointColumnToUTF16(t *testing.T) {
 	}
 	if _, err := codePointColumnToUTF16(text, 0, 3); err == nil {
 		t.Fatal("accepted code-point column past end of line")
+	}
+}
+
+func TestLegacyRelationAtConvertsUTF16CursorBeforeParser(t *testing.T) {
+	text := "SELECT '😀' FROM CITY"
+	start := strings.Index(text, "CITY")
+	position, err := PositionAt(text, start+1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := Request{
+		Document: Document{Text: text},
+		Context:  Context{Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL}},
+	}
+	id, rng, ok, err := legacyRelationAt(req, position)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || id != (catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "CITY"}) {
+		t.Fatalf("legacyRelationAt = (%+v, %v, %v), want CITY table", id, rng, ok)
+	}
+	wantStart, _ := PositionAt(text, start)
+	wantEnd, _ := PositionAt(text, start+len("CITY"))
+	if rng != (Range{Start: wantStart, End: wantEnd}) {
+		t.Fatalf("legacy relation range = %+v, want %+v", rng, Range{Start: wantStart, End: wantEnd})
+	}
+	if _, _, _, err := legacyRelationAt(req, Position{Line: 0, UTF16Column: 9}); err != ErrPosition {
+		t.Fatalf("split-surrogate legacy position error = %v, want ErrPosition", err)
 	}
 }
 
