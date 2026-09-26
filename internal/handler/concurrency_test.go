@@ -150,14 +150,16 @@ type stubQuery struct {
 }
 
 type stubBackend struct {
-	mu             sync.Mutex
-	gates          map[string]*stubGate
-	served         []stubQuery
-	execServed     []string
-	openedDB       []*sql.DB
-	readOnly       bool
-	readOnlyServed []string
-	procedures     []*database.ProcedureDesc
+	mu                sync.Mutex
+	gates             map[string]*stubGate
+	served            []stubQuery
+	execServed        []string
+	openedDB          []*sql.DB
+	readOnly          bool
+	readOnlyServed    []string
+	procedures        []*database.ProcedureDesc
+	definitionTables  map[string][]string
+	definitionColumns []*database.ColumnDesc
 }
 
 func (b *stubBackend) newGate(method string, ignoreCancel bool) *stubGate {
@@ -270,6 +272,26 @@ func (b *stubBackend) describedProcedures() []*database.ProcedureDesc {
 	return append([]*database.ProcedureDesc(nil), b.procedures...)
 }
 
+func (b *stubBackend) setDefinitionCatalog(tables map[string][]string, columns []*database.ColumnDesc) {
+	b.mu.Lock()
+	b.definitionTables = tables
+	b.definitionColumns = columns
+	b.mu.Unlock()
+}
+
+func (b *stubBackend) definitionCatalog() (map[string][]string, []*database.ColumnDesc, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.definitionTables == nil {
+		return nil, nil, false
+	}
+	tables := make(map[string][]string, len(b.definitionTables))
+	for schema, names := range b.definitionTables {
+		tables[schema] = append([]string(nil), names...)
+	}
+	return tables, append([]*database.ColumnDesc(nil), b.definitionColumns...), true
+}
+
 // stubRepository is a MockDBRepository whose Query, CurrentSchema and Databases
 // can be parked by the backend's gates.
 type stubRepository struct {
@@ -328,6 +350,27 @@ func (r *stubRepository) Databases(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return r.MockDBRepository.Databases(ctx)
+}
+
+func (r *stubRepository) SchemaTables(ctx context.Context) (map[string][]string, error) {
+	if tables, _, ok := r.backend.definitionCatalog(); ok {
+		return tables, nil
+	}
+	return r.MockDBRepository.SchemaTables(ctx)
+}
+
+func (r *stubRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
+	if _, columns, ok := r.backend.definitionCatalog(); ok {
+		return columns, nil
+	}
+	return r.MockDBRepository.DescribeDatabaseTable(ctx)
+}
+
+func (r *stubRepository) DescribeDatabaseTableBySchema(ctx context.Context, schema string) ([]*database.ColumnDesc, error) {
+	if _, columns, ok := r.backend.definitionCatalog(); ok {
+		return columns, nil
+	}
+	return r.MockDBRepository.DescribeDatabaseTableBySchema(ctx, schema)
 }
 
 // readOnlyStubRepository is a distinct type rather than a method on
