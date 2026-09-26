@@ -2,12 +2,22 @@ package language
 
 import (
 	"context"
+	"fmt"
 	"sort"
 
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
+
+// ValidateDiagnosticPolicy validates rule codes and levels against SQLs's
+// single diagnostic registry.
+func ValidateDiagnosticPolicy(policy DiagnosticPolicy) error {
+	if err := (sqlsymbol.DiagnosticOptions{Rules: policy.Rules}).Validate(); err != nil {
+		return fmt.Errorf("language: invalid diagnostic policy: %w", err)
+	}
+	return nil
+}
 
 // cacheDiagnosticCatalog answers sqlsymbol's Catalog/UniqueKeyCatalog
 // interfaces directly from a *catalog.Cache, on demand, per lookup. It never
@@ -156,6 +166,9 @@ func diagnosticCatalogReady(snapshot *catalog.MetadataSnapshot, variant dialect.
 // cannot parse also yields an empty list rather than an error: in-progress
 // edits must not surface a diagnostics failure.
 func (s *Service) Diagnostics(ctx context.Context, req Request) (Result[[]Diagnostic], error) {
+	if err := ValidateDiagnosticPolicy(req.Policy); err != nil {
+		return Result[[]Diagnostic]{}, err
+	}
 	if err := ctx.Err(); err != nil {
 		return Result[[]Diagnostic]{}, ErrCanceled
 	}
@@ -168,11 +181,10 @@ func (s *Service) Diagnostics(ctx context.Context, req Request) (Result[[]Diagno
 	if err != nil {
 		return Result[[]Diagnostic]{Value: diagnostics, Stamp: stamp}, nil
 	}
-	var catalogView sqlsymbol.Catalog
-	if diagnosticCatalogReady(req.Context.Snapshot, req.Context.Variant) {
-		catalogView = cacheDiagnosticCatalog{cache: req.Context.Snapshot.Cache}
-	}
-	found := analysis.Diagnostics(catalogView)
+	// Text-only rules remain active regardless of catalog readiness. The
+	// snapshot adapter independently gates each semantic namespace/category.
+	var catalogView sqlsymbol.Catalog = snapshotSemanticCatalog{snapshot: req.Context.Snapshot}
+	found := analysis.DiagnosticsWithOptions(catalogView, sqlsymbol.DiagnosticOptions{Rules: req.Policy.Rules})
 	sort.SliceStable(found, func(i, j int) bool {
 		left, right := found[i], found[j]
 		if left.Span.Start != right.Span.Start {
@@ -204,5 +216,3 @@ func (s *Service) Diagnostics(ctx context.Context, req Request) (Result[[]Diagno
 	}
 	return Result[[]Diagnostic]{Value: diagnostics, Stamp: stamp}, nil
 }
-
-
