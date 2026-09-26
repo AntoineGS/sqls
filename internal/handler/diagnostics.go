@@ -41,6 +41,7 @@ type documentDiagnosticsSnapshot struct {
 	metadataKey         metadata.Key
 	metadataIncarnation uint64
 	metadataGeneration  uint64
+	metadataRevision    uint64
 }
 
 func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, bool) {
@@ -64,6 +65,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		metadataKey:         editor.MetadataKey,
 		metadataIncarnation: editor.MetadataIncarnation,
 		metadataGeneration:  editor.MetadataGeneration,
+		metadataRevision:    metadataRevision(editor),
 	}, true
 }
 
@@ -108,7 +110,8 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 		return false
 	}
 	meta := lease.Snapshot()
-	return meta != nil && meta.Cache == snapshot.cache && meta.Generation == snapshot.metadataGeneration
+	return meta != nil && meta.Cache == snapshot.cache && meta.Generation == snapshot.metadataGeneration &&
+		meta.Revision == snapshot.metadataRevision
 }
 
 // configuredDriverVariant mirrors the pre-attachment parser selection used by

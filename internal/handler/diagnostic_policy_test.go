@@ -12,12 +12,14 @@ import (
 
 	"github.com/sourcegraph/jsonrpc2"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
 	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
+	"github.com/sqls-server/sqls/metadata/metadatatest"
 )
 
 func TestCaptureEditorSnapshotDeepCopiesDiagnosticRules(t *testing.T) {
@@ -282,20 +284,54 @@ func TestDiagnosticsEmptyResultIsJSONArray(t *testing.T) {
 func TestSlowDiagnosticsCannotPublishAcrossSameURLRoleRebind(t *testing.T) {
 	const uri = "file:///role-policy.sql"
 	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
-	a := roleLeaseForTest(t, tx.server, "ROLE_A", "ROLE_A_ONLY")
-	rebindTestLease(tx.server, a, "ROLE_A", 1)
+	providerA := metadatatest.New()
+	providerA.Cache = &catalog.Cache{SchemaTables: map[string][]string{"": {"ROLE_A_ONLY"}}}
+	providerB := metadatatest.New()
+	providerB.Cache = &catalog.Cache{SchemaTables: map[string][]string{"": {"ROLE_B_ONLY"}}}
+	key := metadata.Key{Engine: "interbase", URL: "fixture://same-url-role-test"}
+	tx.server.openConnection = func(context.Context, *database.DBConfig) (*database.DBConnection, error) {
+		return &database.DBConnection{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}, nil
+	}
+	tx.server.stateMu.Lock()
+	tx.server.metadataFactoryOverride = func(cfg *database.DBConfig) (metadata.Key, metadata.Scope, metadata.Factory, bool) {
+		role := cfg.InterBase.Role
+		provider := providerA
+		if role == "ROLE_B" {
+			provider = providerB
+		}
+		return key, metadata.Scope{Principal: "same-user", Role: role}, provider.Factory, true
+	}
+	tx.server.stateMu.Unlock()
 	tx.server.snapshots = newSourceSnapshotStore(t.TempDir())
 	tx.server.stateMu.Lock()
 	tx.server.files[uri] = &File{Text: "SELECT 1", Version: 1}
 	tx.server.stateMu.Unlock()
+	roleConfig := func(role string) *database.DBConfig {
+		return &database.DBConfig{Driver: dialect.DatabaseDriverInterBase, Alias: "same-target", DataSourceName: "fixture://same-url-role-test", Dialect: 3, InterBase: &database.InterBaseConfig{Role: role}}
+	}
+	if err := awaitConnectionIntent(context.Background(), tx.server.coordinator.Request(context.Background(), roleConfig("ROLE_A"), 0, "")); err != nil {
+		t.Fatalf("attach ROLE_A: %v", err)
+	}
+	waitCurrentMetadataSettledForTest(t, context.Background(), tx.server)
+	a := currentLeaseForTest(tx.server)
+	tx.server.stateMu.RLock()
+	keyA, scopeA := tx.server.metaKey, tx.server.metaScope
+	tx.server.stateMu.RUnlock()
+	if keyA != key || scopeA.Role != "ROLE_A" {
+		t.Fatalf("production binding for A = key %+v scope %+v", keyA, scopeA)
+	}
 	tx.server.stateMu.RLock()
 	capturedA, err := tx.server.captureEditorSnapshotLocked(uri)
 	tx.server.stateMu.RUnlock()
 	if err != nil {
 		t.Fatal(err)
 	}
+	generationA := capturedA.MetadataGeneration
 
 	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseOld := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseOld)
 	var once sync.Once
 	tx.server.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
 		if snapshot.metadataLease == a {
@@ -319,11 +355,20 @@ func TestSlowDiagnosticsCannotPublishAcrossSameURLRoleRebind(t *testing.T) {
 		t.Fatal("old-role diagnostic computation did not enter its gate")
 	}
 
-	b := roleLeaseForTest(t, tx.server, "ROLE_B", "ROLE_B_ONLY")
-	if a.Snapshot().Generation != b.Snapshot().Generation {
-		t.Fatalf("test precondition: metadata generations differ: %d vs %d", a.Snapshot().Generation, b.Snapshot().Generation)
+	if err := awaitConnectionIntent(context.Background(), tx.server.coordinator.Request(context.Background(), roleConfig("ROLE_B"), 0, "")); err != nil {
+		t.Fatalf("attach ROLE_B: %v", err)
 	}
-	rebindTestLease(tx.server, b, "ROLE_B", 2)
+	waitCurrentMetadataSettledForTest(t, context.Background(), tx.server)
+	b := currentLeaseForTest(tx.server)
+	tx.server.stateMu.RLock()
+	keyB, scopeB := tx.server.metaKey, tx.server.metaScope
+	tx.server.stateMu.RUnlock()
+	if keyB != key || scopeB.Role != "ROLE_B" {
+		t.Fatalf("production binding for B = key %+v scope %+v", keyB, scopeB)
+	}
+	if generationA != b.Snapshot().Generation {
+		t.Fatalf("test precondition: metadata generations differ: %d vs %d", generationA, b.Snapshot().Generation)
+	}
 	oldRequest := languageRequest(capturedA)
 	oldStamp := language.Stamp{
 		URI: oldRequest.Document.URI, Version: oldRequest.Document.Version, Binding: oldRequest.Document.Binding,
@@ -350,7 +395,7 @@ func TestSlowDiagnosticsCannotPublishAcrossSameURLRoleRebind(t *testing.T) {
 	if len(staleFiles) != 0 {
 		t.Fatalf("stale source candidate remained after role rebind: %v", staleFiles)
 	}
-	close(release)
+	releaseOld()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
@@ -384,26 +429,6 @@ func TestSlowDiagnosticsCannotPublishAcrossSameURLRoleRebind(t *testing.T) {
 	if got := current.Metadata.Cache.SchemaTables[""][0]; got != "ROLE_B_ONLY" {
 		t.Fatalf("captured role catalog marker = %q, want ROLE_B_ONLY", got)
 	}
-}
-
-func roleLeaseForTest(t *testing.T, s *Server, role, marker string) *metadata.Lease {
-	t.Helper()
-	repo := database.NewMockCapabilityRepository()
-	repo.MockDatabase = func(context.Context) (string, error) { return "TEST", nil }
-	repo.MockDatabaseTables = func(context.Context) (map[string][]string, error) {
-		return map[string][]string{"": {marker}}, nil
-	}
-	key := metadata.Key{Engine: "interbase", URL: "fixture://same-url-role-test"}
-	scope := metadata.Scope{Principal: "same-user", Role: role}
-	lease, err := s.registry.Acquire(context.Background(), key, scope, func(context.Context) (metadata.Provider, error) {
-		return &genericMetadataProvider{repo: repo}, nil
-	})
-	if err != nil {
-		t.Fatalf("acquire %s lease: %v", role, err)
-	}
-	t.Cleanup(lease.Release)
-	waitMetadataSettledForTest(t, context.Background(), lease)
-	return lease
 }
 
 func rebindTestLease(s *Server, lease *metadata.Lease, role string, generation int) {
