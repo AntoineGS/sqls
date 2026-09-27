@@ -2,6 +2,7 @@ package metadata
 
 import (
 	"database/sql"
+	"reflect"
 	"testing"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -76,6 +77,37 @@ func TestMetadataMergePrimaryKeysAndColumnsInEitherOrder(t *testing.T) {
 				t.Fatal("published enriched descriptor aliases retained descriptor")
 			}
 		})
+	}
+}
+
+func TestMetadataMergePrimaryKeysByIDPreservesExactOrderAndIdentity(t *testing.T) {
+	mixed := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "Foo"}.Key()
+	upper := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "FOO"}.Key()
+	fragment := &catalog.Cache{PrimaryKeyColumns: map[string]map[string]struct{}{}, PrimaryKeysByID: map[string][]string{
+		mixed: {"B", "A"}, upper: {"ID"},
+	}}
+	published, err := Merge(NewCache(), catalog.MetadataPrimaryKeys, catalog.MetadataPatch{Cache: fragment})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fragment.PrimaryKeysByID[mixed][0] = "changed"
+	if !reflect.DeepEqual(published.PrimaryKeysByID[mixed], []string{"B", "A"}) {
+		t.Fatal("PK order/ownership lost")
+	}
+	if !reflect.DeepEqual(published.PrimaryKeysByID[upper], []string{"ID"}) {
+		t.Fatal("exact identities merged")
+	}
+}
+
+func TestMetadataMergePrimaryKeysByIDNilWhenNotSupplied(t *testing.T) {
+	merged, err := mergeMetadata(newMetadataCache(), catalog.MetadataPrimaryKeys, catalog.MetadataPatch{Cache: &catalog.Cache{
+		PrimaryKeyColumns: map[string]map[string]struct{}{},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.PrimaryKeysByID != nil {
+		t.Fatalf("PrimaryKeysByID = %#v, want nil when the provider did not supply it", merged.PrimaryKeysByID)
 	}
 }
 

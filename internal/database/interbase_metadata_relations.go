@@ -191,20 +191,29 @@ func interBaseViewColumnsWithoutKey(columns []*ColumnDesc) []*ColumnDesc {
 	return result
 }
 
+// readMetadataPrimaryKeys publishes both the legacy shared upper-cased
+// PrimaryKeyColumns set and the exact-identity, segment-ordered
+// PrimaryKeysByID projection (see catalog.Cache.PrimaryKeysByID) from the
+// same interBaseBulkScanPrimaryKeyFields read: interBaseBulkPrimaryKeyFieldsQueryForWidth
+// orders its rows by relation and then by segment position, so appending in
+// scan order reproduces the composite key's exact column order.
 func (db *InterBaseDBRepository) readMetadataPrimaryKeys(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 	primaryKeys := make(map[string]map[string]struct{})
+	primaryKeysByID := make(map[string][]string)
 	err := interBaseBulkScanPrimaryKeyFields(ctx, q, width, func(relation, column string) error {
 		relationKey := columnDatabaseKey("", relation)
 		if primaryKeys[relationKey] == nil {
 			primaryKeys[relationKey] = make(map[string]struct{})
 		}
 		primaryKeys[relationKey][column] = struct{}{}
+		idKey := interBaseByIDKey(ObjectKindTable, relation)
+		primaryKeysByID[idKey] = append(primaryKeysByID[idKey], column)
 		return nil
 	})
 	if err != nil {
 		return MetadataPatch{}, err
 	}
-	return MetadataPatch{Cache: &DBCache{PrimaryKeyColumns: primaryKeys}, Count: len(primaryKeys)}, nil
+	return MetadataPatch{Cache: &DBCache{PrimaryKeyColumns: primaryKeys, PrimaryKeysByID: primaryKeysByID}, Count: len(primaryKeys)}, nil
 }
 
 func (db *InterBaseDBRepository) readMetadataForeignKeys(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {

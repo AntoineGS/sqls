@@ -92,6 +92,7 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 		}
 	case catalog.MetadataPrimaryKeys:
 		next.PrimaryKeyColumns = cloneNestedSetMap(fragment.PrimaryKeyColumns)
+		next.PrimaryKeysByID = cloneOrderedIDMap(fragment.PrimaryKeysByID)
 		if base.ColumnsReady() {
 			next.ColumnsWithParent = columnsWithPrimaryKeys(base.ColumnsWithParent, next.PrimaryKeyColumns)
 			next.ColumnsByID = columnsByIDWithPrimaryKeys(base.ColumnsByID, next.PrimaryKeyColumns)
@@ -209,6 +210,20 @@ func cloneColumnSlices(source map[string][]*catalog.ColumnDesc) map[string][]*ca
 	result := make(map[string][]*catalog.ColumnDesc, len(source))
 	for key, columns := range source {
 		result[key] = append([]*catalog.ColumnDesc(nil), columns...)
+	}
+	return result
+}
+
+// cloneOrderedIDMap deep-copies an exact-identity map[string][]string,
+// preserving nil input as nil output (see catalog.Cache.PrimaryKeysByID):
+// nil means "not supplied by this provider", never merely "empty".
+func cloneOrderedIDMap(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	result := make(map[string][]string, len(source))
+	for key, values := range source {
+		result[key] = append([]string(nil), values...)
 	}
 	return result
 }
