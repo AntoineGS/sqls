@@ -263,6 +263,44 @@ func TestNeovimFixtureCancellationWaitsForQueryEntry(t *testing.T) {
 	}
 }
 
+func TestFixtureRawClientStopUnblocksFullMessageQueue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := startFixtureRawClient(t, ctx)
+	defer client.stop()
+	for range cap(client.messages) {
+		client.messages <- fixtureRPCMessage{}
+	}
+	params := map[string]any{"initializationOptions": map[string]any{"connectionConfig": map[string]any{
+		"alias": "old", "driver": string(neovimFixtureDriver), "dataSourceName": "fixture://old",
+	}}}
+	if err := client.write(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params}); err != nil {
+		t.Fatal("write initialize to fixture child:", err)
+	}
+	select {
+	case <-client.readPending:
+	case <-ctx.Done():
+		t.Fatal("fixture reader did not reach full message queue:", ctx.Err())
+	}
+
+	client.stop()
+	if !isClosed(client.readDone) {
+		// Leave the regression test's child and reader clean on the unfixed
+		// implementation while preserving the failed assertion below.
+		<-client.messages
+		select {
+		case <-client.readDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("fixture stdout reader remained blocked after draining queue")
+		}
+		client.stop()
+		t.Fatal("stop did not unblock stdout reader blocked on a full message queue")
+	}
+	if !client.waited {
+		t.Fatal("stop returned before reaping fixture child")
+	}
+}
+
 type fixtureRPCMessage struct {
 	ID     json.RawMessage `json:"id"`
 	Method string          `json:"method"`
@@ -272,18 +310,21 @@ type fixtureRPCMessage struct {
 }
 
 type fixtureRawClient struct {
-	cmd       *exec.Cmd
-	stdin     io.WriteCloser
-	messages  chan fixtureRPCMessage
-	readErr   chan error
-	readDone  chan struct{}
-	waitDone  chan error
-	stderr    bytes.Buffer
-	stderrEnd chan struct{}
-	writeMu   sync.Mutex
-	waitOnce  sync.Once
-	closed    bool
-	waited    bool
+	cmd         *exec.Cmd
+	stdin       io.WriteCloser
+	messages    chan fixtureRPCMessage
+	readErr     chan error
+	readDone    chan struct{}
+	readPending chan struct{}
+	readCancel  chan struct{}
+	waitDone    chan error
+	stderr      bytes.Buffer
+	stderrEnd   chan struct{}
+	writeMu     sync.Mutex
+	waitOnce    sync.Once
+	readOnce    sync.Once
+	closed      bool
+	waited      bool
 }
 
 func startFixtureRawClient(t *testing.T, ctx context.Context) *fixtureRawClient {
@@ -314,7 +355,7 @@ func startFixtureRawClient(t *testing.T, ctx context.Context) *fixtureRawClient 
 	if err := cmd.Start(); err != nil {
 		t.Fatal("start fixture test-binary child:", err)
 	}
-	c := &fixtureRawClient{cmd: cmd, stdin: stdin, messages: make(chan fixtureRPCMessage, 64), readErr: make(chan error, 1), readDone: make(chan struct{}), waitDone: make(chan error, 1), stderrEnd: make(chan struct{})}
+	c := &fixtureRawClient{cmd: cmd, stdin: stdin, messages: make(chan fixtureRPCMessage, 64), readErr: make(chan error, 1), readDone: make(chan struct{}), readPending: make(chan struct{}, 1), readCancel: make(chan struct{}), waitDone: make(chan error, 1), stderrEnd: make(chan struct{})}
 	go func() {
 		_, _ = io.Copy(&c.stderr, stderr)
 		close(c.stderrEnd)
@@ -483,7 +524,15 @@ func (c *fixtureRawClient) readFrames(r io.Reader) {
 			c.readErr <- fmt.Errorf("invalid JSON-RPC JSON: %w", err)
 			return
 		}
-		c.messages <- message
+		select {
+		case c.readPending <- struct{}{}:
+		default:
+		}
+		select {
+		case c.messages <- message:
+		case <-c.readCancel:
+			return
+		}
 	}
 }
 
@@ -535,6 +584,7 @@ func (c *fixtureRawClient) startWait() {
 }
 
 func (c *fixtureRawClient) stop() {
+	c.readOnce.Do(func() { close(c.readCancel) })
 	c.writeMu.Lock()
 	if !c.closed {
 		c.closed = true
