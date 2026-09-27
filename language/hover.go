@@ -64,7 +64,7 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 		}
 		return Result[Hover]{Value: Hover{Markdown: markdown, Range: &hoverRange}, Stamp: stampFor(req)}, nil
 	}
-	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
+	detail, available, err := s.loadNavigationDetail(ctx, req, target, position, nil)
 	if err != nil {
 		// Detail is optional hover augmentation. A provider error (including
 		// the host's detail deadline) must not discard a valid cache summary.

@@ -24,6 +24,21 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	if local, handled, err := localDefinition(req, position); err != nil {
 		return Result[[]Location]{}, err
 	} else if handled {
+		if len(local) == 0 {
+			target, column, proven, err := provenDefinitionColumnAt(req, position)
+			if err != nil {
+				return Result[[]Location]{}, err
+			}
+			if proven {
+				location, available, err := s.provenColumnDefinition(ctx, req, target, column, position)
+				if err != nil {
+					return Result[[]Location]{}, err
+				}
+				if available {
+					local = []Location{location}
+				}
+			}
+		}
 		return Result[[]Location]{Value: local, Stamp: stampFor(req)}, nil
 	}
 	role := sqlsymbol.Outside
@@ -58,7 +73,7 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 	if !ok {
 		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
 	}
-	detail, available, err := s.loadNavigationDetail(ctx, req, target, position)
+	detail, available, err := s.loadNavigationDetail(ctx, req, target, position, nil)
 	if err != nil {
 		return Result[[]Location]{}, err
 	}
@@ -69,6 +84,56 @@ func (s *Service) Definition(ctx context.Context, req Request, position Position
 		return Result[[]Location]{Value: []Location{}, Stamp: stampFor(req)}, nil
 	}
 	return Result[[]Location]{Value: []Location{{Range: detail.range_, Source: detail.source}}, Stamp: stampFor(req)}, nil
+}
+
+func (s *Service) provenColumnDefinition(ctx context.Context, req Request, target catalog.ObjectID, column sqlsymbol.Name, position Position) (Location, bool, error) {
+	detail, available, err := s.loadNavigationDetail(ctx, req, target, position, &column)
+	if err != nil {
+		return Location{}, false, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Location{}, false, ErrCanceled
+	}
+	if !available || detail.source == nil || !detail.hasRange {
+		return Location{}, false, nil
+	}
+	return Location{Range: detail.range_, Source: detail.source}, true, nil
+}
+
+// provenDefinitionColumnAt admits a database definition only when the shared
+// snapshot proves both an exact base-table identity and complete exact columns.
+// In particular, ColumnsByID alone is insufficient because it also contains
+// view columns.
+func provenDefinitionColumnAt(req Request, position Position) (catalog.ObjectID, sqlsymbol.Name, bool, error) {
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase || req.Context.Snapshot == nil || req.Context.Snapshot.Stale {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	analysis, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
+	if err != nil {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, err
+	}
+	proof, ok := analysis.ProvenDefinitionColumn(offset, snapshotSemanticCatalog{snapshot: req.Context.Snapshot})
+	if !ok || !exactBaseTable(req.Context.Snapshot, proof.Relation) {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	columns, complete := exactTableColumns(req.Context.Snapshot.Cache, proof.Relation)
+	if !complete {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	matches := 0
+	for _, candidate := range columns {
+		if candidate != nil && proof.Column.MatchesCatalogName(candidate.Name) {
+			matches++
+		}
+	}
+	if matches != 1 {
+		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	return catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: proof.Relation.Key()}, proof.Column, true, nil
 }
 
 // References returns same-document procedure-local symbol references.

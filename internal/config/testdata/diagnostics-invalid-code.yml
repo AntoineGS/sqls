@@ -1,0 +1,3 @@
+diagnostics:
+  rules:
+    not-a-real-rule: error

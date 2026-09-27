@@ -41,9 +41,12 @@ type editorSnapshot struct {
 	Metadata            *database.MetadataSnapshot
 	MetadataIncarnation uint64
 	MetadataGeneration  uint64
+	MetadataKey         metadata.Key
 	MetadataLease       *metadata.Lease
 	Repository          database.DBRepository
 	LowercaseKeywords   bool
+	DiagnosticPolicy    language.DiagnosticPolicy
+	PolicyRevision      uint64
 	Attaching           bool
 	ConnectionReady     bool
 	SourceContext       snapshotContext
@@ -73,6 +76,8 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
 		Generation: s.connGeneration, Cache: &database.DBCache{},
 		LowercaseKeywords: configSnapshot.LowercaseKeywords,
+		DiagnosticPolicy:  language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
+		PolicyRevision:    s.policyRevision,
 		Attaching:         s.connectionState == connectionConnecting,
 		ConnectionReady:   s.connectionState == connectionReady,
 	}
@@ -102,6 +107,7 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 			snapshot.Metadata = meta
 			snapshot.MetadataIncarnation = s.metaLease.Incarnation()
 			snapshot.MetadataGeneration = meta.Generation
+			snapshot.MetadataKey = s.metaLease.Key()
 			snapshot.MetadataLease = s.metaLease
 			if meta.Cache != nil {
 				snapshot.Cache = meta.Cache
@@ -122,6 +128,17 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 		}
 	}
 	return snapshot, nil
+}
+
+func cloneDiagnosticRules(rules map[string]string) map[string]string {
+	if len(rules) == 0 {
+		return nil
+	}
+	clone := make(map[string]string, len(rules))
+	for code, level := range rules {
+		clone[code] = level
+	}
+	return clone
 }
 
 // publishDefinitionCandidate writes privately, then validates and publishes
@@ -157,10 +174,7 @@ func (s *Server) publishDefinitionCandidate(ctx context.Context, captured editor
 }
 
 func metadataKeyEqual(a, b editorSnapshot) bool {
-	if a.MetadataLease == nil || b.MetadataLease == nil {
-		return a.MetadataLease == nil && b.MetadataLease == nil
-	}
-	return a.MetadataLease.Key() == b.MetadataLease.Key()
+	return a.MetadataKey == b.MetadataKey && (a.MetadataLease == nil) == (b.MetadataLease == nil)
 }
 
 func metadataRevision(snapshot editorSnapshot) uint64 {

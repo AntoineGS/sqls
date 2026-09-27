@@ -2,6 +2,7 @@ package sqlsymbol
 
 import (
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -109,6 +110,118 @@ func TestLocalInterBaseExample(t *testing.T) {
 		}
 		if !owned {
 			t.Fatalf("AMOUNTPAID candidates do not include CUSTOMERINVOICE: %+v", column.SQL.Scopes)
+		}
+	})
+}
+
+func TestDiagnosticExpansionRecoveryAndCommentLiteralNegatives(t *testing.T) {
+	variant := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}
+	commentLiteral := "SELECT 'MISSING = NULL' AS NOTE FROM T; -- MISSING = NULL\nSELECT 1 FROM T;"
+	commentAnalysis, err := Analyze(commentLiteral, variant)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings := commentAnalysis.Diagnostics(nil); len(findings) != 0 {
+		t.Fatalf("comment/literal-only names and NULL comparisons produced findings: %+v", findings)
+	}
+	for _, text := range []string{
+		"SELECT MISSING FROM T; SELECT FROM; SELECT 1 + 2 FROM T;",
+		commentLiteral,
+		"/* SELECT MISSING FROM T WHERE A = NULL; */ SELECT 1 FROM T;",
+		"CREATE PROCEDURE P AS BEGIN IF (1 + (2 * 3) > 0) THEN V = 1; END",
+	} {
+		a, err := Analyze(text, variant)
+		if err != nil {
+			t.Fatalf("Analyze(%q): %v", text, err)
+		}
+		got := a.Diagnostics(nil)
+		again := a.Diagnostics(nil)
+		if !reflect.DeepEqual(got, again) {
+			t.Fatalf("diagnostics are not deterministic for %q: first=%+v second=%+v", text, got, again)
+		}
+		for _, finding := range got {
+			if finding.Span.Start < 0 || finding.Span.Start >= finding.Span.End || finding.Span.End > len(text) {
+				t.Fatalf("finding %s has out-of-source span %+v for %q", finding.Code, finding.Span, text)
+			}
+		}
+		if strings.Contains(text, "MISSING") {
+			for _, finding := range got {
+				if strings.Contains(text[finding.Span.Start:finding.Span.End], "MISSING") {
+					t.Fatalf("finding %s points into a comment/literal identifier in %q", finding.Code, text)
+				}
+			}
+		}
+	}
+}
+
+func TestDiagnosticExpansionBudgetWithholdsPartialRegionAndKeepsCompleteNeighbor(t *testing.T) {
+	var source strings.Builder
+	source.WriteString("SELECT ID FROM T WHERE V = NULL;\n")
+	source.WriteString("CREATE PROCEDURE OVER_BUDGET RETURNS (O INTEGER) AS DECLARE VARIABLE V INTEGER; BEGIN O = V;")
+	for i := 0; i < 6000; i++ {
+		source.WriteString(" V = 1;")
+	}
+	source.WriteString(" SUSPEND; END")
+	text := source.String()
+	a, err := Analyze(text, dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase})
+	if err != nil {
+		t.Fatalf("Analyze adversarial bounded fixture: %v", err)
+	}
+	options := DiagnosticOptions{Rules: map[string]string{
+		codeReadBeforeAssignment: "warning",
+		codeOutputNotAssigned:    "warning",
+		codeDeadStore:            "warning",
+		codeUnreachable:          "warning",
+		codeNullableAssignment:   "warning",
+		codeNullableNotIn:        "warning",
+		codeOuterJoinFilter:      "warning",
+	}}
+	findings := a.DiagnosticsWithOptions(nil, options)
+	if len(findings) != 1 || findings[0].Code != codeNullComparison {
+		t.Fatalf("findings after an over-budget procedure = %+v, want only the independently complete neighboring null-comparison", findings)
+	}
+	if got, want := text[findings[0].Span.Start:findings[0].Span.End], "V = NULL"; got != want {
+		t.Fatalf("neighbor finding span text = %q, want %q", got, want)
+	}
+}
+
+func FuzzDiagnosticExpansionRecovery(f *testing.F) {
+	for _, seed := range []string{
+		"SELECT A FROM T; SELECT FROM; SELECT B FROM U;",
+		"SELECT (1 + 2) * 3 FROM T WHERE ID = NULL;",
+		"WITH A AS (SELECT 1 AS X), B AS (SELECT X FROM A) SELECT X FROM B;",
+		"SELECT 'MISSING = NULL' FROM T; -- MISSING = NULL\nSELECT 1 FROM T;",
+		"CREATE PROCEDURE P AS BEGIN V = CASE WHEN 1 = 1 THEN 2 ELSE 3 END; END",
+		"SELECT (((((((1)))))));",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, text string) {
+		if len(text) > 4096 {
+			t.Skip()
+		}
+		variant := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}
+		a, err := Analyze(text, variant)
+		if err != nil {
+			t.Fatalf("Analyze: %v", err)
+		}
+		first := a.Diagnostics(nil)
+		second := a.Diagnostics(nil)
+		if !reflect.DeepEqual(first, second) {
+			t.Fatalf("nondeterministic findings: first=%+v second=%+v", first, second)
+		}
+		for _, finding := range first {
+			if finding.Span.Start < 0 || finding.Span.Start >= finding.Span.End || finding.Span.End > len(text) {
+				t.Fatalf("finding %s span %+v outside source length %d", finding.Code, finding.Span, len(text))
+			}
+			for _, ignored := range []string{"'MISSING = NULL'", "-- MISSING = NULL"} {
+				if start := strings.Index(text, ignored); start >= 0 {
+					end := start + len(ignored)
+					if finding.Span.Start < end && start < finding.Span.End {
+						t.Fatalf("finding %s span %+v overlaps comment/literal seed %q", finding.Code, finding.Span, ignored)
+					}
+				}
+			}
 		}
 	})
 }

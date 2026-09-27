@@ -137,7 +137,7 @@ func newDiagnosticsTestContext(t *testing.T, driver dialect.DatabaseDriver) *dia
 	return &diagnosticsTestContext{server: server, clientConn: clientConn, serverConn: serverConn, client: client, ctx: ctx}
 }
 
-func diagnosticsRepository(types map[string]string) *database.MockDBRepository {
+func diagnosticsRepository(types map[string]string) *database.MockCapabilityRepository {
 	columns := make([]*database.ColumnDesc, 0, len(types))
 	for key, typeName := range types {
 		parts := strings.SplitN(key, ".", 2)
@@ -149,7 +149,8 @@ func diagnosticsRepository(types map[string]string) *database.MockDBRepository {
 			Type:       typeName,
 		})
 	}
-	return &database.MockDBRepository{
+	repo := database.NewMockCapabilityRepository()
+	repo.MockDBRepository = &database.MockDBRepository{
 		MockDatabase: func(context.Context) (string, error) { return "TEST", nil },
 		MockDatabases: func(context.Context) ([]string, error) {
 			return []string{"TEST"}, nil
@@ -167,6 +168,7 @@ func diagnosticsRepository(types map[string]string) *database.MockDBRepository {
 			return nil, nil
 		},
 	}
+	return repo
 }
 
 func diagnosticTypes(destinationType string) map[string]string {

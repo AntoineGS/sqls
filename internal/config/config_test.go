@@ -208,3 +208,55 @@ func TestGetConfig(t *testing.T) {
 		})
 	}
 }
+
+func TestDiagnosticsConfigValidatesAndReturnsIndependentRules(t *testing.T) {
+	diagnostics := DiagnosticsConfig{Rules: map[string]string{"interbase-null-comparison": "error"}}
+	if err := diagnostics.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+	options := diagnostics.Options()
+	options.Rules["interbase-null-comparison"] = "off"
+	if got := diagnostics.Rules["interbase-null-comparison"]; got != "error" {
+		t.Fatalf("Options() exposed config's mutable rule map: got %q", got)
+	}
+	for name, rules := range map[string]map[string]string{
+		"unknown code":  {"not-a-real-rule": "error"},
+		"unknown level": {"interbase-null-comparison": "fatal"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := (DiagnosticsConfig{Rules: rules}).Validate(); err == nil {
+				t.Fatal("Validate() error = nil, want invalid diagnostic policy rejection")
+			}
+		})
+	}
+}
+
+func TestLoadDiagnosticPolicyYAML(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		file    string
+		want    string
+		wantErr bool
+	}{
+		{name: "valid policy", file: "diagnostics.yml", want: "error"},
+		{name: "unknown code", file: "diagnostics-invalid-code.yml", wantErr: true},
+		{name: "unknown level", file: "diagnostics-invalid-level.yml", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join("testdata", tc.file)
+			got, err := GetConfig(path)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("GetConfig() error = nil, want policy validation failure")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetConfig() error = %v", err)
+			}
+			if got.Diagnostics.Rules["interbase-null-comparison"] != tc.want {
+				t.Fatalf("loaded diagnostic rules = %#v, want error override", got.Diagnostics.Rules)
+			}
+		})
+	}
+}

@@ -89,6 +89,13 @@ type Context struct {
 type Request struct {
 	Document Document
 	Context  Context
+	Policy   DiagnosticPolicy
+}
+
+// DiagnosticPolicy configures rule-level diagnostics. The caller owns Rules
+// and must not mutate it while a request is running.
+type DiagnosticPolicy struct {
+	Rules map[string]string
 }
 
 // Stamp identifies the exact document and metadata state a Result was

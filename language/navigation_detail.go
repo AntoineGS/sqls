@@ -22,7 +22,7 @@ type navigationDetail struct {
 	unsupported bool
 }
 
-func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object catalog.ObjectID, position Position) (navigationDetail, bool, error) {
+func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object catalog.ObjectID, position Position, provenColumn *sqlsymbol.Name) (navigationDetail, bool, error) {
 	if req.Context.Details == nil {
 		return navigationDetail{}, false, nil
 	}
@@ -35,7 +35,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if detail.Object != object || detail.Text == "" {
 			return navigationDetail{}, false, nil
 		}
-		rng, hasRange := detailBodyRange(detail.Text, object, selectedNavigationColumn(req, object, position))
+		rng, hasRange := detailBodyRange(detail.Text, object, navigationColumn(req, object, position, provenColumn))
 		return navigationDetail{source: &Source{Object: detail.Object, Text: detail.Text, Provenance: detail.Provenance}, range_: rng, hasRange: hasRange, executable: true}, true, nil
 	}
 	if ctx.Err() != nil {
@@ -69,7 +69,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		if description.Object != object || description.Description.Body == "" {
 			return navigationDetail{}, true, nil
 		}
-		span, ok := descriptionSpanFor(description.Description, object.Name, selectedNavigationColumn(req, object, position))
+		span, ok := descriptionSpanFor(description.Description, object.Name, navigationColumn(req, object, position, provenColumn))
 		if !ok {
 			return navigationDetail{}, true, nil
 		}
@@ -96,7 +96,7 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 	if source.Object != object || source.Text == "" {
 		return navigationDetail{unsupported: true}, true, nil
 	}
-	column := selectedNavigationColumn(req, object, position)
+	column := navigationColumn(req, object, position, provenColumn)
 	rng, hasRange := detailBodyRange(source.Text, object, column)
 	if !hasRange && column == nil && (object.Kind == catalog.ObjectKindView || object.Kind == catalog.ObjectKindProcedure || object.Kind == catalog.ObjectKindTrigger) && !ddlCreateTokenExists(source.Text) {
 		// Handler snapshotRange historically returned (0,0) when a native body
@@ -106,6 +106,14 @@ func (s *Service) loadNavigationDetail(ctx context.Context, req Request, object 
 		rng, hasRange = Range{}, true
 	}
 	return navigationDetail{source: &Source{Object: source.Object, Text: source.Text, Provenance: source.Provenance, Note: unsupportedDDLNote(unsupportedErr)}, range_: rng, hasRange: hasRange, unsupported: true}, true, nil
+}
+
+func navigationColumn(req Request, object catalog.ObjectID, position Position, proven *sqlsymbol.Name) *sqlsymbol.Name {
+	if proven != nil {
+		column := *proven
+		return &column
+	}
+	return selectedNavigationColumn(req, object, position)
 }
 
 func unsupportedDDLNote(err error) string {
@@ -139,12 +147,14 @@ func selectedNavigationColumn(req Request, object catalog.ObjectID, position Pos
 func detailBodyRange(body string, object catalog.ObjectID, column *sqlsymbol.Name) (Range, bool) {
 	var span sqlsymbol.Span
 	var ok bool
-	if object.Kind == catalog.ObjectKindTable || object.Kind == catalog.ObjectKindView && column != nil {
+	if object.Kind == catalog.ObjectKindTable {
 		if column != nil {
-			span, ok = sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, *column)
+			span, ok = provenTableColumnDeclaration(body, object, *column)
 		} else {
 			span, ok = sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true})
 		}
+	} else if object.Kind == catalog.ObjectKindView && column != nil {
+		span, ok = sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, *column)
 	} else {
 		return ddlDeclarationNameRange(body, object)
 	}
@@ -152,6 +162,26 @@ func detailBodyRange(body string, object catalog.ObjectID, column *sqlsymbol.Nam
 		return Range{}, false
 	}
 	return byteSpanRange(body, span.Start, span.End)
+}
+
+func provenTableColumnDeclaration(body string, object catalog.ObjectID, column sqlsymbol.Name) (sqlsymbol.Span, bool) {
+	table, ok := sqlsymbol.TableDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true})
+	if !ok {
+		return sqlsymbol.Span{}, false
+	}
+	selected, ok := sqlsymbol.ColumnDeclaration(body, sqlsymbol.Name{Text: object.Name, Quoted: true}, column)
+	if !ok || selected.Start < table.End {
+		return sqlsymbol.Span{}, false
+	}
+	// ColumnDeclaration also supports explicit CREATE VIEW columns. A separate
+	// CREATE declaration between the matched TABLE name and selected column
+	// means the column did not come from that TABLE declaration.
+	for _, token := range declarationTokens(body) {
+		if declarationWord(token, "CREATE") && token.start > table.End && token.start < selected.Start {
+			return sqlsymbol.Span{}, false
+		}
+	}
+	return selected, true
 }
 
 func descriptionSpanFor(description catalog.TableDescription, table string, column *sqlsymbol.Name) (sqlsymbol.Span, bool) {

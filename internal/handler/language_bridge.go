@@ -13,6 +13,7 @@ import (
 // every call derives its Context fresh from the snapshot it is given.
 func languageRequest(snapshot editorSnapshot) language.Request {
 	lctx := language.Context{
+		Key:               snapshot.MetadataKey,
 		Snapshot:          snapshot.Metadata,
 		Variant:           snapshot.Variant,
 		DialectResolved:   snapshot.DialectResolved,
@@ -20,7 +21,6 @@ func languageRequest(snapshot editorSnapshot) language.Request {
 		Incarnation:       snapshot.MetadataIncarnation,
 	}
 	if snapshot.MetadataLease != nil {
-		lctx.Key = snapshot.MetadataLease.Key()
 		lctx.Details = snapshot.MetadataLease
 	}
 	return language.Request{
@@ -31,6 +31,7 @@ func languageRequest(snapshot editorSnapshot) language.Request {
 			Binding: uint64(snapshot.Generation),
 		},
 		Context: lctx,
+		Policy:  snapshot.DiagnosticPolicy,
 	}
 }
 

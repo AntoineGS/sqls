@@ -40,6 +40,7 @@ func singletonDiagnosticCache() *database.DBCache {
 			IndexesByTable: map[string][]*database.IndexDesc{"ORDERS": {index}},
 		},
 		Metadata: map[database.MetadataKind]database.MetadataState{
+			database.MetadataRelations:      database.MetadataReady,
 			database.MetadataColumnsCurrent: database.MetadataReady,
 			database.MetadataViews:          database.MetadataReady,
 			database.MetadataIndexes:        database.MetadataReady,

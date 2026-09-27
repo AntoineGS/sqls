@@ -19,25 +19,27 @@ import (
 func BenchmarkDiagnosticsReusesSharedCatalog(b *testing.B) {
 	const tableCount = 256
 	cache := &catalog.Cache{
-		ColumnsByID: make(map[string][]*catalog.ColumnDesc, tableCount),
+		ColumnsByID:  make(map[string][]*catalog.ColumnDesc, tableCount),
+		Catalog:      &catalog.CatalogCache{ViewsByID: map[string]*catalog.ViewDesc{}, IndexesByID: map[string]*catalog.IndexDesc{}},
+		SchemaTables: map[string][]string{},
 		Metadata: map[catalog.MetadataKind]catalog.MetadataState{
 			catalog.MetadataColumnsCurrent: catalog.MetadataReady,
+			catalog.MetadataRelations:      catalog.MetadataReady,
+			catalog.MetadataViews:          catalog.MetadataReady,
+			catalog.MetadataIndexes:        catalog.MetadataReady,
 		},
 	}
 	for i := 0; i < tableCount; i++ {
 		table := "TABLE_" + strconv.Itoa(i)
+		cache.SchemaTables[""] = append(cache.SchemaTables[""], table)
 		key := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: table}.Key()
 		cache.ColumnsByID[key] = []*catalog.ColumnDesc{
 			{ColumnBase: catalog.ColumnBase{Table: table, Name: "VALUE"}, Type: "VARCHAR(10)"},
 		}
 	}
 	snap := &catalog.MetadataSnapshot{Cache: cache}
-	// TABLE_0/TABLE_1 are among the tableCount tables seeded above, so this
-	// insert's width check actually calls cacheDiagnosticCatalog.Columns
-	// against the shared cache on every benchmark iteration; DST/SRC (an
-	// earlier version of this benchmark) named tables outside the seeded
-	// set, so diagnosticCatalogReady never attached a catalog and every
-	// iteration measured the catalog-free path instead.
+	// TABLE_0/TABLE_1 are among the seeded, exactly-listed base tables, so
+	// this insert's width check consults the shared snapshot on each iteration.
 	req := language.Request{
 		Document: language.Document{
 			URI:     "memory:bench",

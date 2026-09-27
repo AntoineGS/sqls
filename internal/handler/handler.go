@@ -66,7 +66,10 @@ type Server struct {
 	// artefacts — the hover DDL memo, and the go-to-definition snapshot
 	// directory — to the connection they were produced under. Guarded by
 	// stateMu.
-	connGeneration  int
+	connGeneration int
+	// policyRevision fences a result computed under an older workspace policy.
+	// It is advanced for every accepted configuration change under stateMu.
+	policyRevision  uint64
 	lifecycleCtx    context.Context
 	lifecycleCancel context.CancelFunc
 	coordinator     *connectionCoordinator
@@ -526,11 +529,27 @@ func (s *Server) handleWorkspaceDidChangeConfiguration(ctx context.Context, conn
 	if err := json.Unmarshal(*req.Params, &params); err != nil {
 		return nil, err
 	}
+	if params.Settings.SQLS != nil {
+		if err := params.Settings.SQLS.Diagnostics.Validate(); err != nil {
+			message := fmt.Sprintf("sqls: rejected workspace/didChangeConfiguration: %v", err)
+			log.Println(message)
+			if conn != nil {
+				if sendErr := lsp.NewMessenger(conn).ShowError(ctx, message); sendErr != nil {
+					log.Println("sqls: send configuration rejection message:", sendErr)
+				}
+			}
+			return nil, err
+		}
+	}
+	s.diagnosticsPublishMu.Lock()
 	s.stateMu.Lock()
 	s.WSCfg = params.Settings.SQLS
+	s.policyRevision++
 	initialized := s.initialized
 	connected := s.dbConn != nil
 	s.stateMu.Unlock()
+	s.diagnosticsPublishMu.Unlock()
+	s.queueAllDiagnostics()
 	if initialized && !connected {
 		cfg, index, dbName := s.desiredConnection()
 		s.coordinator.Request(s.lifecycleCtx, cfg, index, dbName)

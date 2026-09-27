@@ -1,0 +1,5 @@
+diagnostics:
+  rules:
+    interbase-unknown-variable: error
+    interbase-null-comparison: warning
+    interbase-ambiguous-column: default
