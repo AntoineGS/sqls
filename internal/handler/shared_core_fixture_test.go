@@ -276,10 +276,12 @@ type fixtureRawClient struct {
 	stdin     io.WriteCloser
 	messages  chan fixtureRPCMessage
 	readErr   chan error
+	readDone  chan struct{}
 	waitDone  chan error
 	stderr    bytes.Buffer
 	stderrEnd chan struct{}
 	writeMu   sync.Mutex
+	waitOnce  sync.Once
 	closed    bool
 	waited    bool
 }
@@ -312,13 +314,15 @@ func startFixtureRawClient(t *testing.T, ctx context.Context) *fixtureRawClient 
 	if err := cmd.Start(); err != nil {
 		t.Fatal("start fixture test-binary child:", err)
 	}
-	c := &fixtureRawClient{cmd: cmd, stdin: stdin, messages: make(chan fixtureRPCMessage, 64), readErr: make(chan error, 1), waitDone: make(chan error, 1), stderrEnd: make(chan struct{})}
-	go func() { c.waitDone <- cmd.Wait() }()
+	c := &fixtureRawClient{cmd: cmd, stdin: stdin, messages: make(chan fixtureRPCMessage, 64), readErr: make(chan error, 1), readDone: make(chan struct{}), waitDone: make(chan error, 1), stderrEnd: make(chan struct{})}
 	go func() {
 		_, _ = io.Copy(&c.stderr, stderr)
 		close(c.stderrEnd)
 	}()
-	go c.readFrames(stdout)
+	go func() {
+		c.readFrames(stdout)
+		close(c.readDone)
+	}()
 	return c
 }
 
@@ -495,14 +499,13 @@ func (c *fixtureRawClient) shutdown(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// StdoutPipe requires its consumer to finish before Wait. In particular,
+	// Wait closes the pipe, which can otherwise turn a clean EOF into an
+	// os.ErrClosed framing failure in readFrames.
 	select {
-	case err := <-c.waitDone:
-		c.waited = true
-		if err != nil {
-			return fmt.Errorf("fixture child exit: %w (stderr: %s)", err, c.stderr.String())
-		}
+	case <-c.readDone:
 	case <-ctx.Done():
-		return fmt.Errorf("fixture child did not exit after shutdown: %w", ctx.Err())
+		return fmt.Errorf("fixture stdout did not close after shutdown: %w", ctx.Err())
 	}
 	select {
 	case err := <-c.readErr:
@@ -512,7 +515,23 @@ func (c *fixtureRawClient) shutdown(ctx context.Context) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+	c.startWait()
+	select {
+	case err := <-c.waitDone:
+		c.waited = true
+		if err != nil {
+			return fmt.Errorf("fixture child exit: %w (stderr: %s)", err, c.stderr.String())
+		}
+	case <-ctx.Done():
+		return fmt.Errorf("fixture child did not exit after shutdown: %w", ctx.Err())
+	}
 	return nil
+}
+
+func (c *fixtureRawClient) startWait() {
+	c.waitOnce.Do(func() {
+		go func() { c.waitDone <- c.cmd.Wait() }()
+	})
 }
 
 func (c *fixtureRawClient) stop() {
@@ -525,14 +544,33 @@ func (c *fixtureRawClient) stop() {
 	if c.cmd.Process != nil && !c.waited {
 		_ = c.cmd.Process.Kill()
 		select {
-		case <-c.waitDone:
-			c.waited = true
+		case <-c.readDone:
+			c.startWait()
 		case <-time.After(2 * time.Second):
+			// Keep Wait ordered after the StdoutPipe reader even during cleanup.
+			// Killing the child should close stdout; if it does not, avoid calling
+			// Wait against a still-active pipe reader.
+		}
+		if isClosed(c.readDone) {
+			select {
+			case <-c.waitDone:
+				c.waited = true
+			case <-time.After(2 * time.Second):
+			}
 		}
 	}
 	select {
 	case <-c.stderrEnd:
 	case <-time.After(2 * time.Second):
+	}
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
 	}
 }
 
