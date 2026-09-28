@@ -113,10 +113,10 @@ ORDER BY rf.RDB$RELATION_NAME, rf.RDB$FIELD_POSITION`,
 
 var interBaseBulkColumnsQuery = interBaseBulkColumnsQueryForWidth(interBaseBulkIdentifierCastWidth)
 
-// interBaseBulkPrimaryKeyFieldsQuery returns one row per primary-key field.
-// The key flag is a membership test, so the fields need no ordering; the
-// enforcing index supplies them exactly as the driver's per-constraint index
-// lookup did.
+// interBaseBulkPrimaryKeyFieldsQuery returns one row per primary-key field,
+// ordered by relation and then by the enforcing index's segment position so
+// a composite key's exact column order (see catalog.Cache.PrimaryKeysByID)
+// matches the driver's per-constraint index lookup, not scan order.
 //
 // The join onto RDB$INDICES pi filters the enforcing index's own
 // RDB$SYSTEM_FLAG, matching schema.Catalog.Index() (interbase-go's
@@ -133,7 +133,8 @@ JOIN RDB$INDICES pi ON pi.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 JOIN RDB$INDEX_SEGMENTS s ON s.RDB$INDEX_NAME = pk.RDB$INDEX_NAME
 WHERE pk.RDB$CONSTRAINT_TYPE = 'PRIMARY KEY'
   AND COALESCE(r.RDB$SYSTEM_FLAG, 0) = 0
-  AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0`,
+  AND COALESCE(pi.RDB$SYSTEM_FLAG, 0) = 0
+ORDER BY pk.RDB$RELATION_NAME, s.RDB$FIELD_POSITION`,
 		interBaseMetadataIdentifier("pk.RDB$RELATION_NAME", width),
 		interBaseMetadataIdentifier("s.RDB$FIELD_NAME", width))
 }

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/metadata"
 	"interbase-go/schema"
 )
@@ -231,6 +232,91 @@ func TestInterBaseMetadataColumnsDoNotRequireRelationsAndPKCanMergeEitherOrder(t
 			}
 		}
 	}
+}
+
+// TestInterBaseMetadataPrimaryKeysProduceExactOrderedProjection proves
+// readMetadataPrimaryKeys's PrimaryKeysByID projection (see
+// catalog.Cache.PrimaryKeysByID) preserves each relation's composite key in
+// its exact segment order, and that two case-distinct relations ("Foo" and
+// "FOO", which fold to the same legacy PrimaryKeyColumns key) are kept as
+// separate exact identities rather than merged.
+func TestInterBaseMetadataPrimaryKeysProduceExactOrderedProjection(t *testing.T) {
+	db := openInterBaseScalableFixture(t, 1)
+	insertInterBaseCaseDistinctPrimaryKeyFixtures(t, db)
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	ctx := context.Background()
+
+	count := interBaseFixtureCountPrepares(t)
+	patch, err := repo.runMetadataRead(ctx, repo.readMetadataPrimaryKeys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := count(); got != 2 {
+		t.Fatalf("prepared queries = %d, want one width and one primary key data query", got)
+	}
+
+	t001 := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T001"}.Key()
+	mixed := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "Foo"}.Key()
+	upper := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "FOO"}.Key()
+
+	if !reflect.DeepEqual(patch.Cache.PrimaryKeysByID[t001], []string{"KEY_A", "KEY_B"}) {
+		t.Fatalf("T001 primary keys = %#v, want [KEY_A KEY_B]", patch.Cache.PrimaryKeysByID[t001])
+	}
+	if !reflect.DeepEqual(patch.Cache.PrimaryKeysByID[mixed], []string{"B", "A"}) {
+		t.Fatalf("Foo primary keys = %#v, want [B A]", patch.Cache.PrimaryKeysByID[mixed])
+	}
+	if !reflect.DeepEqual(patch.Cache.PrimaryKeysByID[upper], []string{"ID"}) {
+		t.Fatalf("FOO primary keys = %#v, want [ID]", patch.Cache.PrimaryKeysByID[upper])
+	}
+}
+
+// insertInterBaseCaseDistinctPrimaryKeyFixtures adds two relations whose
+// names differ only by case, "Foo" and "FOO", each with its own composite or
+// single-column primary key. "Foo"'s key segments are inserted out of
+// column-name order (B before A) so a reader trusting insertion order
+// instead of RDB$FIELD_POSITION would fail.
+func insertInterBaseCaseDistinctPrimaryKeyFixtures(t *testing.T, db *sql.DB) {
+	t.Helper()
+	insert := func(statement string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(statement, args...); err != nil {
+			t.Fatalf("insert case-distinct fixture row: %v: %s", err, statement)
+		}
+	}
+	relation := func(name string, id int) {
+		insert(`INSERT INTO "RDB$RELATIONS" ("RDB$RELATION_NAME","RDB$RELATION_ID","RDB$OWNER_NAME","RDB$SYSTEM_FLAG") VALUES (?,?,?,?)`,
+			name, id, interBaseFixed("SYSDBA"), 0)
+	}
+	field := func(relationName, name string, position int) {
+		insert(`INSERT INTO "RDB$RELATION_FIELDS" ("RDB$FIELD_NAME","RDB$RELATION_NAME","RDB$FIELD_SOURCE","RDB$FIELD_POSITION","RDB$SYSTEM_FLAG","RDB$NULL_FLAG") VALUES (?,?,?,?,?,?)`,
+			interBaseFixed(name), relationName, "D_KEY", position, 0, 1)
+	}
+	index := func(name, relationName string, id, segmentCount int) {
+		insert(`INSERT INTO "RDB$INDICES" ("RDB$INDEX_NAME","RDB$RELATION_NAME","RDB$INDEX_ID","RDB$UNIQUE_FLAG","RDB$SEGMENT_COUNT","RDB$INDEX_INACTIVE","RDB$INDEX_TYPE","RDB$SYSTEM_FLAG") VALUES (?,?,?,?,?,?,?,?)`,
+			name, relationName, id, 1, segmentCount, 0, 0, 0)
+	}
+	segment := func(indexName, fieldName string, position int) {
+		insert(`INSERT INTO "RDB$INDEX_SEGMENTS" ("RDB$INDEX_NAME","RDB$FIELD_NAME","RDB$FIELD_POSITION") VALUES (?,?,?)`,
+			indexName, interBaseFixed(fieldName), position)
+	}
+	constraint := func(name, relationName, indexName string) {
+		insert(`INSERT INTO "RDB$RELATION_CONSTRAINTS" ("RDB$CONSTRAINT_NAME","RDB$CONSTRAINT_TYPE","RDB$RELATION_NAME","RDB$INDEX_NAME") VALUES (?,?,?,?)`,
+			name, "PRIMARY KEY", relationName, indexName)
+	}
+
+	relation("Foo", 500)
+	field("Foo", "B", 0)
+	field("Foo", "A", 1)
+	index("IDX_PK_Foo", "Foo", 5000, 2)
+	segment("IDX_PK_Foo", "B", 0)
+	segment("IDX_PK_Foo", "A", 1)
+	constraint("PK_Foo", "Foo", "IDX_PK_Foo")
+
+	relation("FOO", 501)
+	field("FOO", "ID", 0)
+	index("IDX_PK_FOO", "FOO", 5001, 1)
+	segment("IDX_PK_FOO", "ID", 0)
+	constraint("PK_FOO", "FOO", "IDX_PK_FOO")
 }
 
 // TestInterBaseMetadataViewsFromColumnsKeyDeterministicRegardlessOfAdmissionOrder
