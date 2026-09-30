@@ -212,6 +212,8 @@ func TestMetadataMergeRejectsMissingCategoryPayload(t *testing.T) {
 		{catalog.MetadataFunctions, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
 		{catalog.MetadataIndexes, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
 		{catalog.MetadataTriggers, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
+		{catalog.MetadataSystemRelations, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
+		{catalog.MetadataExceptions, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.kind), func(t *testing.T) {
@@ -225,19 +227,21 @@ func TestMetadataMergeRejectsMissingCategoryPayload(t *testing.T) {
 
 func TestMetadataMergeAcceptsAllocatedEmptyCategoryPayload(t *testing.T) {
 	patches := map[catalog.MetadataKind]*catalog.Cache{
-		catalog.MetadataSchemas:        {Schemas: map[string]string{}},
-		catalog.MetadataRelations:      {SchemaTables: map[string][]string{}},
-		catalog.MetadataColumnsCurrent: {ColumnsWithParent: map[string][]*catalog.ColumnDesc{}},
-		catalog.MetadataColumnsAll:     {ColumnsWithParent: map[string][]*catalog.ColumnDesc{}},
-		catalog.MetadataPrimaryKeys:    {PrimaryKeyColumns: map[string]map[string]struct{}{}},
-		catalog.MetadataForeignKeys:    {ForeignKeys: map[string]map[string][]*catalog.ForeignKey{}},
-		catalog.MetadataViews:          {Catalog: &catalog.CatalogCache{Views: map[string]*catalog.ViewDesc{}}},
-		catalog.MetadataProcedures:     {Catalog: &catalog.CatalogCache{Procedures: map[string]*catalog.ProcedureDesc{}}},
-		catalog.MetadataGenerators:     {Catalog: &catalog.CatalogCache{Generators: map[string]*catalog.GeneratorDesc{}}},
-		catalog.MetadataDomains:        {Catalog: &catalog.CatalogCache{Domains: map[string]*catalog.DomainDesc{}}},
-		catalog.MetadataFunctions:      {Catalog: &catalog.CatalogCache{Functions: map[string]*catalog.FunctionDesc{}}},
-		catalog.MetadataIndexes:        {Catalog: &catalog.CatalogCache{Indexes: map[string]*catalog.IndexDesc{}}},
-		catalog.MetadataTriggers:       {Catalog: &catalog.CatalogCache{Triggers: map[string]*catalog.TriggerDesc{}}},
+		catalog.MetadataSchemas:         {Schemas: map[string]string{}},
+		catalog.MetadataRelations:       {SchemaTables: map[string][]string{}},
+		catalog.MetadataColumnsCurrent:  {ColumnsWithParent: map[string][]*catalog.ColumnDesc{}},
+		catalog.MetadataColumnsAll:      {ColumnsWithParent: map[string][]*catalog.ColumnDesc{}},
+		catalog.MetadataPrimaryKeys:     {PrimaryKeyColumns: map[string]map[string]struct{}{}},
+		catalog.MetadataForeignKeys:     {ForeignKeys: map[string]map[string][]*catalog.ForeignKey{}},
+		catalog.MetadataViews:           {Catalog: &catalog.CatalogCache{Views: map[string]*catalog.ViewDesc{}}},
+		catalog.MetadataProcedures:      {Catalog: &catalog.CatalogCache{Procedures: map[string]*catalog.ProcedureDesc{}}},
+		catalog.MetadataGenerators:      {Catalog: &catalog.CatalogCache{Generators: map[string]*catalog.GeneratorDesc{}}},
+		catalog.MetadataDomains:         {Catalog: &catalog.CatalogCache{Domains: map[string]*catalog.DomainDesc{}}},
+		catalog.MetadataFunctions:       {Catalog: &catalog.CatalogCache{Functions: map[string]*catalog.FunctionDesc{}}},
+		catalog.MetadataIndexes:         {Catalog: &catalog.CatalogCache{Indexes: map[string]*catalog.IndexDesc{}}},
+		catalog.MetadataTriggers:        {Catalog: &catalog.CatalogCache{Triggers: map[string]*catalog.TriggerDesc{}}},
+		catalog.MetadataSystemRelations: {Catalog: &catalog.CatalogCache{SystemRelationsByID: map[string]*catalog.SystemRelationDesc{}}},
+		catalog.MetadataExceptions:      {Catalog: &catalog.CatalogCache{ExceptionsByID: map[string]*catalog.ExceptionDesc{}}},
 	}
 	for kind, cache := range patches {
 		t.Run(string(kind), func(t *testing.T) {
@@ -327,5 +331,89 @@ func TestMetadataMergePreservesGenericKeyWhenPKNotReady(t *testing.T) {
 	}
 	if got := merged.ColumnsWithParent[key][0].Key; got != "PRI" {
 		t.Fatalf("generic key flag = %q, want PRI", got)
+	}
+}
+
+func TestMetadataMergeSystemRelationsAndExceptionsKeepSeparateExactIdentities(t *testing.T) {
+	base := NewCache()
+	userRelations, err := Merge(base, catalog.MetadataRelations, catalog.MetadataPatch{Cache: &catalog.Cache{
+		SchemaTables: map[string][]string{"": {"RDB$USER_PREFIX", "USER_TABLE"}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	systemIDs := []catalog.ObjectID{
+		{Kind: catalog.ObjectKindTable, Name: "NoPrefixSystem"},
+		{Kind: catalog.ObjectKindTable, Name: "MIXED_SYSTEM"},
+		{Kind: catalog.ObjectKindTable, Name: "Mixed_System"},
+	}
+	systemByID := make(map[string]*catalog.SystemRelationDesc, len(systemIDs))
+	for _, id := range systemIDs {
+		systemByID[id.Key()] = &catalog.SystemRelationDesc{Schema: "", Name: id.Name, IsSystem: true}
+	}
+	withSystem, err := Merge(userRelations, catalog.MetadataSystemRelations, catalog.MetadataPatch{Cache: &catalog.Cache{
+		Catalog: &catalog.CatalogCache{SystemRelationsByID: systemByID},
+	}, Count: len(systemByID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	exceptionIDs := []catalog.ObjectID{
+		{Kind: catalog.ObjectKindException, Name: "NoPrefixSystem"},
+		{Kind: catalog.ObjectKindException, Name: "EXCEPTION"},
+		{Kind: catalog.ObjectKindException, Name: "Exception"},
+	}
+	exceptionsByID := map[string]*catalog.ExceptionDesc{
+		exceptionIDs[0].Key(): {Schema: "", Name: exceptionIDs[0].Name, Message: sql.NullString{String: "same name, different kind", Valid: true}},
+		exceptionIDs[1].Key(): {Schema: "", Name: exceptionIDs[1].Name, Message: sql.NullString{}},
+		exceptionIDs[2].Key(): {Schema: "", Name: exceptionIDs[2].Name, Message: sql.NullString{String: "", Valid: true}},
+	}
+	merged, err := Merge(withSystem, catalog.MetadataExceptions, catalog.MetadataPatch{Cache: &catalog.Cache{
+		Catalog: &catalog.CatalogCache{ExceptionsByID: exceptionsByID},
+	}, Count: len(exceptionsByID)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !merged.MetadataReady(catalog.MetadataSystemRelations, catalog.MetadataExceptions) {
+		t.Fatalf("new category states are not both ready: %#v", merged.Metadata)
+	}
+	if got, want := merged.SortedTables(), []string{"RDB$USER_PREFIX", "USER_TABLE"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("SortedTables() = %q, want only user relations %q", got, want)
+	}
+	if got := merged.SchemaTables[""]; !reflect.DeepEqual(got, []string{"RDB$USER_PREFIX", "USER_TABLE"}) {
+		t.Fatalf("user SchemaTables changed: %q", got)
+	}
+	if _, ok := merged.SystemRelationByID("NoPrefixSystem"); !ok {
+		t.Fatal("non-RDB$ system relation was not retained in the system category")
+	}
+	if _, ok := merged.SystemRelationByID("MIXED_SYSTEM"); !ok {
+		t.Fatal("exact upper-case system relation identity was lost")
+	}
+	if _, ok := merged.SystemRelationByID("Mixed_System"); !ok {
+		t.Fatal("case-fold-colliding system relation identity was lost")
+	}
+	if _, ok := merged.ExceptionByID("NoPrefixSystem"); !ok {
+		t.Fatal("same-name exception identity collided with the table identity")
+	}
+	if got, ok := merged.ExceptionByID("EXCEPTION"); !ok || got.Message.Valid {
+		t.Fatalf("NULL exception message = %#v, %v; want invalid NullString", got, ok)
+	}
+	if got, ok := merged.ExceptionByID("Exception"); !ok || !got.Message.Valid || got.Message.String != "" {
+		t.Fatalf("empty exception message = %#v, %v; want valid empty NullString", got, ok)
+	}
+	for _, id := range systemIDs {
+		if got, ok := merged.Catalog.Objects.Lookup(id); !ok || got != id {
+			t.Errorf("system exact identity lookup(%+v) = %+v, %v", id, got, ok)
+		}
+	}
+	for _, id := range exceptionIDs {
+		if got, ok := merged.Catalog.Objects.Lookup(id); !ok || got != id {
+			t.Errorf("exception exact identity lookup(%+v) = %+v, %v", id, got, ok)
+		}
+	}
+	if _, ok := merged.Catalog.Objects.Lookup(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "RDB$USER_PREFIX"}); ok {
+		t.Fatal("user relation was added to the new system-category object index")
 	}
 }

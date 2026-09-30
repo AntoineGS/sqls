@@ -57,7 +57,7 @@ func TestInterBaseMetadataPlanHasIndependentBoundedJobs(t *testing.T) {
 	if plan.Parallelism != 3 {
 		t.Fatalf("parallelism = %d, want 3", plan.Parallelism)
 	}
-	want := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataDomains, MetadataTriggers}
+	want := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataSystemRelations, MetadataExceptions, MetadataDomains, MetadataTriggers}
 	if len(plan.Jobs) != len(want) {
 		t.Fatalf("job count = %d, want %d", len(plan.Jobs), len(want))
 	}

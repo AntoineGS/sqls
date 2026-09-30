@@ -102,9 +102,10 @@ func (db *InterBaseDBRepository) ObjectDDL(ctx context.Context, kind ObjectKind,
 		}
 		generator = *object
 	case ObjectKindFunction:
-		// An external function's creation semantics include calling-convention
-		// policy the catalog does not record, so GenerateDDL always refuses.
-		// The lookup still runs, so an unknown name is ErrObjectNotFound.
+		// Keep this legacy ObjectDDL surface unsupported: its existing editor
+		// contract treats external functions as catalog metadata, not generated
+		// declarations. The metadata-detail path may use Function.GenerateDDL
+		// when explicitly requested and mark that result as generated.
 		object, err := catalog.Function(ctx, name)
 		if err != nil {
 			return "", err
@@ -112,7 +113,9 @@ func (db *InterBaseDBRepository) ObjectDDL(ctx context.Context, kind ObjectKind,
 		if object == nil {
 			return "", ErrObjectNotFound
 		}
-		generator = *object
+		return "", interBaseWrapDDLError(&schema.UnsupportedDDLError{
+			Object: "external function", Name: object.Name, Feature: "external calling convention",
+		})
 	default:
 		return "", fmt.Errorf("interbase: unsupported object kind %q", kind)
 	}

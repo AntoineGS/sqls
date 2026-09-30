@@ -193,6 +193,21 @@ func TestMetadataStatusFailedAndBlockedJobsOverJSONRPC(t *testing.T) {
 	if got.Categories[0].Kind != string(database.MetadataSchemas) || got.Categories[0].ErrorCode != "metadata_load_failed" || got.Categories[1].Kind != string(database.MetadataRelations) || got.Categories[1].ErrorCode != "dependency_failed" {
 		t.Fatalf("category order/status = %+v", got.Categories)
 	}
+	for _, kind := range []database.MetadataKind{database.MetadataSystemRelations, database.MetadataExceptions} {
+		found := false
+		for _, category := range got.Categories {
+			if category.Kind == string(kind) {
+				found = true
+				if category.State != string(database.MetadataUnsupported) {
+					t.Errorf("unplanned %s state = %s, want unsupported", kind, category.State)
+				}
+				break
+			}
+		}
+		if !found {
+			t.Errorf("metadata status omitted %s category: %+v", kind, got.Categories)
+		}
+	}
 	body, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)

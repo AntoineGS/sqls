@@ -16,6 +16,7 @@ var metadataKindOrder = []database.MetadataKind{
 	database.MetadataSchemas, database.MetadataRelations, database.MetadataColumnsCurrent,
 	database.MetadataColumnsAll, database.MetadataPrimaryKeys, database.MetadataForeignKeys,
 	database.MetadataViews, database.MetadataProcedures, database.MetadataGenerators,
+	database.MetadataSystemRelations, database.MetadataExceptions,
 	database.MetadataDomains, database.MetadataFunctions, database.MetadataIndexes, database.MetadataTriggers,
 }
 

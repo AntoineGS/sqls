@@ -100,7 +100,8 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 	case catalog.MetadataForeignKeys:
 		next.ForeignKeys = cloneForeignKeyMap(fragment.ForeignKeys)
 	case catalog.MetadataViews, catalog.MetadataProcedures, catalog.MetadataGenerators, catalog.MetadataDomains,
-		catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers:
+		catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
+		catalog.MetadataSystemRelations, catalog.MetadataExceptions:
 		catalogHeader := cloneCatalogHeader(base.Catalog)
 		fragmentCatalog := fragment.Catalog
 		switch kind {
@@ -127,6 +128,10 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 			catalogHeader.Triggers = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.Triggers }))
 			catalogHeader.TriggersByTable = triggerGroups(catalogHeader.Triggers)
 			catalogHeader.TriggersByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.TriggersByID }))
+		case catalog.MetadataSystemRelations:
+			catalogHeader.SystemRelationsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.SystemRelationDesc { return c.SystemRelationsByID }))
+		case catalog.MetadataExceptions:
+			catalogHeader.ExceptionsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.ExceptionDesc { return c.ExceptionsByID }))
 		}
 		// Objects accumulates exact identities across every category loaded
 		// so far (see CatalogCache.RebuildObjects), so it is rebuilt from
@@ -165,6 +170,10 @@ func validateMetadataPayload(kind catalog.MetadataKind, fragment *catalog.Cache)
 		present = fragment.Catalog != nil && fragment.Catalog.Indexes != nil
 	case catalog.MetadataTriggers:
 		present = fragment.Catalog != nil && fragment.Catalog.Triggers != nil
+	case catalog.MetadataSystemRelations:
+		present = fragment.Catalog != nil && fragment.Catalog.SystemRelationsByID != nil
+	case catalog.MetadataExceptions:
+		present = fragment.Catalog != nil && fragment.Catalog.ExceptionsByID != nil
 	}
 	if !present {
 		return fmt.Errorf("metadata %s payload is missing its category data", kind)
@@ -183,7 +192,8 @@ func knownMetadataKind(kind catalog.MetadataKind) bool {
 	switch kind {
 	case catalog.MetadataSchemas, catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataColumnsAll,
 		catalog.MetadataPrimaryKeys, catalog.MetadataForeignKeys, catalog.MetadataViews, catalog.MetadataProcedures,
-		catalog.MetadataGenerators, catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers:
+		catalog.MetadataGenerators, catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
+		catalog.MetadataSystemRelations, catalog.MetadataExceptions:
 		return true
 	default:
 		return false

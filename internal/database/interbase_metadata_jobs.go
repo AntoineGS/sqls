@@ -155,6 +155,36 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Generators: items, GeneratorsByID: byID}}, Count: len(items)}, nil
 			})
 		}},
+		{Kind: MetadataSystemRelations, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
+			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
+				values, err := bound.DescribeSystemRelations(ctx)
+				if err != nil {
+					return MetadataPatch{}, err
+				}
+				byID := make(map[string]*SystemRelationDesc, len(values))
+				for _, value := range values {
+					if value != nil {
+						byID[interBaseByIDKey(ObjectKindTable, value.Name)] = value
+					}
+				}
+				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{SystemRelationsByID: byID}}, Count: len(byID)}, nil
+			})
+		}},
+		{Kind: MetadataExceptions, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
+			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
+				values, err := bound.DescribeExceptions(ctx)
+				if err != nil {
+					return MetadataPatch{}, err
+				}
+				byID := make(map[string]*ExceptionDesc, len(values))
+				for _, value := range values {
+					if value != nil {
+						byID[interBaseByIDKey(ObjectKindException, value.Name)] = value
+					}
+				}
+				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{ExceptionsByID: byID}}, Count: len(byID)}, nil
+			})
+		}},
 		{Kind: MetadataDomains, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
 				values, err := bound.DescribeDomains(ctx)

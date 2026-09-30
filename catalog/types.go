@@ -99,6 +99,7 @@ const (
 	ObjectKindIndex     ObjectKind = "index"
 	ObjectKindGenerator ObjectKind = "generator"
 	ObjectKindFunction  ObjectKind = "function"
+	ObjectKindException ObjectKind = "exception"
 )
 
 // TableDescription is a SQL-shaped informational reconstruction of recorded
@@ -139,6 +140,26 @@ type GeneratorDesc struct {
 	Schema string
 	Name   string
 	ID     sql.NullInt64
+}
+
+// SystemRelationDesc describes one system relation. It is stored separately
+// from user SchemaTables and carries classification explicitly rather than
+// inferring it from the relation name.
+type SystemRelationDesc struct {
+	Schema    string
+	Name      string
+	ID        sql.NullInt64
+	OwnerName sql.NullString
+	IsSystem  bool
+}
+
+// ExceptionDesc describes one InterBase exception. Message keeps SQL NULL
+// distinct from a valid empty string for generated-detail consumers.
+type ExceptionDesc struct {
+	Schema  string
+	Name    string
+	Number  sql.NullInt64
+	Message sql.NullString
 }
 
 // ProcedureDesc describes a stored procedure and its ordered parameters.
@@ -278,6 +299,11 @@ type CatalogCache struct {
 	FunctionsByID  map[string]*FunctionDesc
 	IndexesByID    map[string]*IndexDesc
 	TriggersByID   map[string]*TriggerDesc
+	// SystemRelationsByID and ExceptionsByID are exact-only category stores.
+	// System relations use ObjectKindTable identities but never enter the user
+	// relation maps or completion candidates.
+	SystemRelationsByID map[string]*SystemRelationDesc
+	ExceptionsByID      map[string]*ExceptionDesc
 }
 
 // ColumnDatabaseKey normalises a schema/table pair for column cache lookup.

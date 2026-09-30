@@ -92,7 +92,8 @@ func NewLoader(budget *StoreBudget) *Loader {
 var metadataKinds = []catalog.MetadataKind{
 	catalog.MetadataSchemas, catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataColumnsAll,
 	catalog.MetadataPrimaryKeys, catalog.MetadataForeignKeys, catalog.MetadataViews, catalog.MetadataProcedures,
-	catalog.MetadataGenerators, catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
+	catalog.MetadataGenerators, catalog.MetadataSystemRelations, catalog.MetadataExceptions,
+	catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
 }
 
 func emptyMetadataStatus() map[catalog.MetadataKind]catalog.MetadataStatus {

@@ -161,6 +161,16 @@ func (cc *CatalogCache) RebuildObjects(fold func(string) string) {
 	for _, v := range cc.TriggersByID {
 		idx.Insert(ObjectID{Kind: ObjectKindTrigger, Name: v.Name})
 	}
+	for _, v := range cc.SystemRelationsByID {
+		if v != nil {
+			idx.Insert(ObjectID{Kind: ObjectKindTable, Name: v.Name})
+		}
+	}
+	for _, v := range cc.ExceptionsByID {
+		if v != nil {
+			idx.Insert(ObjectID{Kind: ObjectKindException, Schema: v.Schema, Name: v.Name})
+		}
+	}
 	cc.Objects = idx
 }
 
@@ -173,7 +183,7 @@ func objectIDKeyFor(kind ObjectKind, name string) string {
 }
 
 // ViewByID, ProcedureByID, GeneratorByID, DomainByID, FunctionByID,
-// IndexByID and TriggerByID resolve a catalog object by its exact name,
+// IndexByID, TriggerByID, SystemRelationByID and ExceptionByID resolve a catalog object by its exact name,
 // never subject to the upper-casing collision the corresponding legacy
 // accessor (View, Procedure, ...) has. They return false when the category
 // has not published yet, or genuinely has no such exact object.
@@ -230,6 +240,22 @@ func (dc *Cache) TriggerByID(name string) (*TriggerDesc, bool) {
 		return nil, false
 	}
 	v, ok := dc.Catalog.TriggersByID[objectIDKeyFor(ObjectKindTrigger, name)]
+	return v, ok
+}
+
+func (dc *Cache) SystemRelationByID(name string) (*SystemRelationDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.SystemRelationsByID[objectIDKeyFor(ObjectKindTable, name)]
+	return v, ok
+}
+
+func (dc *Cache) ExceptionByID(name string) (*ExceptionDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	v, ok := dc.Catalog.ExceptionsByID[objectIDKeyFor(ObjectKindException, name)]
 	return v, ok
 }
 

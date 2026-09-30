@@ -9,19 +9,21 @@ import (
 type MetadataKind string
 
 const (
-	MetadataSchemas        MetadataKind = "schemas"
-	MetadataRelations      MetadataKind = "relations"
-	MetadataColumnsCurrent MetadataKind = "columns-current"
-	MetadataColumnsAll     MetadataKind = "columns-all"
-	MetadataPrimaryKeys    MetadataKind = "primary-keys"
-	MetadataForeignKeys    MetadataKind = "foreign-keys"
-	MetadataViews          MetadataKind = "views"
-	MetadataProcedures     MetadataKind = "procedures"
-	MetadataGenerators     MetadataKind = "generators"
-	MetadataDomains        MetadataKind = "domains"
-	MetadataFunctions      MetadataKind = "functions"
-	MetadataIndexes        MetadataKind = "indexes"
-	MetadataTriggers       MetadataKind = "triggers"
+	MetadataSchemas         MetadataKind = "schemas"
+	MetadataRelations       MetadataKind = "relations"
+	MetadataColumnsCurrent  MetadataKind = "columns-current"
+	MetadataColumnsAll      MetadataKind = "columns-all"
+	MetadataPrimaryKeys     MetadataKind = "primary-keys"
+	MetadataForeignKeys     MetadataKind = "foreign-keys"
+	MetadataViews           MetadataKind = "views"
+	MetadataProcedures      MetadataKind = "procedures"
+	MetadataGenerators      MetadataKind = "generators"
+	MetadataDomains         MetadataKind = "domains"
+	MetadataFunctions       MetadataKind = "functions"
+	MetadataIndexes         MetadataKind = "indexes"
+	MetadataTriggers        MetadataKind = "triggers"
+	MetadataSystemRelations MetadataKind = "system-relations"
+	MetadataExceptions      MetadataKind = "exceptions"
 )
 
 // MetadataState describes a category's progress in one metadata generation.

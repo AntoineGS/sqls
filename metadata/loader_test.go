@@ -89,6 +89,29 @@ func (rows *drainRows) Close() error {
 
 func (*drainRows) Next([]driver.Value) error { return io.EOF }
 
+func emptyMetadataFamilyPatch(kind catalog.MetadataKind) catalog.MetadataPatch {
+	switch kind {
+	case catalog.MetadataSystemRelations:
+		return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{SystemRelationsByID: map[string]*catalog.SystemRelationDesc{}}}}
+	case catalog.MetadataExceptions:
+		return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{ExceptionsByID: map[string]*catalog.ExceptionDesc{}}}}
+	default:
+		panic("not a metadata-family kind: " + string(kind))
+	}
+}
+
+func waitForMetadataState(t *testing.T, loader *Loader, kind catalog.MetadataKind, want catalog.MetadataState) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if loader.Snapshot().Status[kind].State == want {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("metadata state for %s = %s, want %s", kind, loader.Snapshot().Status[kind].State, want)
+}
+
 func waitLoad(t *testing.T, load *Load) {
 	t.Helper()
 	select {
@@ -777,4 +800,218 @@ func TestMetadataLoaderStopIsIdempotent(t *testing.T) {
 	if _, err := loader.Start(context.Background(), 1, metadataRepo(catalog.MetadataPlan{Parallelism: 1})); !errors.Is(err, ErrMetadataStopped) {
 		t.Fatalf("Start after repeated Stop = %v, want stopped", err)
 	}
+}
+
+func TestMetadataLoaderSystemRelationsAndExceptionsTransitionIndependently(t *testing.T) {
+	kinds := []catalog.MetadataKind{catalog.MetadataSystemRelations, catalog.MetadataExceptions}
+	loader := NewLoader(nil)
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	for _, kind := range kinds {
+		if got := loader.Snapshot().Status[kind].State; got != catalog.MetadataUnsupported {
+			t.Fatalf("unplanned initial state for %s = %s, want unsupported", kind, got)
+		}
+	}
+
+	pending := make(chan struct{}, 1)
+	loader.SetChangedCallback(func() {
+		status := loader.Snapshot().Status
+		if status[catalog.MetadataSystemRelations].State == catalog.MetadataPending &&
+			status[catalog.MetadataExceptions].State == catalog.MetadataPending {
+			select {
+			case pending <- struct{}{}:
+			default:
+			}
+		}
+	})
+
+	started := make(chan catalog.MetadataKind, len(kinds))
+	release := make(chan struct{})
+	jobs := make([]catalog.MetadataJob, 0, len(kinds))
+	for _, kind := range kinds {
+		kind := kind
+		jobs = append(jobs, catalog.MetadataJob{Kind: kind, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
+			started <- kind
+			select {
+			case <-ctx.Done():
+				return catalog.MetadataPatch{}, ctx.Err()
+			case <-release:
+				return emptyMetadataFamilyPatch(kind), nil
+			}
+		}})
+	}
+	load, err := loader.Start(context.Background(), 1, catalog.MetadataPlan{Parallelism: 2, Jobs: jobs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-pending:
+	case <-time.After(2 * time.Second):
+		t.Fatal("new metadata categories were not published pending before execution")
+	}
+	for range kinds {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("both independent category jobs did not start")
+		}
+	}
+	for _, kind := range kinds {
+		if got := loader.Snapshot().Status[kind].State; got != catalog.MetadataLoading {
+			t.Errorf("state for %s while its job is gated = %s, want loading", kind, got)
+		}
+	}
+	close(release)
+	waitLoad(t, load)
+	for _, kind := range kinds {
+		if got := loader.Snapshot().Status[kind].State; got != catalog.MetadataReady {
+			t.Errorf("completed state for %s = %s, want ready", kind, got)
+		}
+		if !loader.Cache().MetadataReady(kind) {
+			t.Errorf("ready-empty category %s was not marked ready in the cache", kind)
+		}
+	}
+}
+
+func TestMetadataLoaderSystemRelationsAndExceptionsIsolateOtherOutcomes(t *testing.T) {
+	kinds := []catalog.MetadataKind{catalog.MetadataSystemRelations, catalog.MetadataExceptions}
+
+	t.Run("failed", func(t *testing.T) {
+		for _, failedKind := range kinds {
+			t.Run(string(failedKind), func(t *testing.T) {
+				loader := NewLoader(nil)
+				t.Cleanup(loader.Stop)
+				loader.Reset(1)
+				jobs := make([]catalog.MetadataJob, 0, len(kinds))
+				for _, kind := range kinds {
+					kind := kind
+					jobs = append(jobs, catalog.MetadataJob{Kind: kind, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+						if kind == failedKind {
+							return catalog.MetadataPatch{}, errors.New("injected category failure")
+						}
+						return emptyMetadataFamilyPatch(kind), nil
+					}})
+				}
+				load, err := loader.Start(context.Background(), 1, catalog.MetadataPlan{Parallelism: 2, Jobs: jobs})
+				if err != nil {
+					t.Fatal(err)
+				}
+				waitLoad(t, load)
+				for _, kind := range kinds {
+					want := catalog.MetadataReady
+					if kind == failedKind {
+						want = catalog.MetadataFailed
+					}
+					if got := loader.Snapshot().Status[kind].State; got != want {
+						t.Errorf("state for %s = %s, want %s", kind, got, want)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("cancelled", func(t *testing.T) {
+		for _, cancelledKind := range kinds {
+			t.Run(string(cancelledKind), func(t *testing.T) {
+				loader := NewLoader(nil)
+				t.Cleanup(loader.Stop)
+				loader.Reset(1)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				jobs := make([]catalog.MetadataJob, 0, len(kinds))
+				for _, kind := range kinds {
+					kind := kind
+					jobs = append(jobs, catalog.MetadataJob{Kind: kind, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
+						if kind == cancelledKind {
+							<-ctx.Done()
+							return catalog.MetadataPatch{}, ctx.Err()
+						}
+						return emptyMetadataFamilyPatch(kind), nil
+					}})
+				}
+				load, err := loader.Start(ctx, 1, catalog.MetadataPlan{Parallelism: 2, Jobs: jobs})
+				if err != nil {
+					t.Fatal(err)
+				}
+				sibling := kinds[0]
+				if sibling == cancelledKind {
+					sibling = kinds[1]
+				}
+				waitForMetadataState(t, loader, sibling, catalog.MetadataReady)
+				cancel()
+				waitLoad(t, load)
+				if got := loader.Snapshot().Status[cancelledKind].State; got != catalog.MetadataCancelled {
+					t.Errorf("cancelled category state = %s, want cancelled", got)
+				}
+				if got := loader.Snapshot().Status[sibling].State; got != catalog.MetadataReady {
+					t.Errorf("ready sibling state after cancellation = %s, want ready", got)
+				}
+			})
+		}
+	})
+
+	t.Run("blocked", func(t *testing.T) {
+		for _, blockedKind := range kinds {
+			t.Run(string(blockedKind), func(t *testing.T) {
+				loader := NewLoader(nil)
+				t.Cleanup(loader.Stop)
+				loader.Reset(1)
+				jobs := []catalog.MetadataJob{{Kind: catalog.MetadataSchemas, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+					return catalog.MetadataPatch{}, errors.New("injected prerequisite failure")
+				}}}
+				for _, kind := range kinds {
+					kind := kind
+					job := catalog.MetadataJob{Kind: kind, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+						return emptyMetadataFamilyPatch(kind), nil
+					}}
+					if kind == blockedKind {
+						job.DependsOn = []catalog.MetadataKind{catalog.MetadataSchemas}
+					}
+					jobs = append(jobs, job)
+				}
+				load, err := loader.Start(context.Background(), 1, catalog.MetadataPlan{Parallelism: 3, Jobs: jobs})
+				if err != nil {
+					t.Fatal(err)
+				}
+				waitLoad(t, load)
+				sibling := kinds[0]
+				if sibling == blockedKind {
+					sibling = kinds[1]
+				}
+				if got := loader.Snapshot().Status[blockedKind].State; got != catalog.MetadataBlocked {
+					t.Errorf("blocked category state = %s, want blocked", got)
+				}
+				if got := loader.Snapshot().Status[sibling].State; got != catalog.MetadataReady {
+					t.Errorf("ready sibling state after blocking = %s, want ready", got)
+				}
+			})
+		}
+	})
+
+	t.Run("unsupported", func(t *testing.T) {
+		for _, unsupportedKind := range kinds {
+			t.Run(string(unsupportedKind), func(t *testing.T) {
+				loader := NewLoader(nil)
+				t.Cleanup(loader.Stop)
+				loader.Reset(1)
+				sibling := kinds[0]
+				if sibling == unsupportedKind {
+					sibling = kinds[1]
+				}
+				load, err := loader.Start(context.Background(), 1, catalog.MetadataPlan{Parallelism: 1, Jobs: []catalog.MetadataJob{{Kind: sibling, Run: func(context.Context, *catalog.Cache) (catalog.MetadataPatch, error) {
+					return emptyMetadataFamilyPatch(sibling), nil
+				}}}})
+				if err != nil {
+					t.Fatal(err)
+				}
+				waitLoad(t, load)
+				if got := loader.Snapshot().Status[unsupportedKind].State; got != catalog.MetadataUnsupported {
+					t.Errorf("unplanned category state = %s, want unsupported", got)
+				}
+				if got := loader.Snapshot().Status[sibling].State; got != catalog.MetadataReady {
+					t.Errorf("ready sibling state with unsupported category = %s, want ready", got)
+				}
+			})
+		}
+	})
 }

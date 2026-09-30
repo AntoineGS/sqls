@@ -284,6 +284,83 @@ func TestInterBaseMetadataPlanCompletesWithOneConnection(t *testing.T) {
 	}
 }
 
+func TestInterBaseMetadataPlanSystemRelationsAndExceptionsAreSeparate(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	insertRelation := func(name string, id, systemFlag int) {
+		t.Helper()
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATIONS" VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			name, id, nil, nil, nil, interBaseFixed("SYSDBA"), nil, 8, 1, nil, 0,
+			interBaseFixed("PERSISTENT"), systemFlag, nil); err != nil {
+			t.Fatalf("insert fixture relation %q: %v", name, err)
+		}
+	}
+	insertRelation("RDB$USER_PREFIX", 600, 0)
+	insertRelation("NoPrefixSystem", 601, 9)
+	if _, err := db.Exec(`INSERT INTO "RDB$EXCEPTIONS" VALUES (?,?,?)`, "Null_Message", 701, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$EXCEPTIONS" VALUES (?,?,?)`, "Empty_Message", 702, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	var jobs []MetadataJob
+	for _, job := range repo.MetadataPlan().Jobs {
+		if job.Kind == MetadataRelations || job.Kind == MetadataSystemRelations || job.Kind == MetadataExceptions {
+			if len(job.DependsOn) != 0 {
+				t.Errorf("%s job depends on %v, want an independent category read", job.Kind, job.DependsOn)
+			}
+			jobs = append(jobs, job)
+		}
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("selected category jobs = %d, want user relations, system relations and exceptions", len(jobs))
+	}
+	loader := metadata.NewLoader(nil)
+	t.Cleanup(loader.Stop)
+	loader.Reset(1)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	load, err := loader.Start(ctx, 1, MetadataPlan{Parallelism: 3, Jobs: jobs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitLoad(t, load)
+	snapshot := loader.Snapshot()
+	for _, kind := range []MetadataKind{MetadataRelations, MetadataSystemRelations, MetadataExceptions} {
+		if got := snapshot.Status[kind].State; got != MetadataReady {
+			t.Errorf("%s category state = %s, want ready: %v", kind, got, snapshot.Status[kind].Err)
+		}
+	}
+
+	cache := snapshot.Cache
+	if relation, ok := cache.SystemRelationByID("NoPrefixSystem"); !ok || !relation.IsSystem {
+		t.Fatalf("non-prefix flagged system relation = %#v, %v", relation, ok)
+	}
+	if _, ok := cache.SystemRelationByID("RDB$USER_PREFIX"); ok {
+		t.Fatal("RDB$-prefixed user relation was inferred to be a system relation")
+	}
+	userPrefixFound, noPrefixSystemFound := false, false
+	for _, name := range cache.SchemaTables[""] {
+		userPrefixFound = userPrefixFound || name == "RDB$USER_PREFIX"
+		noPrefixSystemFound = noPrefixSystemFound || name == "NoPrefixSystem"
+	}
+	if !userPrefixFound || noPrefixSystemFound {
+		t.Fatalf("user relation names = %q; want RDB$-prefixed user relation and no non-prefix system relation", cache.SchemaTables[""])
+	}
+	for _, name := range cache.SortedTables() {
+		if name == "NoPrefixSystem" || name == "RDB$SYSTEM" {
+			t.Errorf("system relation %q leaked into SortedTables()", name)
+		}
+	}
+	if exception, ok := cache.ExceptionByID("Null_Message"); !ok || exception.Message.Valid {
+		t.Errorf("NULL exception message = %#v, %v; want invalid sql.NullString", exception, ok)
+	}
+	if exception, ok := cache.ExceptionByID("Empty_Message"); !ok || !exception.Message.Valid || exception.Message.String != "" {
+		t.Errorf("empty exception message = %#v, %v; want valid empty sql.NullString", exception, ok)
+	}
+}
+
 func TestInterBaseMetadataForeignKeyParityCountsUniqueOrderedCompositeMappings(t *testing.T) {
 	db := openInterBaseScalableFixture(t, 2)
 	repo := &InterBaseDBRepository{Conn: db}
@@ -516,6 +593,8 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 		{MetadataProcedures, "FROM RDB$PROCEDURES p"},
 		{MetadataFunctions, "FROM RDB$FUNCTIONS f"},
 		{MetadataGenerators, "RDB$GENERATORS"},
+		{MetadataSystemRelations, "WHERE COALESCE(r.RDB$SYSTEM_FLAG, 0) <> 0"},
+		{MetadataExceptions, "FROM RDB$EXCEPTIONS e"},
 		{MetadataDomains, "FROM RDB$FIELDS f\n"},
 		{MetadataTriggers, "RDB$TRIGGERS"},
 	}
@@ -609,6 +688,14 @@ func interBaseMetadataFragmentCount(cache *DBCache, kind MetadataKind) int {
 	case MetadataDomains:
 		if cache.Catalog != nil {
 			return len(cache.Catalog.Domains)
+		}
+	case MetadataSystemRelations:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.SystemRelationsByID)
+		}
+	case MetadataExceptions:
+		if cache.Catalog != nil {
+			return len(cache.Catalog.ExceptionsByID)
 		}
 	case MetadataTriggers:
 		if cache.Catalog != nil {
@@ -725,7 +812,7 @@ func TestInterBaseMetadataJobPanicDoesNotSuppressIndependentSibling(t *testing.T
 }
 
 func TestInterBaseMetadataFailureIsIsolatedForEveryIndependentKind(t *testing.T) {
-	kinds := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataDomains, MetadataTriggers}
+	kinds := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataSystemRelations, MetadataExceptions, MetadataDomains, MetadataTriggers}
 	for _, failed := range kinds {
 		t.Run(string(failed), func(t *testing.T) {
 			jobs := make([]MetadataJob, 0, len(kinds))
@@ -784,6 +871,10 @@ func emptyMetadataPatch(kind MetadataKind) *DBCache {
 		return &DBCache{Catalog: &CatalogCache{Generators: map[string]*GeneratorDesc{}}}
 	case MetadataDomains:
 		return &DBCache{Catalog: &CatalogCache{Domains: map[string]*DomainDesc{}}}
+	case MetadataSystemRelations:
+		return &DBCache{Catalog: &CatalogCache{SystemRelationsByID: map[string]*SystemRelationDesc{}}}
+	case MetadataExceptions:
+		return &DBCache{Catalog: &CatalogCache{ExceptionsByID: map[string]*ExceptionDesc{}}}
 	case MetadataTriggers:
 		return &DBCache{Catalog: &CatalogCache{Triggers: map[string]*TriggerDesc{}}}
 	default:

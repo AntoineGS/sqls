@@ -464,6 +464,50 @@ func (db *InterBaseDBRepository) DescribeGenerators(ctx context.Context) ([]*Gen
 	return result, nil
 }
 
+// DescribeSystemRelations returns explicitly flagged relations without adding
+// them to the repository's user-table/schema or completion projections.
+func (db *InterBaseDBRepository) DescribeSystemRelations(ctx context.Context) ([]*SystemRelationDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	relations, err := catalog.SystemRelations(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*SystemRelationDesc, 0, len(relations))
+	for _, relation := range relations {
+		if !relation.SystemFlag.Valid || relation.SystemFlag.Int64 == 0 {
+			return nil, fmt.Errorf("interbase: system relation %q has no nonzero RDB$SYSTEM_FLAG", relation.Name)
+		}
+		result = append(result, &SystemRelationDesc{
+			Schema: "", Name: relation.Name, ID: relation.ID,
+			OwnerName: trimInterBaseCatalogName(relation.OwnerName), IsSystem: true,
+		})
+	}
+	return result, nil
+}
+
+// DescribeExceptions returns exact exception names and preserves NULL versus
+// empty catalog messages for selected generated-detail handling.
+func (db *InterBaseDBRepository) DescribeExceptions(ctx context.Context) ([]*ExceptionDesc, error) {
+	catalog, err := db.catalogReader()
+	if err != nil {
+		return nil, err
+	}
+	exceptions, err := catalog.Exceptions(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	result := make([]*ExceptionDesc, 0, len(exceptions))
+	for _, exception := range exceptions {
+		result = append(result, &ExceptionDesc{
+			Schema: "", Name: exception.Name, Number: exception.Number, Message: exception.Message,
+		})
+	}
+	return result, nil
+}
+
 func (db *InterBaseDBRepository) DescribeDomains(ctx context.Context) ([]*DomainDesc, error) {
 	catalog, err := db.catalogReader()
 	if err != nil {

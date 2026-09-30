@@ -24,6 +24,8 @@ type (
 	TriggerDesc            = catalog.TriggerDesc
 	DomainDesc             = catalog.DomainDesc
 	IndexDesc              = catalog.IndexDesc
+	SystemRelationDesc     = catalog.SystemRelationDesc
+	ExceptionDesc          = catalog.ExceptionDesc
 	FunctionDesc           = catalog.FunctionDesc
 	FunctionArgumentDesc   = catalog.FunctionArgumentDesc
 	TableDescription       = catalog.TableDescription
@@ -58,23 +60,26 @@ const (
 	ObjectKindIndex     = catalog.ObjectKindIndex
 	ObjectKindGenerator = catalog.ObjectKindGenerator
 	ObjectKindFunction  = catalog.ObjectKindFunction
+	ObjectKindException = catalog.ObjectKindException
 
 	ParameterInput  = catalog.ParameterInput
 	ParameterOutput = catalog.ParameterOutput
 
-	MetadataSchemas        = catalog.MetadataSchemas
-	MetadataRelations      = catalog.MetadataRelations
-	MetadataColumnsCurrent = catalog.MetadataColumnsCurrent
-	MetadataColumnsAll     = catalog.MetadataColumnsAll
-	MetadataPrimaryKeys    = catalog.MetadataPrimaryKeys
-	MetadataForeignKeys    = catalog.MetadataForeignKeys
-	MetadataViews          = catalog.MetadataViews
-	MetadataProcedures     = catalog.MetadataProcedures
-	MetadataGenerators     = catalog.MetadataGenerators
-	MetadataDomains        = catalog.MetadataDomains
-	MetadataFunctions      = catalog.MetadataFunctions
-	MetadataIndexes        = catalog.MetadataIndexes
-	MetadataTriggers       = catalog.MetadataTriggers
+	MetadataSchemas         = catalog.MetadataSchemas
+	MetadataRelations       = catalog.MetadataRelations
+	MetadataColumnsCurrent  = catalog.MetadataColumnsCurrent
+	MetadataColumnsAll      = catalog.MetadataColumnsAll
+	MetadataPrimaryKeys     = catalog.MetadataPrimaryKeys
+	MetadataForeignKeys     = catalog.MetadataForeignKeys
+	MetadataViews           = catalog.MetadataViews
+	MetadataProcedures      = catalog.MetadataProcedures
+	MetadataGenerators      = catalog.MetadataGenerators
+	MetadataDomains         = catalog.MetadataDomains
+	MetadataFunctions       = catalog.MetadataFunctions
+	MetadataIndexes         = catalog.MetadataIndexes
+	MetadataTriggers        = catalog.MetadataTriggers
+	MetadataSystemRelations = catalog.MetadataSystemRelations
+	MetadataExceptions      = catalog.MetadataExceptions
 
 	MetadataPending     = catalog.MetadataPending
 	MetadataLoading     = catalog.MetadataLoading
