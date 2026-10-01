@@ -209,6 +209,154 @@ func TestDetailCacheSurvivesStatusOnlyRevisions(t *testing.T) {
 	}
 }
 
+func TestVolatileDetailCoalescesInFlightAndReloadsAfterSettlement(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var calls atomic.Int64
+	p := &renderingProvider{
+		cache:    &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}},
+		volatile: true,
+		load: func(ctx context.Context) (metadata.Detail, error) {
+			call := calls.Add(1)
+			if call == 1 {
+				close(entered)
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return metadata.Detail{}, ctx.Err()
+				}
+			}
+			return metadata.Detail{Text: fmt.Sprintf("value-%d", call)}, nil
+		},
+	}
+	lease, err := r.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "ib://host/detail-volatile"}, metadata.Scope{Principal: "U"}, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	waitReadyOrFatal(t, lease)
+
+	request := metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindGenerator, Name: "G"}, Facet: "ddl", Consistency: metadata.Committed}
+	type result struct {
+		detail metadata.Detail
+		err    error
+	}
+	firstDone := make(chan result, 1)
+	go func() {
+		detail, err := lease.Detail(ctx, request)
+		firstDone <- result{detail: detail, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("volatile detail load did not enter")
+	}
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan result, 1)
+	go func() {
+		close(secondStarted)
+		detail, err := lease.Detail(ctx, request)
+		secondDone <- result{detail: detail, err: err}
+	}()
+	<-secondStarted
+	select {
+	case got := <-secondDone:
+		close(gate)
+		t.Fatalf("concurrent volatile detail returned before shared load settled: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := calls.Load(); got != 1 {
+		close(gate)
+		t.Fatalf("in-flight load calls = %d, want 1", got)
+	}
+	close(gate)
+	first, second := <-firstDone, <-secondDone
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent Detail errors = %v, %v", first.err, second.err)
+	}
+	if first.detail.Text != "value-1" || second.detail.Text != "value-1" {
+		t.Fatalf("coalesced values = %q, %q; want value-1 for both", first.detail.Text, second.detail.Text)
+	}
+
+	third, err := lease.Detail(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Text != "value-2" || calls.Load() != 2 {
+		t.Fatalf("post-settlement detail = %q after %d loads, want value-2 after 2 loads", third.Text, calls.Load())
+	}
+}
+
+func TestVolatileDetailGenerationChangeMakesOldWaitersStale(t *testing.T) {
+	ctx := context.Background()
+	r := metadata.NewRegistry(ctx, metadata.Options{})
+	defer r.Close(ctx)
+
+	gate := make(chan struct{})
+	entered := make(chan struct{})
+	var calls atomic.Int64
+	p := &renderingProvider{
+		cache:    &catalog.Cache{SchemaTables: map[string][]string{"": {"T"}}},
+		volatile: true,
+		load: func(context.Context) (metadata.Detail, error) {
+			call := calls.Add(1)
+			if call == 1 {
+				close(entered)
+				<-gate
+			}
+			return metadata.Detail{Text: fmt.Sprintf("value-%d", call)}, nil
+		},
+	}
+	lease, err := r.Acquire(ctx, metadata.Key{Engine: "interbase", URL: "ib://host/detail-volatile-generation"}, metadata.Scope{Principal: "U"}, p.Factory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	waitReadyOrFatal(t, lease)
+
+	request := metadata.Request{Object: catalog.ObjectID{Kind: catalog.ObjectKindGenerator, Name: "G"}, Facet: "ddl", Consistency: metadata.Committed}
+	oldDone := make(chan error, 1)
+	go func() {
+		_, err := lease.Detail(ctx, request)
+		oldDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("old-generation volatile load did not enter")
+	}
+	if err := lease.Refresh(ctx); err != nil {
+		close(gate)
+		t.Fatalf("Refresh() error = %v", err)
+	}
+	if err := metadatatest.WaitReady(ctx, lease); err != nil {
+		close(gate)
+		t.Fatalf("WaitReady after Refresh() error = %v", err)
+	}
+	close(gate)
+	select {
+	case err := <-oldDone:
+		if !errors.Is(err, metadata.ErrStale) {
+			t.Fatalf("old-generation volatile detail error = %v, want ErrStale", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("old-generation volatile detail did not settle after release")
+	}
+
+	current, err := lease.Detail(ctx, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Text != "value-2" || calls.Load() != 2 {
+		t.Fatalf("current-generation detail = %q after %d loads, want value-2 after 2 loads", current.Text, calls.Load())
+	}
+}
+
 // TestDetailDialectOnlyDifferenceDoesNotReload proves Render (when present)
 // runs per request against the one acquired Detail, so two requests that
 // differ only in Dialect never trigger a second Load.
@@ -396,6 +544,7 @@ func (p *consistencyProvider) Factory(context.Context) (metadata.Provider, error
 // and Render, for tests needing a real (non-nil) Render function.
 type renderingProvider struct {
 	cache     *catalog.Cache
+	volatile  bool
 	gate      <-chan struct{}
 	entered   chan struct{}
 	enterOnce sync.Once
@@ -432,6 +581,7 @@ func (p *renderingProvider) DetailPlan(req metadata.Request) (metadata.DetailPla
 	return metadata.DetailPlan{
 		Requires:         []catalog.MetadataKind{catalog.MetadataRelations},
 		Coverage:         req.Object.Key() + "\x00" + req.Facet,
+		Volatile:         p.volatile,
 		CoverageForCache: p.coverage,
 		Load: func(ctx context.Context, cache *catalog.Cache) (metadata.Detail, error) {
 			p.mu.Lock()

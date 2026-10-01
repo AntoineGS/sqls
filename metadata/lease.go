@@ -97,7 +97,7 @@ func (l *Lease) Detail(ctx context.Context, req Request) (Detail, error) {
 		}
 	}
 
-	acquired, err := l.track.details.acquire(ctx, snapshot.Generation, coverage, func(jobCtx context.Context) (Detail, error) {
+	acquired, err := l.track.details.acquire(ctx, snapshot.Generation, coverage, plan.Volatile, func(jobCtx context.Context) (Detail, error) {
 		return plan.Load(jobCtx, snapshot.Cache)
 	})
 	if err != nil {

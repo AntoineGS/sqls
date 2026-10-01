@@ -52,6 +52,9 @@ type Request struct {
 	Facet       string
 	Dialect     int
 	Consistency Consistency
+	// IsSystem routes selected table detail through the system-relations
+	// category. It is presentation/routing metadata, not part of ObjectID.
+	IsSystem bool
 }
 
 // Detail is one rendered object fragment: source text, provenance, columns
@@ -68,6 +71,10 @@ type Detail struct {
 type DetailPlan struct {
 	Requires []catalog.MetadataKind
 	Coverage string
+	// Volatile keeps a successful Load only long enough for concurrent
+	// callers of the same coverage to share it. Once settled, a later logical
+	// request starts a fresh Load. The zero value retains successful details.
+	Volatile bool
 	// CoverageForCache optionally derives the store's acquisition key from
 	// the exact ready cache snapshot whose categories were checked by Lease.
 	// It must be pure and read-only: it may resolve canonical object identity,

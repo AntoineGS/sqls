@@ -730,9 +730,18 @@ func functionDescriptions(functions []schema.Function) ([]*FunctionDesc, error) 
 				return nil, err
 			}
 			arguments = append(arguments, &FunctionArgumentDesc{
-				Name:     argument.Name,
-				Position: argument.Position,
-				Type:     argumentType,
+				Name:            argument.Name,
+				FunctionName:    argument.FunctionName,
+				Position:        argument.Position,
+				Mechanism:       argument.Mechanism,
+				FieldLength:     argument.FieldLength,
+				FieldScale:      argument.FieldScale,
+				FieldType:       argument.FieldType,
+				FieldSubType:    argument.FieldSubType,
+				CharacterSetID:  argument.CharacterSetID,
+				FieldPrecision:  argument.FieldPrecision,
+				CharacterLength: argument.CharacterLength,
+				Type:            argumentType,
 			})
 		}
 		// RDB$RETURN_ARGUMENT is an argument position, not an index into
@@ -746,6 +755,8 @@ func functionDescriptions(functions []schema.Function) ([]*FunctionDesc, error) 
 		result = append(result, &FunctionDesc{
 			Schema:         "",
 			Name:           function.Name,
+			FunctionType:   function.FunctionType,
+			SystemFlag:     function.SystemFlag,
 			ReturnType:     returnType,
 			ReturnPosition: function.ReturnArgument,
 			Arguments:      arguments,

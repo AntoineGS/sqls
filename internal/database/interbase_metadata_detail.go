@@ -3,7 +3,9 @@ package database
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -14,15 +16,15 @@ import (
 // MetadataDetailPlan adapts detail requests onto InterBase's retained
 // bulk-category facts where possible. Most facets only resolve the requested
 // object against an already-ready category and perform pure per-request
-// rendering. Table DDL is the narrow exception described below: the driver
-// does not retain its complete DDL facts in the bulk cache, so its bounded
-// detail read and source-dialect rendering both run in Load.
+// rendering. Selected system columns, generator values and table DDL use
+// bounded provider-owned reads in Load; all other renderers use the checked
+// category snapshot.
 //
 // Table DDL is the narrow provider-owned exception: schema.Table performs
 // bounded, context-aware reads for that exact relation's constraints,
 // indexes and triggers, then renders using the repository's source dialect.
-// Its rendered text is cached with dialect-specific coverage. External
-// function DDL remains unsupported because the driver itself refuses it.
+// Its rendered text is cached with dialect-specific coverage. Selected
+// generator values are volatile detail reads coalesced only while in flight.
 func (db *InterBaseDBRepository) MetadataDetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
 	if req.Consistency == metadata.TransactionLocal || req.Consistency == metadata.ConsistentSnapshot {
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
@@ -181,9 +183,57 @@ func interBaseResolveGenerator(cache *DBCache, object catalog.ObjectID) (string,
 	return name, generator, nil
 }
 
+func interBaseResolveSystemRelation(cache *DBCache, object catalog.ObjectID) (string, *SystemRelationDesc, error) {
+	if cache == nil || cache.Catalog == nil {
+		return "", nil, ErrObjectNotFound
+	}
+	names := make([]string, 0, len(cache.Catalog.SystemRelationsByID))
+	for _, relation := range cache.Catalog.SystemRelationsByID {
+		if relation != nil {
+			names = append(names, relation.Name)
+		}
+	}
+	name, err := interBaseResolveObjectName(ObjectKindTable, names, object.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	relation, ok := cache.SystemRelationByID(name)
+	if !ok || relation == nil || !relation.IsSystem {
+		return "", nil, ErrObjectNotFound
+	}
+	return name, relation, nil
+}
+
+func interBaseResolveException(cache *DBCache, object catalog.ObjectID) (string, *ExceptionDesc, error) {
+	name, err := interBaseResolveCatalogName(cache, ObjectKindException, object.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	exception, ok := cache.ExceptionByID(name)
+	if !ok || exception == nil {
+		return "", nil, ErrObjectNotFound
+	}
+	return name, exception, nil
+}
+
+func interBaseResolveFunction(cache *DBCache, object catalog.ObjectID) (string, *FunctionDesc, error) {
+	name, err := interBaseResolveCatalogName(cache, ObjectKindFunction, object.Name)
+	if err != nil {
+		return "", nil, err
+	}
+	function, ok := cache.FunctionByID(name)
+	if !ok || function == nil {
+		return "", nil, ErrObjectNotFound
+	}
+	return name, function, nil
+}
+
 // --- facet: columns -------------------------------------------------------
 
 func (db *InterBaseDBRepository) detailPlanColumns(req metadata.Request) (metadata.DetailPlan, error) {
+	if req.Object.Kind == ObjectKindTable && req.IsSystem {
+		return db.detailPlanSystemColumns(req)
+	}
 	return metadata.DetailPlan{
 		Requires: []MetadataKind{MetadataRelations, MetadataColumnsCurrent},
 		Coverage: detailCoverage(req.Object, "columns"),
@@ -204,11 +254,69 @@ func (db *InterBaseDBRepository) detailPlanColumns(req metadata.Request) (metada
 	}, nil
 }
 
+func (db *InterBaseDBRepository) detailPlanSystemColumns(req metadata.Request) (metadata.DetailPlan, error) {
+	return metadata.DetailPlan{
+		Requires: []MetadataKind{MetadataSystemRelations},
+		Coverage: detailCoverage(req.Object, "columns") + "\x00system",
+		CoverageForCache: func(cache *catalog.Cache) (string, error) {
+			name, _, err := interBaseResolveSystemRelation(cache, req.Object)
+			if err != nil {
+				return "", err
+			}
+			object := catalog.ObjectID{Kind: ObjectKindTable, Name: name}
+			return detailCoverage(object, "columns") + "\x00system", nil
+		},
+		Load: func(ctx context.Context, cache *DBCache) (metadata.Detail, error) {
+			name, _, err := interBaseResolveSystemRelation(cache, req.Object)
+			if err != nil {
+				return metadata.Detail{}, err
+			}
+			var relation *schema.Relation
+			if err := db.withReadOnlyDetailTransaction(ctx, func(tx *sql.Tx) error {
+				var err error
+				relation, err = schema.New(tx).SystemRelation(ctx, name)
+				return err
+			}); err != nil {
+				return metadata.Detail{}, err
+			}
+			if relation == nil {
+				return metadata.Detail{}, ErrObjectNotFound
+			}
+			if !relation.SystemFlag.Valid || relation.SystemFlag.Int64 == 0 {
+				return metadata.Detail{}, ErrObjectNotFound
+			}
+			columns := make([]*ColumnDesc, 0, len(relation.Columns))
+			for _, column := range relation.Columns {
+				columns = append(columns, db.columnDescription(relation.Name, column, nil))
+			}
+			return metadata.Detail{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: name}, Columns: columns}, nil
+		},
+	}, nil
+}
+
+func (db *InterBaseDBRepository) withReadOnlyDetailTransaction(ctx context.Context, read func(*sql.Tx) error) error {
+	if db == nil || db.Conn == nil {
+		return fmt.Errorf("interbase: database connection is nil")
+	}
+	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := read(tx); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // --- facet: description ----------------------------------------------------
 
 func (db *InterBaseDBRepository) detailPlanDescription(req metadata.Request) (metadata.DetailPlan, error) {
 	switch req.Object.Kind {
 	case ObjectKindTable:
+		if req.IsSystem {
+			return metadata.DetailPlan{}, metadata.ErrUnsupported
+		}
 		return metadata.DetailPlan{
 			Requires: []MetadataKind{MetadataRelations, MetadataColumnsCurrent},
 			Coverage: detailCoverage(req.Object, "description"),
@@ -415,14 +523,31 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 		return metadata.DetailPlan{
 			Requires: []MetadataKind{MetadataGenerators},
 			Coverage: detailCoverage(req.Object, "ddl"),
-			Load: func(_ context.Context, cache *DBCache) (metadata.Detail, error) {
-				if _, _, err := interBaseResolveGenerator(cache, req.Object); err != nil {
+			Volatile: true,
+			CoverageForCache: func(cache *catalog.Cache) (string, error) {
+				name, _, err := interBaseResolveGenerator(cache, req.Object)
+				if err != nil {
+					return "", err
+				}
+				object := catalog.ObjectID{Kind: ObjectKindGenerator, Name: name}
+				return detailCoverage(object, "ddl"), nil
+			},
+			Load: func(ctx context.Context, cache *DBCache) (metadata.Detail, error) {
+				name, _, err := interBaseResolveGenerator(cache, req.Object)
+				if err != nil {
 					return metadata.Detail{}, err
 				}
-				return metadata.Detail{Object: req.Object}, nil
+				value, err := db.generatorValueWithDetailTransaction(ctx, name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{
+					Object: catalog.ObjectID{Kind: ObjectKindGenerator, Name: name},
+					Text:   strconv.FormatInt(value, 10),
+				}, nil
 			},
 			Render: func(cache *DBCache, acquired metadata.Detail, req metadata.Request) (metadata.Detail, error) {
-				_, generator, err := interBaseResolveGenerator(cache, req.Object)
+				name, generator, err := interBaseResolveGenerator(cache, req.Object)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -430,8 +555,95 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
-				acquired.Text = ddl
+				identifier, err := interBaseGeneratedIdentifier(ddl, "CREATE GENERATOR ")
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				if acquired.Text == "" {
+					return metadata.Detail{}, metadata.ErrUnsupported
+				}
+				acquired.Object = catalog.ObjectID{Kind: ObjectKindGenerator, Name: name}
+				acquired.Text = ddl + "\nSET GENERATOR " + identifier + " TO " + acquired.Text + ";"
 				acquired.Provenance = "interbase:generator-ddl"
+				return acquired, nil
+			},
+		}, nil
+	case ObjectKindException:
+		return metadata.DetailPlan{
+			Requires: []MetadataKind{MetadataExceptions},
+			Coverage: detailCoverage(req.Object, "ddl"),
+			CoverageForCache: func(cache *catalog.Cache) (string, error) {
+				name, _, err := interBaseResolveException(cache, req.Object)
+				if err != nil {
+					return "", err
+				}
+				object := catalog.ObjectID{Kind: ObjectKindException, Name: name}
+				return detailCoverage(object, "ddl"), nil
+			},
+			Load: func(_ context.Context, cache *DBCache) (metadata.Detail, error) {
+				name, _, err := interBaseResolveException(cache, req.Object)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: catalog.ObjectID{Kind: ObjectKindException, Name: name}}, nil
+			},
+			Render: func(cache *DBCache, acquired metadata.Detail, req metadata.Request) (metadata.Detail, error) {
+				name, exception, err := interBaseResolveException(cache, req.Object)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				if !exception.Message.Valid {
+					return metadata.Detail{}, metadata.ErrUnsupported
+				}
+				sequenceDDL, err := interBaseSchemaSequence(&GeneratorDesc{Name: name}).GenerateDDLWithOptions(
+					schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				if err != nil {
+					return metadata.Detail{}, metadata.ErrUnsupported
+				}
+				identifier, err := interBaseGeneratedIdentifier(sequenceDDL, "CREATE GENERATOR ")
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				acquired.Object = catalog.ObjectID{Kind: ObjectKindException, Name: name}
+				acquired.Text = "CREATE EXCEPTION " + identifier + " '" + strings.ReplaceAll(exception.Message.String, "'", "''") + "';"
+				acquired.Provenance = "interbase:exception-ddl"
+				return acquired, nil
+			},
+		}, nil
+	case ObjectKindFunction:
+		return metadata.DetailPlan{
+			Requires: []MetadataKind{MetadataFunctions},
+			Coverage: detailCoverage(req.Object, "ddl"),
+			CoverageForCache: func(cache *catalog.Cache) (string, error) {
+				name, _, err := interBaseResolveFunction(cache, req.Object)
+				if err != nil {
+					return "", err
+				}
+				object := catalog.ObjectID{Kind: ObjectKindFunction, Name: name}
+				return detailCoverage(object, "ddl"), nil
+			},
+			Load: func(_ context.Context, cache *DBCache) (metadata.Detail, error) {
+				name, _, err := interBaseResolveFunction(cache, req.Object)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: name}}, nil
+			},
+			Render: func(cache *DBCache, acquired metadata.Detail, req metadata.Request) (metadata.Detail, error) {
+				name, function, err := interBaseResolveFunction(cache, req.Object)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				ddl, err := interBaseSchemaFunction(function).GenerateDDL()
+				if err != nil {
+					if errors.Is(err, schema.ErrUnsupportedDDL) {
+						return metadata.Detail{}, metadata.ErrUnsupported
+					}
+					return metadata.Detail{}, err
+				}
+				acquired.Object = catalog.ObjectID{Kind: ObjectKindFunction, Name: name}
+				acquired.Text = ddl
+				acquired.Provenance = "interbase:function-ddl"
 				return acquired, nil
 			},
 		}, nil
@@ -460,6 +672,9 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 			},
 		}, nil
 	case ObjectKindTable:
+		if req.IsSystem {
+			return metadata.DetailPlan{}, metadata.ErrUnsupported
+		}
 		// schema.Table needs to fetch constraints/indexes/triggers and its DDL
 		// is dialect-specific. Canonicalize the request using the ready cache
 		// in CoverageForCache, then include the effective source dialect in
@@ -501,8 +716,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 			},
 		}, nil
 	default:
-		// Function DDL is permanently refused by the driver itself. It must
-		// not silently trigger a full-catalog refetch.
+		// Unsupported object kinds must not trigger a full-catalog refetch.
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
 	}
 }
@@ -514,6 +728,32 @@ func interBaseDDLDialectFor(dialect int) schema.DDLDialect {
 		return schema.Dialect1
 	}
 	return schema.Dialect3
+}
+
+func interBaseGeneratedIdentifier(statement, prefix string) (string, error) {
+	if !strings.HasPrefix(statement, prefix) {
+		return "", fmt.Errorf("interbase: generated statement %q has no %q identifier prefix", statement, prefix)
+	}
+	identifier := strings.TrimPrefix(statement, prefix)
+	if identifier == "" {
+		return "", metadata.ErrUnsupported
+	}
+	return identifier, nil
+}
+
+func (db *InterBaseDBRepository) generatorValueWithDetailTransaction(ctx context.Context, name string) (int64, error) {
+	var value int64
+	err := db.withReadOnlyDetailTransaction(ctx, func(tx *sql.Tx) error {
+		var err error
+		value, err = schema.New(tx).GeneratorValueWithOptions(ctx, name, schema.DDLOptions{
+			Dialect: interBaseDDLDialectFor(db.SQLDialect),
+		})
+		return err
+	})
+	if err != nil {
+		return 0, err
+	}
+	return value, nil
 }
 
 func interBaseSchemaDomainFromFacts(facts *ColumnTypeFacts) *schema.Domain {
@@ -625,6 +865,39 @@ func interBaseSchemaProcedure(desc *ProcedureDesc) schema.Procedure {
 		procedure.OutputParameters = append(procedure.OutputParameters, interBaseSchemaParameter(parameter, desc.Name, schema.ParameterOutput))
 	}
 	return procedure
+}
+
+func interBaseSchemaFunction(desc *FunctionDesc) schema.Function {
+	function := schema.Function{
+		Name:           desc.Name,
+		FunctionType:   desc.FunctionType,
+		Description:    desc.Description,
+		ModuleName:     desc.ModuleName,
+		EntryPoint:     desc.EntryPoint,
+		ReturnArgument: desc.ReturnPosition,
+		SystemFlag:     desc.SystemFlag,
+		Arguments:      make([]schema.FunctionArgument, 0, len(desc.Arguments)),
+	}
+	for _, argument := range desc.Arguments {
+		if argument == nil {
+			function.Arguments = append(function.Arguments, schema.FunctionArgument{})
+			continue
+		}
+		function.Arguments = append(function.Arguments, schema.FunctionArgument{
+			Name:            argument.Name,
+			FunctionName:    argument.FunctionName,
+			Position:        argument.Position,
+			Mechanism:       argument.Mechanism,
+			FieldLength:     argument.FieldLength,
+			FieldScale:      argument.FieldScale,
+			FieldType:       argument.FieldType,
+			FieldSubType:    argument.FieldSubType,
+			CharacterSetID:  argument.CharacterSetID,
+			FieldPrecision:  argument.FieldPrecision,
+			CharacterLength: argument.CharacterLength,
+		})
+	}
+	return function
 }
 
 func interBaseSchemaDomain(desc *DomainDesc) schema.Domain {

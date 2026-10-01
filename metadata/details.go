@@ -17,6 +17,7 @@ const defaultMaxDetailBytes = 64 << 20
 type detailEntry struct {
 	coverage string
 	ready    chan struct{}
+	volatile bool
 	value    Detail
 	err      error
 	size     int64
@@ -105,7 +106,7 @@ func (d *detailStore) clearLocked() {
 // concurrent callers. ctx only bounds this specific caller's wait: canceling
 // it never cancels a load another caller (or a later caller of the same
 // coverage) still needs.
-func (d *detailStore) acquire(ctx context.Context, generation uint64, coverage string, load func(context.Context) (Detail, error)) (Detail, error) {
+func (d *detailStore) acquire(ctx context.Context, generation uint64, coverage string, volatile bool, load func(context.Context) (Detail, error)) (Detail, error) {
 	d.mu.Lock()
 	if d.stale {
 		d.mu.Unlock()
@@ -119,7 +120,7 @@ func (d *detailStore) acquire(ctx context.Context, generation uint64, coverage s
 	if existed {
 		d.touchLocked(entry)
 	} else {
-		entry = &detailEntry{coverage: coverage, ready: make(chan struct{})}
+		entry = &detailEntry{coverage: coverage, ready: make(chan struct{}), volatile: volatile}
 		d.entries[coverage] = entry
 		d.pushFrontLocked(entry)
 		genCtx := d.genCtx
@@ -184,10 +185,18 @@ func (d *detailStore) settle(entry *detailEntry, generation uint64, value Detail
 			entry.err = ErrDetailLimit
 		} else {
 			entry.value = value
-			entry.size = size
-			entry.settled = true
-			d.totalBytes += size
-			d.evictLocked()
+			if entry.volatile {
+				// Keep the result on the entry for current waiters, but remove
+				// its coverage before waking them so a later request cannot
+				// observe this completed value.
+				d.removeLocked(entry)
+				delete(d.entries, entry.coverage)
+			} else {
+				entry.size = size
+				entry.settled = true
+				d.totalBytes += size
+				d.evictLocked()
+			}
 		}
 	}
 	d.mu.Unlock()

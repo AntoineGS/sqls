@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"sort"
@@ -133,6 +134,81 @@ func TestInterBaseFunctionDescriptionsIsStandalone(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("standalone descriptors differ\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestInterBaseFunctionDescriptionsRetainNativeDeclarationFacts(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	if _, err := db.Exec(`INSERT INTO "RDB$FUNCTIONS" VALUES (?,?,?,?,?,?,?)`,
+		"UDF_FACTS", 7, "function description", interBaseFixed("module'file"),
+		interBaseFixed("entry'point"), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, argument := range []struct {
+		position, mechanism, length, scale, fieldType, subtype int
+		charset, precision, characterLength                    any
+	}{
+		{0, -1, 80, 0, 40, 0, 0, nil, nil},
+		{1, 2, 4, -2, 8, 1, nil, 9, nil},
+	} {
+		if _, err := db.Exec(`INSERT INTO "RDB$FUNCTION_ARGUMENTS" VALUES (?,?,?,?,?,?,?,?,?,?)`,
+			"UDF_FACTS", argument.position, argument.mechanism, argument.length,
+			argument.scale, argument.fieldType, argument.subtype, argument.charset,
+			argument.precision, argument.characterLength); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	descriptors, err := repository.DescribeFunctions(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got *FunctionDesc
+	for _, descriptor := range descriptors {
+		if descriptor.Name == "UDF_FACTS" {
+			got = descriptor
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("DescribeFunctions omitted UDF_FACTS")
+	}
+	if got.FunctionType != (sql.NullInt64{Int64: 7, Valid: true}) ||
+		got.SystemFlag != (sql.NullInt64{Int64: 0, Valid: true}) ||
+		got.ReturnPosition != (sql.NullInt64{Int64: 0, Valid: true}) ||
+		got.ModuleName != (sql.NullString{String: "module'file", Valid: true}) ||
+		got.EntryPoint != (sql.NullString{String: "entry'point", Valid: true}) {
+		t.Fatalf("function native facts = %+v", got)
+	}
+	if len(got.Arguments) != 2 {
+		t.Fatalf("argument count = %d, want 2", len(got.Arguments))
+	}
+	returnArg, inputArg := got.Arguments[0], got.Arguments[1]
+	if returnArg.FunctionName != "UDF_FACTS" || returnArg.Position != (sql.NullInt64{Int64: 0, Valid: true}) ||
+		returnArg.Mechanism != (sql.NullInt64{Int64: -1, Valid: true}) ||
+		returnArg.FieldType != (sql.NullInt64{Int64: 40, Valid: true}) ||
+		returnArg.FieldLength != (sql.NullInt64{Int64: 80, Valid: true}) ||
+		returnArg.CharacterSetID != (sql.NullInt64{Int64: 0, Valid: true}) {
+		t.Fatalf("return argument native facts = %+v", returnArg)
+	}
+	if inputArg.FunctionName != "UDF_FACTS" || inputArg.Position != (sql.NullInt64{Int64: 1, Valid: true}) ||
+		inputArg.Mechanism != (sql.NullInt64{Int64: 2, Valid: true}) ||
+		inputArg.FieldType != (sql.NullInt64{Int64: 8, Valid: true}) ||
+		inputArg.FieldSubType != (sql.NullInt64{Int64: 1, Valid: true}) ||
+		inputArg.FieldScale != (sql.NullInt64{Int64: -2, Valid: true}) ||
+		inputArg.FieldLength != (sql.NullInt64{Int64: 4, Valid: true}) ||
+		inputArg.FieldPrecision != (sql.NullInt64{Int64: 9, Valid: true}) {
+		t.Fatalf("input argument native facts = %+v", inputArg)
+	}
+
+	ddl, err := interBaseSchemaFunction(got).GenerateDDL()
+	if err != nil {
+		t.Fatalf("reconstructed Function.GenerateDDL() error = %v", err)
+	}
+	want := `DECLARE EXTERNAL FUNCTION "UDF_FACTS" NUMERIC(9, 2) BY DESCRIPTOR RETURNS CSTRING(80) FREE_IT ENTRY_POINT 'entry''point' MODULE_NAME 'module''file'`
+	if ddl != want {
+		t.Fatalf("reconstructed function DDL = %q, want %q", ddl, want)
 	}
 }
 

@@ -247,6 +247,8 @@ type IndexDesc struct {
 type FunctionDesc struct {
 	Schema         string
 	Name           string
+	FunctionType   sql.NullInt64
+	SystemFlag     sql.NullInt64
 	ReturnType     string // rendered; "" when the catalog cannot render it
 	ReturnPosition sql.NullInt64
 	Arguments      []*FunctionArgumentDesc // ordered by Position
@@ -257,9 +259,18 @@ type FunctionDesc struct {
 
 // FunctionArgumentDesc describes one external function argument.
 type FunctionArgumentDesc struct {
-	Name     string
-	Position sql.NullInt64
-	Type     string // rendered; "" when the catalog cannot render it
+	Name            string
+	FunctionName    string
+	Position        sql.NullInt64
+	Mechanism       sql.NullInt64
+	FieldLength     sql.NullInt64
+	FieldScale      sql.NullInt64
+	FieldType       sql.NullInt64
+	FieldSubType    sql.NullInt64
+	CharacterSetID  sql.NullInt64
+	FieldPrecision  sql.NullInt64
+	CharacterLength sql.NullInt64
+	Type            string // rendered; "" when the catalog cannot render it
 }
 
 // CatalogCache holds extended catalog objects. A nil *CatalogCache means the

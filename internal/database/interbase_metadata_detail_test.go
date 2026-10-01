@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"strings"
@@ -331,7 +332,7 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Detail(generator ddl) error = %v", err)
 		}
-		if got.Text != `CREATE GENERATOR "GEN_CUSTOMER_ID"` {
+		if got.Text != "CREATE GENERATOR \"GEN_CUSTOMER_ID\"\nSET GENERATOR \"GEN_CUSTOMER_ID\" TO 0;" {
 			t.Fatalf("generator ddl = %q", got.Text)
 		}
 	})
@@ -449,7 +450,7 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		}
 	})
 
-	t.Run("table ddl is bounded and function ddl remains unsupported", func(t *testing.T) {
+	t.Run("table ddl is bounded and incomplete function declaration is unsupported", func(t *testing.T) {
 		count := interBaseFixtureCountPrepares(t)
 		tableDDL, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "PARENT"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
 		if err != nil {
@@ -461,13 +462,308 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		if tableDDL.Provenance != "interbase:table-ddl" {
 			t.Fatalf("Detail(table ddl).Provenance = %q, want interbase:table-ddl", tableDDL.Provenance)
 		}
-		if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: "F_LTRIM"}, Facet: "ddl", Consistency: metadata.Committed}); err == nil {
-			t.Fatalf("Detail(function ddl) error = nil, want unsupported")
+		if _, ok := lease.Snapshot().Cache.FunctionByID("F_LTRIM"); !ok {
+			t.Fatal("function with incomplete declaration facts was dropped from the category")
+		}
+		if _, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: "F_LTRIM"}, Facet: "ddl", Consistency: metadata.Committed}); !errors.Is(err, metadata.ErrUnsupported) {
+			t.Fatalf("incomplete function ddl error = %v, want metadata.ErrUnsupported", err)
 		}
 		if got := count(); got == 0 {
 			t.Fatalf("queries for table ddl = %d, want bounded provider read", got)
 		}
 	})
+}
+
+func TestInterBaseMetadataSelectedDetailsRenderExceptionUDFAndSystemColumns(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	for _, exception := range []struct {
+		name    string
+		message any
+	}{
+		{"Mixed_Exception", `MDE L'"ok"`},
+		{"Empty_Exception", ""},
+		{"Null_Exception", nil},
+	} {
+		if _, err := db.Exec(`INSERT INTO "RDB$EXCEPTIONS" VALUES (?,?,?)`, exception.name, 1, exception.message); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$FUNCTIONS" VALUES (?,?,?,?,?,?,?)`,
+		"UDF_RENDERABLE", 0, nil, interBaseFixed("module'file"), interBaseFixed("entry'point"), 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$FUNCTION_ARGUMENTS" VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		"UDF_RENDERABLE", 0, 0, 4, 0, 8, 0, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$FUNCTIONS" VALUES (?,?,?,?,?,?,?)`,
+		"UDF_UNSUPPORTED", 0, nil, nil, nil, 0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$FUNCTION_ARGUMENTS" VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		"UDF_UNSUPPORTED", 0, 0, 4, 0, 8, 0, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []struct {
+		name     string
+		position int
+	}{
+		{"SYSTEM_SECOND", 1},
+		{"SYSTEM_FIRST", 0},
+	} {
+		if _, err := db.Exec(`INSERT INTO "RDB$RELATION_FIELDS" ("RDB$FIELD_NAME","RDB$RELATION_NAME","RDB$FIELD_SOURCE","RDB$FIELD_POSITION","RDB$SYSTEM_FLAG") VALUES (?,?,?,?,?)`,
+			interBaseFixed(field.name), "RDB$SYSTEM", "CUSTOMER_ID", field.position, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	_, lease := acquireInterBaseTestLease(t, repository)
+	ctx := context.Background()
+
+	exception, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindException, Name: "Mixed_Exception"},
+		Facet:  "ddl", Dialect: 3, Consistency: metadata.Committed,
+	})
+	if err != nil {
+		t.Fatalf("exception detail error = %v", err)
+	}
+	if exception.Text != `CREATE EXCEPTION "Mixed_Exception" 'MDE L''"ok"';` || exception.Provenance != "interbase:exception-ddl" {
+		t.Fatalf("exception detail = (%q, %q)", exception.Text, exception.Provenance)
+	}
+	empty, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindException, Name: "Empty_Exception"},
+		Facet:  "ddl", Dialect: 3, Consistency: metadata.Committed,
+	})
+	if err != nil || empty.Text != `CREATE EXCEPTION "Empty_Exception" '';` {
+		t.Fatalf("empty exception detail = (%+v, %v), want an explicit empty literal", empty, err)
+	}
+	if _, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindException, Name: "Null_Exception"},
+		Facet:  "ddl", Dialect: 3, Consistency: metadata.Committed,
+	}); !errors.Is(err, metadata.ErrUnsupported) {
+		t.Fatalf("NULL exception message detail error = %v, want metadata.ErrUnsupported", err)
+	}
+
+	function, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: "UDF_RENDERABLE"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	})
+	if err != nil {
+		t.Fatalf("renderable function detail error = %v", err)
+	}
+	if function.Provenance != "interbase:function-ddl" ||
+		!strings.Contains(function.Text, `DECLARE EXTERNAL FUNCTION "UDF_RENDERABLE" RETURNS INTEGER BY VALUE`) ||
+		!strings.Contains(function.Text, `ENTRY_POINT 'entry''point' MODULE_NAME 'module''file'`) {
+		t.Fatalf("renderable function detail = (%q, %q)", function.Text, function.Provenance)
+	}
+	if _, ok := lease.Snapshot().Cache.FunctionByID("UDF_UNSUPPORTED"); !ok {
+		t.Fatal("unsupported UDF was dropped from the function category")
+	}
+	if _, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindFunction, Name: "UDF_UNSUPPORTED"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	}); !errors.Is(err, metadata.ErrUnsupported) {
+		t.Fatalf("incomplete UDF detail error = %v, want metadata.ErrUnsupported", err)
+	}
+
+	systemRequest := metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindTable, Name: "RDB$SYSTEM"},
+		Facet:  "columns", IsSystem: true, Consistency: metadata.Committed,
+	}
+	plan, err := repository.MetadataDetailPlan(systemRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Requires) != 1 || plan.Requires[0] != MetadataSystemRelations {
+		t.Fatalf("system columns Requires = %v, want only MetadataSystemRelations", plan.Requires)
+	}
+	columns, err := lease.Detail(ctx, systemRequest)
+	if err != nil {
+		t.Fatalf("selected system columns error = %v", err)
+	}
+	if names := columnNames(columns.Columns); fmt.Sprint(names) != "[SYSTEM_FIRST SYSTEM_SECOND]" {
+		t.Fatalf("system relation columns = %v, want [SYSTEM_FIRST SYSTEM_SECOND] in field position order", names)
+	}
+	userRequest := systemRequest
+	userRequest.IsSystem = false
+	userPlan, err := repository.MetadataDetailPlan(userRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(userPlan.Requires) != 2 || userPlan.Requires[0] != MetadataRelations || userPlan.Requires[1] != MetadataColumnsCurrent {
+		t.Fatalf("ordinary table columns Requires = %v, want only user-relation categories", userPlan.Requires)
+	}
+	if _, err := lease.Detail(ctx, userRequest); !errors.Is(err, ErrObjectNotFound) {
+		t.Fatalf("system relation without marker resolved through user relations: %v", err)
+	}
+	if _, err := repository.MetadataDetailPlan(metadata.Request{
+		Object: systemRequest.Object, Facet: "ddl", Dialect: 3, IsSystem: true, Consistency: metadata.Committed,
+	}); !errors.Is(err, metadata.ErrUnsupported) {
+		t.Fatalf("system relation DDL plan error = %v, want unsupported", err)
+	}
+}
+
+func TestInterBaseGeneratorDetailReadsFreshValueInOwnedReadOnlyTransaction(t *testing.T) {
+	var generatorReads atomic.Int64
+	var matchedQueries atomic.Int64
+	fault := &interBaseFixtureFault{
+		match:   "SELECT GEN_ID(",
+		stage:   "gate",
+		matches: &matchedQueries,
+		generatorRead: func(name string, increment int64) (int64, error) {
+			if name != "GEN_CUSTOMER_ID" || increment != 0 {
+				return 0, fmt.Errorf("GEN_ID(%q, %d) unexpected", name, increment)
+			}
+			switch generatorReads.Add(1) {
+			case 1:
+				return 0, errors.New("planned generator read failure")
+			case 2:
+				return 9007199254740993, nil
+			default:
+				return -9007199254740993, nil
+			}
+		},
+	}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	// The request renders DDL in Dialect 3, while the attached connection's
+	// dialect is 1; GeneratorValue must use the latter for its catalog read.
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 1}
+	_, lease := acquireInterBaseTestLease(t, repository)
+	ctx := context.Background()
+	request := metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindGenerator, Name: "GEN_CUSTOMER_ID"},
+		Facet:  "ddl", Dialect: 3, Consistency: metadata.Committed,
+	}
+	plan, err := repository.MetadataDetailPlan(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Volatile {
+		t.Fatal("generator detail plan is not volatile")
+	}
+	if generatorReads.Load() != 0 || matchedQueries.Load() != 0 {
+		t.Fatalf("generator listing performed %d GEN_ID calls / %d matching queries", generatorReads.Load(), matchedQueries.Load())
+	}
+	fault.resetTransactions()
+
+	if _, err := lease.Detail(ctx, request); err == nil {
+		t.Fatal("first selected generator read unexpectedly succeeded")
+	}
+	first, err := lease.Detail(ctx, request)
+	if err != nil {
+		t.Fatalf("second selected generator read error = %v", err)
+	}
+	if want := "CREATE GENERATOR \"GEN_CUSTOMER_ID\"\nSET GENERATOR \"GEN_CUSTOMER_ID\" TO 9007199254740993;"; first.Text != want {
+		t.Fatalf("second generator detail = %q, want %q", first.Text, want)
+	}
+	second, err := lease.Detail(ctx, request)
+	if err != nil {
+		t.Fatalf("third selected generator read error = %v", err)
+	}
+	if want := "CREATE GENERATOR \"GEN_CUSTOMER_ID\"\nSET GENERATOR \"GEN_CUSTOMER_ID\" TO -9007199254740993;"; second.Text != want {
+		t.Fatalf("third generator detail = %q, want %q", second.Text, want)
+	}
+	if generatorReads.Load() != 3 || matchedQueries.Load() != 3 {
+		t.Fatalf("generator read counts = %d callback / %d SQL, want 3/3", generatorReads.Load(), matchedQueries.Load())
+	}
+	queries := fault.generatorQuerySnapshot()
+	if len(queries) != 3 {
+		t.Fatalf("captured generator SQL = %v, want one per selected detail request", queries)
+	}
+	for i, query := range queries {
+		if query != "SELECT GEN_ID(GEN_CUSTOMER_ID, 0) FROM RDB$DATABASE" {
+			t.Errorf("generator query %d = %q, want the Dialect 1 connection identifier", i, query)
+		}
+	}
+	options, commits, rollbacks := fault.transactionSnapshot()
+	if len(options) != 3 || commits != 2 || rollbacks != 1 {
+		t.Fatalf("detail transaction lifecycle = %d begins, %d commits, %d rollbacks; want 3/2/1", len(options), commits, rollbacks)
+	}
+	for i, option := range options {
+		if !option.ReadOnly || option.Isolation != driver.IsolationLevel(sql.LevelReadCommitted) {
+			t.Errorf("transaction %d options = %+v, want read-only read-committed", i, option)
+		}
+	}
+}
+
+func TestInterBaseGeneratorDetailCoalescesEqualConcurrentRequests(t *testing.T) {
+	gate := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	var generatorReads atomic.Int64
+	var matchedQueries atomic.Int64
+	fault := &interBaseFixtureFault{
+		match:   "SELECT GEN_ID(",
+		stage:   "gate",
+		gate:    gate,
+		entered: entered,
+		matches: &matchedQueries,
+		generatorRead: func(name string, increment int64) (int64, error) {
+			generatorReads.Add(1)
+			if name != "GEN_CUSTOMER_ID" || increment != 0 {
+				return 0, fmt.Errorf("GEN_ID(%q, %d) unexpected", name, increment)
+			}
+			return 77, nil
+		},
+	}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	repository := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
+	_, lease := acquireInterBaseTestLease(t, repository)
+	fault.resetTransactions()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request := metadata.Request{
+		Object: catalog.ObjectID{Kind: ObjectKindGenerator, Name: "GEN_CUSTOMER_ID"},
+		Facet:  "ddl", Dialect: 3, Consistency: metadata.Committed,
+	}
+	type result struct {
+		detail metadata.Detail
+		err    error
+	}
+	firstDone := make(chan result, 1)
+	go func() {
+		detail, err := lease.Detail(ctx, request)
+		firstDone <- result{detail: detail, err: err}
+	}()
+	select {
+	case <-entered:
+	case <-ctx.Done():
+		close(gate)
+		t.Fatalf("generator query did not reach gate: %v", ctx.Err())
+	}
+	secondStarted := make(chan struct{})
+	secondDone := make(chan result, 1)
+	go func() {
+		close(secondStarted)
+		detail, err := lease.Detail(ctx, request)
+		secondDone <- result{detail: detail, err: err}
+	}()
+	<-secondStarted
+	select {
+	case got := <-secondDone:
+		close(gate)
+		t.Fatalf("concurrent generator Detail returned before the shared read settled: %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if got := matchedQueries.Load(); got != 1 {
+		close(gate)
+		t.Fatalf("GEN_ID query count while gated = %d, want one", got)
+	}
+	close(gate)
+	first, second := <-firstDone, <-secondDone
+	if first.err != nil || second.err != nil {
+		t.Fatalf("concurrent generator detail errors = %v, %v", first.err, second.err)
+	}
+	if first.detail.Text != second.detail.Text || !strings.HasSuffix(first.detail.Text, " TO 77;") {
+		t.Fatalf("concurrent generator texts = %q / %q, want identical value 77", first.detail.Text, second.detail.Text)
+	}
+	if got := generatorReads.Load(); got != 1 {
+		t.Fatalf("GEN_ID callback calls = %d, want one coalesced selected read", got)
+	}
+	options, commits, rollbacks := fault.transactionSnapshot()
+	if len(options) != 1 || commits != 1 || rollbacks != 0 {
+		t.Fatalf("coalesced transaction lifecycle = %d begins, %d commits, %d rollbacks; want 1/1/0", len(options), commits, rollbacks)
+	}
 }
 
 func TestInterBaseTableDDLCoalescesAcrossLeases(t *testing.T) {

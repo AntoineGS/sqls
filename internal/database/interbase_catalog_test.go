@@ -37,6 +37,15 @@ type interBaseFixtureFault struct {
 	// jobs' own prepares. Nil is safe; only tests that need this counter
 	// set it.
 	matches *atomic.Int64
+
+	// generatorRead supplies a test-only GEN_ID implementation so selected
+	// generator details can use the real schema reader against SQLite.
+	generatorRead func(string, int64) (int64, error)
+
+	txMu                   sync.Mutex
+	txOptions              []driver.TxOptions
+	txCommits, txRollbacks int
+	generatorQueries       []string
 }
 
 var interBaseFixtureFaults sync.Map // map[DSN]*interBaseFixtureFault
@@ -51,7 +60,58 @@ func (d interBaseFixtureDriver) Open(name string) (driver.Conn, error) {
 	if faultValue != nil {
 		fault = faultValue.(*interBaseFixtureFault)
 	}
+	if sqliteConn, ok := conn.(*sqlite3.SQLiteConn); ok {
+		generatorRead := func(string, int64) (int64, error) { return 0, nil }
+		if fault != nil && fault.generatorRead != nil {
+			generatorRead = fault.generatorRead
+		}
+		if err := sqliteConn.RegisterFunc("GEN_ID", generatorRead, true); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+	}
 	return interBaseFixtureConn{Conn: conn, fault: fault}, nil
+}
+
+func (f *interBaseFixtureFault) recordTxBegin(options driver.TxOptions) {
+	f.txMu.Lock()
+	f.txOptions = append(f.txOptions, options)
+	f.txMu.Unlock()
+}
+
+func (f *interBaseFixtureFault) recordTxFinish(committed bool) {
+	f.txMu.Lock()
+	defer f.txMu.Unlock()
+	if committed {
+		f.txCommits++
+	} else {
+		f.txRollbacks++
+	}
+}
+
+func (f *interBaseFixtureFault) resetTransactions() {
+	f.txMu.Lock()
+	f.txOptions = nil
+	f.txCommits, f.txRollbacks = 0, 0
+	f.txMu.Unlock()
+}
+
+func (f *interBaseFixtureFault) transactionSnapshot() ([]driver.TxOptions, int, int) {
+	f.txMu.Lock()
+	defer f.txMu.Unlock()
+	return append([]driver.TxOptions(nil), f.txOptions...), f.txCommits, f.txRollbacks
+}
+
+func (f *interBaseFixtureFault) recordGeneratorQuery(query string) {
+	f.txMu.Lock()
+	f.generatorQueries = append(f.generatorQueries, query)
+	f.txMu.Unlock()
+}
+
+func (f *interBaseFixtureFault) generatorQuerySnapshot() []string {
+	f.txMu.Lock()
+	defer f.txMu.Unlock()
+	return append([]string(nil), f.generatorQueries...)
 }
 
 type interBaseFixtureConn struct {
@@ -60,7 +120,20 @@ type interBaseFixtureConn struct {
 }
 
 func interBaseFixtureRewrite(query string) string {
-	return strings.ReplaceAll(query, "NOT STARTING WITH 'RDB$'", "NOT LIKE 'RDB$%'")
+	query = strings.ReplaceAll(query, "NOT STARTING WITH 'RDB$'", "NOT LIKE 'RDB$%'")
+	// Dialect 1 passes an unquoted generator identifier where SQLite expects
+	// a string argument for the test-only GEN_ID function.
+	if start := strings.Index(query, "GEN_ID("); start >= 0 {
+		argStart := start + len("GEN_ID(")
+		if relativeComma := strings.IndexByte(query[argStart:], ','); relativeComma >= 0 {
+			comma := argStart + relativeComma
+			argument := strings.TrimSpace(query[argStart:comma])
+			if argument != "" && !strings.HasPrefix(argument, `"`) {
+				query = query[:argStart] + `"` + strings.ReplaceAll(argument, `"`, `""`) + `"` + query[comma:]
+			}
+		}
+	}
+	return query
 }
 
 // interBaseFixturePrepares counts every statement the fixture prepares. Because
@@ -125,6 +198,9 @@ func (s interBaseFixtureStmt) QueryContext(ctx context.Context, args []driver.Na
 
 func (s interBaseFixtureStmt) queryRows(query func() (driver.Rows, error)) (driver.Rows, error) {
 	f := s.fault
+	if f != nil && strings.Contains(s.query, "GEN_ID(") {
+		f.recordGeneratorQuery(s.query)
+	}
 	if f != nil && strings.Contains(s.query, f.match) {
 		if f.matches != nil {
 			f.matches.Add(1)
@@ -178,10 +254,38 @@ func (r *interBaseFixtureFaultRows) Close() error {
 }
 
 func (c interBaseFixtureConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	var tx driver.Tx
+	var err error
 	if beginner, ok := c.Conn.(driver.ConnBeginTx); ok {
-		return beginner.BeginTx(ctx, opts)
+		tx, err = beginner.BeginTx(ctx, opts)
+	} else {
+		tx, err = c.Conn.Begin()
 	}
-	return c.Conn.Begin()
+	if err != nil {
+		return nil, err
+	}
+	if c.fault != nil {
+		c.fault.recordTxBegin(opts)
+		return interBaseFixtureTx{Tx: tx, fault: c.fault}, nil
+	}
+	return tx, nil
+}
+
+type interBaseFixtureTx struct {
+	driver.Tx
+	fault *interBaseFixtureFault
+}
+
+func (tx interBaseFixtureTx) Commit() error {
+	err := tx.Tx.Commit()
+	tx.fault.recordTxFinish(true)
+	return err
+}
+
+func (tx interBaseFixtureTx) Rollback() error {
+	err := tx.Tx.Rollback()
+	tx.fault.recordTxFinish(false)
+	return err
 }
 
 func init() {
@@ -243,6 +347,7 @@ func openInterBaseSchemaFixtureWithFault(t *testing.T, fault *interBaseFixtureFa
 			t.Fatalf("insert catalog fixture row: %v: %s", err, statement)
 		}
 	}
+	insert(`INSERT INTO "RDB$DATABASE" VALUES (?)`, "fixture")
 
 	// RDB$RELATIONS: three tables, one view, one system relation.
 	relation := func(name string, id int, viewBLR, viewSource any, systemFlag int) {
@@ -459,6 +564,7 @@ func addInterBaseCatalogIdentifierMetadata(t *testing.T, db *sql.DB) {
 }
 
 var interBaseFixtureTables = []string{
+	`CREATE TABLE "RDB$DATABASE" ("RDB$DATABASE_NAME" TEXT)`,
 	`CREATE TABLE "RDB$RELATIONS" ("RDB$RELATION_NAME" TEXT, "RDB$RELATION_ID" INTEGER, "RDB$VIEW_SOURCE" TEXT, "RDB$DESCRIPTION" TEXT, "RDB$SECURITY_CLASS" TEXT, "RDB$OWNER_NAME" TEXT, "RDB$DEFAULT_CLASS" TEXT, "RDB$DBKEY_LENGTH" INTEGER, "RDB$FORMAT" INTEGER, "RDB$EXTERNAL_FILE" TEXT, "RDB$FLAGS" INTEGER, "RDB$RELATION_TYPE" TEXT, "RDB$SYSTEM_FLAG" INTEGER, "RDB$VIEW_BLR" TEXT)`,
 	`CREATE TABLE "RDB$RELATION_FIELDS" ("RDB$FIELD_NAME" TEXT, "RDB$RELATION_NAME" TEXT, "RDB$FIELD_SOURCE" TEXT, "RDB$FIELD_POSITION" INTEGER, "RDB$UPDATE_FLAG" INTEGER, "RDB$FIELD_ID" INTEGER, "RDB$DESCRIPTION" TEXT, "RDB$SYSTEM_FLAG" INTEGER, "RDB$SECURITY_CLASS" TEXT, "RDB$NULL_FLAG" INTEGER, "RDB$DEFAULT_SOURCE" TEXT, "RDB$COLLATION_ID" INTEGER, "RDB$BASE_FIELD" TEXT, "RDB$VIEW_CONTEXT" INTEGER)`,
 	`CREATE TABLE "RDB$FIELDS" ("RDB$FIELD_NAME" TEXT, "RDB$VALIDATION_SOURCE" TEXT, "RDB$COMPUTED_SOURCE" TEXT, "RDB$DEFAULT_SOURCE" TEXT, "RDB$FIELD_LENGTH" INTEGER, "RDB$FIELD_SCALE" INTEGER, "RDB$FIELD_TYPE" INTEGER, "RDB$FIELD_SUB_TYPE" INTEGER, "RDB$DESCRIPTION" TEXT, "RDB$SYSTEM_FLAG" INTEGER, "RDB$SEGMENT_LENGTH" INTEGER, "RDB$EXTERNAL_LENGTH" INTEGER, "RDB$EXTERNAL_SCALE" INTEGER, "RDB$EXTERNAL_TYPE" INTEGER, "RDB$DIMENSIONS" INTEGER, "RDB$NULL_FLAG" INTEGER, "RDB$CHARACTER_LENGTH" INTEGER, "RDB$COLLATION_ID" INTEGER, "RDB$CHARACTER_SET_ID" INTEGER, "RDB$FIELD_PRECISION" INTEGER)`,
