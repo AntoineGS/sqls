@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -13,15 +13,16 @@ import (
 	"github.com/jackc/pgx/v4"
 	"github.com/jackc/pgx/v4/stdlib"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 	"golang.org/x/crypto/ssh"
 )
 
 func init() {
-	RegisterOpen("postgresql", postgreSQLOpen)
-	RegisterFactory("postgresql", NewPostgreSQLDBRepository)
+	database.RegisterOpen("postgresql", postgreSQLOpen)
+	database.RegisterFactory("postgresql", NewPostgreSQLDBRepository)
 }
 
-func postgreSQLOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func postgreSQLOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn    *sql.DB
 		sshConn *ssh.Client
@@ -49,16 +50,16 @@ func postgreSQLOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, err
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:    conn,
 		SSHConn: sshConn,
 	}, nil
 }
 
-func openPostgreSQLViaSSH(dsn string, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, error) {
+func openPostgreSQLViaSSH(dsn string, sshCfg *database.SSHConfig) (*sql.DB, *ssh.Client, error) {
 	sshConfig, err := sshCfg.ClientConfig()
 	if err != nil {
 		return nil, nil, err
@@ -85,7 +86,7 @@ type PostgreSQLDBRepository struct {
 	Conn *sql.DB
 }
 
-func NewPostgreSQLDBRepository(conn *sql.DB) DBRepository {
+func NewPostgreSQLDBRepository(conn *sql.DB) database.DBRepository {
 	return &PostgreSQLDBRepository{Conn: conn}
 }
 
@@ -230,7 +231,7 @@ func (db *PostgreSQLDBRepository) Tables(ctx context.Context) ([]string, error) 
 	return tables, nil
 }
 
-func (db *PostgreSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *PostgreSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -273,9 +274,9 @@ func (db *PostgreSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -297,7 +298,7 @@ func (db *PostgreSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]
 	return tableInfos, nil
 }
 
-func (db *PostgreSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *PostgreSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -343,9 +344,9 @@ func (db *PostgreSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Cont
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -367,7 +368,7 @@ func (db *PostgreSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Cont
 	return tableInfos, nil
 }
 
-func (db *PostgreSQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *PostgreSQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -396,7 +397,7 @@ func (db *PostgreSQLDBRepository) DescribeForeignKeysBySchema(ctx context.Contex
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	return parseForeignKeys(rows, schemaName)
+	return database.ParseForeignKeys(rows, schemaName)
 }
 
 func (db *PostgreSQLDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
@@ -407,7 +408,7 @@ func (db *PostgreSQLDBRepository) Query(ctx context.Context, query string) (*sql
 	return db.Conn.QueryContext(ctx, query)
 }
 
-func genPostgresConfig(connCfg *DBConfig) (string, error) {
+func genPostgresConfig(connCfg *database.DBConfig) (string, error) {
 	if connCfg.DataSourceName != "" {
 		return connCfg.DataSourceName, nil
 	}
@@ -418,7 +419,7 @@ func genPostgresConfig(connCfg *DBConfig) (string, error) {
 	q.Set("dbname", quotePostgresParam(connCfg.DBName))
 
 	switch connCfg.Proto {
-	case ProtoTCP, ProtoUDP:
+	case database.ProtoTCP, database.ProtoUDP:
 		host, port := connCfg.Host, connCfg.Port
 		if host == "" {
 			host = "127.0.0.1"
@@ -428,9 +429,9 @@ func genPostgresConfig(connCfg *DBConfig) (string, error) {
 		}
 		q.Set("host", quotePostgresParam(host))
 		q.Set("port", strconv.Itoa(port))
-	case ProtoUnix:
+	case database.ProtoUnix:
 		q.Set("host", quotePostgresParam(connCfg.Path))
-	case ProtoHTTP:
+	case database.ProtoHTTP:
 	default:
 		return "", fmt.Errorf("default addr for network %s unknown", connCfg.Proto)
 	}

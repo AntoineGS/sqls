@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -8,14 +8,15 @@ import (
 
 	_ "github.com/godror/godror"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func init() {
-	RegisterOpen("oracle", oracleOpen)
-	RegisterFactory("oracle", NewOracleDBRepository)
+	database.RegisterOpen("oracle", oracleOpen)
+	database.RegisterFactory("oracle", NewOracleDBRepository)
 }
 
-func oracleOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func oracleOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn *sql.DB
 	)
@@ -29,16 +30,16 @@ func oracleOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, err
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:   conn,
 		Driver: dialect.DatabaseDriverOracle,
 	}, nil
 }
 
-func genOracleConfig(connCfg *DBConfig) (string, error) {
+func genOracleConfig(connCfg *database.DBConfig) (string, error) {
 	if connCfg.DataSourceName != "" {
 		return connCfg.DataSourceName, nil
 	}
@@ -58,7 +59,7 @@ type OracleDBRepository struct {
 	Conn *sql.DB
 }
 
-func NewOracleDBRepository(conn *sql.DB) DBRepository {
+func NewOracleDBRepository(conn *sql.DB) database.DBRepository {
 	return &OracleDBRepository{Conn: conn}
 }
 
@@ -155,7 +156,7 @@ func (db *OracleDBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *OracleDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *OracleDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -174,9 +175,9 @@ FROM SYS.ALL_TAB_COLUMNS
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -198,7 +199,7 @@ FROM SYS.ALL_TAB_COLUMNS
 	return tableInfos, nil
 }
 
-func (db *OracleDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *OracleDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -222,9 +223,9 @@ func (db *OracleDBRepository) DescribeDatabaseTableBySchema(ctx context.Context,
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -246,7 +247,7 @@ func (db *OracleDBRepository) DescribeDatabaseTableBySchema(ctx context.Context,
 	return tableInfos, nil
 }
 
-func (db *OracleDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *OracleDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -270,7 +271,7 @@ func (db *OracleDBRepository) DescribeForeignKeysBySchema(ctx context.Context, s
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	return parseForeignKeys(rows, schemaName)
+	return database.ParseForeignKeys(rows, schemaName)
 }
 
 func (db *OracleDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {

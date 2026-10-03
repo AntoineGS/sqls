@@ -188,17 +188,10 @@ func TestNonInterBaseRepositoriesDoNotImplementCapabilities(t *testing.T) {
 	// The guard that this change stays additive: no other driver's repository
 	// may accidentally satisfy a capability, and MockDBRepository must not
 	// either, or every existing handler test would start taking the capability
-	// branch and panic on a nil func field.
+	// branch and panic on a nil func field. The foreign drivers are checked in
+	// the drivers package.
 	repositories := map[dialect.DatabaseDriver]DBRepository{
-		dialect.DatabaseDriverMySQL:      NewMySQLDBRepository(nil),
-		dialect.DatabaseDriverPostgreSQL: NewPostgreSQLDBRepository(nil),
-		dialect.DatabaseDriverSQLite3:    NewSQLite3DBRepository(nil),
-		dialect.DatabaseDriverMssql:      NewMssqlDBRepository(nil),
-		dialect.DatabaseDriverH2:         NewH2DBRepository(nil),
-		dialect.DatabaseDriverVertica:    NewVerticaDBRepository(nil),
-		dialect.DatabaseDriverClickhouse: NewClickhouseRepository(nil),
-		dialect.DatabaseDriverOracle:     NewOracleDBRepository(nil),
-		dialect.DatabaseDriver("mock"):   NewMockDBRepository(nil),
+		dialect.DatabaseDriver("mock"): NewMockDBRepository(nil),
 	}
 
 	for driver, repository := range repositories {

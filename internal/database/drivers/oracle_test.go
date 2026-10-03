@@ -1,4 +1,4 @@
-package database
+package drivers
 
 // import (
 // 	"context"
@@ -64,14 +64,14 @@ package database
 // 	// Suit all DB
 // 	tests := []struct {
 // 		name    string
-// 		connCfg *DBConfig
+// 		connCfg *database.DBConfig
 // 		want    string
 // 		wantErr bool
 // 		ctx     context.Context
 // 	}{
 // 		/*	{
 // 			name: "test1",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:  "TestDB",
 // 				Driver: "oracle",
 // 				Proto:  "tcp",
@@ -87,7 +87,7 @@ package database
 // 		},*/
 // 		{
 // 			name: "test2",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:          "TestDB",
 // 				Driver:         "oracle",
 // 				DataSourceName: "SYSTEM/P1ssword@localhost:1521/XE",
@@ -126,14 +126,14 @@ package database
 // func Test_BasicOperation(t *testing.T) {
 // 	tests := []struct {
 // 		name    string
-// 		connCfg *DBConfig
+// 		connCfg *database.DBConfig
 // 		want    string
 // 		wantErr bool
 // 		ctx     context.Context
 // 	}{
 // 		/*	{
 // 			name: "test1",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:  "TestDB",
 // 				Driver: "oracle",
 // 				Proto:  "tcp",
@@ -149,7 +149,7 @@ package database
 // 		},*/
 // 		{
 // 			name: "test2",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:          "TestDB",
 // 				Driver:         "oracle",
 // 				DataSourceName: "SYSTEM/P1ssword@localhost:1521/XE",
@@ -232,14 +232,14 @@ package database
 // 	// Suit all DB
 // 	tests := []struct {
 // 		name    string
-// 		connCfg *DBConfig
+// 		connCfg *database.DBConfig
 // 		want    string
 // 		wantErr bool
 // 		ctx     context.Context
 // 	}{
 // 		/*	{
 // 			name: "test1",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:  "TestDB",
 // 				Driver: "oracle",
 // 				Proto:  "tcp",
@@ -255,7 +255,7 @@ package database
 // 		},*/
 // 		{
 // 			name: "test2",
-// 			connCfg: &DBConfig{
+// 			connCfg: &database.DBConfig{
 // 				Alias:          "TestDB",
 // 				Driver:         "oracle",
 // 				DataSourceName: "SYSTEM/P1ssword@localhost:1521/XE",

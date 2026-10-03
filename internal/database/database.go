@@ -72,7 +72,7 @@ func SubqueryColumnDoc(identName string, views []*parseutil.SubQueryView, dbCach
 	return catalog.SubqueryColumnDoc(identName, views, dbCache)
 }
 
-func parseForeignKeys(rows *sql.Rows, schemaName string) ([]*ForeignKey, error) {
+func ParseForeignKeys(rows *sql.Rows, schemaName string) ([]*ForeignKey, error) {
 	var retVal []*ForeignKey
 	var prevFk string
 	var cur *ForeignKey

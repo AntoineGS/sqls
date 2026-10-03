@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -12,15 +12,16 @@ import (
 
 	clickhouse "github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 	"golang.org/x/crypto/ssh"
 )
 
 func init() {
-	RegisterOpen("clickhouse", clickhouseOpen)
-	RegisterFactory("clickhouse", NewClickhouseRepository)
+	database.RegisterOpen("clickhouse", clickhouseOpen)
+	database.RegisterFactory("clickhouse", NewClickhouseRepository)
 }
 
-func clickhouseOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func clickhouseOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn    *sql.DB
 		sshConn *ssh.Client
@@ -51,17 +52,17 @@ func clickhouseOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, err
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:    conn,
 		SSHConn: sshConn,
 		Driver:  dbConnCfg.Driver,
 	}, nil
 }
 
-func openClickhouseViaSSH(dsn string, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, error) {
+func openClickhouseViaSSH(dsn string, sshCfg *database.SSHConfig) (*sql.DB, *ssh.Client, error) {
 	sshConfig, err := sshCfg.ClientConfig()
 	if err != nil {
 		return nil, nil, err
@@ -84,7 +85,7 @@ func openClickhouseViaSSH(dsn string, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, 
 	return conn, sshConn, nil
 }
 
-func genClickhouseDsn(dbConfig *DBConfig) (string, error) {
+func genClickhouseDsn(dbConfig *database.DBConfig) (string, error) {
 	if dbConfig.DataSourceName != "" {
 		return dbConfig.DataSourceName, nil
 	}
@@ -92,13 +93,13 @@ func genClickhouseDsn(dbConfig *DBConfig) (string, error) {
 	u := url.URL{}
 
 	switch dbConfig.Proto {
-	case ProtoTCP:
+	case database.ProtoTCP:
 		u.Scheme = "clickhouse"
 
-	case ProtoHTTP:
+	case database.ProtoHTTP:
 		u.Scheme = "http"
 
-	case ProtoUDP, ProtoUnix:
+	case database.ProtoUDP, database.ProtoUnix:
 		return "", fmt.Errorf("unsupported protocol %s", dbConfig.Proto)
 	}
 
@@ -113,7 +114,7 @@ func genClickhouseDsn(dbConfig *DBConfig) (string, error) {
 		host = "127.0.0.1"
 	}
 	if port == 0 {
-		if dbConfig.Proto == ProtoHTTP {
+		if dbConfig.Proto == database.ProtoHTTP {
 			port = 8123
 		} else {
 			port = 9000
@@ -136,7 +137,7 @@ func genClickhouseDsn(dbConfig *DBConfig) (string, error) {
 	return u.String(), nil
 }
 
-func genClickhouseConfig(dbConfig *DBConfig) (*clickhouse.Options, error) {
+func genClickhouseConfig(dbConfig *database.DBConfig) (*clickhouse.Options, error) {
 	if dbConfig.DataSourceName != "" {
 		return clickhouse.ParseDSN(dbConfig.DataSourceName)
 	}
@@ -148,7 +149,7 @@ func genClickhouseConfig(dbConfig *DBConfig) (*clickhouse.Options, error) {
 	cfg.Auth.Database = dbConfig.DBName
 
 	switch dbConfig.Proto {
-	case ProtoTCP, ProtoHTTP:
+	case database.ProtoTCP, database.ProtoHTTP:
 		host, port := dbConfig.Host, dbConfig.Port
 		if host == "" {
 			host = "127.0.0.1"
@@ -158,12 +159,12 @@ func genClickhouseConfig(dbConfig *DBConfig) (*clickhouse.Options, error) {
 		}
 		cfg.Addr = append(cfg.Addr, host+":"+strconv.Itoa(port))
 
-		if dbConfig.Proto == ProtoTCP {
+		if dbConfig.Proto == database.ProtoTCP {
 			cfg.Protocol = clickhouse.Native
 		} else {
 			cfg.Protocol = clickhouse.HTTP
 		}
-	case ProtoUnix, ProtoUDP:
+	case database.ProtoUnix, database.ProtoUDP:
 	default:
 		return nil, fmt.Errorf("default addr for network %s unknown", dbConfig.Proto)
 	}
@@ -198,7 +199,7 @@ type clickhouseSQLDBRepository struct {
 	Conn *sql.DB
 }
 
-func NewClickhouseRepository(conn *sql.DB) DBRepository {
+func NewClickhouseRepository(conn *sql.DB) database.DBRepository {
 	return &clickhouseSQLDBRepository{Conn: conn}
 }
 
@@ -235,7 +236,7 @@ func (db *clickhouseSQLDBRepository) Databases(ctx context.Context) ([]string, e
 	return databases, nil
 }
 
-func (db *clickhouseSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *clickhouseSQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -264,9 +265,9 @@ WHERE  ( c.database = currentDatabase()
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		var columnName *string
 		err := rows.Scan(
 			&tableInfo.Schema,
@@ -292,7 +293,7 @@ WHERE  ( c.database = currentDatabase()
 	return tableInfos, nil
 }
 
-func (db *clickhouseSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *clickhouseSQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -322,9 +323,9 @@ WHERE  ( c.database = ?
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		var columnName *string
 		err := rows.Scan(
 			&tableInfo.Schema,
@@ -350,7 +351,7 @@ WHERE  ( c.database = ?
 	return tableInfos, nil
 }
 
-func (*clickhouseSQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (*clickhouseSQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	// clickhouse doesn't support foreign keys
 	return nil, nil
 }

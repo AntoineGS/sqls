@@ -641,15 +641,9 @@ func TestInterBaseValidatesDatabaseSwitch(t *testing.T) {
 func TestOnlyInterBaseConstrainsDatabaseSwitching(t *testing.T) {
 	var _ DatabaseSwitchRepository = (*InterBaseDBRepository)(nil)
 
+	// The foreign drivers are checked in the drivers package.
 	repositories := map[string]DBRepository{
-		"mysql":      NewMySQLDBRepository(nil),
-		"postgresql": NewPostgreSQLDBRepository(nil),
-		"sqlite3":    NewSQLite3DBRepository(nil),
-		"mssql":      NewMssqlDBRepository(nil),
-		"h2":         NewH2DBRepository(nil),
-		"vertica":    NewVerticaDBRepository(nil),
-		"oracle":     NewOracleDBRepository(nil),
-		"mock":       NewMockDBRepository(nil),
+		"mock": NewMockDBRepository(nil),
 	}
 	for name, repository := range repositories {
 		if _, ok := repository.(DatabaseSwitchRepository); ok {

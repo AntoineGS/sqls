@@ -14,6 +14,7 @@ import (
 	"github.com/urfave/cli/v2"
 
 	"github.com/sqls-server/sqls/internal/config"
+	_ "github.com/sqls-server/sqls/internal/database/drivers"
 	"github.com/sqls-server/sqls/internal/handler"
 )
 

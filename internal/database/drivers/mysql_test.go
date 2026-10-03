@@ -1,20 +1,22 @@
-package database
+package drivers
 
 import (
 	"testing"
+
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func Test_genMysqlConfig(t *testing.T) {
 	tests := []struct {
 		name     string
-		connCfg  *DBConfig
+		connCfg  *database.DBConfig
 		wantNet  string
 		wantAddr string
 	}{
 		{
 			name: "tcp defaults",
-			connCfg: &DBConfig{
-				Proto: ProtoTCP,
+			connCfg: &database.DBConfig{
+				Proto: database.ProtoTCP,
 				User:  "user",
 			},
 			wantNet:  "tcp",
@@ -22,8 +24,8 @@ func Test_genMysqlConfig(t *testing.T) {
 		},
 		{
 			name: "unix socket with path",
-			connCfg: &DBConfig{
-				Proto: ProtoUnix,
+			connCfg: &database.DBConfig{
+				Proto: database.ProtoUnix,
 				User:  "user",
 				Path:  "/var/run/mysqld/mysqld.sock",
 			},
@@ -32,8 +34,8 @@ func Test_genMysqlConfig(t *testing.T) {
 		},
 		{
 			name: "unix socket without path",
-			connCfg: &DBConfig{
-				Proto: ProtoUnix,
+			connCfg: &database.DBConfig{
+				Proto: database.ProtoUnix,
 				User:  "user",
 			},
 			wantNet:  "unix",

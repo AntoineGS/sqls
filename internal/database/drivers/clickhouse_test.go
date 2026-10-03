@@ -1,11 +1,15 @@
-package database
+package drivers
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sqls-server/sqls/internal/database"
+)
 
 func TestGenClickhouseDsn(t *testing.T) {
 	type testCase struct {
 		name    string
-		connCfg *DBConfig
+		connCfg *database.DBConfig
 		want    string
 		wantErr bool
 	}
@@ -13,7 +17,7 @@ func TestGenClickhouseDsn(t *testing.T) {
 	tests := []testCase{
 		{
 			name: "use datasource name",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				DataSourceName: "clickhouse://user:pwd@localhost:9001",
 				Driver:         "clickhouse",
 			},
@@ -22,7 +26,7 @@ func TestGenClickhouseDsn(t *testing.T) {
 		},
 		{
 			name: "use config properties",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				Alias:          "",
 				DataSourceName: "",
 				Driver:         "clickhouse",
@@ -41,7 +45,7 @@ func TestGenClickhouseDsn(t *testing.T) {
 		},
 		{
 			name: "default host and port",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				Driver: "clickhouse",
 				Proto:  "tcp",
 				User:   "test",

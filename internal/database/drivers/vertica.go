@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -9,15 +9,16 @@ import (
 	"strconv"
 
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 	_ "github.com/vertica/vertica-sql-go"
 )
 
 func init() {
-	RegisterOpen("vertica", verticaOpen)
-	RegisterFactory("vertica", NewVerticaDBRepository)
+	database.RegisterOpen("vertica", verticaOpen)
+	database.RegisterFactory("vertica", NewVerticaDBRepository)
 }
 
-func verticaOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func verticaOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn *sql.DB
 	)
@@ -31,16 +32,16 @@ func verticaOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, err
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:   conn,
 		Driver: dialect.DatabaseDriverVertica,
 	}, nil
 }
 
-func genVerticaConfig(connCfg *DBConfig) (string, error) {
+func genVerticaConfig(connCfg *database.DBConfig) (string, error) {
 	if connCfg.DataSourceName != "" {
 		return connCfg.DataSourceName, nil
 	}
@@ -66,7 +67,7 @@ type VerticaDBRepository struct {
 	Conn *sql.DB
 }
 
-func NewVerticaDBRepository(conn *sql.DB) DBRepository {
+func NewVerticaDBRepository(conn *sql.DB) database.DBRepository {
 	return &VerticaDBRepository{Conn: conn}
 }
 
@@ -162,7 +163,7 @@ func (db *VerticaDBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *VerticaDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *VerticaDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -180,9 +181,9 @@ SELECT table_schema,
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -204,7 +205,7 @@ SELECT table_schema,
 	return tableInfos, nil
 }
 
-func (db *VerticaDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *VerticaDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -227,9 +228,9 @@ func (db *VerticaDBRepository) DescribeDatabaseTableBySchema(ctx context.Context
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -259,6 +260,6 @@ func (db *VerticaDBRepository) Query(ctx context.Context, query string) (*sql.Ro
 	return db.Conn.QueryContext(ctx, query)
 }
 
-func (db *VerticaDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *VerticaDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	return nil, fmt.Errorf("describe foreign keys is not supported")
 }

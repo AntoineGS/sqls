@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -7,21 +7,22 @@ import (
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func init() {
-	RegisterOpen(dialect.DatabaseDriverSQLite3, sqlite3Open)
-	RegisterFactory(dialect.DatabaseDriverSQLite3, NewSQLite3DBRepository)
+	database.RegisterOpen(dialect.DatabaseDriverSQLite3, sqlite3Open)
+	database.RegisterFactory(dialect.DatabaseDriverSQLite3, NewSQLite3DBRepository)
 }
 
-func sqlite3Open(connCfg *DBConfig) (*DBConnection, error) {
+func sqlite3Open(connCfg *database.DBConfig) (*database.DBConnection, error) {
 	conn, err := sql.Open("sqlite3", connCfg.DataSourceName)
 	if err != nil {
 		return nil, err
 	}
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
-	return &DBConnection{
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
+	return &database.DBConnection{
 		Conn: conn,
 	}, nil
 }
@@ -30,7 +31,7 @@ type SQLite3DBRepository struct {
 	Conn *sql.DB
 }
 
-func NewSQLite3DBRepository(conn *sql.DB) DBRepository {
+func NewSQLite3DBRepository(conn *sql.DB) database.DBRepository {
 	return &SQLite3DBRepository{Conn: conn}
 }
 
@@ -91,18 +92,18 @@ func (db *SQLite3DBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *SQLite3DBRepository) describeTable(ctx context.Context, tableName string) ([]*ColumnDesc, error) {
+func (db *SQLite3DBRepository) describeTable(ctx context.Context, tableName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(ctx, fmt.Sprintf("PRAGMA table_info(%s);", tableName))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
 		var id int
 		var nonnull int
 		var pk int
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&id,
 			&tableInfo.Name,
@@ -133,12 +134,12 @@ func (db *SQLite3DBRepository) describeTable(ctx context.Context, tableName stri
 	return tableInfos, nil
 }
 
-func (db *SQLite3DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *SQLite3DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	tables, err := db.Tables(ctx)
 	if err != nil {
 		return nil, err
 	}
-	all := []*ColumnDesc{}
+	all := []*database.ColumnDesc{}
 	for _, table := range tables {
 		descs, err := db.describeTable(ctx, table)
 		if err != nil {
@@ -149,11 +150,11 @@ func (db *SQLite3DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*Co
 	return all, nil
 }
 
-func (db *SQLite3DBRepository) DescribeDatabaseTableBySchema(ctx context.Context, _ string) ([]*ColumnDesc, error) {
+func (db *SQLite3DBRepository) DescribeDatabaseTableBySchema(ctx context.Context, _ string) ([]*database.ColumnDesc, error) {
 	return db.DescribeDatabaseTable(ctx)
 }
 
-func (db *SQLite3DBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *SQLite3DBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -171,7 +172,7 @@ func (db *SQLite3DBRepository) DescribeForeignKeysBySchema(ctx context.Context, 
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	return parseForeignKeys(rows, schemaName)
+	return database.ParseForeignKeys(rows, schemaName)
 }
 
 func (db *SQLite3DBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {

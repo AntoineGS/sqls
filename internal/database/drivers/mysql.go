@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -9,21 +9,22 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 	"golang.org/x/crypto/ssh"
 )
 
 func init() {
-	RegisterOpen("mysql", mysqlOpen)
-	RegisterOpen("mysql8", mysqlOpen)
-	RegisterOpen("mysql57", mysqlOpen)
-	RegisterOpen("mysql56", mysqlOpen)
-	RegisterFactory("mysql", NewMySQLDBRepository)
-	RegisterFactory("mysql8", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL8))
-	RegisterFactory("mysql57", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL57))
-	RegisterFactory("mysql56", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL56))
+	database.RegisterOpen("mysql", mysqlOpen)
+	database.RegisterOpen("mysql8", mysqlOpen)
+	database.RegisterOpen("mysql57", mysqlOpen)
+	database.RegisterOpen("mysql56", mysqlOpen)
+	database.RegisterFactory("mysql", NewMySQLDBRepository)
+	database.RegisterFactory("mysql8", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL8))
+	database.RegisterFactory("mysql57", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL57))
+	database.RegisterFactory("mysql56", newMySQLVariantDBRepository(dialect.DatabaseDriverMySQL56))
 }
 
-func mysqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func mysqlOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn    *sql.DB
 		sshConn *ssh.Client
@@ -53,10 +54,10 @@ func mysqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, fmt.Errorf("cannot ping to database, %w", err)
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:    conn,
 		SSHConn: sshConn,
 		Driver:  dbConnCfg.Driver,
@@ -71,7 +72,7 @@ func (d *MySQLViaSSHDialer) Dial(ctx context.Context, addr string) (net.Conn, er
 	return d.client.Dial("tcp", addr)
 }
 
-func openMySQLViaSSH(dsn string, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, error) {
+func openMySQLViaSSH(dsn string, sshCfg *database.SSHConfig) (*sql.DB, *ssh.Client, error) {
 	sshConfig, err := sshCfg.ClientConfig()
 	if err != nil {
 		return nil, nil, err
@@ -88,7 +89,7 @@ func openMySQLViaSSH(dsn string, sshCfg *SSHConfig) (*sql.DB, *ssh.Client, error
 	return conn, sshConn, nil
 }
 
-func genMysqlConfig(connCfg *DBConfig) (*mysql.Config, error) {
+func genMysqlConfig(connCfg *database.DBConfig) (*mysql.Config, error) {
 	cfg := mysql.NewConfig()
 
 	if connCfg.DataSourceName != "" {
@@ -100,7 +101,7 @@ func genMysqlConfig(connCfg *DBConfig) (*mysql.Config, error) {
 	cfg.DBName = connCfg.DBName
 
 	switch connCfg.Proto {
-	case ProtoTCP, ProtoUDP:
+	case database.ProtoTCP, database.ProtoUDP:
 		host, port := connCfg.Host, connCfg.Port
 		if host == "" {
 			host = "127.0.0.1"
@@ -110,14 +111,14 @@ func genMysqlConfig(connCfg *DBConfig) (*mysql.Config, error) {
 		}
 		cfg.Addr = host + ":" + strconv.Itoa(port)
 		cfg.Net = string(connCfg.Proto)
-	case ProtoUnix:
+	case database.ProtoUnix:
 		if connCfg.Path == "" {
 			cfg.Addr = "/tmp/mysql.sock"
 		} else {
 			cfg.Addr = connCfg.Path
 		}
 		cfg.Net = string(connCfg.Proto)
-	case ProtoHTTP:
+	case database.ProtoHTTP:
 	default:
 		return nil, fmt.Errorf("default addr for network %s unknown", connCfg.Proto)
 	}
@@ -132,15 +133,15 @@ type MySQLDBRepository struct {
 	driver dialect.DatabaseDriver
 }
 
-func NewMySQLDBRepository(conn *sql.DB) DBRepository {
+func NewMySQLDBRepository(conn *sql.DB) database.DBRepository {
 	return &MySQLDBRepository{Conn: conn, driver: dialect.DatabaseDriverMySQL}
 }
 
-// newMySQLVariantDBRepository returns a Factory for a MySQL driver alias
-// (mysql8, mysql57, mysql56). Factory's signature carries no driver name, so
+// newMySQLVariantDBRepository returns a database.Factory for a MySQL driver alias
+// (mysql8, mysql57, mysql56). database.Factory's signature carries no driver name, so
 // each alias needs its own closure to report the right one from Driver().
-func newMySQLVariantDBRepository(driver dialect.DatabaseDriver) Factory {
-	return func(conn *sql.DB) DBRepository {
+func newMySQLVariantDBRepository(driver dialect.DatabaseDriver) database.Factory {
+	return func(conn *sql.DB) database.DBRepository {
 		return &MySQLDBRepository{Conn: conn, driver: driver}
 	}
 }
@@ -242,7 +243,7 @@ func (db *MySQLDBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *MySQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *MySQLDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -261,9 +262,9 @@ FROM information_schema.COLUMNS
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -285,7 +286,7 @@ FROM information_schema.COLUMNS
 	return tableInfos, nil
 }
 
-func (db *MySQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *MySQLDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -305,9 +306,9 @@ WHERE information_schema.COLUMNS.TABLE_SCHEMA = ?
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -329,7 +330,7 @@ WHERE information_schema.COLUMNS.TABLE_SCHEMA = ?
 	return tableInfos, nil
 }
 
-func (db *MySQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *MySQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -351,7 +352,7 @@ func (db *MySQLDBRepository) DescribeForeignKeysBySchema(ctx context.Context, sc
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	return parseForeignKeys(rows, schemaName)
+	return database.ParseForeignKeys(rows, schemaName)
 }
 
 func (db *MySQLDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {

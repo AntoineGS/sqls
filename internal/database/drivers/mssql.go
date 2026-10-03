@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -11,11 +11,12 @@ import (
 	"github.com/jfcote87/sshdb"
 	mssql "github.com/microsoft/go-mssqldb"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func init() {
-	RegisterOpen("mssql", mssqlOpen)
-	RegisterFactory("mssql", NewMssqlDBRepository)
+	database.RegisterOpen("mssql", mssqlOpen)
+	database.RegisterFactory("mssql", NewMssqlDBRepository)
 }
 
 // mssqlTunnelDriver adapts github.com/microsoft/go-mssqldb to the
@@ -37,7 +38,7 @@ func (mssqlTunnelDriver) OpenConnector(dialer sshdb.Dialer, dsn string) (driver.
 	return connector, nil
 }
 
-func mssqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
+func mssqlOpen(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn *sql.DB
 	)
@@ -75,10 +76,10 @@ func mssqlOpen(dbConnCfg *DBConfig) (*DBConnection, error) {
 		return nil, err
 	}
 
-	conn.SetMaxIdleConns(DefaultMaxIdleConns)
-	conn.SetMaxOpenConns(DefaultMaxOpenConns)
+	conn.SetMaxIdleConns(database.DefaultMaxIdleConns)
+	conn.SetMaxOpenConns(database.DefaultMaxOpenConns)
 
-	dbConn := &DBConnection{
+	dbConn := &database.DBConnection{
 		Conn:   conn,
 		Driver: dbConnCfg.Driver,
 	}
@@ -92,7 +93,7 @@ type MssqlDBRepository struct {
 	Conn *sql.DB
 }
 
-func NewMssqlDBRepository(conn *sql.DB) DBRepository {
+func NewMssqlDBRepository(conn *sql.DB) database.DBRepository {
 	return &MssqlDBRepository{Conn: conn}
 }
 
@@ -237,7 +238,7 @@ func (db *MssqlDBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *MssqlDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *MssqlDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -272,9 +273,9 @@ func (db *MssqlDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*Colu
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -296,7 +297,7 @@ func (db *MssqlDBRepository) DescribeDatabaseTable(ctx context.Context) ([]*Colu
 	return tableInfos, nil
 }
 
-func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -333,9 +334,9 @@ func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, 
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -357,7 +358,7 @@ func (db *MssqlDBRepository) DescribeDatabaseTableBySchema(ctx context.Context, 
 	return tableInfos, nil
 }
 
-func (db *MssqlDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *MssqlDBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -385,7 +386,7 @@ func (db *MssqlDBRepository) DescribeForeignKeysBySchema(ctx context.Context, sc
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
-	return parseForeignKeys(rows, schemaName)
+	return database.ParseForeignKeys(rows, schemaName)
 }
 
 func (db *MssqlDBRepository) Exec(ctx context.Context, query string) (sql.Result, error) {
@@ -396,7 +397,7 @@ func (db *MssqlDBRepository) Query(ctx context.Context, query string) (*sql.Rows
 	return db.Conn.QueryContext(ctx, query)
 }
 
-func genMssqlConfig(connCfg *DBConfig) (string, error) {
+func genMssqlConfig(connCfg *database.DBConfig) (string, error) {
 	if connCfg.DataSourceName != "" {
 		return connCfg.DataSourceName, nil
 	}
@@ -407,7 +408,7 @@ func genMssqlConfig(connCfg *DBConfig) (string, error) {
 	q.Set("database", connCfg.DBName)
 
 	switch connCfg.Proto {
-	case ProtoTCP:
+	case database.ProtoTCP:
 		host, port := connCfg.Host, connCfg.Port
 		if host == "" {
 			host = "127.0.0.1"
@@ -417,7 +418,7 @@ func genMssqlConfig(connCfg *DBConfig) (string, error) {
 		}
 		q.Set("server", host)
 		q.Set("port", strconv.Itoa(port))
-	case ProtoUDP, ProtoUnix, ProtoHTTP:
+	case database.ProtoUDP, database.ProtoUnix, database.ProtoHTTP:
 	default:
 		return "", fmt.Errorf("default addr for network %s unknown", connCfg.Proto)
 	}

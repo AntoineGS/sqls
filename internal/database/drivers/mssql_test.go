@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -9,6 +9,8 @@ import (
 
 	"github.com/jfcote87/sshdb"
 	mssql "github.com/microsoft/go-mssqldb"
+
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 var _ sshdb.Driver = mssqlTunnelDriver{}
@@ -16,13 +18,13 @@ var _ sshdb.Driver = mssqlTunnelDriver{}
 func Test_genMssqlConfig(t *testing.T) {
 	tests := []struct {
 		name    string
-		connCfg *DBConfig
+		connCfg *database.DBConfig
 		want    string
 		wantErr bool
 	}{
 		{
 			name: "",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				Alias:          "",
 				Driver:         "mssql",
 				DataSourceName: "",

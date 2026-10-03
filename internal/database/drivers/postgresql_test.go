@@ -1,21 +1,23 @@
-package database
+package drivers
 
 import (
 	"testing"
 
 	_ "github.com/jackc/pgx/v4/stdlib"
+
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func Test_genPostgresConfig(t *testing.T) {
 	tests := []struct {
 		name    string
-		connCfg *DBConfig
+		connCfg *database.DBConfig
 		want    string
 		wantErr bool
 	}{
 		{
 			name: "",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				Alias:          "",
 				Driver:         "postgresql",
 				DataSourceName: "",
@@ -35,7 +37,7 @@ func Test_genPostgresConfig(t *testing.T) {
 		},
 		{
 			name: "password with space and quote",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				Driver: "postgresql",
 				Proto:  "tcp",
 				User:   "postgres",

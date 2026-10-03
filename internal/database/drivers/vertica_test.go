@@ -1,23 +1,27 @@
-package database
+package drivers
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sqls-server/sqls/internal/database"
+)
 
 func Test_genVerticaConfig(t *testing.T) {
 	tests := []struct {
 		name    string
-		connCfg *DBConfig
+		connCfg *database.DBConfig
 		want    string
 	}{
 		{
 			name: "use datasource name",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				DataSourceName: "vertica://user:pwd@localhost:5433/db",
 			},
 			want: "vertica://user:pwd@localhost:5433/db",
 		},
 		{
 			name: "use config properties",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				User:   "dbadmin",
 				Passwd: "secure",
 				Host:   "example.com",
@@ -28,7 +32,7 @@ func Test_genVerticaConfig(t *testing.T) {
 		},
 		{
 			name: "defaults",
-			connCfg: &DBConfig{
+			connCfg: &database.DBConfig{
 				User:   "dbadmin",
 				Passwd: "secure",
 				DBName: "vdb",

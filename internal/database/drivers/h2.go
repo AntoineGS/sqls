@@ -1,4 +1,4 @@
-package database
+package drivers
 
 import (
 	"context"
@@ -7,14 +7,15 @@ import (
 
 	_ "github.com/CodinGame/h2go"
 	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/database"
 )
 
 func init() {
-	RegisterOpen("h2", h2Open)
-	RegisterFactory("h2", NewH2DBRepository)
+	database.RegisterOpen("h2", h2Open)
+	database.RegisterFactory("h2", NewH2DBRepository)
 }
 
-func h2Open(dbConnCfg *DBConfig) (*DBConnection, error) {
+func h2Open(dbConnCfg *database.DBConfig) (*database.DBConnection, error) {
 	var (
 		conn *sql.DB
 	)
@@ -32,13 +33,13 @@ func h2Open(dbConnCfg *DBConfig) (*DBConnection, error) {
 	}
 	conn = dbConn
 
-	return &DBConnection{
+	return &database.DBConnection{
 		Conn:   conn,
 		Driver: dbConnCfg.Driver,
 	}, nil
 }
 
-func genH2Config(connCfg *DBConfig) (string, error) {
+func genH2Config(connCfg *database.DBConfig) (string, error) {
 	if connCfg.DataSourceName != "" {
 		return connCfg.DataSourceName, nil
 	}
@@ -51,7 +52,7 @@ type H2DBRepository struct {
 	driver dialect.DatabaseDriver
 }
 
-func NewH2DBRepository(conn *sql.DB) DBRepository {
+func NewH2DBRepository(conn *sql.DB) database.DBRepository {
 	return &H2DBRepository{Conn: conn, driver: dialect.DatabaseDriverH2}
 }
 
@@ -163,7 +164,7 @@ func (db *H2DBRepository) Tables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
-func (db *H2DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnDesc, error) {
+func (db *H2DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*database.ColumnDesc, error) {
 	rows, err := db.Conn.QueryContext(
 		ctx,
 		`
@@ -194,9 +195,9 @@ func (db *H2DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnD
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -218,7 +219,7 @@ func (db *H2DBRepository) DescribeDatabaseTable(ctx context.Context) ([]*ColumnD
 	return tableInfos, nil
 }
 
-func (db *H2DBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*ColumnDesc, error) {
+func (db *H2DBRepository) DescribeDatabaseTableBySchema(ctx context.Context, schemaName string) ([]*database.ColumnDesc, error) {
 	// h2go doesn't support NamedValue yet
 	rows, err := db.Conn.QueryContext(
 		ctx,
@@ -252,9 +253,9 @@ func (db *H2DBRepository) DescribeDatabaseTableBySchema(ctx context.Context, sch
 		return nil, err
 	}
 	defer rows.Close()
-	tableInfos := []*ColumnDesc{}
+	tableInfos := []*database.ColumnDesc{}
 	for rows.Next() {
-		var tableInfo ColumnDesc
+		var tableInfo database.ColumnDesc
 		err := rows.Scan(
 			&tableInfo.Schema,
 			&tableInfo.Table,
@@ -284,6 +285,6 @@ func (db *H2DBRepository) Query(ctx context.Context, query string) (*sql.Rows, e
 	return db.Conn.QueryContext(ctx, query)
 }
 
-func (db *H2DBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*ForeignKey, error) {
+func (db *H2DBRepository) DescribeForeignKeysBySchema(ctx context.Context, schemaName string) ([]*database.ForeignKey, error) {
 	return nil, fmt.Errorf("describe foreign keys is not supported")
 }
