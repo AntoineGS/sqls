@@ -99,6 +99,8 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 		}
 	case catalog.MetadataForeignKeys:
 		next.ForeignKeys = cloneForeignKeyMap(fragment.ForeignKeys)
+	case catalog.MetadataDependencies:
+		next.Dependencies = fragment.Dependencies
 	case catalog.MetadataViews, catalog.MetadataProcedures, catalog.MetadataGenerators, catalog.MetadataDomains,
 		catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
 		catalog.MetadataSystemRelations, catalog.MetadataExceptions:
@@ -156,6 +158,8 @@ func validateMetadataPayload(kind catalog.MetadataKind, fragment *catalog.Cache)
 		present = fragment.PrimaryKeyColumns != nil
 	case catalog.MetadataForeignKeys:
 		present = fragment.ForeignKeys != nil
+	case catalog.MetadataDependencies:
+		present = fragment.Dependencies != nil
 	case catalog.MetadataViews:
 		present = fragment.Catalog != nil && fragment.Catalog.Views != nil
 	case catalog.MetadataProcedures:
@@ -193,7 +197,7 @@ func knownMetadataKind(kind catalog.MetadataKind) bool {
 	case catalog.MetadataSchemas, catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataColumnsAll,
 		catalog.MetadataPrimaryKeys, catalog.MetadataForeignKeys, catalog.MetadataViews, catalog.MetadataProcedures,
 		catalog.MetadataGenerators, catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
-		catalog.MetadataSystemRelations, catalog.MetadataExceptions:
+		catalog.MetadataSystemRelations, catalog.MetadataExceptions, catalog.MetadataDependencies:
 		return true
 	default:
 		return false

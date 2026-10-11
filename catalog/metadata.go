@@ -24,6 +24,7 @@ const (
 	MetadataTriggers        MetadataKind = "triggers"
 	MetadataSystemRelations MetadataKind = "system-relations"
 	MetadataExceptions      MetadataKind = "exceptions"
+	MetadataDependencies    MetadataKind = "dependencies"
 )
 
 // MetadataState describes a category's progress in one metadata generation.
