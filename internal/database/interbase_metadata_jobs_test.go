@@ -597,6 +597,7 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 		{MetadataExceptions, "FROM RDB$EXCEPTIONS e"},
 		{MetadataDomains, "FROM RDB$FIELDS f\n"},
 		{MetadataTriggers, "RDB$TRIGGERS"},
+		{MetadataDependencies, "FROM RDB$DEPENDENCIES d"},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.kind), func(t *testing.T) {
@@ -630,8 +631,13 @@ func TestInterBaseMetadataActualPlanReaderQueryFaultsAreIsolated(t *testing.T) {
 				// Views intentionally depends on ColumnsCurrent (see
 				// readMetadataViewsFromColumns): a ColumnsCurrent failure
 				// legitimately blocks it instead of leaving it independent.
+				// Dependencies depends on Views, so it is blocked transitively
+				// when ColumnsCurrent or Views fails.
 				wantState := MetadataReady
 				if job.Kind == MetadataViews && tc.kind == MetadataColumnsCurrent {
+					wantState = MetadataBlocked
+				}
+				if job.Kind == MetadataDependencies && (tc.kind == MetadataColumnsCurrent || tc.kind == MetadataViews) {
 					wantState = MetadataBlocked
 				}
 				if snapshot.Status[job.Kind].State != wantState {

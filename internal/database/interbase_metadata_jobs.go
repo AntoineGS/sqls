@@ -130,6 +130,13 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 				return db.readMetadataViewsFromColumns(ctx, q, width, cache)
 			})
 		}},
+		// Dependencies resolves relation dependencies to tables or views,
+		// so it reads the already-loaded view namespace.
+		{Kind: MetadataDependencies, DependsOn: []MetadataKind{MetadataViews}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
+			return db.runMetadataRead(ctx, func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+				return db.readMetadataDependencies(ctx, q, width, cache)
+			})
+		}},
 		{Kind: MetadataIndexes, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataIndexes)
 		}},

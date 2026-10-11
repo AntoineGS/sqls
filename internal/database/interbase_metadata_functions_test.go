@@ -58,16 +58,18 @@ func TestInterBaseMetadataPlanHasIndependentBoundedJobs(t *testing.T) {
 	if plan.Parallelism != 3 {
 		t.Fatalf("parallelism = %d, want 3", plan.Parallelism)
 	}
-	want := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataSystemRelations, MetadataExceptions, MetadataDomains, MetadataTriggers}
+	want := []MetadataKind{MetadataSchemas, MetadataRelations, MetadataColumnsCurrent, MetadataProcedures, MetadataPrimaryKeys, MetadataViews, MetadataDependencies, MetadataIndexes, MetadataForeignKeys, MetadataFunctions, MetadataGenerators, MetadataSystemRelations, MetadataExceptions, MetadataDomains, MetadataTriggers}
 	if len(plan.Jobs) != len(want) {
 		t.Fatalf("job count = %d, want %d", len(plan.Jobs), len(want))
 	}
 	// Views is the sole intentional exception: it depends on ColumnsCurrent
 	// so its Run function can reuse the already-loaded column data instead
 	// of issuing its own duplicate view-columns query (see
-	// readMetadataViewsFromColumns). Every other category stays independent.
+	// readMetadataViewsFromColumns). Dependencies depends on Views so it can
+	// resolve relations to views. Every other category stays independent.
 	wantDeps := map[MetadataKind][]MetadataKind{
-		MetadataViews: {MetadataColumnsCurrent},
+		MetadataViews:        {MetadataColumnsCurrent},
+		MetadataDependencies: {MetadataViews},
 	}
 	for i, job := range plan.Jobs {
 		if job.Kind != want[i] {
