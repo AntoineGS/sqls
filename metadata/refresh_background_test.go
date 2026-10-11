@@ -139,10 +139,32 @@ func TestRegistryCloseDrainsBackgroundRefreshBeforeClosingProvider(t *testing.T)
 	if err := reg.Close(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := <-done; err == nil {
-		t.Fatal("refresh succeeded on a closed registry")
+	if err := <-done; !errors.Is(err, metadata.ErrClosed) {
+		t.Fatalf("err = %v, want ErrClosed", err)
 	}
 	if p.closes.Load() != 1 || p.closedWhileRunning.Load() {
 		t.Fatalf("closes = %d, closed while a load ran = %v", p.closes.Load(), p.closedWhileRunning.Load())
+	}
+}
+
+func TestRefreshInBackgroundPublishesStaleWhenInvalidatedDuringLoad(t *testing.T) {
+	p := newPhasedProvider()
+	gate := make(chan struct{})
+	p.gates[2] = gate
+	reg, lease := acquirePhased(t, p)
+	defer func() { lease.Release(); _ = reg.Close(context.Background()) }()
+	done := make(chan error, 1)
+	go func() { done <- lease.RefreshInBackground(context.Background()) }()
+	<-p.entered
+	if err := lease.Invalidate(); err != nil {
+		t.Fatal(err)
+	}
+	close(gate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	after := lease.Snapshot()
+	if after.Generation != 2 || !after.Stale || !reflect.DeepEqual(phasedTables(after), []string{"T2"}) {
+		t.Fatalf("snapshot after refresh = gen %d stale %v tables %v", after.Generation, after.Stale, phasedTables(after))
 	}
 }

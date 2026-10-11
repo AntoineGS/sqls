@@ -70,6 +70,8 @@ type track struct {
 	// staging is a background refresh's loader before it is published.
 	// Protected by mu; shutdown stops and drains it like the live loader.
 	staging *Loader
+	// invalidations counts Lease.Invalidate calls. Protected by mu.
+	invalidations uint64
 }
 
 func (t *track) isClosed() bool {

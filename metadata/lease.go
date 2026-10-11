@@ -179,6 +179,7 @@ func (l *Lease) Invalidate() error {
 	}
 	l.track.mu.Lock()
 	loader := l.track.loader
+	l.track.invalidations++
 	l.track.mu.Unlock()
 	if loader == nil {
 		return ErrUnsupported
@@ -262,6 +263,7 @@ func (l *Lease) RefreshInBackground(ctx context.Context) error {
 		return ErrClosed
 	}
 	t.staging = staging
+	invalidations := t.invalidations
 	t.mu.Unlock()
 	discard := func() {
 		staging.Stop()
@@ -283,6 +285,10 @@ func (l *Lease) RefreshInBackground(ctx context.Context) error {
 		discard()
 		return ctx.Err()
 	}
+	if t.ctx.Err() != nil {
+		discard()
+		return ErrClosed
+	}
 	if err := backgroundRefreshFailure(previous, staging.Snapshot()); err != nil {
 		discard()
 		return err
@@ -295,9 +301,15 @@ func (l *Lease) RefreshInBackground(ctx context.Context) error {
 	}
 	staging.SetChangedCallback(func() { l.registry.publishTrackEvent(t) })
 	t.loader, t.staging = staging, nil
+	invalidated := t.invalidations != invalidations
 	t.mu.Unlock()
 	t.details.beginGeneration(generation)
 	current.Stop()
+	if invalidated {
+		// An Invalidate during the load may postdate the staged queries.
+		staging.MarkStale()
+		t.details.markStale()
+	}
 	l.registry.publishTrackEvent(t)
 	return nil
 }
