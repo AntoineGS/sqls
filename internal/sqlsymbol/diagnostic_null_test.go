@@ -10,6 +10,31 @@ func TestDiagnosticNullComparison(t *testing.T) {
 	requireCodeCount(t, "UPDATE T SET V = NULL;", nil, "interbase-null-comparison", 0)
 }
 
+func TestDiagnosticNullComparisonAtEndOfText(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want int
+	}{
+		{"where", "SELECT ID FROM T WHERE COST = NULL", 1},
+		{"having", "SELECT ID FROM T GROUP BY ID HAVING ID = NULL", 1},
+		{"join on", "SELECT ID FROM T JOIN U ON T.ID = NULL", 1},
+		{"incomplete where", "SELECT ID FROM T WHERE V = NULL AND", 0},
+		{"incomplete having", "SELECT ID FROM T GROUP BY ID HAVING ID = NULL OR", 0},
+		{"incomplete join on", "SELECT ID FROM T JOIN U ON T.ID = NULL AND", 0},
+		{"incomplete case when", "SELECT CASE WHEN V = NULL", 0},
+		{"unclosed expression", "SELECT ID FROM T WHERE (V = NULL", 0},
+		{"unclosed nested where", "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U WHERE U.V = NULL", 0},
+		{"unclosed nested having", "SELECT ID FROM T WHERE EXISTS (SELECT U.V FROM U GROUP BY U.V HAVING U.V = NULL", 0},
+		{"unclosed nested join on", "SELECT ID FROM T WHERE EXISTS (SELECT 1 FROM U JOIN V ON U.ID = NULL", 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requireCodeCount(t, tc.sql, nil, "interbase-null-comparison", tc.want)
+		})
+	}
+}
+
 // --- clause coverage: WHERE, JOIN ON, HAVING, CASE WHEN, procedural IF ---
 
 func TestDiagnosticNullComparisonJoinOn(t *testing.T) {

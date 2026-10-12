@@ -61,11 +61,10 @@ func (a *Analysis) nullComparisonFindings() []Finding {
 // depth (leaving an enclosing subquery/derived-table's parentheses) when
 // depthDropOK -- the natural close of a WHERE/HAVING/ON clause nested inside
 // EXISTS/IN/a derived table, which has no boundary keyword or semicolon of
-// its own. Reaching the end of items without any of these is reported
-// incomplete (ok=false): a clause that never proves its own extent is never
-// scanned, matching this package's existing width/singleton diagnostics,
-// which likewise withhold findings for a statement completeStatementEnd
-// cannot bound.
+// its own. A top-level query-condition clause may also end at document EOF;
+// nested clauses must reach their enclosing close parenthesis. In either
+// case, clauseNullFindings requires the resulting body to be a complete
+// expression before scanning.
 func clauseBody(items []lexeme, depths []int, keywordIndex int, boundaryWords []string, semicolonOK, depthDropOK bool) (bodyStart, bodyEnd int, ok bool) {
 	depth := depths[keywordIndex]
 	bodyStart = keywordIndex + 1
@@ -94,6 +93,9 @@ func clauseBody(items []lexeme, depths []int, keywordIndex int, boundaryWords []
 				return bodyStart, i, true
 			}
 		}
+	}
+	if semicolonOK && depthDropOK && depth == 0 {
+		return bodyStart, len(items), true
 	}
 	return 0, 0, false
 }
