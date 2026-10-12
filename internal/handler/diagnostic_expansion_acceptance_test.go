@@ -143,6 +143,12 @@ func TestDiagnosticExpansionFailedColumnRefreshKeepsOnlyTextFinding(t *testing.T
 	if !hasDiagnosticCode(initial.Diagnostics, "interbase-unknown-column") || !hasDiagnosticCode(initial.Diagnostics, "interbase-null-comparison") {
 		t.Fatalf("initial ready-catalog findings = %+v, want unknown-column and null-comparison", initial.Diagnostics)
 	}
+	tx.client.drain(uri)
+	tx.server.queueAllDiagnostics()
+	duplicate := tx.client.waitPending(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if !hasDiagnosticCode(duplicate.Diagnostics, "interbase-unknown-column") || !hasDiagnosticCode(duplicate.Diagnostics, "interbase-null-comparison") {
+		t.Fatalf("duplicate ready-catalog findings = %+v, want unknown-column and null-comparison", duplicate.Diagnostics)
+	}
 	initialGeneration := lease.Snapshot().Generation
 	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
 		t.Fatal("send pre-refresh barrier:", err)
@@ -152,6 +158,7 @@ func TestDiagnosticExpansionFailedColumnRefreshKeepsOnlyTextFinding(t *testing.T
 	case <-time.After(time.Second):
 		t.Fatal("pre-refresh notification barrier timed out")
 	}
+	tx.client.drain(uri)
 	tx.server.stateMu.Lock()
 	tx.server.notificationConn = nil // Assert the final serialized publication explicitly below.
 	tx.server.stateMu.Unlock()
@@ -169,7 +176,18 @@ func TestDiagnosticExpansionFailedColumnRefreshKeepsOnlyTextFinding(t *testing.T
 		t.Fatalf("refresh categories/generation = %d %+v; want ready namespaces, failed columns, generation > %d", refreshed.Generation, refreshed.Status, initialGeneration)
 	}
 	tx.server.publishDocumentDiagnostics(tx.ctx, tx.serverConn, uri)
-	final := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil && *n.Version == 1 })
+	if err := tx.serverConn.Notify(tx.ctx, "test/notificationBarrier", struct{}{}); err != nil {
+		t.Fatal("send post-refresh notification barrier:", err)
+	}
+	select {
+	case <-tx.client.barrier:
+	case <-time.After(time.Second):
+		t.Fatal("post-refresh notification barrier timed out")
+	}
+	final := tx.client.last(t, uri)
+	if final.Version == nil || *final.Version != 1 {
+		t.Fatalf("last post-refresh diagnostics version = %v, want 1", final.Version)
+	}
 	if len(final.Diagnostics) != 1 || diagnosticCode(final.Diagnostics[0]) != "interbase-null-comparison" {
 		t.Fatalf("final diagnostics after failed column refresh = %+v, want only independent text finding", final.Diagnostics)
 	}

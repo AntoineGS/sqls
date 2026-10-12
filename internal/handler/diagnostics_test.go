@@ -103,6 +103,57 @@ func (c *diagnosticsClient) next(t *testing.T, uri string, matches func(diagnost
 	}
 }
 
+func (c *diagnosticsClient) waitPending(t *testing.T, uri string, matches func(diagnosticsNotification) bool) diagnosticsNotification {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	for {
+		c.mu.Lock()
+		for _, notification := range c.notifications {
+			if notification.URI == uri && matches(notification) {
+				c.mu.Unlock()
+				return notification
+			}
+		}
+		c.mu.Unlock()
+		select {
+		case <-c.changed:
+		case <-deadline:
+			t.Fatalf("timed out waiting for pending diagnostics notification for %s", uri)
+		}
+	}
+}
+
+func (c *diagnosticsClient) drain(uri string) []diagnosticsNotification {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	remaining := c.notifications[:0]
+	var drained []diagnosticsNotification
+	for _, notification := range c.notifications {
+		if notification.URI == uri {
+			drained = append(drained, notification)
+			continue
+		}
+		remaining = append(remaining, notification)
+	}
+	c.notifications = remaining
+	return drained
+}
+
+func (c *diagnosticsClient) last(t *testing.T, uri string) diagnosticsNotification {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := len(c.notifications) - 1; i >= 0; i-- {
+		if c.notifications[i].URI == uri {
+			notification := c.notifications[i]
+			c.notifications = append(c.notifications[:i], c.notifications[i+1:]...)
+			return notification
+		}
+	}
+	t.Fatalf("no diagnostics notification for %s", uri)
+	return diagnosticsNotification{}
+}
+
 type diagnosticsTestContext struct {
 	server     *Server
 	clientConn *jsonrpc2.Conn
