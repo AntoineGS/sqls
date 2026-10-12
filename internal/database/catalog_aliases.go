@@ -80,6 +80,7 @@ const (
 	MetadataTriggers        = catalog.MetadataTriggers
 	MetadataSystemRelations = catalog.MetadataSystemRelations
 	MetadataExceptions      = catalog.MetadataExceptions
+	MetadataDependencies    = catalog.MetadataDependencies
 
 	MetadataPending     = catalog.MetadataPending
 	MetadataLoading     = catalog.MetadataLoading

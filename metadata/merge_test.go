@@ -214,6 +214,7 @@ func TestMetadataMergeRejectsMissingCategoryPayload(t *testing.T) {
 		{catalog.MetadataTriggers, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
 		{catalog.MetadataSystemRelations, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
 		{catalog.MetadataExceptions, &catalog.Cache{Catalog: &catalog.CatalogCache{}}},
+		{catalog.MetadataDependencies, &catalog.Cache{}},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.kind), func(t *testing.T) {
@@ -242,6 +243,7 @@ func TestMetadataMergeAcceptsAllocatedEmptyCategoryPayload(t *testing.T) {
 		catalog.MetadataTriggers:        {Catalog: &catalog.CatalogCache{Triggers: map[string]*catalog.TriggerDesc{}}},
 		catalog.MetadataSystemRelations: {Catalog: &catalog.CatalogCache{SystemRelationsByID: map[string]*catalog.SystemRelationDesc{}}},
 		catalog.MetadataExceptions:      {Catalog: &catalog.CatalogCache{ExceptionsByID: map[string]*catalog.ExceptionDesc{}}},
+		catalog.MetadataDependencies:    {Dependencies: catalog.NewDependencyGraph(nil, nil)},
 	}
 	for kind, cache := range patches {
 		t.Run(string(kind), func(t *testing.T) {
@@ -253,6 +255,20 @@ func TestMetadataMergeAcceptsAllocatedEmptyCategoryPayload(t *testing.T) {
 				t.Fatal("allocated empty payload should be ready")
 			}
 		})
+	}
+}
+
+func TestMergeDependenciesPublishesGraph(t *testing.T) {
+	graph := catalog.NewDependencyGraph(nil, nil)
+	merged, err := Merge(NewCache(), catalog.MetadataDependencies, catalog.MetadataPatch{Cache: &catalog.Cache{Dependencies: graph}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if merged.Dependencies != graph || !merged.MetadataReady(catalog.MetadataDependencies) {
+		t.Fatalf("merged = %+v", merged)
+	}
+	if _, err := Merge(NewCache(), catalog.MetadataDependencies, catalog.MetadataPatch{Cache: &catalog.Cache{}}); err == nil {
+		t.Fatal("a dependencies patch without a graph must be rejected")
 	}
 }
 

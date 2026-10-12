@@ -179,6 +179,7 @@ func (l *Lease) Invalidate() error {
 	}
 	l.track.mu.Lock()
 	loader := l.track.loader
+	l.track.invalidations++
 	l.track.mu.Unlock()
 	if loader == nil {
 		return ErrUnsupported
@@ -202,6 +203,8 @@ func (l *Lease) Refresh(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	l.track.refreshMu.Lock()
+	defer l.track.refreshMu.Unlock()
 	if l.track.isClosed() {
 		return ErrClosed
 	}
@@ -220,6 +223,116 @@ func (l *Lease) Refresh(ctx context.Context) error {
 	if _, err := loader.Start(l.track.ctx, generation, provider.Plan()); err != nil {
 		_ = loader.MarkStartFailed(generation)
 		return err
+	}
+	return nil
+}
+
+// RefreshInBackground loads a new generation on a separate loader while the
+// current snapshot stays published, then publishes it in one step. A
+// generation that loses a category the current snapshot had ready is
+// discarded and its error returned, leaving the current snapshot untouched.
+// ctx bounds only this caller's wait; the load runs under the store's
+// context. It never overlaps Refresh.
+func (l *Lease) RefreshInBackground(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	t := l.track
+	t.refreshMu.Lock()
+	defer t.refreshMu.Unlock()
+	if t.isClosed() {
+		return ErrClosed
+	}
+	t.mu.Lock()
+	current, provider := t.loader, t.provider
+	t.mu.Unlock()
+	if current == nil || provider == nil {
+		return ErrUnsupported
+	}
+	// No job of the current generation may still run once it is replaced.
+	if err := current.Wait(ctx); err != nil {
+		return err
+	}
+	previous := current.Snapshot()
+	generation := previous.Generation + 1
+	staging := NewLoader(t.storeBudget)
+	staging.Reset(generation)
+	t.mu.Lock()
+	if t.closed || t.ctx.Err() != nil {
+		t.mu.Unlock()
+		return ErrClosed
+	}
+	t.staging = staging
+	invalidations := t.invalidations
+	t.mu.Unlock()
+	discard := func() {
+		staging.Stop()
+		_ = staging.Wait(context.Background())
+		t.mu.Lock()
+		if t.staging == staging {
+			t.staging = nil
+		}
+		t.mu.Unlock()
+	}
+	load, err := staging.Start(t.ctx, generation, provider.Plan())
+	if err != nil {
+		discard()
+		return err
+	}
+	select {
+	case <-load.Done:
+	case <-ctx.Done():
+		discard()
+		return ctx.Err()
+	}
+	if t.ctx.Err() != nil {
+		discard()
+		return ErrClosed
+	}
+	if err := backgroundRefreshFailure(previous, staging.Snapshot()); err != nil {
+		discard()
+		return err
+	}
+	t.mu.Lock()
+	if t.closed || t.ctx.Err() != nil {
+		t.mu.Unlock()
+		discard()
+		return ErrClosed
+	}
+	staging.SetChangedCallback(func() { l.registry.publishTrackEvent(t) })
+	t.loader, t.staging = staging, nil
+	invalidated := t.invalidations != invalidations
+	t.mu.Unlock()
+	t.details.beginGeneration(generation)
+	current.Stop()
+	if invalidated {
+		// An Invalidate during the load may postdate the staged queries.
+		staging.MarkStale()
+		t.details.markStale()
+	}
+	l.registry.publishTrackEvent(t)
+	return nil
+}
+
+// backgroundRefreshFailure rejects a new generation that start-failed or
+// lost a category the previous one had ready. Categories that were already
+// failed may stay failed: a partial store can still refresh.
+func backgroundRefreshFailure(previous, next *catalog.MetadataSnapshot) error {
+	if next.StartFailed {
+		return fmt.Errorf("%w: metadata load did not start", ErrCategoryFailed)
+	}
+	for kind, status := range previous.Status {
+		if status.State != catalog.MetadataReady {
+			continue
+		}
+		got := next.Status[kind]
+		if got.State == catalog.MetadataReady {
+			continue
+		}
+		if got.Err != nil {
+			return fmt.Errorf("%w: %s: %v", ErrCategoryFailed, kind, got.Err)
+		}
+		return fmt.Errorf("%w: %s is %s", ErrCategoryFailed, kind, got.State)
 	}
 	return nil
 }

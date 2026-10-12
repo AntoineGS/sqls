@@ -40,6 +40,9 @@ type Cache struct {
 	// repository does not implement CatalogRepository, and also before the
 	// first successful secondary pass.
 	Catalog *CatalogCache
+	// Dependencies is the object dependency graph. Nil until the
+	// dependencies category publishes, or when the engine has none.
+	Dependencies *DependencyGraph
 }
 
 // MetadataReady reports whether every explicitly requested category completed.

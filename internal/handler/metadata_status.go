@@ -18,6 +18,7 @@ var metadataKindOrder = []database.MetadataKind{
 	database.MetadataViews, database.MetadataProcedures, database.MetadataGenerators,
 	database.MetadataSystemRelations, database.MetadataExceptions,
 	database.MetadataDomains, database.MetadataFunctions, database.MetadataIndexes, database.MetadataTriggers,
+	database.MetadataDependencies,
 }
 
 func (s *Server) metadataStatus() lsp.MetadataStatusResult {

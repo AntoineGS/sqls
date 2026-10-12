@@ -94,6 +94,7 @@ var metadataKinds = []catalog.MetadataKind{
 	catalog.MetadataPrimaryKeys, catalog.MetadataForeignKeys, catalog.MetadataViews, catalog.MetadataProcedures,
 	catalog.MetadataGenerators, catalog.MetadataSystemRelations, catalog.MetadataExceptions,
 	catalog.MetadataDomains, catalog.MetadataFunctions, catalog.MetadataIndexes, catalog.MetadataTriggers,
+	catalog.MetadataDependencies,
 }
 
 func emptyMetadataStatus() map[catalog.MetadataKind]catalog.MetadataStatus {

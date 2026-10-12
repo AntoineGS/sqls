@@ -64,6 +64,14 @@ type track struct {
 
 	closeOnce sync.Once
 	hub       *eventHub
+
+	// refreshMu serializes Lease.Refresh and Lease.RefreshInBackground.
+	refreshMu sync.Mutex
+	// staging is a background refresh's loader before it is published.
+	// Protected by mu; shutdown stops and drains it like the live loader.
+	staging *Loader
+	// invalidations counts Lease.Invalidate calls. Protected by mu.
+	invalidations uint64
 }
 
 func (t *track) isClosed() bool {
@@ -287,11 +295,13 @@ func (r *Registry) finalizeTrack(t *track) {
 	go func() {
 		<-t.ready
 		t.mu.Lock()
-		provider, loader := t.provider, t.loader
+		provider, loader, staging := t.provider, t.loader, t.staging
 		t.mu.Unlock()
-		if loader != nil {
-			loader.Stop()
-			loader.Wait(context.Background())
+		for _, l := range []*Loader{loader, staging} {
+			if l != nil {
+				l.Stop()
+				l.Wait(context.Background())
+			}
 		}
 		t.details.markStale()
 		t.details.wait(context.Background())
@@ -349,11 +359,14 @@ func (r *Registry) Close(ctx context.Context) error {
 			return ctx.Err()
 		}
 		t.mu.Lock()
-		provider, loader := t.provider, t.loader
+		provider, loader, staging := t.provider, t.loader, t.staging
 		t.mu.Unlock()
-		if loader != nil {
-			loader.Stop()
-			if err := loader.Wait(ctx); err != nil {
+		for _, l := range []*Loader{loader, staging} {
+			if l == nil {
+				continue
+			}
+			l.Stop()
+			if err := l.Wait(ctx); err != nil {
 				return err
 			}
 		}
