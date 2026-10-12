@@ -222,12 +222,37 @@ func (c *completionEngine) foreignKeysForTable(tableName string) map[string][]*c
 	if ok || c.driver != dialect.DatabaseDriverInterBase {
 		return foreignKeys
 	}
+	// InterBase's metadata reader indexes tables with the same unqualified
+	// key used by the column cache. Keep this exact empty-schema lookup scoped
+	// to InterBase so foreign keys from another namespace cannot match by name.
+	foreignKeys, ok = c.cache.ForeignKeys[catalog.ColumnDatabaseKey("", tableName)]
+	if ok {
+		return interBaseForeignKeyReferences(foreignKeys)
+	}
 	for cachedTableName, foreignKeys := range c.cache.ForeignKeys {
 		if strings.EqualFold(cachedTableName, tableName) {
 			return foreignKeys
 		}
 	}
 	return nil
+}
+
+func interBaseForeignKeyReferences(references map[string][]*catalog.ForeignKey) map[string][]*catalog.ForeignKey {
+	tables := make(map[string][]*catalog.ForeignKey, len(references))
+	for key, foreignKeys := range references {
+		// An empty-schema ColumnDatabaseKey starts with one tab. Do not strip
+		// keys containing another schema, which would leak a different
+		// namespace into this unqualified InterBase lookup.
+		if !strings.HasPrefix(key, "\t") {
+			continue
+		}
+		tableName := strings.TrimPrefix(key, "\t")
+		if tableName == "" {
+			continue
+		}
+		tables[tableName] = foreignKeys
+	}
+	return tables
 }
 
 func tableInfoForName(tMap map[string]*parseutil.TableInfo, name string, caseInsensitive bool) (*parseutil.TableInfo, bool) {

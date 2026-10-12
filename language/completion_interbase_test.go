@@ -115,6 +115,29 @@ func interBaseJoinCompletionCache() *catalog.Cache {
 	}
 }
 
+// interBaseMetadataJoinCompletionCache uses the same foreign-key index key
+// convention as readMetadataForeignKeys: both endpoint tables are stored under
+// ColumnDatabaseKey("", table), not GroupForeignKeys' bare table names.
+func interBaseMetadataJoinCompletionCache() *catalog.Cache {
+	foreignKey := &catalog.ForeignKey{
+		[2]*catalog.ColumnBase{{Table: "CHILD", Name: "CHILD_A"}, {Table: "PARENT", Name: "PARENT_A"}},
+		[2]*catalog.ColumnBase{{Table: "CHILD", Name: "CHILD_B"}, {Table: "PARENT", Name: "PARENT_B"}},
+	}
+	childKey := catalog.ColumnDatabaseKey("", "CHILD")
+	parentKey := catalog.ColumnDatabaseKey("", "PARENT")
+	return &catalog.Cache{
+		SchemaTables: map[string][]string{"": {"CHILD", "PARENT"}},
+		ColumnsWithParent: map[string][]*catalog.ColumnDesc{
+			childKey:  {{ColumnBase: catalog.ColumnBase{Table: "CHILD", Name: "CHILD_A"}}, {ColumnBase: catalog.ColumnBase{Table: "CHILD", Name: "CHILD_B"}}},
+			parentKey: {{ColumnBase: catalog.ColumnBase{Table: "PARENT", Name: "PARENT_A"}}, {ColumnBase: catalog.ColumnBase{Table: "PARENT", Name: "PARENT_B"}}},
+		},
+		ForeignKeys: map[string]map[string][]*catalog.ForeignKey{
+			childKey:  {parentKey: {foreignKey}},
+			parentKey: {childKey: {foreignKey}},
+		},
+	}
+}
+
 func interBaseDollarJoinCompletionCache() *catalog.Cache {
 	foreignKeys, err := catalog.GroupForeignKeys([]*catalog.ForeignKey{
 		{
@@ -539,6 +562,51 @@ func TestInterBaseJoinMatchesUppercaseCatalogNames(t *testing.T) {
 				t.Fatalf("missing composite foreign-key completion %q in %v", tt.want, completionLabels(got))
 			}
 		})
+	}
+}
+
+func TestInterBaseJoinUsesMetadataForeignKeyIndexKeys(t *testing.T) {
+	const text = "select * from child c join "
+	const want = "PARENT P1 ON P1.PARENT_A = c.CHILD_A AND P1.PARENT_B = c.CHILD_B"
+	cache := interBaseMetadataJoinCompletionCache()
+
+	got := completeAt(t, interBaseCompletionRequest(cache, text, dialect.SQLVariantInterBase1), len(text))
+	if count := len(candidatesFor(got, want)); count != 1 {
+		t.Fatalf("metadata-indexed foreign-key completion count for %q = %d; candidates: %v", want, count, completionLabels(got))
+	}
+}
+
+func TestInterBaseJoinDoesNotReadForeignKeysFromAnotherSchema(t *testing.T) {
+	cache := interBaseMetadataJoinCompletionCache()
+	childKey := catalog.ColumnDatabaseKey("APP", "CHILD")
+	ghostKey := catalog.ColumnDatabaseKey("APP", "GHOST")
+	ghostForeignKey := &catalog.ForeignKey{
+		[2]*catalog.ColumnBase{{Table: "CHILD", Name: "OTHER_CHILD_ID"}, {Table: "GHOST", Name: "ID"}},
+	}
+	cache.ForeignKeys[childKey] = map[string][]*catalog.ForeignKey{
+		ghostKey: {ghostForeignKey},
+	}
+	cache.ForeignKeys[catalog.ColumnDatabaseKey("", "CHILD")][ghostKey] = []*catalog.ForeignKey{ghostForeignKey}
+	const text = "select * from child c join "
+	const want = "PARENT P1 ON P1.PARENT_A = c.CHILD_A AND P1.PARENT_B = c.CHILD_B"
+
+	got := completeAt(t, interBaseCompletionRequest(cache, text, dialect.SQLVariantInterBase1), len(text))
+	if count := len(candidatesFor(got, want)); count != 1 {
+		t.Fatalf("unqualified metadata completion count for %q = %d; candidates: %v", want, count, completionLabels(got))
+	}
+	for _, item := range got {
+		if strings.Contains(item.Label, "GHOST") {
+			t.Errorf("foreign key from another schema leaked into completion: %q", item.Label)
+		}
+	}
+}
+
+func TestOtherDriverJoinKeepsBareForeignKeyIndexKeys(t *testing.T) {
+	const text = "SELECT * FROM CHILD c JOIN "
+	const want = "PARENT P1 ON P1.PARENT_A = c.CHILD_A AND P1.PARENT_B = c.CHILD_B"
+	got := completeAt(t, otherDriverCompletionRequest(interBaseJoinCompletionCache(), dialect.DatabaseDriverPostgreSQL, text), len(text))
+	if count := len(candidatesFor(got, want)); count != 1 {
+		t.Fatalf("bare-key foreign-key completion count for %q = %d; candidates: %v", want, count, completionLabels(got))
 	}
 }
 
