@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
+	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
@@ -355,6 +356,11 @@ func TestReadinessAcceptanceCompletionsWhileColumnsAreGated(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("columns job did not enter gate")
 	}
+	waitLeaseSnapshot(t, lease, func(snapshot *catalog.MetadataSnapshot) bool {
+		return snapshot.Status[database.MetadataSchemas].State == database.MetadataReady &&
+			snapshot.Status[database.MetadataRelations].State == database.MetadataReady &&
+			snapshot.Status[database.MetadataColumnsCurrent].State == database.MetadataLoading
+	})
 
 	queries := []struct {
 		text string
