@@ -41,6 +41,9 @@ type interBaseFixtureFault struct {
 	// generatorRead supplies a test-only GEN_ID implementation so selected
 	// generator details can use the real schema reader against SQLite.
 	generatorRead func(string, int64) (int64, error)
+	onQuery       func(string)
+	onQueryArgs   func(string, []driver.NamedValue)
+	onTxFinish    func()
 
 	txMu                   sync.Mutex
 	txOptions              []driver.TxOptions
@@ -60,7 +63,7 @@ func (d interBaseFixtureDriver) Open(name string) (driver.Conn, error) {
 	if faultValue != nil {
 		fault = faultValue.(*interBaseFixtureFault)
 	}
-	if sqliteConn, ok := conn.(*sqlite3.SQLiteConn); ok {
+	if sqliteConn, ok := conn.(interface{ RegisterFunc(string, any, bool) error }); ok {
 		generatorRead := func(string, int64) (int64, error) { return 0, nil }
 		if fault != nil && fault.generatorRead != nil {
 			generatorRead = fault.generatorRead
@@ -185,10 +188,20 @@ type interBaseFixtureStmt struct {
 }
 
 func (s interBaseFixtureStmt) Query(args []driver.Value) (driver.Rows, error) {
+	if s.fault != nil && s.fault.onQueryArgs != nil {
+		values := make([]driver.NamedValue, len(args))
+		for i, value := range args {
+			values[i] = driver.NamedValue{Ordinal: i + 1, Value: value}
+		}
+		s.fault.onQueryArgs(s.query, values)
+	}
 	return s.queryRows(func() (driver.Rows, error) { return s.Stmt.Query(args) })
 }
 
 func (s interBaseFixtureStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if s.fault != nil && s.fault.onQueryArgs != nil {
+		s.fault.onQueryArgs(s.query, append([]driver.NamedValue(nil), args...))
+	}
 	queryer, ok := s.Stmt.(driver.StmtQueryContext)
 	if !ok {
 		return nil, driver.ErrSkip
@@ -198,6 +211,9 @@ func (s interBaseFixtureStmt) QueryContext(ctx context.Context, args []driver.Na
 
 func (s interBaseFixtureStmt) queryRows(query func() (driver.Rows, error)) (driver.Rows, error) {
 	f := s.fault
+	if f != nil && f.onQuery != nil {
+		f.onQuery(s.query)
+	}
 	if f != nil && strings.Contains(s.query, "GEN_ID(") {
 		f.recordGeneratorQuery(s.query)
 	}
@@ -285,6 +301,9 @@ func (tx interBaseFixtureTx) Commit() error {
 func (tx interBaseFixtureTx) Rollback() error {
 	err := tx.Tx.Rollback()
 	tx.fault.recordTxFinish(false)
+	if tx.fault.onTxFinish != nil {
+		tx.fault.onTxFinish()
+	}
 	return err
 }
 
@@ -318,6 +337,7 @@ func openInterBaseSchemaFixture(t *testing.T) *sql.DB {
 // fixture openInterBaseScalableFixtureWithFault produces.
 func openInterBaseSchemaFixtureWithFault(t *testing.T, fault *interBaseFixtureFault) *sql.DB {
 	t.Helper()
+	requireInterBaseSQLiteFixture(t)
 
 	name := fmt.Sprintf("file:interbase_catalog_%d?mode=memory&cache=shared", interBaseFixtureSequence.Add(1))
 	if fault != nil {

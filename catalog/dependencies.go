@@ -73,6 +73,26 @@ func (g *DependencyGraph) Len() int {
 	return len(g.edges)
 }
 
+// Edges returns a copy of the graph's complete edge set.
+func (g *DependencyGraph) Edges() []DependencyEdge {
+	if g == nil {
+		return nil
+	}
+	return append([]DependencyEdge(nil), g.edges...)
+}
+
+// CheckNames returns a deep copy of the complete relation/check-name projection.
+func (g *DependencyGraph) CheckNames() map[string][]string {
+	if g == nil {
+		return nil
+	}
+	result := make(map[string][]string, len(g.checks))
+	for relation, names := range g.checks {
+		result[relation] = append([]string(nil), names...)
+	}
+	return result
+}
+
 // Uses returns the edges whose From is ref.
 func (g *DependencyGraph) Uses(ref DependencyRef) []DependencyEdge {
 	if g == nil {

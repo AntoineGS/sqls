@@ -87,7 +87,15 @@ type DetailPlan struct {
 
 // Provider is one engine's catalog-plan and detail-plan source for one
 // (Key, Scope) store. The registry owns its lifecycle; Close is called at
-// most once, when the last lease for that store is released.
+// most once per store, on final lease Release or Registry.Close.
+//
+// Close must finish cleanup of its owned resources before returning. It may
+// perform bookkeeping, notify an external owner or release leases, but must not
+// synchronously wait for its owning Registry.Close or another completion that
+// includes its own return. Calling the owner Close(context.Background()) from
+// Provider.Close creates an unsupported self-join. An already-canceled/expired
+// Close context can withdraw a wait without joining; its error is not cleanup
+// completion. A live-context owner completion wait is not a teardown callback.
 type Provider interface {
 	Plan() catalog.MetadataPlan
 	DetailPlan(Request) (DetailPlan, error)

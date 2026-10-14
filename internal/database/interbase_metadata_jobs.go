@@ -148,81 +148,100 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 		}},
 		{Kind: MetadataGenerators, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
-				values, err := bound.DescribeGenerators(ctx)
-				if err != nil {
-					return MetadataPatch{}, err
-				}
-				items := make(map[string]*GeneratorDesc, len(values))
-				byID := make(map[string]*GeneratorDesc, len(values))
-				for _, value := range values {
-					copy := *value
-					items[catalogCacheKey(value.Name)] = &copy
-					byID[interBaseByIDKey(ObjectKindGenerator, value.Name)] = &copy
-				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Generators: items, GeneratorsByID: byID}}, Count: len(items)}, nil
+				return bound.readMetadataAccessor(ctx, MetadataGenerators)
 			})
 		}},
 		{Kind: MetadataSystemRelations, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
-				values, err := bound.DescribeSystemRelations(ctx)
-				if err != nil {
-					return MetadataPatch{}, err
-				}
-				byID := make(map[string]*SystemRelationDesc, len(values))
-				for _, value := range values {
-					if value != nil {
-						byID[interBaseByIDKey(ObjectKindTable, value.Name)] = value
-					}
-				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{SystemRelationsByID: byID}}, Count: len(byID)}, nil
+				return bound.readMetadataAccessor(ctx, MetadataSystemRelations)
 			})
 		}},
 		{Kind: MetadataExceptions, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
-				values, err := bound.DescribeExceptions(ctx)
-				if err != nil {
-					return MetadataPatch{}, err
-				}
-				byID := make(map[string]*ExceptionDesc, len(values))
-				for _, value := range values {
-					if value != nil {
-						byID[interBaseByIDKey(ObjectKindException, value.Name)] = value
-					}
-				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{ExceptionsByID: byID}}, Count: len(byID)}, nil
+				return bound.readMetadataAccessor(ctx, MetadataExceptions)
 			})
 		}},
 		{Kind: MetadataDomains, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
-				values, err := bound.DescribeDomains(ctx)
-				if err != nil {
-					return MetadataPatch{}, err
-				}
-				items := make(map[string]*DomainDesc, len(values))
-				byID := make(map[string]*DomainDesc, len(values))
-				for _, value := range values {
-					copy := *value
-					items[catalogCacheKey(value.Name)] = &copy
-					byID[interBaseByIDKey(ObjectKindDomain, value.Name)] = &copy
-				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Domains: items, DomainsByID: byID}}, Count: len(items)}, nil
+				return bound.readMetadataAccessor(ctx, MetadataDomains)
 			})
 		}},
 		{Kind: MetadataTriggers, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
-				values, err := bound.DescribeTriggers(ctx)
-				if err != nil {
-					return MetadataPatch{}, err
-				}
-				items := make(map[string]*TriggerDesc, len(values))
-				byID := make(map[string]*TriggerDesc, len(values))
-				for _, value := range values {
-					copy := *value
-					items[catalogCacheKey(value.Name)] = &copy
-					byID[interBaseByIDKey(ObjectKindTrigger, value.Name)] = &copy
-				}
-				return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Triggers: items, TriggersByID: byID}}, Count: len(items)}, nil
+				return bound.readMetadataAccessor(ctx, MetadataTriggers)
 			})
 		}},
 	}}
+}
+
+// readMetadataAccessor shares the ordinary descriptor converters with watched
+// reads. Its receiver must already be bound to the group's query source.
+func (db *InterBaseDBRepository) readMetadataAccessor(ctx context.Context, kind MetadataKind) (MetadataPatch, error) {
+	switch kind {
+	case MetadataGenerators:
+		values, err := db.DescribeGenerators(ctx)
+		if err != nil {
+			return MetadataPatch{}, err
+		}
+		items := make(map[string]*GeneratorDesc, len(values))
+		byID := make(map[string]*GeneratorDesc, len(values))
+		for _, value := range values {
+			copy := *value
+			items[catalogCacheKey(value.Name)] = &copy
+			byID[interBaseByIDKey(ObjectKindGenerator, value.Name)] = &copy
+		}
+		return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Generators: items, GeneratorsByID: byID}}, Count: len(items)}, nil
+	case MetadataSystemRelations:
+		values, err := db.DescribeSystemRelations(ctx)
+		if err != nil {
+			return MetadataPatch{}, err
+		}
+		byID := make(map[string]*SystemRelationDesc, len(values))
+		for _, value := range values {
+			if value != nil {
+				byID[interBaseByIDKey(ObjectKindTable, value.Name)] = value
+			}
+		}
+		return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{SystemRelationsByID: byID}}, Count: len(byID)}, nil
+	case MetadataExceptions:
+		values, err := db.DescribeExceptions(ctx)
+		if err != nil {
+			return MetadataPatch{}, err
+		}
+		byID := make(map[string]*ExceptionDesc, len(values))
+		for _, value := range values {
+			if value != nil {
+				byID[interBaseByIDKey(ObjectKindException, value.Name)] = value
+			}
+		}
+		return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{ExceptionsByID: byID}}, Count: len(byID)}, nil
+	case MetadataDomains:
+		values, err := db.DescribeDomains(ctx)
+		if err != nil {
+			return MetadataPatch{}, err
+		}
+		items := make(map[string]*DomainDesc, len(values))
+		byID := make(map[string]*DomainDesc, len(values))
+		for _, value := range values {
+			copy := *value
+			items[catalogCacheKey(value.Name)] = &copy
+			byID[interBaseByIDKey(ObjectKindDomain, value.Name)] = &copy
+		}
+		return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Domains: items, DomainsByID: byID}}, Count: len(items)}, nil
+	case MetadataTriggers:
+		values, err := db.DescribeTriggers(ctx)
+		if err != nil {
+			return MetadataPatch{}, err
+		}
+		items := make(map[string]*TriggerDesc, len(values))
+		byID := make(map[string]*TriggerDesc, len(values))
+		for _, value := range values {
+			copy := *value
+			items[catalogCacheKey(value.Name)] = &copy
+			byID[interBaseByIDKey(ObjectKindTrigger, value.Name)] = &copy
+		}
+		return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Triggers: items, TriggersByID: byID}}, Count: len(items)}, nil
+	default:
+		return MetadataPatch{}, fmt.Errorf("interbase: unsupported accessor category %s", kind)
+	}
 }
