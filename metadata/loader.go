@@ -97,6 +97,49 @@ var metadataKinds = []catalog.MetadataKind{
 	catalog.MetadataDependencies,
 }
 
+// installSettled installs a fully built immutable generation without category
+// jobs, permits or I/O. Only a fresh loader can accept this staged snapshot.
+func (l *Loader) installSettled(ctx context.Context, snapshot *catalog.MetadataSnapshot) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if snapshot == nil || snapshot.Generation == 0 || snapshot.Cache == nil || !snapshot.Started || snapshot.StartFailed || !snapshot.Settled() {
+		return ErrWatchIncomplete
+	}
+	for kind, s := range snapshot.Status {
+		if !knownMetadataKind(kind) || s.Count < 0 || s.Queries < 0 {
+			return ErrWatchIncomplete
+		}
+		if s.State == catalog.MetadataReady && snapshot.Cache.Metadata[kind] != catalog.MetadataReady {
+			return ErrWatchIncomplete
+		}
+	}
+	for kind, state := range snapshot.Cache.Metadata {
+		if state == catalog.MetadataReady && snapshot.Status[kind].State != catalog.MetadataReady {
+			return ErrWatchIncomplete
+		}
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stopped {
+		return ErrMetadataStopped
+	}
+	if l.started || l.snapshot != nil {
+		return ErrMetadataAlreadyStarted
+	}
+	copy := *snapshot
+	copy.Status = cloneMap(snapshot.Status)
+	l.ctx, l.cancel = context.WithCancel(ctx)
+	l.generation, l.started, l.snapshot = snapshot.Generation, true, &copy
+	l.done = make(chan struct{})
+	close(l.done)
+	l.doneClosed = true
+	return nil
+}
+
 func emptyMetadataStatus() map[catalog.MetadataKind]catalog.MetadataStatus {
 	status := make(map[catalog.MetadataKind]catalog.MetadataStatus, len(metadataKinds))
 	for _, kind := range metadataKinds {
@@ -723,10 +766,16 @@ func (l *Loader) publishLocked(snapshot *catalog.MetadataSnapshot) { l.snapshot 
 // during the window before Refresh completes, rather than presenting a
 // blank tree. See the task report for the full reasoning.
 func (l *Loader) MarkStale() {
+	l.markStaleDeferred()()
+}
+
+// The track uses the deferred notification to make epoch, snapshot and detail
+// invalidation atomic without invoking its callback while holding track.mu.
+func (l *Loader) markStaleDeferred() func() {
 	l.mu.Lock()
 	if l.stopped || l.snapshot == nil || l.snapshot.Stale {
 		l.mu.Unlock()
-		return
+		return func() {}
 	}
 	if l.cancel != nil {
 		l.cancel()
@@ -750,11 +799,13 @@ func (l *Loader) MarkStale() {
 	l.closeDoneLocked()
 	callback := l.callback
 	l.mu.Unlock()
-	if changed {
-		logCancelledMetadataStatuses(next)
-		logMetadataGeneration(next)
+	return func() {
+		if changed {
+			logCancelledMetadataStatuses(next)
+			logMetadataGeneration(next)
+		}
+		callMetadataCallback(callback)
 	}
-	callMetadataCallback(callback)
 }
 
 func (l *Loader) Snapshot() *catalog.MetadataSnapshot {

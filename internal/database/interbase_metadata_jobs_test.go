@@ -28,6 +28,11 @@ type metadataTxState struct {
 	cancelOnRollback            context.CancelFunc
 	width                       driver.Value
 	queryErr, nextErr, closeErr error
+	rollbackGate                <-chan struct{}
+	rollbackEntered             chan<- struct{}
+	beginContext                context.Context
+	queryContexts               []context.Context
+	cancelOnBegin               context.CancelFunc
 }
 
 type metadataTxDriver struct{ state *metadataTxState }
@@ -60,18 +65,23 @@ func (c *metadataTxConn) Close() error {
 func (c *metadataTxConn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
 }
-func (c *metadataTxConn) BeginTx(_ context.Context, opts driver.TxOptions) (driver.Tx, error) {
+func (c *metadataTxConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
+	c.state.beginContext = ctx
 	c.state.begins++
 	c.state.options = opts
 	c.inTx = true
+	if c.state.cancelOnBegin != nil {
+		c.state.cancelOnBegin()
+	}
 	return &metadataTx{conn: c}, nil
 }
-func (c *metadataTxConn) QueryContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
+func (c *metadataTxConn) QueryContext(ctx context.Context, query string, _ []driver.NamedValue) (driver.Rows, error) {
 	c.state.mu.Lock()
 	defer c.state.mu.Unlock()
 	c.state.queries++
+	c.state.queryContexts = append(c.state.queryContexts, ctx)
 	if c.inTx {
 		c.state.queryInTx = true
 	}
@@ -87,6 +97,12 @@ func (tx *metadataTx) Commit() error { tx.conn.inTx = false; return nil }
 func (tx *metadataTx) Rollback() error {
 	tx.conn.state.mu.Lock()
 	defer tx.conn.state.mu.Unlock()
+	if tx.conn.state.rollbackEntered != nil {
+		tx.conn.state.rollbackEntered <- struct{}{}
+	}
+	if tx.conn.state.rollbackGate != nil {
+		<-tx.conn.state.rollbackGate
+	}
 	tx.conn.state.rollbacks++
 	tx.conn.inTx = false
 	if tx.conn.state.cancelOnRollback != nil {

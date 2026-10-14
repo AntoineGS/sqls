@@ -180,12 +180,14 @@ func (l *Lease) Invalidate() error {
 	l.track.mu.Lock()
 	loader := l.track.loader
 	l.track.invalidations++
-	l.track.mu.Unlock()
 	if loader == nil {
+		l.track.mu.Unlock()
 		return ErrUnsupported
 	}
-	loader.MarkStale()
+	notify := loader.markStaleDeferred()
 	l.track.details.markStale()
+	l.track.mu.Unlock()
+	notify()
 	return nil
 }
 
@@ -217,6 +219,9 @@ func (l *Lease) Refresh(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	l.track.mu.Lock()
+	l.track.baseline = nil
+	l.track.mu.Unlock()
 	generation := loader.Snapshot().Generation + 1
 	l.track.details.beginGeneration(generation)
 	loader.Reset(generation)
@@ -258,11 +263,12 @@ func (l *Lease) RefreshInBackground(ctx context.Context) error {
 	staging := NewLoader(t.storeBudget)
 	staging.Reset(generation)
 	t.mu.Lock()
-	if t.closed || t.ctx.Err() != nil {
+	if t.closed.Load() || t.ctx.Err() != nil {
 		t.mu.Unlock()
 		return ErrClosed
 	}
 	t.staging = staging
+	t.baseline = nil
 	invalidations := t.invalidations
 	t.mu.Unlock()
 	discard := func() {
@@ -294,7 +300,7 @@ func (l *Lease) RefreshInBackground(ctx context.Context) error {
 		return err
 	}
 	t.mu.Lock()
-	if t.closed || t.ctx.Err() != nil {
+	if t.closed.Load() || t.ctx.Err() != nil {
 		t.mu.Unlock()
 		discard()
 		return ErrClosed

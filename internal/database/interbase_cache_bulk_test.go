@@ -26,6 +26,7 @@ func openInterBaseScalableFixture(t *testing.T, relationCount int) *sql.DB {
 
 func openInterBaseScalableFixtureWithFault(t *testing.T, relationCount int, fault *interBaseFixtureFault) *sql.DB {
 	t.Helper()
+	requireInterBaseSQLiteFixture(t)
 
 	name := fmt.Sprintf("file:interbase_bulk_%d?mode=memory&cache=shared", interBaseFixtureSequence.Add(1))
 	if fault != nil {

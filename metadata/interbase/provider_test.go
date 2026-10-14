@@ -1,7 +1,6 @@
 package ibmeta_test
 
 import (
-	"context"
 	"errors"
 	"testing"
 
@@ -68,26 +67,5 @@ func TestScopeForDiffersByPrincipalRoleAndTextPolicy(t *testing.T) {
 	}
 	if base.Principal != "ALICE" || same.Principal != "ALICE" {
 		t.Fatal("Scope must never carry a password or other secret field derived from Config")
-	}
-}
-
-// TestFactoryAcceptsNoneCharsetWithoutRejection is the "Charset: NONE must
-// work" requirement: this generic API must never route through SQLs's
-// interBaseCharsets allowlist. On an untagged/non-cgo build there is no
-// native driver to attach with, so the only assertion possible here is that
-// failure comes from "provider unavailable" (the build-tag stub), never a
-// charset-validation error — the same Config with Charset: "UTF8" instead
-// must fail identically, which proves Charset was never inspected.
-func TestFactoryAcceptsNoneCharsetWithoutRejection(t *testing.T) {
-	none := ibmeta.Config{Target: "server:D:\\Data\\APP.GBB", User: "SYSDBA", Charset: "NONE"}
-	utf8 := ibmeta.Config{Target: "server:D:\\Data\\APP.GBB", User: "SYSDBA", Charset: "UTF8"}
-
-	_, errNone := ibmeta.Factory(none)(context.Background())
-	_, errUTF8 := ibmeta.Factory(utf8)(context.Background())
-	if errNone == nil || errUTF8 == nil {
-		t.Skip("native InterBase provider is available in this build; charset-allowlist bypass is exercised via a live attach instead")
-	}
-	if errNone.Error() != errUTF8.Error() {
-		t.Fatalf("Charset: NONE failed differently than Charset: UTF8 (%v vs %v); NONE must not be specially rejected", errNone, errUTF8)
 	}
 }

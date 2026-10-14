@@ -504,7 +504,11 @@ func TestMetadataLoaderDrainsRepeatedRefreshesAndStopWithPendingWork(t *testing.
 		for _, kind := range kinds {
 			kind := kind
 			plan.Jobs = append(plan.Jobs, catalog.MetadataJob{Kind: kind, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-				tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+				// This gated fixture deliberately owns synchronous transaction
+				// ending, like native work that drains after cancellation. A sql
+				// auto-rollback goroutine can otherwise win Tx.Rollback admission
+				// but finish after this job and Loader.Wait, racing these counters.
+				tx, err := db.BeginTx(context.WithoutCancel(ctx), &sql.TxOptions{ReadOnly: true})
 				if err != nil {
 					return catalog.MetadataPatch{}, err
 				}

@@ -3,6 +3,7 @@ package metadata
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // scopeKey is the comparable projection of Scope used to key per-scope
@@ -37,9 +38,10 @@ type registryEntry struct {
 // reference count. A track is created by the first Acquire for its
 // (Key, Scope) and torn down by the Acquire/Release that drops the last
 // reference. refs is protected by the owning Registry's mu (the same lock
-// that protects entry membership); provider/err/loader/closed are protected
+// that protects entry membership); provider/err/loader are protected
 // by t.mu, since they are set by the asynchronous factory/loader lifecycle
-// rather than by registry bookkeeping.
+// rather than by registry bookkeeping. Logical closed is atomic; finalized
+// reports the one-time physical completion, including budget/hub teardown.
 type track struct {
 	entry *registryEntry
 	scope Scope
@@ -60,10 +62,13 @@ type track struct {
 	provider Provider
 	err      error
 	loader   *Loader
-	closed   bool // set once the provider has been finalized (Closed)
+	// Logical retirement rejects admission/publication immediately, even if
+	// cancellation is waiting for the publication mutex. finalized owns drain.
+	closed atomic.Bool
 
-	closeOnce sync.Once
-	hub       *eventHub
+	finalizeOnce sync.Once
+	finalized    chan struct{} // closed after native/provider/hub/budget cleanup
+	hub          *eventHub
 
 	// refreshMu serializes Lease.Refresh and Lease.RefreshInBackground.
 	refreshMu sync.Mutex
@@ -72,12 +77,13 @@ type track struct {
 	staging *Loader
 	// invalidations counts Lease.Invalidate calls. Protected by mu.
 	invalidations uint64
+	baseline      *watchBaseline
+	// Registered atomically under mu; completion means actual provider drain.
+	maintenanceDone chan struct{}
 }
 
 func (t *track) isClosed() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.closed
+	return t.closed.Load()
 }
 
 // Registry shares metadata stores across consumers keyed by (engine,
@@ -103,6 +109,9 @@ type Registry struct {
 	entries        map[Key]*registryEntry
 	incarnationSeq uint64
 	closed         bool
+	closeDone      chan struct{} // one owned shutdown completion, shared by all Close callers
+	// Lifecycle ownership survives last-release retirement from entries.
+	liveTracks map[*track]struct{}
 }
 
 // NewRegistry creates a registry. ctx bounds the lifetime of every factory
@@ -125,11 +134,13 @@ func NewRegistry(ctx context.Context, opts Options) *Registry {
 	}
 	rootCtx, cancel := context.WithCancel(ctx)
 	return &Registry{
-		opts:    opts,
-		budget:  NewBudget(opts.MaxHostJobs, opts.MaxStoreJobs),
-		ctx:     rootCtx,
-		cancel:  cancel,
-		entries: make(map[Key]*registryEntry),
+		opts:       opts,
+		budget:     NewBudget(opts.MaxHostJobs, opts.MaxStoreJobs),
+		ctx:        rootCtx,
+		cancel:     cancel,
+		entries:    make(map[Key]*registryEntry),
+		closeDone:  make(chan struct{}),
+		liveTracks: make(map[*track]struct{}),
 	}
 }
 
@@ -165,7 +176,7 @@ func (r *Registry) Acquire(ctx context.Context, key Key, scope Scope, factory Fa
 			r.releaseTrackRef(t)
 			return nil, trackErr
 		}
-		if t.ctx.Err() != nil {
+		if t.closed.Load() || t.ctx.Err() != nil {
 			// The registry was closed (or this track otherwise force-
 			// canceled) while the provider was being created, so its loader
 			// never started. Never hand out a lease that will never settle.
@@ -204,8 +215,10 @@ func (r *Registry) attach(key Key, sk scopeKey, scope Scope) (entry *registryEnt
 			entry: entry, scope: scope, ctx: tctx, cancel: cancel, ready: make(chan struct{}), hub: newEventHub(),
 			storeBudget: storeBudget,
 			details:     newDetailStore(tctx, storeBudget, r.opts.MaxDetailBytes),
+			finalized:   make(chan struct{}),
 		}
 		entry.tracks[sk] = t
+		r.liveTracks[t] = struct{}{}
 		creator = true
 	}
 	t.refs++
@@ -239,7 +252,7 @@ func (r *Registry) createTrack(t *track, factory Factory) {
 	// for this goroutine to observe cancellation a moment later and abandon
 	// the loader entirely — stranding that lease with a snapshot that never
 	// starts and therefore never settles.
-	if t.ctx.Err() != nil {
+	if t.closed.Load() || t.ctx.Err() != nil {
 		// Every interested caller already withdrew (or the registry closed)
 		// while we were creating the provider; the ref-count-zero path (or
 		// Close) will drain and close it. Acquire's own post-ready check of
@@ -270,6 +283,9 @@ func (r *Registry) releaseTrackRef(t *track) {
 	t.refs--
 	remaining := t.refs
 	if remaining <= 0 {
+		// Commit logical retirement without waiting on the publication mutex.
+		// The owned finalizer requests cancellation under that mutex later.
+		t.closed.Store(true)
 		if current, ok := entry.tracks[sk]; ok && current == t {
 			delete(entry.tracks, sk)
 		}
@@ -289,31 +305,40 @@ func (r *Registry) releaseTrackRef(t *track) {
 
 // finalizeTrack cancels t's registry-owned context and, once its factory call
 // and metadata loader have both settled, closes its provider exactly once.
-// It never blocks its caller.
+// Its one-time cleanup owner outlives any Close caller's wait deadline.
+// It schedules cleanup without waiting for factory, publication or native work.
 func (r *Registry) finalizeTrack(t *track) {
-	t.cancel()
-	go func() {
-		<-t.ready
-		t.mu.Lock()
-		provider, loader, staging := t.provider, t.loader, t.staging
-		t.mu.Unlock()
-		for _, l := range []*Loader{loader, staging} {
-			if l != nil {
-				l.Stop()
-				l.Wait(context.Background())
+	t.finalizeOnce.Do(func() {
+		go func() {
+			t.mu.Lock()
+			t.cancel()
+			t.mu.Unlock()
+			<-t.ready
+			t.mu.Lock()
+			provider, loader, staging, maintenanceDone := t.provider, t.loader, t.staging, t.maintenanceDone
+			t.mu.Unlock()
+			if maintenanceDone != nil {
+				<-maintenanceDone
 			}
-		}
-		t.details.markStale()
-		t.details.wait(context.Background())
-		if provider != nil {
-			t.closeOnce.Do(func() { _ = provider.Close() })
-		}
-		t.mu.Lock()
-		t.closed = true
-		t.mu.Unlock()
-		t.hub.closeAll()
-		r.budget.release(t.entry.key)
-	}()
+			for _, l := range []*Loader{loader, staging} {
+				if l != nil {
+					l.Stop()
+					l.Wait(context.Background())
+				}
+			}
+			t.details.markStale()
+			t.details.wait(context.Background())
+			if provider != nil {
+				_ = provider.Close()
+			}
+			t.hub.closeAll()
+			r.budget.release(t.entry.key)
+			r.mu.Lock()
+			delete(r.liveTracks, t)
+			close(t.finalized)
+			r.mu.Unlock()
+		}()
+	})
 }
 
 func (r *Registry) publishTrackEvent(t *track) {
@@ -328,60 +353,52 @@ func (r *Registry) publishTrackEvent(t *track) {
 }
 
 // Close cancels every store this registry owns and waits for their
-// factories, metadata loads and providers to settle before returning.
+// factories, metadata loads and providers to settle before returning. A caller's
+// context bounds only its wait; retries observe the same owned cleanup completion.
+// A nil return means owned metadata/native work drained and Provider.Close
+// returned for every store; Close is not a request-only shutdown API.
+//
+// A Provider.Close callback must not synchronously join this wait with a live
+// context: the owner's completion includes that callback's own return. Such an
+// owner self-join is unsupported, not a reason to return false early success to
+// external callers. An already-done context can withdraw the wait without
+// joining; until actual cleanup completes, its error does not mean Close is done.
 func (r *Registry) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
-	r.closed = true
 	var tracks []*track
-	for _, entry := range r.entries {
-		entry.retired = true
-		for _, t := range entry.tracks {
+	if !r.closed {
+		r.closed = true
+		// Include already-retired tracks whose native/provider work is still
+		// draining; a replacement may share their store budget.
+		for t := range r.liveTracks {
+			t.closed.Store(true)
 			tracks = append(tracks, t)
+			// Commit every cleanup obligation before any caller can time out.
+			r.finalizeTrack(t)
 		}
-		entry.tracks = make(map[scopeKey]*track)
+		for _, entry := range r.entries {
+			entry.retired = true
+			entry.tracks = make(map[scopeKey]*track)
+		}
+		r.entries = make(map[Key]*registryEntry)
+		// This completion waiter owns no native work and is itself tracked by
+		// closeDone. Track cancellation stays under the publication mutex.
+		go func() {
+			for _, t := range tracks {
+				<-t.finalized
+			}
+			r.cancel()
+			close(r.closeDone)
+		}()
 	}
-	r.entries = make(map[Key]*registryEntry)
 	r.mu.Unlock()
-
-	r.cancel()
-
-	for _, t := range tracks {
-		select {
-		case <-t.ready:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		t.mu.Lock()
-		provider, loader, staging := t.provider, t.loader, t.staging
-		t.mu.Unlock()
-		for _, l := range []*Loader{loader, staging} {
-			if l == nil {
-				continue
-			}
-			l.Stop()
-			if err := l.Wait(ctx); err != nil {
-				return err
-			}
-		}
-		t.details.markStale()
-		if err := t.details.wait(ctx); err != nil {
-			return err
-		}
-		if provider != nil {
-			t.closeOnce.Do(func() { _ = provider.Close() })
-		}
-		t.mu.Lock()
-		t.closed = true
-		t.mu.Unlock()
-		t.hub.closeAll()
-		r.budget.release(t.entry.key)
+	select {
+	case <-r.closeDone:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
-	return ctx.Err()
 }
