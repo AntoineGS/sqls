@@ -23,8 +23,9 @@ func (s *Subscription) Close() {
 // eventHub fans one store's events out to its subscribers. Publish and
 // closeAll never run while a registry/lease mutex is held.
 type eventHub struct {
-	mu   sync.Mutex
-	subs map[*eventSub]struct{}
+	mu     sync.Mutex
+	subs   map[*eventSub]struct{}
+	closed bool
 }
 
 type eventSub struct {
@@ -38,7 +39,11 @@ func newEventHub() *eventHub {
 func (h *eventHub) subscribe() (*eventSub, <-chan Event) {
 	sub := &eventSub{ch: make(chan Event, 1)}
 	h.mu.Lock()
-	h.subs[sub] = struct{}{}
+	if h.closed {
+		close(sub.ch)
+	} else {
+		h.subs[sub] = struct{}{}
+	}
 	h.mu.Unlock()
 	return sub, sub.ch
 }
@@ -51,29 +56,27 @@ func (h *eventHub) unsubscribe(sub *eventSub) {
 
 func (h *eventHub) publish(ev Event) {
 	h.mu.Lock()
-	subs := make([]*eventSub, 0, len(h.subs))
-	for sub := range h.subs {
-		subs = append(subs, sub)
+	defer h.mu.Unlock()
+	if h.closed {
+		return
 	}
-	h.mu.Unlock()
-	for _, sub := range subs {
+	for sub := range h.subs {
+		// Coalescing never blocks. Keep sends serialized with channel closure
+		// and unsubscribe, including a refresh's trailing publication.
 		coalesceSend(sub.ch, ev)
 	}
 }
 
 // closeAll disconnects and closes every subscriber channel. It is called
-// once a store is fully torn down; no further events will publish.
+// once a store is fully torn down; late publications are silently dropped.
 func (h *eventHub) closeAll() {
 	h.mu.Lock()
-	subs := make([]*eventSub, 0, len(h.subs))
+	defer h.mu.Unlock()
+	h.closed = true
 	for sub := range h.subs {
-		subs = append(subs, sub)
-	}
-	h.subs = make(map[*eventSub]struct{})
-	h.mu.Unlock()
-	for _, sub := range subs {
 		close(sub.ch)
 	}
+	h.subs = make(map[*eventSub]struct{})
 }
 
 // coalesceSend delivers ev into a size-1 buffered channel without blocking,
