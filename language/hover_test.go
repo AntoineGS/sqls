@@ -193,3 +193,33 @@ func TestHoverReadsSharedSnapshotOnDemandNotACopy(t *testing.T) {
 		t.Fatalf("hover markdown = %q, want it to reflect the mutated shared cache", result.Value.Markdown)
 	}
 }
+
+func TestHoverUsesNewCatalogSnapshotForSameDocumentIdentity(t *testing.T) {
+	const text = "SELECT ID FROM CITY"
+	position := language.Position{Line: 0, UTF16Column: 8}
+	service := language.NewService()
+
+	firstRequest := hoverRequest(hoverCache(), text)
+	first, err := service.Hover(context.Background(), firstRequest, position)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(first.Value.Markdown, "INTEGER") {
+		t.Fatalf("first hover = %q, want INTEGER from first catalog snapshot", first.Value.Markdown)
+	}
+
+	updatedCache := hoverCache()
+	key := catalog.ColumnDatabaseKey("", "CITY")
+	updatedCache.ColumnsWithParent[key][0].Type = "BIGINT"
+	secondRequest := hoverRequest(updatedCache, text)
+	if firstRequest.Document != secondRequest.Document {
+		t.Fatal("requests must have identical document identity")
+	}
+	second, err := service.Hover(context.Background(), secondRequest, position)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(second.Value.Markdown, "BIGINT") || strings.Contains(second.Value.Markdown, "INTEGER") {
+		t.Fatalf("second hover = %q, want BIGINT from the new snapshot", second.Value.Markdown)
+	}
+}

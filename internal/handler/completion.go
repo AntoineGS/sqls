@@ -26,7 +26,7 @@ func (s *Server) handleTextDocumentCompletion(ctx context.Context, conn *jsonrpc
 	if err != nil {
 		return nil, err
 	}
-	res, err := language.NewService().Complete(ctx, languageRequest(snapshot), languagePosition(params.Position))
+	res, err := s.languageService.Complete(ctx, languageRequest(snapshot), languagePosition(params.Position))
 	if err != nil {
 		return nil, err
 	}

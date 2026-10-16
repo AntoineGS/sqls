@@ -70,8 +70,9 @@ func TestSignatureHelpForExecuteProcedure(t *testing.T) {
 		{col: 31, wantActiveParameter: 1},
 	}
 	req := signatureRequest(signatureProcedureCache(), input)
+	service := language.NewService()
 	for _, tt := range cases {
-		result, err := language.NewService().SignatureHelp(context.Background(), req, language.Position{Line: 0, UTF16Column: tt.col})
+		result, err := service.SignatureHelp(context.Background(), req, language.Position{Line: 0, UTF16Column: tt.col})
 		if err != nil {
 			t.Fatalf("col %d: %v", tt.col, err)
 		}

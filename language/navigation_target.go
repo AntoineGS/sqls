@@ -21,13 +21,30 @@ func navigationTargetAt(req Request, position Position) (catalog.ObjectID, Range
 	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
 		return relationAt(req, position)
 	}
-	offset, err := ByteOffset(req.Document.Text, position)
-	if err != nil {
+	if _, err := ByteOffset(req.Document.Text, position); err != nil {
 		return catalog.ObjectID{}, Range{}, false, nil
+	}
+	parsed, err := parser.ParseWithDriverVariant(req.Document.Text, req.Context.Variant)
+	if err != nil {
+		return catalog.ObjectID{}, Range{}, false, err
 	}
 	analysis, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return catalog.ObjectID{}, Range{}, false, err
+	}
+	return navigationTargetAtWithAnalysis(req, position, parsed, analysis)
+}
+
+func navigationTargetAtWithAnalysis(req Request, position Position, parsed ast.TokenList, analysis *sqlsymbol.Analysis) (catalog.ObjectID, Range, bool, error) {
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
+		return relationAt(req, position)
+	}
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return catalog.ObjectID{}, Range{}, false, nil
+	}
+	if analysis == nil {
+		return catalog.ObjectID{}, Range{}, false, nil
 	}
 	resolution := analysis.Resolve(offset)
 	if resolution.InProcedure {
@@ -56,7 +73,7 @@ func navigationTargetAt(req Request, position Position) (catalog.ObjectID, Range
 	// tokens outside a relation expression. Use the parser's identifier node to
 	// exclude comments and literals, while the exact cache resolver enforces
 	// Procedure > View > Trigger precedence.
-	name, quoted, span, ok, err := identifierAt(req.Document.Text, position, req.Context.Variant)
+	name, quoted, span, ok, err := identifierAtParsed(req.Document.Text, position, parsed)
 	if err != nil || !ok {
 		return catalog.ObjectID{}, Range{}, false, err
 	}
@@ -227,13 +244,20 @@ func hasCatalogColumn(name sqlsymbol.Name, columns []*catalog.ColumnDesc) bool {
 }
 
 func identifierAt(text string, position Position, dv dialect.DriverVariant) (string, bool, Range, bool, error) {
-	offset, err := ByteOffset(text, position)
-	if err != nil {
+	if _, err := ByteOffset(text, position); err != nil {
 		return "", false, Range{}, false, nil
 	}
 	parsed, err := parser.ParseWithDriverVariant(text, dv)
 	if err != nil {
 		return "", false, Range{}, false, err
+	}
+	return identifierAtParsed(text, position, parsed)
+}
+
+func identifierAtParsed(text string, position Position, parsed ast.TokenList) (string, bool, Range, bool, error) {
+	offset, err := ByteOffset(text, position)
+	if err != nil {
+		return "", false, Range{}, false, nil
 	}
 	lineStart := offset
 	for lineStart > 0 && text[lineStart-1] != '\n' && text[lineStart-1] != '\r' {

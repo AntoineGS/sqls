@@ -41,7 +41,7 @@ func (s *Server) handleTextDocumentHover(ctx context.Context, conn *jsonrpc2.Con
 	// remains observable below.
 	detailCtx, cancel := context.WithTimeout(ctx, hoverDDLTimeout)
 	defer cancel()
-	languageResult, err := language.NewService().Hover(detailCtx, languageRequest(snapshot), languagePosition(params.Position))
+	languageResult, err := s.languageService.Hover(detailCtx, languageRequest(snapshot), languagePosition(params.Position))
 	if ctx.Err() != nil {
 		return nil, language.ErrCanceled
 	}

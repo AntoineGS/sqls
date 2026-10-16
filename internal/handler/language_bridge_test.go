@@ -11,6 +11,13 @@ import (
 	"github.com/sqls-server/sqls/language"
 )
 
+func TestLanguageRequestCarriesCacheEpoch(t *testing.T) {
+	req := languageRequest(editorSnapshot{CacheEpoch: 42})
+	if req.Document.CacheEpoch != 42 {
+		t.Fatalf("document cache epoch = %d, want 42", req.Document.CacheEpoch)
+	}
+}
+
 func TestNavigationResultCurrentRejectsDidSaveAtSameVersion(t *testing.T) {
 	s := NewServer()
 	t.Cleanup(func() { _ = s.Stop(); <-s.cleanupDone })
