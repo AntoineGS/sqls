@@ -26,7 +26,11 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 	if err != nil {
 		return nil, err
 	}
-	res, err := s.languageService.SignatureHelp(ctx, languageRequest(snapshot), languagePosition(params.Position))
+	languageReq := languageRequest(snapshot)
+	if languageReq.Context.Snapshot == nil {
+		languageReq.Context.Snapshot = &catalog.MetadataSnapshot{Cache: snapshot.Cache}
+	}
+	res, err := s.languageService.SignatureHelp(ctx, languageReq, languagePosition(params.Position))
 	if err != nil {
 		return nil, err
 	}
