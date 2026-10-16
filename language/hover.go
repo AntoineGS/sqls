@@ -9,7 +9,6 @@ import (
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
-	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
 )
@@ -27,16 +26,31 @@ func (errNoHover) Error() string { return "language: no hover information found"
 // source when the selected relation has a supported detail. Detail loading is
 // always through the request's shared metadata lease.
 func (s *Service) Hover(ctx context.Context, req Request, position Position) (Result[Hover], error) {
-	result, cacheErr := s.hoverCached(ctx, req, position)
+	if err := ctx.Err(); err != nil {
+		return Result[Hover]{}, ErrCanceled
+	}
+	entry := s.documentAnalysis(req)
+	parsed, err := entry.parsed()
+	if err != nil {
+		return Result[Hover]{}, err
+	}
+	var analysis *sqlsymbol.Analysis
+	if req.Context.Variant.Driver == dialect.DatabaseDriverInterBase {
+		analysis, err = entry.analysis()
+		if err != nil {
+			return Result[Hover]{}, err
+		}
+	}
+	result, cacheErr := s.hoverCached(ctx, req, position, parsed)
 	if ctx.Err() != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
-	target, selectedRange, ok, err := navigationTargetAt(req, position)
+	target, selectedRange, ok, err := navigationTargetAtWithAnalysis(req, position, parsed, analysis)
 	if err != nil {
 		return Result[Hover]{}, err
 	}
 	if !ok {
-		if summary, viewRange, found, err := knownViewSummaryWhileViewsLoad(req, position); err != nil {
+		if summary, viewRange, found, err := knownViewSummaryWhileViewsLoadWithAnalysis(req, position, analysis); err != nil {
 			return Result[Hover]{}, err
 		} else if found {
 			return Result[Hover]{Value: Hover{Markdown: summary, Range: &viewRange}, Stamp: stampFor(req)}, nil
@@ -123,24 +137,24 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 // unknown relation as a table. This path returns only the known cached view
 // summary; it deliberately does not issue a detail request before readiness.
 func knownViewSummaryWhileViewsLoad(req Request, position Position) (string, Range, bool, error) {
-	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
-		return "", Range{}, false, nil
-	}
-	cache := req.Context.SnapshotCache()
-	if cache == nil || !cache.MetadataReady(catalog.MetadataRelations) {
-		return "", Range{}, false, nil
-	}
-	state, tracked := cache.Metadata[catalog.MetadataViews]
-	if !tracked || state == catalog.MetadataReady {
-		return "", Range{}, false, nil
-	}
-	offset, err := ByteOffset(req.Document.Text, position)
-	if err != nil {
+	if _, ok := knownViewCacheWhileViewsLoad(req); !ok {
 		return "", Range{}, false, nil
 	}
 	analysis, err := sqlsymbol.Analyze(req.Document.Text, req.Context.Variant)
 	if err != nil {
 		return "", Range{}, false, err
+	}
+	return knownViewSummaryWhileViewsLoadWithAnalysis(req, position, analysis)
+}
+
+func knownViewSummaryWhileViewsLoadWithAnalysis(req Request, position Position, analysis *sqlsymbol.Analysis) (string, Range, bool, error) {
+	cache, ok := knownViewCacheWhileViewsLoad(req)
+	if !ok || analysis == nil {
+		return "", Range{}, false, nil
+	}
+	offset, err := ByteOffset(req.Document.Text, position)
+	if err != nil {
+		return "", Range{}, false, nil
 	}
 	resolution := analysis.Resolve(offset)
 	if resolution.Role != sqlsymbol.Relation || resolution.SQL == nil {
@@ -155,6 +169,21 @@ func knownViewSummaryWhileViewsLoad(req Request, position Position) (string, Ran
 		return "", Range{}, false, nil
 	}
 	return catalog.ViewDoc(view), rangeForResolution(req.Document.Text, resolution), true, nil
+}
+
+func knownViewCacheWhileViewsLoad(req Request) (*catalog.Cache, bool) {
+	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase {
+		return nil, false
+	}
+	cache := req.Context.SnapshotCache()
+	if cache == nil || !cache.MetadataReady(catalog.MetadataRelations) {
+		return nil, false
+	}
+	state, tracked := cache.Metadata[catalog.MetadataViews]
+	if !tracked || state == catalog.MetadataReady {
+		return nil, false
+	}
+	return cache, true
 }
 
 func catalogObjectHoverSummary(object catalog.ObjectID, cache *catalog.Cache) string {
@@ -178,7 +207,7 @@ func catalogObjectHoverSummary(object catalog.ObjectID, cache *catalog.Cache) st
 	return ""
 }
 
-func (s *Service) hoverCached(ctx context.Context, req Request, position Position) (Result[Hover], error) {
+func (s *Service) hoverCached(ctx context.Context, req Request, position Position, parsed ast.TokenList) (Result[Hover], error) {
 	if err := ctx.Err(); err != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
@@ -201,11 +230,6 @@ func (s *Service) hoverCached(ctx context.Context, req Request, position Positio
 		return Result[Hover]{}, err
 	}
 	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column + 1}
-	parsed, err := parser.ParseWithDriverVariant(text, req.Context.Variant)
-	if err != nil {
-		return Result[Hover]{}, err
-	}
-
 	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
 	hoverTargetMatcher := astutil.NodeMatcher{
 		NodeTypes: []ast.NodeType{

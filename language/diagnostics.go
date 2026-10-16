@@ -36,7 +36,7 @@ func (s *Service) Diagnostics(ctx context.Context, req Request) (Result[[]Diagno
 	if req.Context.Variant.Driver != dialect.DatabaseDriverInterBase || !req.Context.DialectResolved {
 		return Result[[]Diagnostic]{Value: diagnostics, Stamp: stamp}, nil
 	}
-	analysis, err := sqlsymbol.AnalyzeDiagnostics(req.Document.Text, req.Context.Variant)
+	analysis, err := s.documentAnalysis(req).diagnosticAnalysis()
 	if err != nil {
 		return Result[[]Diagnostic]{Value: diagnostics, Stamp: stamp}, nil
 	}

@@ -7,12 +7,12 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
-	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
 )
@@ -50,15 +50,35 @@ const (
 
 // Service implements the language algorithms (completion, hover,
 // signature help, diagnostics, format and symbols) over an explicit
-// Context supplied per call. It holds no per-connection state: every
-// method derives its result, and the Stamp identifying it, fresh from the
-// Request it is given.
-type Service struct{}
+// Context supplied per call. It retains only the latest syntax analysis for
+// each document URI; results and metadata remain request-scoped.
+type Service struct {
+	documentMu sync.Mutex
+	documents  map[string]*documentAnalysis
+	cacheEpoch uint64
+}
 
-// NewService returns a Service ready to use. There is nothing to
-// configure: every call is self-contained in its Request.
+// NewService returns a Service with an empty per-document syntax cache.
 func NewService() *Service {
-	return &Service{}
+	return &Service{documents: make(map[string]*documentAnalysis), cacheEpoch: 0}
+}
+
+// CacheEpoch returns the current invalidation epoch. Hosts capture it with
+// their editor snapshot and copy it into subsequent language requests.
+func (s *Service) CacheEpoch() uint64 {
+	s.documentMu.Lock()
+	defer s.documentMu.Unlock()
+	return s.cacheEpoch
+}
+
+// InvalidateDocument advances the insertion fence and drops the URI's latest
+// entry. Requests captured before this call may finish, but cannot repopulate
+// or replace an entry after it.
+func (s *Service) InvalidateDocument(uri string) {
+	s.documentMu.Lock()
+	s.cacheEpoch++
+	delete(s.documents, uri)
+	s.documentMu.Unlock()
 }
 
 func stampFor(req Request) Stamp {
@@ -129,7 +149,7 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 	if err != nil {
 		return Result[CompletionList]{}, err
 	}
-	parsed, err := parser.ParseWithDriverVariant(text, eng.driverVariant())
+	parsed, err := s.documentAnalysis(req).parsed()
 	if err != nil {
 		return Result[CompletionList]{}, err
 	}

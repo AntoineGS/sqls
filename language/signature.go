@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/sqls-server/sqls/catalog"
-	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/parser/parseutil"
 	"github.com/sqls-server/sqls/token"
 )
@@ -32,7 +31,7 @@ func (s *Service) SignatureHelp(ctx context.Context, req Request, position Posit
 	if err != nil {
 		return Result[SignatureHelp]{}, err
 	}
-	parsed, err := parser.ParseWithDriverVariant(text, req.Context.Variant)
+	parsed, err := s.documentAnalysis(req).parsed()
 	if err != nil {
 		return Result[SignatureHelp]{}, err
 	}

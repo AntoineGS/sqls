@@ -57,10 +57,11 @@ type TextEdit struct {
 // Version or Text, so a stale-target result can be detected even when the
 // document's own text and edit count are unchanged (see Current).
 type Document struct {
-	URI     string
-	Text    string
-	Version int64
-	Binding uint64
+	URI        string
+	Text       string
+	Version    int64
+	Binding    uint64
+	CacheEpoch uint64 // insertion fence, not part of syntax identity or result Stamp
 }
 
 // DetailReader loads one object's rendered detail. *metadata.Lease
