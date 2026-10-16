@@ -9,7 +9,7 @@ import (
 
 // languageRequest builds the language.Request a language.Service call needs
 // from one editorSnapshot: the document identity/text and the metadata
-// context to interpret it against. There is no per-connection cache here —
+// context to interpret it against. The Server owns the language-service cache;
 // every call derives its Context fresh from the snapshot it is given.
 func languageRequest(snapshot editorSnapshot) language.Request {
 	lctx := language.Context{
@@ -25,10 +25,11 @@ func languageRequest(snapshot editorSnapshot) language.Request {
 	}
 	return language.Request{
 		Document: language.Document{
-			URI:     snapshot.URI,
-			Text:    snapshot.Text,
-			Version: int64(snapshot.Version),
-			Binding: uint64(snapshot.Generation),
+			URI:        snapshot.URI,
+			Text:       snapshot.Text,
+			Version:    int64(snapshot.Version),
+			Binding:    uint64(snapshot.Generation),
+			CacheEpoch: snapshot.CacheEpoch,
 		},
 		Context: lctx,
 		Policy:  snapshot.DiagnosticPolicy,

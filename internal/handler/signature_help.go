@@ -26,11 +26,11 @@ func (s *Server) handleTextDocumentSignatureHelp(ctx context.Context, conn *json
 	if err != nil {
 		return nil, err
 	}
-	res, err := SignatureHelpWithDriverVariant(ctx, snapshot.Text, params, snapshot.Cache, snapshot.Variant)
+	res, err := s.languageService.SignatureHelp(ctx, languageRequest(snapshot), languagePosition(params.Position))
 	if err != nil {
 		return nil, err
 	}
-	return res, nil
+	return lspSignatureHelp(res.Value), nil
 }
 
 func SignatureHelp(text string, params lsp.SignatureHelpParams, dbCache *database.DBCache) (*lsp.SignatureHelp, error) {
@@ -64,12 +64,15 @@ func SignatureHelpWithDriverVariant(ctx context.Context, text string, params lsp
 	if err != nil {
 		return nil, err
 	}
-	if res.Value.Signatures == nil {
-		return nil, nil
-	}
+	return lspSignatureHelp(res.Value), nil
+}
 
-	signatures := make([]lsp.SignatureInformation, len(res.Value.Signatures))
-	for i, sig := range res.Value.Signatures {
+func lspSignatureHelp(value language.SignatureHelp) *lsp.SignatureHelp {
+	if value.Signatures == nil {
+		return nil
+	}
+	signatures := make([]lsp.SignatureInformation, len(value.Signatures))
+	for i, sig := range value.Signatures {
 		params := make([]lsp.ParameterInformation, len(sig.Parameters))
 		for j, p := range sig.Parameters {
 			params[j] = lsp.ParameterInformation{Label: p.Label, Documentation: p.Documentation}
@@ -82,7 +85,7 @@ func SignatureHelpWithDriverVariant(ctx context.Context, text string, params lsp
 	}
 	return &lsp.SignatureHelp{
 		Signatures:      signatures,
-		ActiveSignature: float64(res.Value.ActiveSignature),
-		ActiveParameter: float64(res.Value.ActiveParameter),
-	}, nil
+		ActiveSignature: float64(value.ActiveSignature),
+		ActiveParameter: float64(value.ActiveParameter),
+	}
 }

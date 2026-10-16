@@ -15,6 +15,7 @@ import (
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/lsp"
+	"github.com/sqls-server/sqls/language"
 	"github.com/sqls-server/sqls/metadata"
 )
 
@@ -49,6 +50,7 @@ type Server struct {
 	diagnosticDocuments  map[string]struct{}
 	diagnosticAllOpen    bool
 	diagnosticAnalyzer   func(documentDiagnosticsSnapshot) []lsp.Diagnostic
+	languageService      *language.Service
 
 	dbConn *database.DBConnection
 
@@ -140,6 +142,7 @@ func NewServer() *Server {
 
 	server := &Server{
 		files:               make(map[string]*File),
+		languageService:     language.NewService(),
 		cancels:             newCancelRegistry(),
 		lifecycleCtx:        lifecycleCtx,
 		lifecycleCancel:     lifecycleCancel,
@@ -361,6 +364,7 @@ func (s *Server) handleTextDocumentDidOpen(ctx context.Context, conn *jsonrpc2.C
 	if err := s.openFileAtVersion(params.TextDocument.URI, params.TextDocument.LanguageID, params.TextDocument.Text, params.TextDocument.Version); err != nil {
 		return nil, err
 	}
+	s.languageService.InvalidateDocument(params.TextDocument.URI)
 	s.queueDiagnosticDocument(params.TextDocument.URI)
 	return nil, nil
 }
@@ -383,6 +387,7 @@ func (s *Server) handleTextDocumentDidChange(ctx context.Context, conn *jsonrpc2
 		return nil, err
 	}
 	if changed {
+		s.languageService.InvalidateDocument(params.TextDocument.URI)
 		s.queueDiagnosticDocument(params.TextDocument.URI)
 	}
 	return nil, nil
@@ -409,6 +414,7 @@ func (s *Server) handleTextDocumentDidSave(ctx context.Context, conn *jsonrpc2.C
 		var applied bool
 		applied, err = s.updateFileAtRevision(params.TextDocument.URI, *params.Text, revision)
 		if err == nil && applied {
+			s.languageService.InvalidateDocument(params.TextDocument.URI)
 			s.queueDiagnosticDocument(params.TextDocument.URI)
 		}
 	} else {
@@ -453,8 +459,9 @@ func (s *Server) openFileAtVersion(uri string, languageID string, text string, v
 
 func (s *Server) closeFile(uri string) error {
 	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
 	delete(s.files, uri)
+	s.stateMu.Unlock()
+	s.languageService.InvalidateDocument(uri)
 	return nil
 }
 

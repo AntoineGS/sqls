@@ -34,6 +34,7 @@ type editorSnapshot struct {
 	URI, Text           string
 	Version             int
 	Revision            uint64
+	CacheEpoch          uint64
 	Generation          int
 	Variant             dialect.DriverVariant
 	DialectResolved     bool
@@ -74,6 +75,7 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 
 	snapshot := editorSnapshot{
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
+		CacheEpoch: s.languageService.CacheEpoch(),
 		Generation: s.connGeneration, Cache: &database.DBCache{},
 		LowercaseKeywords: configSnapshot.LowercaseKeywords,
 		DiagnosticPolicy:  language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},

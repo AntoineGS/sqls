@@ -152,6 +152,43 @@ func TestSignatureHelpMain(t *testing.T) {
 	}
 }
 
+func TestSignatureHelpAfterDocumentChangeUsesCurrentTree(t *testing.T) {
+	tx := newTestContext()
+	tx.initServer(t)
+	defer tx.tearDown()
+	tx.addWorkspaceConfig(t, &config.Config{Connections: []*database.DBConfig{{Driver: "mock"}}})
+
+	first := genSingleRecordInsertTest(50, 0)
+	tx.textDocumentDidOpen(t, testFileURI, first.input)
+	params := lsp.SignatureHelpParams{TextDocumentPositionParams: lsp.TextDocumentPositionParams{
+		TextDocument: lsp.TextDocumentIdentifier{URI: testFileURI},
+		Position:     lsp.Position{Character: first.col},
+	}}
+	var before lsp.SignatureHelp
+	if err := tx.conn.Call(tx.ctx, "textDocument/signatureHelp", params, &before); err != nil {
+		t.Fatal("signatureHelp before change:", err)
+	}
+	if len(before.Signatures) != 1 {
+		t.Fatalf("before change signatures = %d, want 1", len(before.Signatures))
+	}
+
+	change := lsp.DidChangeTextDocumentParams{
+		TextDocument:   lsp.VersionedTextDocumentIdentifier{URI: testFileURI, Version: 1},
+		ContentChanges: []lsp.TextDocumentContentChangeEvent{{Text: "SELECT 1"}},
+	}
+	if err := tx.conn.Call(tx.ctx, "textDocument/didChange", change, nil); err != nil {
+		t.Fatal("didChange:", err)
+	}
+	params.Position.Character = len("SELECT 1")
+	var after lsp.SignatureHelp
+	if err := tx.conn.Call(tx.ctx, "textDocument/signatureHelp", params, &after); err != nil {
+		t.Fatal("signatureHelp after change:", err)
+	}
+	if len(after.Signatures) != 0 {
+		t.Fatalf("after change signatures = %+v, want no signature for SELECT 1", after.Signatures)
+	}
+}
+
 func TestSignatureHelpNoneDBConnection(t *testing.T) {
 	tx := newTestContext()
 	tx.initServer(t)

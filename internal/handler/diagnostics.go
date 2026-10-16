@@ -30,6 +30,7 @@ type documentDiagnosticsSnapshot struct {
 	text                string
 	version             int
 	revision            uint64
+	cacheEpoch          uint64
 	variant             dialect.DriverVariant
 	generation          int
 	cache               *database.DBCache
@@ -54,6 +55,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		text:                editor.Text,
 		version:             editor.Version,
 		revision:            editor.Revision,
+		cacheEpoch:          editor.CacheEpoch,
 		generation:          editor.Generation,
 		variant:             editor.Variant,
 		cache:               editor.Cache,
@@ -146,22 +148,27 @@ func (s *Server) publishDocumentDiagnostics(ctx context.Context, conn *jsonrpc2.
 		if s.diagnosticAnalyzer != nil {
 			diagnostics = s.diagnosticAnalyzer(snapshot)
 		} else {
-			diagnostics = diagnosticsForSnapshot(ctx, snapshot)
+			diagnostics = diagnosticsForSnapshotWithService(ctx, snapshot, s.languageService)
 		}
 	}
 	s.publishDiagnosticsSnapshot(ctx, conn, snapshot, diagnostics)
 }
 
 func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+	return diagnosticsForSnapshotWithService(ctx, snapshot, language.NewService())
+}
+
+func diagnosticsForSnapshotWithService(ctx context.Context, snapshot documentDiagnosticsSnapshot, service *language.Service) []lsp.Diagnostic {
 	editor := editorSnapshot{URI: snapshot.uri, Text: snapshot.text, Version: snapshot.version,
 		Revision: snapshot.revision, Generation: snapshot.generation, Variant: snapshot.variant,
+		CacheEpoch:      snapshot.cacheEpoch,
 		DialectResolved: snapshot.dialectResolved, Metadata: snapshot.metadata,
 		MetadataKey:   snapshot.metadataKey,
 		MetadataLease: snapshot.metadataLease, MetadataIncarnation: snapshot.metadataIncarnation,
 		MetadataGeneration: snapshot.metadataGeneration, DiagnosticPolicy: snapshot.policy,
 		PolicyRevision: snapshot.policyRevision}
 	req := languageRequest(editor)
-	res, err := language.NewService().Diagnostics(ctx, req)
+	res, err := service.Diagnostics(ctx, req)
 	if err != nil {
 		// In-progress malformed SQL must not fail didOpen/didChange. A
 		// canceled request means no finding is currently proven.
