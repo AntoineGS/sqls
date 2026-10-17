@@ -1,7 +1,7 @@
 -- hoge --
 SELECT
-	x/*x*/,
-	/*x*/y
+	x /*x*/,
+	/*x*/ y
 FROM
 	zzz;
 -- zzzz

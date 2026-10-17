@@ -1,7 +1,10 @@
 package formatter
 
 import (
+	"slices"
+
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
 )
 
@@ -51,3 +54,45 @@ var commaNode = ast.NewItem(&token.Token{
 	Kind:  token.Comma,
 	Value: ",",
 })
+
+var comparisonKinds = []token.Kind{token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq}
+
+func isItemKind(node ast.Node, kinds ...token.Kind) bool {
+	item, ok := node.(*ast.Item)
+	return ok && slices.Contains(kinds, item.GetToken().Kind)
+}
+
+// isMemberName reports a keyword written directly after a member identifier
+// such as "a." that the parser left without a name, as "active" in "a.active".
+func isMemberName(member ast.Node, item *ast.Item) bool {
+	m, ok := member.(*ast.MemberIdentifier)
+	if !ok || m.Child != nil || item.GetToken().Kind != token.SQLKeyword {
+		return false
+	}
+	_, ok = item.GetToken().Value.(*token.SQLWord)
+	return ok && token.ComparePos(m.End(), item.Pos()) == 0
+}
+
+// memberKeyword renders a keyword used as a member name as written.
+func memberKeyword(item *ast.Item) ast.Node {
+	tok := item.GetToken()
+	word := *tok.Value.(*token.SQLWord)
+	word.Kind = dialect.Unmatched
+	return ast.NewItem(&token.Token{Kind: tok.Kind, Value: &word, From: tok.From, To: tok.To})
+}
+
+// startsWithWord reports whether node begins with a token that must stay
+// separated from a preceding word-like token.
+func startsWithWord(node ast.Node) bool {
+	switch node := node.(type) {
+	case *ast.Item:
+		return wordLike(node.GetToken().Kind)
+	case *ast.Identifier, *ast.MemberIdentifier, *ast.Aliased, *ast.FunctionLiteral:
+		return true
+	case *ast.IdentifierList:
+		if toks := node.GetTokens(); len(toks) > 0 {
+			return startsWithWord(toks[0])
+		}
+	}
+	return false
+}
