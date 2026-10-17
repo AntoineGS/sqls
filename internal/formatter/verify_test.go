@@ -27,6 +27,8 @@ func TestVerifyFormatted(t *testing.T) {
 		{"line comment swallows code", "select 1 -- c\nfrom t", "SELECT 1 -- c FROM t", false},
 		{"split operator", "select a <> b from t", "SELECT a < > b FROM t", false},
 		{"split concatenation", "select a||b from t", "SELECT a | | b FROM t", false},
+		{"split charset introducer", "select _utf8'abc' from t", "SELECT _ utf8'abc' FROM t", false},
+		{"spaced placeholder", "select a from t where a=?", "SELECT a FROM t WHERE a = ?", true},
 		{"spaced operators", "select a||b, -1 from t where x>=1", "SELECT a || b, - 1 FROM t WHERE x >= 1", true},
 	}
 	for _, tt := range tests {

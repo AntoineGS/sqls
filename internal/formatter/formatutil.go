@@ -96,3 +96,18 @@ func startsWithWord(node ast.Node) bool {
 	}
 	return false
 }
+
+func isCharItem(node ast.Node, value string) bool {
+	item, ok := node.(*ast.Item)
+	return ok && item.GetToken().Kind == token.Char && item.GetToken().Value == value
+}
+
+// lastNode returns the last leaf of node, as the "_" ending the list "'a', _".
+func lastNode(node ast.Node) ast.Node {
+	if list, ok := node.(ast.TokenList); ok {
+		if toks := list.GetTokens(); len(toks) > 0 {
+			return lastNode(toks[len(toks)-1])
+		}
+	}
+	return node
+}

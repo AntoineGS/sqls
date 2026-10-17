@@ -34,8 +34,8 @@ type significantToken struct {
 // verifyFormatted accepts formatted only if it re-tokenizes to the same tokens
 // as original, allowing changes to whitespace and to keyword case only. Where
 // original separated two word-like tokens with whitespace, formatted must too,
-// so that "2 desc" never becomes "2desc"; adjacent operator symbols stay
-// adjacent, so that "||" never becomes "| |".
+// so that "2 desc" never becomes "2desc"; adjacent operator symbols and
+// unrecognized characters stay adjacent, so that "||" never becomes "| |".
 func verifyFormatted(original, formatted string, d dialect.Dialect) error {
 	want, err := significantTokens(original, d)
 	if err != nil {
@@ -55,7 +55,8 @@ func verifyFormatted(original, formatted string, d dialect.Dialect) error {
 		if i > 0 && want[i].spaced && !got[i].spaced && wordLike(want[i-1].tok.Kind) && wordLike(want[i].tok.Kind) {
 			return fmt.Errorf("%w: tokens %d and %d were joined", ErrUnsafeFormat, i-1, i)
 		}
-		if i > 0 && !want[i].spaced && got[i].spaced && operatorLike(want[i-1].tok.Kind) && operatorLike(want[i].tok.Kind) {
+		if i > 0 && !want[i].spaced && got[i].spaced && (operatorLike(want[i-1].tok) && operatorLike(want[i].tok) ||
+			opaqueChar(want[i-1].tok) || opaqueChar(want[i].tok)) {
 			return fmt.Errorf("%w: tokens %d and %d were split", ErrUnsafeFormat, i-1, i)
 		}
 	}
@@ -113,12 +114,26 @@ func wordLike(kind token.Kind) bool {
 
 // operatorLike reports symbols that may form one operator with an adjacent
 // symbol, as the two characters of "||".
-func operatorLike(kind token.Kind) bool {
-	switch kind {
-	case token.Char, token.ILLEGAL, token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq,
+func operatorLike(tok *token.Token) bool {
+	switch tok.Kind {
+	case token.Char:
+		// "?" is a parameter placeholder, an operand
+		return tok.Value != "?"
+	case token.ILLEGAL, token.Eq, token.Neq, token.Lt, token.Gt, token.LtEq, token.GtEq,
 		token.Plus, token.Minus, token.Mult, token.Div, token.Caret, token.Mod,
 		token.Ampersand, token.Backslash:
 		return true
 	}
 	return false
+}
+
+// opaqueChar reports a character the lexer does not recognize, such as the
+// "_" of the charset introducer in "_utf8'abc'". Its meaning may depend on
+// what it touches, so it is never separated from an adjacent token.
+func opaqueChar(tok *token.Token) bool {
+	if tok.Kind != token.Char {
+		return false
+	}
+	value, _ := tok.Value.(string)
+	return value != "|" && value != "?"
 }

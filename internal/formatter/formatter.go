@@ -739,10 +739,14 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 		return true
 	}
 
-	// Symbols such as the two characters of "||" stay together; the
-	// operator they form is spaced from its operands.
-	if isItemKind(curNode, token.Char) || isItemKind(nextNode, token.Char) {
-		return !(isItemKind(curNode, token.Char) && isItemKind(nextNode, token.Char))
+	// The two characters of "||" stay together; the operator they form is
+	// spaced from its operands. Other unrecognized characters, such as the
+	// "_" of "_utf8'abc'", stay attached to what follows.
+	if isCharItem(curNode, "|") || isCharItem(nextNode, "|") {
+		return !(isCharItem(curNode, "|") && isCharItem(nextNode, "|"))
+	}
+	if last := lastNode(curNode); isItemKind(last, token.Char) && !isCharItem(last, "?") {
+		return false
 	}
 
 	// Don't add space before MultiKeyword (e.g., "GROUP BY") - always

@@ -63,6 +63,11 @@ func TestFormatRegressions(t *testing.T) {
 			want:  "SELECT\n  a\nFROM\n  t\nWHERE\n  x = - -1",
 		},
 		{
+			name:  "charset introducers",
+			input: "select _utf8'abc', _win1252 'x' from rdb$database",
+			want:  "SELECT\n  _utf8 'abc',\n  _win1252 'x'\nFROM\n  rdb$database",
+		},
+		{
 			name:  "concatenation",
 			input: "select a||' '||b from t",
 			want:  "SELECT\n  a || ' ' || b\nFROM\n  t",
