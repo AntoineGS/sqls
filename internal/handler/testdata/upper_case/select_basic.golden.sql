@@ -13,7 +13,6 @@ JOIN (
 	ON tbl.a = other.a
 WHERE
 	c IS TRUE
-	AND b BETWEEN 3
-	AND 4
+	AND b BETWEEN 3 AND 4
 	OR d IS 'blue'
 LIMIT 10
