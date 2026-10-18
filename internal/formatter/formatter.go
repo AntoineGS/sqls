@@ -623,20 +623,29 @@ func formatFunctionLiteral(node *ast.FunctionLiteral, env *formatEnvironment) as
 	return &ast.ItemWith{Toks: results}
 }
 
+// formatIdentifierList lays out the list's tokens rather than its
+// identifiers, which omit the comments that follow a comma. A trailing comma
+// precedes a list item the parser left outside the list, as the keyword in
+// "(1, current_date)".
 func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnvironment) ast.Node {
-	idents := identifierList.GetIdentifiers()
 	results := []ast.Node{}
-	for i, ident := range idents {
-		results = append(results, Eval(ident, env))
-		// A trailing comma precedes a list item the parser left outside the
-		// list, as the keyword in "(1, current_date)".
-		if i != len(idents)-1 || len(identifierList.Commas) >= len(idents) {
+	for _, tok := range identifierList.GetTokens() {
+		switch {
+		case isItemKind(tok, token.Whitespace):
+		case isItemKind(tok, token.Comma):
 			if env.inline > 0 {
 				results = append(results, commaNode, whitespaceNode)
 				continue
 			}
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
+		case isItemKind(tok, token.Comment):
+			results = append(results, tok, linebreakNode)
+			results = append(results, env.genIndent()...)
+		case isItemKind(tok, token.MultilineComment):
+			results = append(results, tok, whitespaceNode)
+		default:
+			results = append(results, Eval(tok, env))
 		}
 	}
 	return &ast.ItemWith{Toks: results}

@@ -1,0 +1,751 @@
+SELECT
+  sub_q.*,
+  (
+    SELECT
+      MIN(lkp_1.DESC_1)
+    FROM
+      (
+        SELECT
+          DESC_1,
+          BRANDNAMECODE
+        FROM
+          BRANDNAMES
+      ) lkp_1
+    WHERE
+      lkp_1.BRANDNAMECODE = sub_q.BRANDNAMECODE
+  ) AS BRANDNAMES_DESC_1,
+  lkp_3.COORDINATEGRP2 AS COORDINATEGRP2LK,
+  (
+    SELECT
+      lkp_5.NAME1
+    FROM
+      (
+        SELECT
+          name1,
+          suppid,
+          supptype
+        FROM
+          supplier
+      ) lkp_5
+    WHERE
+      lkp_5.SUPPID = sub_q.DEFSUPPID
+  ) AS DEFSUPPIDLK,
+  (
+    SELECT
+      lkp_6.NAME1
+    FROM
+      (
+        SELECT
+          name1,
+          suppid,
+          supptype
+        FROM
+          supplier
+      ) lkp_6
+    WHERE
+      lkp_6.SUPPID = sub_q.DEFSUPPID
+  ) AS DEFSUPPIDLK2,
+  (
+    SELECT
+      MIN(lkp_12.desc_1)
+    FROM
+      (
+        SELECT
+          hgs,
+          desc_1,
+          desc_2
+        FROM
+          hgdescs
+      ) lkp_12
+    WHERE
+      lkp_12.hgs = sub_q.hg4
+  ) AS HG4_LK,
+  (
+    SELECT
+      MIN(lkp_29.LDESC_1)
+    FROM
+      (
+        SELECT
+          a.ldesc_1,
+          a.ldesc_2,
+          a.elementid,
+          a.eleclass
+        FROM
+          elements a
+        JOIN dimseleclass b
+          ON b.eleclass = a.eleclass
+        WHERE
+          b.isforcolors = 'Y'
+      ) lkp_29
+    WHERE
+      lkp_29.ELEMENTID = sub_q.NHG1
+  ) AS NHG1ASCOLORLK,
+  (
+    SELECT
+      lkp_41.DESC_1
+    FROM
+      (
+        SELECT
+          DESC_1,
+          DESC_2,
+          CURRID
+        FROM
+          CURRTYPE
+      ) lkp_41
+    WHERE
+      lkp_41.CURRID = sub_q.CURRID
+  ) AS CURRTYPE_DESC_1,
+  (
+    SELECT
+      lkp_55.Desc_1
+    FROM
+      (
+        SELECT
+          productid,
+          desc_1,
+          desc_2
+        FROM
+          inventorymaster
+        WHERE
+          BMKS = 'N'
+      ) lkp_55
+    WHERE
+      lkp_55.productid = sub_q.RENTAL_RATE_PRODUCTID
+  ) AS RENTAL_RATE_PRODUCTID_LOOKUP,
+  (
+    SELECT
+      lkp_56.Desc_1
+    FROM
+      (
+        SELECT
+          Productid,
+          Productcode,
+          desc_1,
+          Desc_2
+        FROM
+          Inventorymaster
+        WHERE
+          pclass IN ('7072')
+          AND PSClass IN ('7202')
+      ) lkp_56
+    WHERE
+      lkp_56.productid = sub_q.giftboxproduct
+  ) AS GIFTBOX_PRODUCT_LOOKUP,
+  (
+    SELECT
+      MIN(lkp_64.prodDesc)
+    FROM
+      (
+        SELECT
+          a.CCHGroupid,
+          b.groupDesc,
+          a.CCHProductCode,
+          a.prodDesc
+        FROM
+          CCHProductItem a
+        JOIN CCHProductGroup b
+          ON (a.CCHGroupid = b.CCHgroupID)
+        WHERE
+          b.groupActive = 'Y'
+      ) lkp_64
+    WHERE
+      lkp_64.CCHProductCode = sub_q.CCHProductCode
+  ) AS CCHPRODUCTCODE_LK
+FROM
+  (
+    SELECT
+      a.BINMAJ,
+      a.BINMIN,
+      a.BKORD,
+      a.BMKS,
+      a.BRANDNAMECODE,
+      a.BRSUMCREATED,
+      a.COMMCOST,
+      a.COORDINATEGRP,
+      a.COORDINATEGRP2,
+      a.CORPMAX,
+      a.CORPMIN,
+      a.COST * 1.0 cost,
+      a.COSTMTHD,
+      a.COST_01,
+      a.COST_02,
+      a.CUSTOMRATE,
+      a.DEFACTPERIOD,
+      a.DEFESTMIN,
+      a.DEFMTD,
+      a.DEFSTATN,
+      a.DEFSTATTYPE,
+      a.DEFSUPPID,
+      a.DEFSUPPPRODID,
+      a.DEFYTD,
+      a.DEPT,
+      a.DESC_1,
+      a.DESC_2,
+      a.DETBOCREATED,
+      a.DETBRCREATED,
+      a.DIMENSIONID,
+      a.F_SELLPRICE,
+      a.GOSUBS,
+      a.HG1,
+      a.HG2,
+      a.HG3,
+      a.HG4,
+      a.HG5,
+      a.HG6,
+      a.IMAX,
+      a.IMDESC_1,
+      a.IMDESC_2,
+      a.IMIN,
+      a.INITCOST,
+      a.INITINV,
+      a.INTRANSIT,
+      a.INVADJ,
+      a.INVCONTRLMTHD,
+      a.INVCREATESTAT,
+      a.INVENTORYPRODUCT,
+      a.INVENTORYTYPE,
+      a.KITCOMPODISC,
+      a.KITRETAILVALUE,
+      a.LASTLANDEDCOST,
+      a.LASTPURCHASECOST * 1.0 LASTPURCHASECOST,
+      a.LASTSALE,
+      a.MASTERPACKQTY,
+      a.MATRIXCONFIG,
+      a.MATRIXUSER,
+      a.ONESTOPSHIPLVL,
+      a.ONHAND,
+      a.ONORDER,
+      a.PACFORMULA,
+      a.PCLASS,
+      a.PKEYDISCDIMID,
+      a.PREVIOUSCOST,
+      a.PRICEKEY,
+      a.PRODSELLSTAT,
+      a.PRODUCTCODE,
+      a.PRODUCTID,
+      a.PSCLASS,
+      a.QUARANTAINE,
+      a.RESERVED,
+      a.WEEKONFLOOR,
+      a.gold_karat,
+      a.gold_dwt,
+      a.RETAILPRICE * 1.0 retailprice,
+      a.SALESBO,
+      a.SEASONID,
+      a.SKUMATRIXID,
+      a.STDPRODMESS,
+      a.STOCKWEEKCNTR,
+      a.STOCKWEEKS,
+      a.STOREINVCTRLMETHOD,
+      a.TICKETFORMAT,
+      a.TRANSFERCOST,
+      a.UKDESC_1,
+      a.UKDESC_2,
+      a.UNITOFMESURE,
+      a.UOFMTRANSFER,
+      a.WCODE,
+      a.WEIGHT,
+      a.impof3,
+      a.goldfto,
+      a.lastpurchasegoldrate,
+      a.gold_increment * 1.00 gold_increment,
+      a.eleclass1,
+      a.eleclass2,
+      a.eleclass3,
+      a.PERMID_,
+      a.cds_,
+      a.cdu_,
+      a.eds_,
+      a.edu_,
+      a.invsctype,
+      a.invscamount_perc,
+      a.altonhand,
+      a.NHG1,
+      a.NHG2,
+      a.NHG3,
+      a.NHG4,
+      a.NHG5,
+      a.NHG6,
+      a.NHG7,
+      a.NHG8,
+      a.NHG9,
+      a.NHG10,
+      a.NHG11,
+      a.NHG12,
+      a.NHG13,
+      a.NHG14,
+      a.FIRSTSALE,
+      a.FIRSTPURCH,
+      a.LASTPURCH,
+      a.specpriceid,
+      a.jdcosttype,
+      a.refinvoice,
+      a.singleserial,
+      a.gs1,
+      a.gs2,
+      a.gs3,
+      a.gs4,
+      a.gs5,
+      a.gs6,
+      a.replcostuom,
+      a.replcost,
+      a.altuom,
+      (a.imax - a.imin) imax_imin,
+      a.lastcountdate,
+      a.gmr_avgu,
+      a.gmr_avguvalue,
+      a.gmr_totgpd,
+      a.gmr_sdate,
+      a.gmr_edate,
+      a.retperc,
+      a.usersales,
+      a.userhi,
+      a.userlow,
+      pk.pkprice1 * 1.0 pkprice1,
+      pk.pricechangecode,
+      psc.desc_1 subclassdesc,
+      a.cc_date,
+      a.ccinterval,
+      (a.cc_date + a.ccinterval) next_ccdate,
+      a.binfamily,
+      /*(select min(cds_) from poreceiptsdet where productid=a.productid) firstpurch,
+(select max(cds_) from poreceiptsdet where productid=a.productid) lastpurch,
+*/ a.totalpurch TOTALRECEIVED,
+      a.INSTORESON,
+      a.totalsales,
+      a.emplyid,
+      a.rnlabelvalue,
+      a.hg7,
+      a.hg8,
+      a.DATEMinRESET,
+      a.SALESOVERRIDEFORMULA,
+      a.DATEMaxRESET,
+      a.MINRESETWEEKS,
+      a.MaxRESETWEEKS,
+      a.STORERELEASEDATE,
+      a.serialmgmttype,
+      a.editlock,
+      a.dealid,
+      a.cust_tick_info,
+      a.GPM_DISCPRODGRPID,
+      b.currid,
+      ((((a.retailprice * 1.0) - (a.lastpurchasecost * (
+        SELECT
+          exchrate
+        FROM
+          currtype
+        WHERE
+          currid = b.currid
+      ))) / (a.retailprice + .01)) * 100) lpgcp,
+      c.productioncolor,
+      c.fabricdescription,
+      pc.groupcode,
+      c.nrfColor,
+      c.nrfColorDesc,
+      a.totalPurch,
+      a.custid,
+      a.PRODDISC,
+      a.POQTYTOIMPORT,
+      a.rawmaterial,
+      a.szLength,
+      a.szWidth,
+      a.szHeight,
+      a.SZ_IMP_YN,
+      (a.onhand * a.cost) IM_EXTCOST,
+      f_safedivide((gmr_totgpd / (gmr_edate - gmr_sdate) * 365), gmr_avguvalue, 0) IMAnnualGMROI,
+      a.C_DATE,
+      a.CCHProductcode,
+      a.IntShipTaxNumber,
+      a.enforceserial,
+      a.unit_time,
+      a.CONTENTTEXT_1,
+      a.CONTENTTEXT_2,
+      a.suppprodid_ext,
+      a.OverSizeCharge,
+      a.GiftBoxProduct,
+      a.ShipAlone,
+      a.isWebProduct,
+      a.RENTAL_RATE_PRODUCTID,
+      a.ExplodeKitAtSale,
+      a.TariffNo,
+      a.TariffDutyPerc,
+      a.forcepick,
+      a.simatpos,
+      /*Aug 1  2014*/ a.eav_templateid,
+      /*Oct 7  2014*/ a.prod_dev_path,
+      a.dev_state,
+      a.nextstep,
+      pds.Stepdesc_1,
+      pds.nextsteplist,
+      /*Mar 19 2015*/ a.assemblytype,
+      /*May 12 2015*/ a.sizescale,
+      a.prod_asst_type,
+      /*May 23 2015*/ a.NHG15,
+      a.NHG16,
+      a.NHG17,
+      a.NHG18,
+      a.NHG19,
+      a.NHG20,
+      a.NHG21,
+      a.NHG22,
+      a.NHG23,
+      a.NHG24,
+      a.NHG25,
+      /*Jul 15 2015*/ a.subdisttype,
+      /*Apr 11 2016*/ a.warrgroupid,
+      /*May 26 2016*/ a.defpictureid,
+      /*Oct 12 2017*/ a.dispuofm,
+      pk.MFGSUGGRETPRICE,
+      /*feb 26 2019*/ a.BINABLE,
+      a.objective_id,
+      a.master_of_coordgrp,
+      /*june 11 2020 */ a.OrderasSold /* December 10 2020 to be in sync with change done manually at AIC */,
+      (
+        SELECT
+          SUM(ibs.ptotsales)
+        FROM
+          invbranchskus ibs
+        WHERE
+          a.productid = ibs.productid
+      ) ptotsales /* June 1 2021*/,
+      e.MIN_ORDER_QTY,
+      /* Aug 18 2021 */ e.gold_increment * 1.00 supp_gold_increment,
+      /* march 7 2022 */ a.ticketdesc,
+      a.Bom_template_id,
+      a.spiff_flag,
+      a.metalid,
+      /* Feb 8 2023 */ a.synced_date,
+      a.SAT_PKPRICE,
+      a.SAT_INITPRICE,
+      a.SAT_TOSYNC,
+      a.publish_date,
+      a.stockreq_4_webdisp,
+      a.track_inventory,
+      a.eav_status,
+      a.se_product,
+      a.cpath_errors,
+      a.impof2,
+      a.MISC_FEE_ID,
+      lkp_0.DESC_1 AS PRODGRPBMKS_DESC_1,
+      lkp_2.coordinategrp AS Coordinatelk,
+      lkp_4.DESC_1 AS COSTMETHODS_DESC_1,
+      lkp_7.DESC_1 AS DEPARTEMENTS_DESC_1,
+      lkp_8.DESC_1 AS DIMENSIONS_DESC_1,
+      lkp_9.desc_1 AS HG1LK,
+      lkp_10.desc_1 AS HG2LK,
+      lkp_11.desc_1 AS HG3LK,
+      lkp_13.desc_1 AS HG4LK,
+      lkp_14.desc_1 AS HG5LK,
+      lkp_15.desc_1 AS HG6LK,
+      lkp_16.DESC_1 AS INVCONTROLMETHOD_DESC_1,
+      lkp_17.DESC_1 AS POMADDCOSTFORMULAS_DESC_1,
+      lkp_18.DESC_1 AS PCLASS_DESC_1,
+      lkp_19.DESC_1 AS PSCLASS_DESC_1,
+      lkp_20.DESC_1 AS SEASONDESC_1,
+      lkp_21.DESC_1 AS SEASONS_DESC_1,
+      lkp_22.DESC_1 AS TICKETFORMATS_DESC_1,
+      lkp_23.DESC_1 AS UNITSOFMESURE_DESC_1,
+      lkp_24.DESC_1 AS WARRPERIODS_DESC_1,
+      lkp_25.DESC_1 AS ELECLASS1LK,
+      lkp_26.DESC_1 AS ELECLASS2LK,
+      lkp_27.DESC_1 AS ELECLASS3LK,
+      lkp_28.LDESC_1 AS NHG1LK,
+      lkp_30.LDESC_1 AS NHG2LK,
+      lkp_31.LDESC_1 AS NHG3LK,
+      lkp_32.LDESC_1 AS NHG4LK,
+      lkp_33.LDESC_1 AS NHG5LK,
+      lkp_34.LDESC_1 AS NHG6LK,
+      lkp_35.LDESC_1 AS NHG7LK,
+      lkp_36.LDESC_1 AS NHG8LK,
+      lkp_37.surname || '  ' || lkp_37.name AS EMPLOYEE_FULL,
+      lkp_38.surname || '  ' || lkp_38.name AS employe_fullname_Buyers,
+      lkp_39.surname || '  ' || lkp_39.name AS EMPL_LK_REC,
+      lkp_40.surname || '  ' || lkp_40.name AS EMPLY_LK_VTE,
+      lkp_42.DESC_1 AS PSUBC_DESC_1,
+      lkp_43.desc_1 AS HG7LK,
+      lkp_44.desc_1 AS HG8LK,
+      lkp_45.name1 AS NHG8SCHOOL_LK,
+      lkp_46.DESC_1 AS SPECPRICEHDR_DESC_1,
+      lkp_47.DESC_1 AS ALTUOMLK,
+      lkp_48.DESC_1 AS REPLCOSTUOMLK,
+      lkp_49.LDESC_1 AS NHG9LK,
+      lkp_50.LDESC_1 AS NHG10LK,
+      lkp_51.LDESC_1 AS NHG11LK,
+      lkp_52.LDESC_1 AS NHG12LK,
+      lkp_53.LDESC_1 AS NHG13LK,
+      lkp_54.LDESC_1 AS NHG14LK,
+      lkp_58.desc_1 AS Prod_dev_cpath_lk,
+      lkp_59.STEPDESC_1 AS NextStepLK,
+      lkp_60.desc_1 AS SIzeScaleLK,
+      lkp_61.FISCALWEEKNUM AS WEEKONFLOOR_LK,
+      lkp_62.desc_1_douane AS TariffNoLK,
+      lkp_63.DESC_1 AS BINFAMLYLK,
+      lkp_65.desc_1 AS WARRGRPLK,
+      lkp_66.LDESC_1 AS NHG15LK,
+      lkp_67.LDESC_1 AS NHG16LK,
+      lkp_68.Desc_1 AS Objective_ID_LK,
+      lkp_69.LDESC_1 AS NHG17LK,
+      lkp_70.LDESC_1 AS NHG18LK,
+      lkp_71.Bom_template_desc AS VBOM_LK,
+      lkp_72.LDESC_1 AS NHG19LK,
+      lkp_73.LDESC_1 AS NHG20LK,
+      lkp_74.metalid AS Metalid_LK,
+      lkp_75.LDESC_1 AS NHG21LK,
+      lkp_76.LDESC_1 AS NHG22LK,
+      lkp_77.LDESC_1 AS NHG23LK,
+      lkp_78.LDESC_1 AS NHG24LK,
+      lkp_79.LDESC_1 AS NHG25LK,
+      lkp_80.id AS MISC_FEELKUP
+    FROM
+      INVENTORYMASTER a
+    LEFT JOIN SUPPLIERACCOUNTING b
+      ON (suppid = a.defsuppid)
+    LEFT JOIN invcolorext c
+      ON (c.productid = a.productid
+      AND c.dim1 = a.nhg1)
+    LEFT JOIN pclass pc
+      ON (pc.pclass = a.pclass)
+    LEFT JOIN psubc psc
+      ON psc.pclass = a.pclass
+      AND psc.psclass = a.psclass
+    LEFT JOIN pricing pk
+      ON (pk.pricekey = a.PRODUCTID
+      AND pk.pricezoneid = '00'
+      AND pk.dim1 = '------'
+      AND pk.efdatestart <= 'today'
+      AND pk.efdateends >= 'today')
+    LEFT JOIN suppprod e
+      ON e.productid = a.productid
+      AND e.suppid = a.defsuppid /* Oct 7 2014    */
+    LEFT JOIN prod_dev_steps pds
+      ON pds.cstep = a.dev_state
+    LEFT JOIN PRODGRPBMKS lkp_0
+      ON lkp_0.BMKS = a.BMKS
+    LEFT JOIN COORDINATEGRP lkp_2
+      ON lkp_2.coordinategrp = a.COORDINATEGRP
+    LEFT JOIN COSTMETHODS lkp_4
+      ON lkp_4.COSTMTHD = a.COSTMTHD
+    LEFT JOIN DEPARTEMENTS lkp_7
+      ON lkp_7.DEPT = a.DEPT
+    LEFT JOIN DIMENSIONS lkp_8
+      ON lkp_8.DIMENSIONID = a.DIMENSIONID
+    LEFT JOIN HGDESCS lkp_9
+      ON lkp_9.hgs = a.HG1
+      AND lkp_9.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_10
+      ON lkp_10.hgs = a.HG2
+      AND lkp_10.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_11
+      ON lkp_11.hgs = a.HG3
+      AND lkp_11.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_13
+      ON lkp_13.hgs = a.HG4
+      AND lkp_13.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_14
+      ON lkp_14.hgs = a.HG5
+      AND lkp_14.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_15
+      ON lkp_15.hgs = a.HG6
+      AND lkp_15.hgs <> '-894728'
+    LEFT JOIN INVCONTROLMETHOD lkp_16
+      ON lkp_16.INVCONTRLMTHD = a.INVCONTRLMTHD
+    LEFT JOIN POMADDCOSTFORMULAS lkp_17
+      ON lkp_17.PACFORMULA = a.PACFORMULA
+    LEFT JOIN PCLASS lkp_18
+      ON lkp_18.PCLASS = a.PCLASS
+    LEFT JOIN PSUBC lkp_19
+      ON lkp_19.pclass = a.PCLASS
+      AND lkp_19.PSCLASS = a.PSCLASS
+    LEFT JOIN SEASONS lkp_20
+      ON lkp_20.SEASONID = a.SEASONID
+    LEFT JOIN SEASONS lkp_21
+      ON lkp_21.SEASONID = a.SEASONID
+    LEFT JOIN TICKETFORMATS lkp_22
+      ON lkp_22.TICKETFORMAT = a.TICKETFORMAT
+    LEFT JOIN UNITSOFMESURE lkp_23
+      ON lkp_23.UNITOFMESURE = a.UNITOFMESURE
+    LEFT JOIN WARRPERIODS lkp_24
+      ON lkp_24.WCODE = a.WCODE
+    LEFT JOIN DIMSELECLASS lkp_25
+      ON lkp_25.ELECLASS = a.eleclass1
+    LEFT JOIN DIMSELECLASS lkp_26
+      ON lkp_26.ELECLASS = a.eleclass2
+    LEFT JOIN DIMSELECLASS lkp_27
+      ON lkp_27.ELECLASS = a.eleclass3
+    LEFT JOIN ELEMENTS lkp_28
+      ON lkp_28.ELEMENTID = a.NHG1
+      AND lkp_28.ELECLASS = 'NHG'
+      AND lkp_28.elementorder = 1
+    LEFT JOIN ELEMENTS lkp_30
+      ON lkp_30.ELEMENTID = a.NHG2
+      AND lkp_30.ELECLASS = 'NHG'
+      AND lkp_30.elementorder = 2
+    LEFT JOIN ELEMENTS lkp_31
+      ON lkp_31.ELEMENTID = a.NHG3
+      AND lkp_31.ELECLASS = 'NHG'
+      AND lkp_31.elementorder = 3
+    LEFT JOIN ELEMENTS lkp_32
+      ON lkp_32.ELEMENTID = a.NHG4
+      AND lkp_32.ELECLASS = 'NHG'
+      AND lkp_32.elementorder = 4
+    LEFT JOIN ELEMENTS lkp_33
+      ON lkp_33.ELEMENTID = a.NHG5
+      AND lkp_33.ELECLASS = 'NHG'
+      AND lkp_33.elementorder = 5
+    LEFT JOIN ELEMENTS lkp_34
+      ON lkp_34.ELEMENTID = a.NHG6
+      AND lkp_34.ELECLASS = 'NHG'
+      AND lkp_34.elementorder = 6
+    LEFT JOIN ELEMENTS lkp_35
+      ON lkp_35.ELEMENTID = a.NHG7
+      AND lkp_35.ELECLASS = 'NHG'
+      AND lkp_35.elementorder = 7
+    LEFT JOIN ELEMENTS lkp_36
+      ON lkp_36.ELEMENTID = a.NHG8
+      AND lkp_36.ELECLASS = 'NHG'
+      AND lkp_36.elementorder = 8
+    LEFT JOIN EMPLOYEE lkp_37
+      ON lkp_37.emplyid = a.emplyid
+      AND lkp_37.EMPSTATUS NOT IN ('TE', 'RS')
+    LEFT JOIN EMPLFUNCTIONS lkp_37_1
+      ON lkp_37_1.EMPLYPOSITION = lkp_37.EMPLYPOSITION
+    LEFT JOIN EMPLOYEE lkp_38
+      ON lkp_38.emplyid = a.emplyid
+      AND lkp_38.EMPSTATUS NOT IN ('TE', 'RS')
+    LEFT JOIN EMPLFUNCTIONS lkp_38_1
+      ON lkp_38_1.EMPLYPOSITION = lkp_38.EMPLYPOSITION
+    LEFT JOIN EMPLOYEE lkp_39
+      ON lkp_39.emplyid = a.emplyid
+      AND lkp_39.EMPSTATUS NOT IN ('TE', 'RS')
+    LEFT JOIN EMPLFUNCTIONS lkp_39_1
+      ON lkp_39_1.EMPLYPOSITION = lkp_39.EMPLYPOSITION
+    LEFT JOIN EMPLOYEE lkp_40
+      ON lkp_40.emplyid = a.emplyid
+      AND lkp_40.EMPSTATUS NOT IN ('TE', 'RS')
+    LEFT JOIN EMPLFUNCTIONS lkp_40_1
+      ON lkp_40_1.EMPLYPOSITION = lkp_40.EMPLYPOSITION
+    LEFT JOIN PSUBC lkp_42
+      ON lkp_42.pclass = a.PCLASS
+      AND lkp_42.PSCLASS = a.PSCLASS
+    LEFT JOIN HGDESCS lkp_43
+      ON lkp_43.hgs = a.hg7
+      AND lkp_43.hgs <> '-894728'
+    LEFT JOIN HGDESCS lkp_44
+      ON lkp_44.hgs = a.hg8
+      AND lkp_44.hgs <> '-894728'
+    LEFT JOIN CUSTOMERS lkp_45
+      ON lkp_45.custid = a.custid
+      AND lkp_45.isschool = 'Y'
+    LEFT JOIN SPECPRICEHDR lkp_46
+      ON lkp_46.SPECPRICEID = a.specpriceid
+    LEFT JOIN UNITSOFMESURE lkp_47
+      ON lkp_47.UNITOFMESURE = a.altuom
+    LEFT JOIN UNITSOFMESURE lkp_48
+      ON lkp_48.UNITOFMESURE = a.replcostuom
+    LEFT JOIN ELEMENTS lkp_49
+      ON lkp_49.ELEMENTID = a.NHG9
+      AND lkp_49.ELECLASS = 'NHG'
+      AND lkp_49.elementorder = 9
+    LEFT JOIN ELEMENTS lkp_50
+      ON lkp_50.ELEMENTID = a.NHG10
+      AND lkp_50.ELECLASS = 'NHG'
+      AND lkp_50.elementorder = 10
+    LEFT JOIN ELEMENTS lkp_51
+      ON lkp_51.ELEMENTID = a.NHG11
+      AND lkp_51.ELECLASS = 'NHG'
+      AND lkp_51.elementorder = 11
+    LEFT JOIN ELEMENTS lkp_52
+      ON lkp_52.ELEMENTID = a.NHG12
+      AND lkp_52.ELECLASS = 'NHG'
+      AND lkp_52.elementorder = 12
+    LEFT JOIN ELEMENTS lkp_53
+      ON lkp_53.ELEMENTID = a.NHG13
+      AND lkp_53.ELECLASS = 'NHG'
+      AND lkp_53.elementorder = 13
+    LEFT JOIN ELEMENTS lkp_54
+      ON lkp_54.ELEMENTID = a.NHG14
+      AND lkp_54.ELECLASS = 'NHG'
+      AND lkp_54.elementorder = 14
+    LEFT JOIN PROD_DEV_PATH lkp_58
+      ON lkp_58.PROD_DEV_path = a.prod_dev_path
+    LEFT JOIN PROD_DEV_STEPS lkp_59
+      ON lkp_59.CSTEP = a.nextstep
+    LEFT JOIN DIMENSIONS lkp_60
+      ON lkp_60.dimensionid = a.sizescale
+      AND lkp_60.mx_gr = 2
+    LEFT JOIN STATSENGINEPERIODS lkp_61
+      ON lkp_61.FISCALWEEKNUM = a.WEEKONFLOOR
+    LEFT JOIN TARIFFCODEDESC lkp_62
+      ON lkp_62.tariffno = a.TariffNo
+    LEFT JOIN BINFAMILY lkp_63
+      ON lkp_63.BINFAMILY = a.binfamily
+    LEFT JOIN WARRGROUP lkp_65
+      ON lkp_65.warrgroupid = a.warrgroupid
+    LEFT JOIN ELEMENTS lkp_66
+      ON lkp_66.ELEMENTID = a.NHG15
+      AND lkp_66.ELECLASS = 'NHG'
+      AND lkp_66.elementorder = 15
+    LEFT JOIN ELEMENTS lkp_67
+      ON lkp_67.ELEMENTID = a.NHG16
+      AND lkp_67.ELECLASS = 'NHG'
+      AND lkp_67.elementorder = 16
+    LEFT JOIN SELLTHRU_OBJ_HDR lkp_68
+      ON lkp_68.Objective_ID = a.objective_id
+    LEFT JOIN ELEMENTS lkp_69
+      ON lkp_69.ELEMENTID = a.NHG17
+      AND lkp_69.ELECLASS = 'NHG'
+      AND lkp_69.elementorder = 17
+    LEFT JOIN ELEMENTS lkp_70
+      ON lkp_70.ELEMENTID = a.NHG18
+      AND lkp_70.ELECLASS = 'NHG'
+      AND lkp_70.elementorder = 18
+    LEFT JOIN BOM_TEMPLATES lkp_71
+      ON lkp_71.Bom_template_id = a.Bom_template_id
+    LEFT JOIN ELEMENTS lkp_72
+      ON lkp_72.ELEMENTID = a.NHG19
+      AND lkp_72.ELECLASS = 'NHG'
+      AND lkp_72.elementorder = 19
+    LEFT JOIN ELEMENTS lkp_73
+      ON lkp_73.ELEMENTID = a.NHG20
+      AND lkp_73.ELECLASS = 'NHG'
+      AND lkp_73.elementorder = 20
+    LEFT JOIN METALINFO lkp_74
+      ON lkp_74.metalid = a.metalid
+    LEFT JOIN ELEMENTS lkp_75
+      ON lkp_75.ELEMENTID = a.NHG21
+      AND lkp_75.ELECLASS = 'NHG'
+      AND lkp_75.elementorder = 21
+    LEFT JOIN ELEMENTS lkp_76
+      ON lkp_76.ELEMENTID = a.NHG22
+      AND lkp_76.ELECLASS = 'NHG'
+      AND lkp_76.elementorder = 22
+    LEFT JOIN ELEMENTS lkp_77
+      ON lkp_77.ELEMENTID = a.NHG23
+      AND lkp_77.ELECLASS = 'NHG'
+      AND lkp_77.elementorder = 23
+    LEFT JOIN ELEMENTS lkp_78
+      ON lkp_78.ELEMENTID = a.NHG24
+      AND lkp_78.ELECLASS = 'NHG'
+      AND lkp_78.elementorder = 24
+    LEFT JOIN ELEMENTS lkp_79
+      ON lkp_79.ELEMENTID = a.NHG25
+      AND lkp_79.ELECLASS = 'NHG'
+      AND lkp_79.elementorder = 25
+    LEFT JOIN MISC_FEES lkp_80
+      ON lkp_80.id = a.MISC_FEE_ID
+    WHERE
+      a.invcreatestat <> 'K' /* Was
+   where <% @DsplInctvStll='Y' ?'1=1' : "a.invcreatestat<>'K' and a.invcreatestat<>'X' "%> 
+   Futur only hides X not inactives at POS
+   where <% @DsplInctvStll='Y' ?  '1=1' 
+            : @DsplInctvStll='P' ?  "a.invcreatestat<>'X'" 
+            : "a.invcreatestat<>'K' and a.invcreatestat<>'X'"%> 
+*/
+  ) sub_q
+LEFT JOIN (
+  SELECT
+    DISTINCT coordinategrp2
+  FROM
+    inventorymaster
+) lkp_3
+  ON lkp_3.COORDINATEGRP2 = sub_q.COORDINATEGRP2 ROWS 200 TO 400
