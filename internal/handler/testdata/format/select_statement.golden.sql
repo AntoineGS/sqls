@@ -11,5 +11,4 @@ from
 	table
 where
 	c is true
-	and b between 3
-	and 4
+	and b between 3 and 4

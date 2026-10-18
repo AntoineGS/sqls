@@ -4,14 +4,12 @@ import (
 	"errors"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/internal/config"
 	"github.com/sqls-server/sqls/internal/lsp"
-	"github.com/sqls-server/sqls/parser"
 	"github.com/sqls-server/sqls/token"
 )
 
@@ -36,36 +34,19 @@ func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *co
 		return nil, errors.New("empty")
 	}
 	return recoverFormat(func() ([]lsp.TextEdit, error) {
-		parsed, err := parser.ParseWithDialect(text, d)
+		// The edit spans the text between leading and trailing whitespace.
+		// Offsets come from the text, not from the lexer, which does not
+		// count line breaks inside string literals.
+		from := len(text) - len(strings.TrimLeft(text, " \t\r\n"))
+		to := len(strings.TrimRight(text, " \t\r\n"))
+		if from >= to {
+			return nil, errors.New("empty")
+		}
+		st, en := offsetToUTF16(text, from), offsetToUTF16(text, to)
+		newText, err := formatSource(text[from:to], params, cfg, d)
 		if err != nil {
 			return nil, err
 		}
-
-		st, err := parserPositionToUTF16(text, parsed.Pos())
-		if err != nil {
-			return nil, err
-		}
-		en, err := parserPositionToUTF16(text, parsed.End())
-		if err != nil {
-			return nil, err
-		}
-		from, err := parserPositionToOffset(text, parsed.Pos())
-		if err != nil {
-			return nil, err
-		}
-		to, err := parserPositionToOffset(text, parsed.End())
-		if err != nil {
-			return nil, err
-		}
-		env := &formatEnvironment{
-			options: params.Options,
-		}
-		formatted := Eval(parsed, env)
-
-		opts := &ast.RenderOptions{
-			LowerCase: cfg.LowercaseKeywords,
-		}
-		newText := formatted.Render(opts)
 		if err := verifyFormatted(text[from:to], newText, d); err != nil {
 			return nil, err
 		}
@@ -82,70 +63,26 @@ func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *co
 	})
 }
 
-// parserPositionToOffset converts an AST's rune-based position into a byte
-// offset in text.
-func parserPositionToOffset(text string, pos token.Pos) (int, error) {
-	if pos.Line < 0 || pos.Col < 0 {
-		return 0, errors.New("invalid parser position")
-	}
-	offset := 0
-	for line := 0; line < pos.Line; line++ {
-		delim, delimLen := nextLineBreak(text, offset)
-		if delim < 0 {
-			return 0, errors.New("invalid parser position")
-		}
-		offset = delim + delimLen
-	}
-	for col := 0; col < pos.Col; col++ {
-		if offset >= len(text) || text[offset] == '\n' || text[offset] == '\r' {
-			return 0, errors.New("invalid parser position")
-		}
-		_, size := utf8.DecodeRuneInString(text[offset:])
-		offset += size
-	}
-	return offset, nil
-}
-
-// parserPositionToUTF16 converts an AST's rune-based position into the UTF-16
-// code-unit coordinates required by LSP. It is used here so direct formatter
-// callers receive the same edit range as callers through language.Service.
-func parserPositionToUTF16(text string, pos token.Pos) (lsp.Position, error) {
-	if pos.Line < 0 || pos.Col < 0 {
-		return lsp.Position{}, errors.New("invalid parser position")
-	}
-	lineStart := 0
-	for line := 0; line < pos.Line; line++ {
+// offsetToUTF16 converts a byte offset in text into the UTF-16 code-unit
+// position required by LSP.
+func offsetToUTF16(text string, offset int) lsp.Position {
+	line, lineStart := 0, 0
+	for {
 		delim, delimLen := nextLineBreak(text, lineStart)
-		if delim < 0 {
-			return lsp.Position{}, errors.New("invalid parser position")
-		}
-		lineStart = delim + delimLen
-	}
-	lineEnd := len(text)
-	if delim, _ := nextLineBreak(text, lineStart); delim >= 0 {
-		lineEnd = delim
-	}
-	codePointColumn := 0
-	utf16Column := 0
-	for offset := lineStart; offset < lineEnd; {
-		if codePointColumn == pos.Col {
+		if delim < 0 || delim >= offset {
 			break
 		}
-		r, size := utf8.DecodeRuneInString(text[offset:lineEnd])
-		if r == utf8.RuneError && size == 1 {
-			return lsp.Position{}, errors.New("invalid UTF-8 in parser source")
-		}
-		codePointColumn++
-		utf16Column++
+		line++
+		lineStart = delim + delimLen
+	}
+	column := 0
+	for _, r := range text[lineStart:offset] {
+		column++
 		if r > 0xFFFF {
-			utf16Column++
+			column++
 		}
-		offset += size
 	}
-	if pos.Col > codePointColumn {
-		return lsp.Position{}, errors.New("invalid parser position")
-	}
-	return lsp.Position{Line: pos.Line, Character: utf16Column}, nil
+	return lsp.Position{Line: line, Character: column}
 }
 
 // nextLineBreak matches the lexer's supported line endings: LF, CRLF and a
@@ -170,6 +107,13 @@ type formatEnvironment struct {
 	indentLevel int
 	options     lsp.FormattingOptions
 	lastKeyword string // Track last processed keyword
+	// inline counts the enclosing function arguments and IN lists, which
+	// are laid out on one line.
+	inline int
+	// blocks holds the open BEGIN (true) and CASE (false) of the statement.
+	blocks []bool
+	// betweenPending is set from BETWEEN to the AND of its range.
+	betweenPending bool
 }
 
 func (e *formatEnvironment) indentLevelReset() {
@@ -245,10 +189,13 @@ func formatItem(node ast.Node, env *formatEnvironment) ast.Node {
 			if sqlWord, ok := tok.Value.(*token.SQLWord); ok {
 				kw := sqlWord.Keyword
 				// Only track keywords that matter for context-sensitive formatting
-				if kw == "JOIN" || kw == "DELETE" || kw == "INSERT" || kw == "CREATE" {
+				if kw == "JOIN" || kw == "DELETE" || kw == "INSERT" || kw == "CREATE" || kw == "UPDATE" {
 					env.lastKeyword = kw
 				}
 			}
+		}
+		if formatted := formatContextItem(item, env); formatted != nil {
+			return formatted
 		}
 	}
 
@@ -398,6 +345,8 @@ func formatItem(node ast.Node, env *formatEnvironment) ast.Node {
 	if breakStatementAfterMatcher.IsMatch(node) {
 		results = append(results, linebreakNode)
 		env.indentLevelReset()
+		env.lastKeyword = ""
+		env.betweenPending = false
 	}
 
 	return &ast.ItemWith{Toks: results}
@@ -563,6 +512,14 @@ func formatParenthesis(node *ast.Parenthesis, env *formatEnvironment) ast.Node {
 	results = append(results, lparenNode)
 
 	inner := node.Inner()
+	if containsSelect(node) {
+		// A subquery is laid out on its own lines, even within arguments.
+		inline := env.inline
+		env.inline = 0
+		defer func() { env.inline = inline }()
+	} else if env.inline > 0 {
+		return &ast.ItemWith{Toks: []ast.Node{lparenNode, Eval(inner, env), rparenNode}}
+	}
 
 	// Check if inner contains IdentifierList
 	innerToks := inner.GetTokens()
@@ -654,10 +611,14 @@ func formatFunctionLiteral(node *ast.FunctionLiteral, env *formatEnvironment) as
 		}
 	}
 
-	// Default: format recursively
+	// Default: format recursively, arguments on one line
 	results := []ast.Node{}
 	for _, tok := range node.Toks {
-		results = append(results, Eval(tok, env))
+		if isParenthesis(tok) {
+			results = append(results, formatInline(tok, env))
+		} else {
+			results = append(results, Eval(tok, env))
+		}
 	}
 	return &ast.ItemWith{Toks: results}
 }
@@ -670,6 +631,10 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 		// A trailing comma precedes a list item the parser left outside the
 		// list, as the keyword in "(1, current_date)".
 		if i != len(idents)-1 || len(identifierList.Commas) >= len(idents) {
+			if env.inline > 0 {
+				results = append(results, commaNode, whitespaceNode)
+				continue
+			}
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
 		}
@@ -684,17 +649,25 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 	for reader.NextNode(true) {
 		env.reader = reader
 		var formatted ast.Node
-		if item, ok := reader.CurNode.(*ast.Item); ok && isMemberName(previous, item) {
+		item, isItem := reader.CurNode.(*ast.Item)
+		switch {
+		case isItem && isMemberName(previous, item):
 			formatted = memberKeyword(item)
-		} else {
+		case isKeywordNode(previous, "IN") && isParenthesis(reader.CurNode):
+			formatted = formatInline(reader.CurNode, env)
+		case isKeywordNode(reader.CurNode, "SELECT") && isParenthesis(previous) && env.inline == 0:
+			// INSERT INTO t (...) SELECT
+			formatted = &ast.ItemWith{Toks: []ast.Node{linebreakNode, Eval(reader.CurNode, env)}}
+		default:
 			formatted = Eval(reader.CurNode, env)
 		}
+		before := previous
 		previous = reader.CurNode
 		results = append(results, formatted)
 
 		// Add whitespace between adjacent tokens when needed
 		// Check if we should add space after current token
-		if shouldAddSpaceAfter(reader.CurNode, reader, formatted) {
+		if shouldAddSpaceAfter(reader.CurNode, before, reader, formatted, env) {
 			results = append(results, whitespaceNode)
 		}
 	}
@@ -702,7 +675,7 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 	return reader.Node
 }
 
-func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted ast.Node) bool {
+func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader, formatted ast.Node, env *formatEnvironment) bool {
 	// Don't add space if already ends with whitespace/linebreak
 	if endsWithWhitespace(formatted) {
 		return false
@@ -725,6 +698,19 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 		return !isItemKind(nextNode, token.Comma, token.RParen, token.Semicolon)
 	}
 	if isItemKind(nextNode, token.Comment, token.MultilineComment) {
+		return true
+	}
+
+	// "X = CASE", "IF (cond)", "IN (1, 2)"; "INSERT INTO t (a) SELECT"
+	if isDanglingInfix(curNode) || isParenthesis(nextNode) && (isKeywordNode(curNode, "IN") || isIdentifierKeyword(curNode)) {
+		return true
+	}
+	if isParenthesis(curNode) && isKeywordNode(nextNode, "SELECT") && env.inline == 0 {
+		return false
+	}
+
+	// A binary "-" or "+" is spaced from its right operand
+	if isItemKind(curNode, token.Minus, token.Plus) && isOperand(previous) {
 		return true
 	}
 
@@ -784,6 +770,10 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 				}
 				for _, lbkw := range linebreakBeforeKeywords {
 					if kw == lbkw {
+						// On one line, or the AND of BETWEEN, it stays on this line
+						if env.inline > 0 || kw == "AND" && env.betweenPending {
+							return true
+						}
 						// Exception: if current keyword is DELETE and next is FROM, always add space
 						// because "DELETE FROM" should be on one line
 						if curItem, ok := curNode.(*ast.Item); ok {

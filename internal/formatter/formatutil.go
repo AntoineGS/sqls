@@ -2,6 +2,7 @@ package formatter
 
 import (
 	"slices"
+	"strings"
 
 	"github.com/sqls-server/sqls/ast"
 	"github.com/sqls-server/sqls/dialect"
@@ -105,9 +106,19 @@ func isCharItem(node ast.Node, value string) bool {
 // lastNode returns the last leaf of node, as the "_" ending the list "'a', _".
 func lastNode(node ast.Node) ast.Node {
 	if list, ok := node.(ast.TokenList); ok {
-		if toks := list.GetTokens(); len(toks) > 0 {
-			return lastNode(toks[len(toks)-1])
+		toks := list.GetTokens()
+		for i := len(toks) - 1; i >= 0; i-- {
+			if !isItemKind(toks[i], token.Whitespace) {
+				return lastNode(toks[i])
+			}
 		}
 	}
 	return node
+}
+
+// isIdentifierKeyword reports an identifier the formatter renders as a
+// keyword, as IF.
+func isIdentifierKeyword(node ast.Node) bool {
+	ident, ok := node.(*ast.Identifier)
+	return ok && slices.Contains(identifierKeywords, strings.ToUpper(ident.String()))
 }

@@ -21,6 +21,7 @@ func TestVerifyFormatted(t *testing.T) {
 		{"joined comment and word", "select /* c */ x from t", "SELECT /* c */x FROM t", false},
 		{"identifier case", "select Name from t", "SELECT NAME FROM t", false},
 		{"identifier the formatter renders as keyword", "drop table IF exists t", "DROP TABLE if EXISTS t", true},
+		{"table named term", "select * from TERM", "select * from term", false},
 		{"delimited identifier case", `select "Name" from t`, `SELECT "NAME" FROM t`, false},
 		{"string literal", "select 'a b' from t", "SELECT 'a  b' FROM t", false},
 		{"comment text", "select 1 -- Note\nfrom t", "SELECT 1 -- note\nFROM t", false},
