@@ -40,28 +40,28 @@ var hoverTestCases = []struct {
 	{
 		name:   "select ident head",
 		input:  "SELECT ID, Name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    8,
 	},
 	{
 		name:   "select ident tail",
 		input:  "SELECT ID, Name FROM city",
-		output: "`city`.`Name` column\n\n`char(35)`\n",
+		output: "`city`.`Name` column\n\n`char(35)` NOT NULL\n",
 		line:   0,
 		col:    15,
 	},
 	{
 		name:   "select quoted ident head",
 		input:  "SELECT `ID`, Name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    8,
 	},
 	{
 		name:   "select quoted ident head",
 		input:  "SELECT `ID`, Name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    11,
 	},
@@ -96,21 +96,21 @@ var hoverTestCases = []struct {
 	{
 		name:   "select member ident child dot",
 		input:  "SELECT city.ID, city.Name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    12,
 	},
 	{
 		name:   "select member ident child head",
 		input:  "SELECT city.ID, city.Name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    13,
 	},
 	{
 		name:   "select member ident child tail",
 		input:  "SELECT city.ID, city.Name FROM city",
-		output: "`city`.`Name` column\n\n`char(35)`\n",
+		output: "`city`.`Name` column\n\n`char(35)` NOT NULL\n",
 		line:   0,
 		col:    25,
 	},
@@ -124,7 +124,7 @@ var hoverTestCases = []struct {
 	{
 		name:   "select aliased member ident child",
 		input:  "SELECT ci.ID, ci.Name FROM city AS ci",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    10,
 	},
@@ -166,14 +166,14 @@ var hoverTestCases = []struct {
 	{
 		name:   "select aliased select identifier",
 		input:  "SELECT ID AS city_id, Name AS city_name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    14,
 	},
 	{
 		name:   "select aliased select member identifier",
 		input:  "SELECT city.ID AS city_id, city.Name AS city_name FROM city",
-		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment\n",
+		output: "`city`.`ID` column\n\n`int(11)` PRI auto_increment NOT NULL\n",
 		line:   0,
 		col:    19,
 	},
@@ -184,7 +184,7 @@ var hoverTestCases = []struct {
   Name
 FROM city
 `,
-		output: "`city`.`Name` column\n\n`char(35)`\n",
+		output: "`city`.`Name` column\n\n`char(35)` NOT NULL\n",
 		line:   2,
 		col:    3,
 	},
@@ -195,7 +195,7 @@ FROM city
   Name
 FROM city
 `,
-		output: "`city`.`Name` column\n\n`char(35)`\n",
+		output: "`city`.`Name` column\n\n`char(35)` NOT NULL\n",
 		line:   2,
 		col:    6,
 	},

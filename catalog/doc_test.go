@@ -7,6 +7,19 @@ import (
 	"testing"
 )
 
+func TestColumnHoverDocRendersAvailableDefinitionFacts(t *testing.T) {
+	desc := &ColumnDesc{
+		ColumnBase: ColumnBase{Table: "CITY", Name: "ID"},
+		Type:       "INTEGER",
+		Null:       "NO",
+		Key:        "YES",
+		Default:    sql.NullString{String: "0", Valid: true},
+	}
+	if got, want := ColumnHoverDoc("CITY", desc), "`CITY`.`ID` column\n\n`INTEGER` PRIMARY KEY NOT NULL DEFAULT `0`\n"; got != want {
+		t.Errorf("ColumnHoverDoc = %q, want %q", got, want)
+	}
+}
+
 func testProcedureDesc() *ProcedureDesc {
 	return &ProcedureDesc{
 		Name:        "MYPROC",
