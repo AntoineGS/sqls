@@ -114,6 +114,8 @@ type formatEnvironment struct {
 	blocks []bool
 	// betweenPending is set from BETWEEN to the AND of its range.
 	betweenPending bool
+	// commentBreaks holds the source line breaks around each comment.
+	commentBreaks map[ast.Node]lineBreaks
 }
 
 func (e *formatEnvironment) indentLevelReset() {
@@ -630,8 +632,7 @@ func formatFunctionLiteral(node *ast.FunctionLiteral, env *formatEnvironment) as
 // "(1, current_date)".
 func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnvironment) ast.Node {
 	results := []ast.Node{}
-	toks := identifierList.GetTokens()
-	for i, tok := range toks {
+	for _, tok := range identifierList.GetTokens() {
 		switch {
 		case isItemKind(tok, token.Whitespace):
 		case isItemKind(tok, token.Comma):
@@ -642,7 +643,7 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
 		case isItemKind(tok, token.Comment, token.MultilineComment):
-			comment := formatComment(toks, i, results, env)
+			comment := formatComment(tok, results, env)
 			results = append(results, comment)
 			if !endsWithWhitespace(comment) {
 				results = append(results, whitespaceNode)
@@ -666,7 +667,7 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 		case isItem && isMemberName(previous, item):
 			formatted = memberKeyword(item)
 		case isItemKind(reader.CurNode, token.Comment, token.MultilineComment):
-			formatted = formatComment(list.GetTokens(), reader.Index-1, results, env)
+			formatted = formatComment(reader.CurNode, results, env)
 		case isKeywordNode(previous, "IN") && isParenthesis(reader.CurNode):
 			formatted = formatInline(reader.CurNode, env)
 		case isKeywordNode(reader.CurNode, "SELECT") && isParenthesis(previous) && env.inline == 0:

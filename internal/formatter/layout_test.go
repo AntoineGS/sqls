@@ -104,6 +104,16 @@ func TestFormatLayout(t *testing.T) {
 			want:  "SELECT\n  a\nFROM\n  t\nORDER BY\n  a OFFSET 10 ROWS FETCH next 5 ROWS ONLY",
 		},
 		{
+			name:  "rows of offset and a commented fetch stay on their line",
+			input: "select a from t order by a offset 10 rows;\nselect a from t order by a fetch next 5 rows /* c */ only",
+			want:  "SELECT\n  a\nFROM\n  t\nORDER BY\n  a OFFSET 10 ROWS;\nSELECT\n  a\nFROM\n  t\nORDER BY\n  a FETCH next 5 ROWS /* c */ ONLY",
+		},
+		{
+			name:  "comment on its own line after an operator",
+			input: "select a +\n/* c */\nb from t where a =\n/* d */\n1",
+			want:  "SELECT\n  a +\n  /* c */\n  b\nFROM\n  t\nWHERE\n  a =\n  /* d */\n  1",
+		},
+		{
 			name:  "comment on its own line between clauses",
 			input: "select a from t a\nleft join u b on b.id = a.id\n\n/* Oct 7 2014 */\nleft join v c on c.id = a.id",
 			want:  "SELECT\n  a\nFROM\n  t a\nLEFT JOIN u b\n  ON b.id = a.id\n  /* Oct 7 2014 */\nLEFT JOIN v c\n  ON c.id = a.id",

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
 )
@@ -78,8 +79,7 @@ func formatContextItem(item *ast.Item, env *formatEnvironment) ast.Node {
 			return &ast.ItemWith{Toks: append([]ast.Node{item, linebreakNode}, env.genIndent()...)}
 		}
 	case "ROWS":
-		// The InterBase ROWS clause, not the ROWS of "FETCH NEXT 1 ROWS ONLY".
-		if _, next := env.reader.PeekNode(true); env.inline == 0 && !isKeywordNode(next, "ONLY", "FETCH") {
+		if env.inline == 0 && takesValue(env.reader) {
 			env.indentLevelDown()
 			toks := append([]ast.Node{linebreakNode}, env.genIndent()...)
 			return &ast.ItemWith{Toks: append(toks, item, whitespaceNode)}
@@ -136,26 +136,71 @@ func containsSelect(node ast.Node) bool {
 	return slices.ContainsFunc(paren.Inner().GetTokens(), func(tok ast.Node) bool { return isKeywordNode(tok, "SELECT") })
 }
 
-// formatComment lays out the comment toks[i]. A comment the source puts on
-// a line of its own keeps it, at the current indent; one that shares a line
-// with code stays on that line. A line comment always ends its line. done
-// holds the output so far.
-func formatComment(toks []ast.Node, i int, done []ast.Node, env *formatEnvironment) ast.Node {
-	before, after := false, false
+// takesValue reports whether the node after the current one, past comments,
+// is a value, as in the InterBase "ROWS 1 TO 10", rather than a keyword or
+// nothing, as in "OFFSET 10 ROWS" and "FETCH NEXT 1 ROWS ONLY".
+func takesValue(reader *astutil.NodeReader) bool {
+	next := reader.CopyReader()
+	for next.NextNode(true) {
+		if !isItemKind(next.CurNode, token.Comment, token.MultilineComment) {
+			return keywordOf(next.CurNode) == "" && !isItemKind(next.CurNode, token.Semicolon)
+		}
+	}
+	return false
+}
+
+// lineBreaks records whether the source breaks the line before and after a
+// comment.
+type lineBreaks struct{ before, after bool }
+
+// commentLineBreaks returns the source line breaks around every comment in
+// node. It reads the parsed tree before formatting rewrites it; a comment's
+// neighbouring whitespace may belong to another node.
+func commentLineBreaks(node ast.Node) map[ast.Node]lineBreaks {
+	leaves := []ast.Node{}
+	var walk func(ast.Node)
+	walk = func(node ast.Node) {
+		if list, ok := node.(ast.TokenList); ok {
+			for _, child := range list.GetTokens() {
+				walk(child)
+			}
+			return
+		}
+		leaves = append(leaves, node)
+	}
+	walk(node)
+	breaks := map[ast.Node]lineBreaks{}
+	for i, leaf := range leaves {
+		if !isItemKind(leaf, token.Comment, token.MultilineComment) {
+			continue
+		}
+		var b lineBreaks
+		for j := i - 1; j >= 0 && isItemKind(leaves[j], token.Whitespace); j-- {
+			b.before = b.before || isLineBreak(leaves[j])
+		}
+		for j := i + 1; j < len(leaves) && isItemKind(leaves[j], token.Whitespace); j++ {
+			b.after = b.after || isLineBreak(leaves[j])
+		}
+		breaks[leaf] = b
+	}
+	return breaks
+}
+
+// formatComment lays out a comment. A comment the source puts on a line of
+// its own keeps it, at the current indent; one that shares a line with code
+// stays on that line. A line comment always ends its line. done holds the
+// output so far.
+func formatComment(comment ast.Node, done []ast.Node, env *formatEnvironment) ast.Node {
+	var b lineBreaks
 	if env.inline == 0 {
-		for j := i - 1; j >= 0 && isItemKind(toks[j], token.Whitespace); j-- {
-			before = before || isLineBreak(toks[j])
-		}
-		for j := i + 1; j < len(toks) && isItemKind(toks[j], token.Whitespace); j++ {
-			after = after || isLineBreak(toks[j])
-		}
+		b = env.commentBreaks[comment]
 	}
 	results := []ast.Node{}
-	if before && !atLineStart(done) {
+	if b.before && !atLineStart(done) {
 		results = append(append(results, linebreakNode), env.genIndent()...)
 	}
-	results = append(results, toks[i])
-	if after || isItemKind(toks[i], token.Comment) {
+	results = append(results, comment)
+	if b.after || isItemKind(comment, token.Comment) {
 		results = append(append(results, linebreakNode), env.genIndent()...)
 	}
 	return &ast.ItemWith{Toks: results}
