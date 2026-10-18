@@ -447,8 +447,8 @@ func formatAliased(node *ast.Aliased, env *formatEnvironment) ast.Node {
 }
 
 // identifierKeywords are keywords the parser reads as identifiers and the
-// formatter renders as keywords: IF, and TERM of SET TERM.
-var identifierKeywords = []string{"IF", "TERM"}
+// formatter renders as keywords.
+var identifierKeywords = []string{"IF"}
 
 func formatIdentifier(node ast.Node, env *formatEnvironment) ast.Node {
 	// Handle special case: IF keyword parsed as Identifier

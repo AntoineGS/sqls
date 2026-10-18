@@ -31,7 +31,8 @@ func formatSource(src string, params lsp.DocumentFormattingParams, cfg *config.C
 			if comment := strings.TrimSpace(part.text); comment != "" {
 				lines = append(lines, comment)
 			}
-			lines = append(lines, keyword("SET")+" "+keyword("TERM")+" "+part.term+" "+part.previous)
+			// TERM is an identifier to the lexer; it keeps its spelling.
+			lines = append(lines, keyword("SET")+" "+part.termWord+" "+part.term+" "+part.previous)
 			continue
 		}
 		body, err := formatStatements(part.text, params, cfg, d)
@@ -69,6 +70,7 @@ type scriptPart struct {
 	text     string
 	term     string // terminator ending text, or the new one of SET TERM
 	previous string // terminator in effect before SET TERM
+	termWord string // TERM as written
 	setTerm  bool
 }
 
@@ -86,8 +88,8 @@ func splitScript(src string) ([]scriptPart, bool) {
 		}
 		for i := s.from; i < s.to; {
 			if fresh && !isSpace(src[i]) {
-				if next, end, ok := matchSetTerm(src, i, min(s.to, i+64), term); ok {
-					parts = append(parts, scriptPart{text: src[start:i], term: next, previous: term, setTerm: true})
+				if next, word, end, ok := matchSetTerm(src, i, min(s.to, i+64), term); ok {
+					parts = append(parts, scriptPart{text: src[start:i], term: next, previous: term, termWord: word, setTerm: true})
 					term, start, i, script = next, end, end, true
 					continue
 				}
@@ -108,22 +110,23 @@ func splitScript(src string) ([]scriptPart, bool) {
 	return parts, script
 }
 
-// matchSetTerm matches "SET TERM <new> <term>" at src[i:limit].
-func matchSetTerm(src string, i, limit int, term string) (string, int, bool) {
+// matchSetTerm matches "SET TERM <new> <term>" at src[i:limit], returning
+// the new terminator, TERM as written and the end of the match.
+func matchSetTerm(src string, i, limit int, term string) (string, string, int, bool) {
 	words := strings.Fields(src[i:limit])
 	if len(words) < 3 || !strings.EqualFold(words[0], "SET") || !strings.EqualFold(words[1], "TERM") {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	at := i + strings.Index(src[i:limit], words[2])
 	if strings.HasSuffix(words[2], term) && len(words[2]) > len(term) {
-		return strings.TrimSuffix(words[2], term), at + len(words[2]), true
+		return strings.TrimSuffix(words[2], term), words[1], at + len(words[2]), true
 	}
 	if len(words) < 4 || !strings.HasPrefix(words[3], term) {
-		return "", 0, false
+		return "", "", 0, false
 	}
 	end := at + len(words[2])
 	end += strings.Index(src[end:limit], term) + len(term)
-	return words[2], end, true
+	return words[2], words[1], end, true
 }
 
 func isSpace(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }

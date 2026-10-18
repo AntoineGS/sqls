@@ -79,6 +79,11 @@ func formatContextItem(item *ast.Item, env *formatEnvironment) ast.Node {
 		}
 	}
 	if env.inline > 0 && keyword != "" {
+		// On one line: no line breaks, but these keywords still bring the
+		// spaces the general rules expect from them.
+		if keyword == "BETWEEN" || keyword == "USING" || keyword == "THEN" {
+			return &ast.ItemWith{Toks: []ast.Node{whitespaceNode, item, whitespaceNode}}
+		}
 		return item
 	}
 	return nil

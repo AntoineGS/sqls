@@ -32,6 +32,16 @@ func TestFormatLayout(t *testing.T) {
 			want:  "SELECT\n  EXTRACT(YEAR FROM d),\n  COALESCE(x, 0),\n  SUBSTRING(a FROM 1 FOR 2)\nFROM\n  t\nWHERE\n  a IN (1, 2, 3)",
 		},
 		{
+			name:  "case and between inside arguments",
+			input: "select sum(case when x = 1 then 1 else 0 end), coalesce(a between 1 and 2, b) from t",
+			want:  "SELECT\n  SUM(CASE WHEN x = 1 THEN 1 ELSE 0 END),\n  COALESCE(a BETWEEN 1 AND 2, b)\nFROM\n  t",
+		},
+		{
+			name:  "set term keeps the spelling of term",
+			input: "set term ^ ;\nselect 1 from t^\nset Term ; ^",
+			want:  "SET term ^ ;\nSELECT\n  1\nFROM\n  t^\nSET Term ; ^",
+		},
+		{
 			name:  "in subquery stays multi-line",
 			input: "select a from t where b in (select b from u)",
 			want:  "SELECT\n  a\nFROM\n  t\nWHERE\n  b IN (\n    SELECT\n      b\n    FROM\n      u\n  )",
@@ -61,7 +71,7 @@ func TestFormatLayout(t *testing.T) {
 		{
 			name:  "multi-character terminator and terminators in strings",
 			input: "set term ^^ ;\ncreate procedure p as begin x = ';^^'; end^^\nset term ; ^^",
-			want:  "SET TERM ^^ ;\nCREATE PROCEDURE p AS\nBEGIN\n  x = ';^^';\nEND^^\nSET TERM ; ^^",
+			want:  "SET term ^^ ;\nCREATE PROCEDURE p AS\nBEGIN\n  x = ';^^';\nEND^^\nSET term ; ^^",
 		},
 		{
 			name:  "comment before set term and before the terminator",
