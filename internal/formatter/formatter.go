@@ -114,6 +114,8 @@ type formatEnvironment struct {
 	blocks []bool
 	// betweenPending is set from BETWEEN to the AND of its range.
 	betweenPending bool
+	// commentBreaks holds the source line breaks around each comment.
+	commentBreaks map[ast.Node]lineBreaks
 }
 
 func (e *formatEnvironment) indentLevelReset() {
@@ -539,8 +541,9 @@ func formatParenthesis(node *ast.Parenthesis, env *formatEnvironment) ast.Node {
 		}
 	}
 
-	// Check if should format multi-line (has comma or SELECT keyword)
-	shouldMultiLine := false
+	// Check if should format multi-line (has comma, SELECT keyword or a
+	// condition joined by AND or OR)
+	shouldMultiLine := joinsConditions(innerToks)
 
 	for _, tok := range innerToks {
 		if _, ok := tok.(*ast.IdentifierList); ok {
@@ -639,11 +642,12 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 			}
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
-		case isItemKind(tok, token.Comment):
-			results = append(results, tok, linebreakNode)
-			results = append(results, env.genIndent()...)
-		case isItemKind(tok, token.MultilineComment):
-			results = append(results, tok, whitespaceNode)
+		case isItemKind(tok, token.Comment, token.MultilineComment):
+			comment := formatComment(tok, results, env)
+			results = append(results, comment)
+			if !endsWithWhitespace(comment) {
+				results = append(results, whitespaceNode)
+			}
 		default:
 			results = append(results, Eval(tok, env))
 		}
@@ -662,6 +666,8 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 		switch {
 		case isItem && isMemberName(previous, item):
 			formatted = memberKeyword(item)
+		case isItemKind(reader.CurNode, token.Comment, token.MultilineComment):
+			formatted = formatComment(reader.CurNode, results, env)
 		case isKeywordNode(previous, "IN") && isParenthesis(reader.CurNode):
 			formatted = formatInline(reader.CurNode, env)
 		case isKeywordNode(reader.CurNode, "SELECT") && isParenthesis(previous) && env.inline == 0:

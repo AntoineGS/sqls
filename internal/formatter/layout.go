@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/sqls-server/sqls/ast"
+	"github.com/sqls-server/sqls/ast/astutil"
 	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/token"
 )
@@ -77,6 +78,12 @@ func formatContextItem(item *ast.Item, env *formatEnvironment) ast.Node {
 			env.lastKeyword = ""
 			return &ast.ItemWith{Toks: append([]ast.Node{item, linebreakNode}, env.genIndent()...)}
 		}
+	case "ROWS":
+		if env.inline == 0 && takesValue(env.reader) {
+			env.indentLevelDown()
+			toks := append([]ast.Node{linebreakNode}, env.genIndent()...)
+			return &ast.ItemWith{Toks: append(toks, item, whitespaceNode)}
+		}
 	}
 	if env.inline > 0 && keyword != "" {
 		// On one line: no line breaks, but these keywords still bring the
@@ -127,6 +134,111 @@ func containsSelect(node ast.Node) bool {
 		return false
 	}
 	return slices.ContainsFunc(paren.Inner().GetTokens(), func(tok ast.Node) bool { return isKeywordNode(tok, "SELECT") })
+}
+
+// takesValue reports whether the node after the current one, past comments,
+// is a value, as in the InterBase "ROWS 1 TO 10", rather than a keyword or
+// nothing, as in "OFFSET 10 ROWS" and "FETCH NEXT 1 ROWS ONLY".
+func takesValue(reader *astutil.NodeReader) bool {
+	next := reader.CopyReader()
+	for next.NextNode(true) {
+		if !isItemKind(next.CurNode, token.Comment, token.MultilineComment) {
+			return keywordOf(next.CurNode) == "" && !isItemKind(next.CurNode, token.Semicolon)
+		}
+	}
+	return false
+}
+
+// lineBreaks records whether the source breaks the line before and after a
+// comment.
+type lineBreaks struct{ before, after bool }
+
+// commentLineBreaks returns the source line breaks around every comment in
+// node. It reads the parsed tree before formatting rewrites it; a comment's
+// neighbouring whitespace may belong to another node.
+func commentLineBreaks(node ast.Node) map[ast.Node]lineBreaks {
+	leaves := []ast.Node{}
+	var walk func(ast.Node)
+	walk = func(node ast.Node) {
+		if list, ok := node.(ast.TokenList); ok {
+			for _, child := range list.GetTokens() {
+				walk(child)
+			}
+			return
+		}
+		leaves = append(leaves, node)
+	}
+	walk(node)
+	breaks := map[ast.Node]lineBreaks{}
+	for i, leaf := range leaves {
+		if !isItemKind(leaf, token.Comment, token.MultilineComment) {
+			continue
+		}
+		var b lineBreaks
+		for j := i - 1; j >= 0 && isItemKind(leaves[j], token.Whitespace); j-- {
+			b.before = b.before || isLineBreak(leaves[j])
+		}
+		for j := i + 1; j < len(leaves) && isItemKind(leaves[j], token.Whitespace); j++ {
+			b.after = b.after || isLineBreak(leaves[j])
+		}
+		breaks[leaf] = b
+	}
+	return breaks
+}
+
+// formatComment lays out a comment. A comment the source puts on a line of
+// its own keeps it, at the current indent; one that shares a line with code
+// stays on that line. A line comment always ends its line. done holds the
+// output so far.
+func formatComment(comment ast.Node, done []ast.Node, env *formatEnvironment) ast.Node {
+	var b lineBreaks
+	if env.inline == 0 {
+		b = env.commentBreaks[comment]
+	}
+	results := []ast.Node{}
+	if b.before && !atLineStart(done) {
+		results = append(append(results, linebreakNode), env.genIndent()...)
+	}
+	results = append(results, comment)
+	if b.after || isItemKind(comment, token.Comment) {
+		results = append(append(results, linebreakNode), env.genIndent()...)
+	}
+	return &ast.ItemWith{Toks: results}
+}
+
+// atLineStart reports whether nodes end with a line break and indent.
+func atLineStart(nodes []ast.Node) bool {
+	for i := len(nodes) - 1; i >= 0; i-- {
+		if text := strings.TrimRight(nodes[i].Render(&ast.RenderOptions{}), " \t"); text != "" {
+			return strings.HasSuffix(text, "\n")
+		}
+	}
+	return false
+}
+
+func isLineBreak(node ast.Node) bool {
+	item, ok := node.(*ast.Item)
+	return ok && item.GetToken().Kind == token.Whitespace && item.GetToken().Value == "\n"
+}
+
+// joinsConditions reports an AND or OR among toks, other than the AND of
+// "BETWEEN 1 AND 2".
+func joinsConditions(toks []ast.Node) bool {
+	between := false
+	for _, tok := range toks {
+		switch keywordOf(tok) {
+		case "BETWEEN":
+			between = true
+		case "AND":
+			if !between {
+				return true
+			}
+			between = false
+		case "OR":
+			return true
+		}
+	}
+	return false
 }
 
 // isDanglingInfix reports a comparison or operator whose right operand the

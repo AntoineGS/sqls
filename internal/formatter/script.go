@@ -54,7 +54,7 @@ func formatStatements(src string, params lsp.DocumentFormattingParams, cfg *conf
 	if err != nil {
 		return "", err
 	}
-	env := &formatEnvironment{options: params.Options}
+	env := &formatEnvironment{options: params.Options, commentBreaks: commentLineBreaks(parsed)}
 	rendered := Eval(parsed, env).Render(&ast.RenderOptions{LowerCase: cfg.LowercaseKeywords})
 	return tidyLines(rendered, indentUnit(params.Options)), nil
 }
