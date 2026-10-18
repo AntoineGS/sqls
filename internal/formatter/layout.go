@@ -77,6 +77,13 @@ func formatContextItem(item *ast.Item, env *formatEnvironment) ast.Node {
 			env.lastKeyword = ""
 			return &ast.ItemWith{Toks: append([]ast.Node{item, linebreakNode}, env.genIndent()...)}
 		}
+	case "ROWS":
+		// The InterBase ROWS clause, not the ROWS of "FETCH NEXT 1 ROWS ONLY".
+		if _, next := env.reader.PeekNode(true); env.inline == 0 && !isKeywordNode(next, "ONLY", "FETCH") {
+			env.indentLevelDown()
+			toks := append([]ast.Node{linebreakNode}, env.genIndent()...)
+			return &ast.ItemWith{Toks: append(toks, item, whitespaceNode)}
+		}
 	}
 	if env.inline > 0 && keyword != "" {
 		// On one line: no line breaks, but these keywords still bring the
@@ -127,6 +134,66 @@ func containsSelect(node ast.Node) bool {
 		return false
 	}
 	return slices.ContainsFunc(paren.Inner().GetTokens(), func(tok ast.Node) bool { return isKeywordNode(tok, "SELECT") })
+}
+
+// formatComment lays out the comment toks[i]. A comment the source puts on
+// a line of its own keeps it, at the current indent; one that shares a line
+// with code stays on that line. A line comment always ends its line. done
+// holds the output so far.
+func formatComment(toks []ast.Node, i int, done []ast.Node, env *formatEnvironment) ast.Node {
+	before, after := false, false
+	if env.inline == 0 {
+		for j := i - 1; j >= 0 && isItemKind(toks[j], token.Whitespace); j-- {
+			before = before || isLineBreak(toks[j])
+		}
+		for j := i + 1; j < len(toks) && isItemKind(toks[j], token.Whitespace); j++ {
+			after = after || isLineBreak(toks[j])
+		}
+	}
+	results := []ast.Node{}
+	if before && !atLineStart(done) {
+		results = append(append(results, linebreakNode), env.genIndent()...)
+	}
+	results = append(results, toks[i])
+	if after || isItemKind(toks[i], token.Comment) {
+		results = append(append(results, linebreakNode), env.genIndent()...)
+	}
+	return &ast.ItemWith{Toks: results}
+}
+
+// atLineStart reports whether nodes end with a line break and indent.
+func atLineStart(nodes []ast.Node) bool {
+	for i := len(nodes) - 1; i >= 0; i-- {
+		if text := strings.TrimRight(nodes[i].Render(&ast.RenderOptions{}), " \t"); text != "" {
+			return strings.HasSuffix(text, "\n")
+		}
+	}
+	return false
+}
+
+func isLineBreak(node ast.Node) bool {
+	item, ok := node.(*ast.Item)
+	return ok && item.GetToken().Kind == token.Whitespace && item.GetToken().Value == "\n"
+}
+
+// joinsConditions reports an AND or OR among toks, other than the AND of
+// "BETWEEN 1 AND 2".
+func joinsConditions(toks []ast.Node) bool {
+	between := false
+	for _, tok := range toks {
+		switch keywordOf(tok) {
+		case "BETWEEN":
+			between = true
+		case "AND":
+			if !between {
+				return true
+			}
+			between = false
+		case "OR":
+			return true
+		}
+	}
+	return false
 }
 
 // isDanglingInfix reports a comparison or operator whose right operand the

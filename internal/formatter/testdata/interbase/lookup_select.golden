@@ -310,7 +310,8 @@ FROM
       a.binfamily,
       /*(select min(cds_) from poreceiptsdet where productid=a.productid) firstpurch,
 (select max(cds_) from poreceiptsdet where productid=a.productid) lastpurch,
-*/ a.totalpurch TOTALRECEIVED,
+*/
+      a.totalpurch TOTALRECEIVED,
       a.INSTORESON,
       a.totalsales,
       a.emplyid,
@@ -399,7 +400,8 @@ FROM
       /*feb 26 2019*/ a.BINABLE,
       a.objective_id,
       a.master_of_coordgrp,
-      /*june 11 2020 */ a.OrderasSold /* December 10 2020 to be in sync with change done manually at AIC */,
+      /*june 11 2020 */ a.OrderasSold
+      /* December 10 2020 to be in sync with change done manually at AIC */,
       (
         SELECT
           SUM(ibs.ptotsales)
@@ -407,7 +409,8 @@ FROM
           invbranchskus ibs
         WHERE
           a.productid = ibs.productid
-      ) ptotsales /* June 1 2021*/,
+      ) ptotsales
+      /* June 1 2021*/,
       e.MIN_ORDER_QTY,
       /* Aug 18 2021 */ e.gold_increment * 1.00 supp_gold_increment,
       /* march 7 2022 */ a.ticketdesc,
@@ -501,22 +504,27 @@ FROM
     LEFT JOIN SUPPLIERACCOUNTING b
       ON (suppid = a.defsuppid)
     LEFT JOIN invcolorext c
-      ON (c.productid = a.productid
-      AND c.dim1 = a.nhg1)
+      ON (
+        c.productid = a.productid
+        AND c.dim1 = a.nhg1
+      )
     LEFT JOIN pclass pc
       ON (pc.pclass = a.pclass)
     LEFT JOIN psubc psc
       ON psc.pclass = a.pclass
       AND psc.psclass = a.psclass
     LEFT JOIN pricing pk
-      ON (pk.pricekey = a.PRODUCTID
-      AND pk.pricezoneid = '00'
-      AND pk.dim1 = '------'
-      AND pk.efdatestart <= 'today'
-      AND pk.efdateends >= 'today')
+      ON (
+        pk.pricekey = a.PRODUCTID
+        AND pk.pricezoneid = '00'
+        AND pk.dim1 = '------'
+        AND pk.efdatestart <= 'today'
+        AND pk.efdateends >= 'today'
+      )
     LEFT JOIN suppprod e
       ON e.productid = a.productid
-      AND e.suppid = a.defsuppid /* Oct 7 2014    */
+      AND e.suppid = a.defsuppid
+      /* Oct 7 2014    */
     LEFT JOIN prod_dev_steps pds
       ON pds.cstep = a.dev_state
     LEFT JOIN PRODGRPBMKS lkp_0
@@ -734,7 +742,8 @@ FROM
     LEFT JOIN MISC_FEES lkp_80
       ON lkp_80.id = a.MISC_FEE_ID
     WHERE
-      a.invcreatestat <> 'K' /* Was
+      a.invcreatestat <> 'K'
+      /* Was
    where <% @DsplInctvStll='Y' ?'1=1' : "a.invcreatestat<>'K' and a.invcreatestat<>'X' "%> 
    Futur only hides X not inactives at POS
    where <% @DsplInctvStll='Y' ?  '1=1' 
@@ -748,4 +757,5 @@ LEFT JOIN (
   FROM
     inventorymaster
 ) lkp_3
-  ON lkp_3.COORDINATEGRP2 = sub_q.COORDINATEGRP2 ROWS 200 TO 400
+  ON lkp_3.COORDINATEGRP2 = sub_q.COORDINATEGRP2
+ROWS 200 TO 400

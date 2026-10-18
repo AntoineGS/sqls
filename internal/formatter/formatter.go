@@ -539,8 +539,9 @@ func formatParenthesis(node *ast.Parenthesis, env *formatEnvironment) ast.Node {
 		}
 	}
 
-	// Check if should format multi-line (has comma or SELECT keyword)
-	shouldMultiLine := false
+	// Check if should format multi-line (has comma, SELECT keyword or a
+	// condition joined by AND or OR)
+	shouldMultiLine := joinsConditions(innerToks)
 
 	for _, tok := range innerToks {
 		if _, ok := tok.(*ast.IdentifierList); ok {
@@ -629,7 +630,8 @@ func formatFunctionLiteral(node *ast.FunctionLiteral, env *formatEnvironment) as
 // "(1, current_date)".
 func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnvironment) ast.Node {
 	results := []ast.Node{}
-	for _, tok := range identifierList.GetTokens() {
+	toks := identifierList.GetTokens()
+	for i, tok := range toks {
 		switch {
 		case isItemKind(tok, token.Whitespace):
 		case isItemKind(tok, token.Comma):
@@ -639,11 +641,12 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 			}
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
-		case isItemKind(tok, token.Comment):
-			results = append(results, tok, linebreakNode)
-			results = append(results, env.genIndent()...)
-		case isItemKind(tok, token.MultilineComment):
-			results = append(results, tok, whitespaceNode)
+		case isItemKind(tok, token.Comment, token.MultilineComment):
+			comment := formatComment(toks, i, results, env)
+			results = append(results, comment)
+			if !endsWithWhitespace(comment) {
+				results = append(results, whitespaceNode)
+			}
 		default:
 			results = append(results, Eval(tok, env))
 		}
@@ -662,6 +665,8 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 		switch {
 		case isItem && isMemberName(previous, item):
 			formatted = memberKeyword(item)
+		case isItemKind(reader.CurNode, token.Comment, token.MultilineComment):
+			formatted = formatComment(list.GetTokens(), reader.Index-1, results, env)
 		case isKeywordNode(previous, "IN") && isParenthesis(reader.CurNode):
 			formatted = formatInline(reader.CurNode, env)
 		case isKeywordNode(reader.CurNode, "SELECT") && isParenthesis(previous) && env.inline == 0:

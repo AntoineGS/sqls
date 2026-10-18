@@ -88,6 +88,56 @@ func TestFormatLayout(t *testing.T) {
 			input: "CREATE TRIGGER T1 FOR T ACTIVE BEFORE INSERT AS BEGIN NEW.ID = GEN_ID(G, 1); END",
 			want:  "CREATE TRIGGER T1 FOR T ACTIVE BEFORE INSERT AS\nBEGIN\n  NEW.ID = GEN_ID(G, 1);\nEND",
 		},
+		{
+			name:  "rows on its own line",
+			input: "select a from t rows 200 to 400",
+			want:  "SELECT\n  a\nFROM\n  t\nROWS 200 TO 400",
+		},
+		{
+			name:  "rows after a join and after order by",
+			input: "select a from t a left join u b on b.id = a.id order by a rows 1 to 2",
+			want:  "SELECT\n  a\nFROM\n  t a\nLEFT JOIN u b\n  ON b.id = a.id\nORDER BY\n  a\nROWS 1 TO 2",
+		},
+		{
+			name:  "rows of fetch stays on its line",
+			input: "select a from t order by a offset 10 rows fetch next 5 rows only",
+			want:  "SELECT\n  a\nFROM\n  t\nORDER BY\n  a OFFSET 10 ROWS FETCH next 5 ROWS ONLY",
+		},
+		{
+			name:  "comment on its own line between clauses",
+			input: "select a from t a\nleft join u b on b.id = a.id\n\n/* Oct 7 2014 */\nleft join v c on c.id = a.id",
+			want:  "SELECT\n  a\nFROM\n  t a\nLEFT JOIN u b\n  ON b.id = a.id\n  /* Oct 7 2014 */\nLEFT JOIN v c\n  ON c.id = a.id",
+		},
+		{
+			name:  "comment on its own line in a list",
+			input: "select a,\n/* own line */\nb from t",
+			want:  "SELECT\n  a,\n  /* own line */\n  b\nFROM\n  t",
+		},
+		{
+			name:  "comment on its own line before a comma",
+			input: "select a\n/* before comma */, b from t",
+			want:  "SELECT\n  a\n  /* before comma */,\n  b\nFROM\n  t",
+		},
+		{
+			name:  "multi-line comment on its own line at the end",
+			input: "select a from t where x <> 'K'\n\n/* Was\n  old */",
+			want:  "SELECT\n  a\nFROM\n  t\nWHERE\n  x <> 'K'\n  /* Was\n  old */",
+		},
+		{
+			name:  "parenthesized join condition as a block",
+			input: "select x from t a left join u c on (c.p = a.p and c.d = a.n)",
+			want:  "SELECT\n  x\nFROM\n  t a\nLEFT JOIN u c\n  ON (\n    c.p = a.p\n    AND c.d = a.n\n  )",
+		},
+		{
+			name:  "single parenthesized condition inline",
+			input: "select x from t a left join u c on (c.p = a.p) where (a between 1 and 2)",
+			want:  "SELECT\n  x\nFROM\n  t a\nLEFT JOIN u c\n  ON (c.p = a.p)\nWHERE\n  (a BETWEEN 1 AND 2)",
+		},
+		{
+			name:  "nested parenthesized conditions",
+			input: "select x from t where (a = 1 and (b = 2 or c = 3)) or d = 4",
+			want:  "SELECT\n  x\nFROM\n  t\nWHERE\n  (\n    a = 1\n    AND (\n      b = 2\n      OR c = 3\n    )\n  )\n  OR d = 4",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
