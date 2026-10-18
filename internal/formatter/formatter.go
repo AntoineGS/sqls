@@ -2,6 +2,7 @@ package formatter
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -28,41 +29,81 @@ func FormatWithDriverVariant(text string, params lsp.DocumentFormattingParams, c
 	return formatWithDialect(text, params, cfg, dialect.DialectForDriverVariant(dv))
 }
 
+// formatWithDialect returns ErrUnsafeFormat, and no edit, when formatting
+// panics or would change anything but whitespace and keyword case.
 func formatWithDialect(text string, params lsp.DocumentFormattingParams, cfg *config.Config, d dialect.Dialect) ([]lsp.TextEdit, error) {
 	if text == "" {
 		return nil, errors.New("empty")
 	}
-	parsed, err := parser.ParseWithDialect(text, d)
-	if err != nil {
-		return nil, err
-	}
+	return recoverFormat(func() ([]lsp.TextEdit, error) {
+		parsed, err := parser.ParseWithDialect(text, d)
+		if err != nil {
+			return nil, err
+		}
 
-	st, err := parserPositionToUTF16(text, parsed.Pos())
-	if err != nil {
-		return nil, err
-	}
-	en, err := parserPositionToUTF16(text, parsed.End())
-	if err != nil {
-		return nil, err
-	}
-	env := &formatEnvironment{
-		options: params.Options,
-	}
-	formatted := Eval(parsed, env)
+		st, err := parserPositionToUTF16(text, parsed.Pos())
+		if err != nil {
+			return nil, err
+		}
+		en, err := parserPositionToUTF16(text, parsed.End())
+		if err != nil {
+			return nil, err
+		}
+		from, err := parserPositionToOffset(text, parsed.Pos())
+		if err != nil {
+			return nil, err
+		}
+		to, err := parserPositionToOffset(text, parsed.End())
+		if err != nil {
+			return nil, err
+		}
+		env := &formatEnvironment{
+			options: params.Options,
+		}
+		formatted := Eval(parsed, env)
 
-	opts := &ast.RenderOptions{
-		LowerCase: cfg.LowercaseKeywords,
-	}
-	res := []lsp.TextEdit{
-		{
-			Range: lsp.Range{
-				Start: st,
-				End:   en,
+		opts := &ast.RenderOptions{
+			LowerCase: cfg.LowercaseKeywords,
+		}
+		newText := formatted.Render(opts)
+		if err := verifyFormatted(text[from:to], newText, d); err != nil {
+			return nil, err
+		}
+		res := []lsp.TextEdit{
+			{
+				Range: lsp.Range{
+					Start: st,
+					End:   en,
+				},
+				NewText: newText,
 			},
-			NewText: formatted.Render(opts),
-		},
+		}
+		return res, nil
+	})
+}
+
+// parserPositionToOffset converts an AST's rune-based position into a byte
+// offset in text.
+func parserPositionToOffset(text string, pos token.Pos) (int, error) {
+	if pos.Line < 0 || pos.Col < 0 {
+		return 0, errors.New("invalid parser position")
 	}
-	return res, nil
+	offset := 0
+	for line := 0; line < pos.Line; line++ {
+		delim, delimLen := nextLineBreak(text, offset)
+		if delim < 0 {
+			return 0, errors.New("invalid parser position")
+		}
+		offset = delim + delimLen
+	}
+	for col := 0; col < pos.Col; col++ {
+		if offset >= len(text) || text[offset] == '\n' || text[offset] == '\r' {
+			return 0, errors.New("invalid parser position")
+		}
+		_, size := utf8.DecodeRuneInString(text[offset:])
+		offset += size
+	}
+	return offset, nil
 }
 
 // parserPositionToUTF16 converts an AST's rune-based position into the UTF-16
@@ -456,11 +497,15 @@ func formatAliased(node *ast.Aliased, env *formatEnvironment) ast.Node {
 	return &ast.ItemWith{Toks: results}
 }
 
+// identifierKeywords are keywords the parser reads as identifiers and the
+// formatter renders as keywords.
+var identifierKeywords = []string{"IF"}
+
 func formatIdentifier(node ast.Node, env *formatEnvironment) ast.Node {
 	// Handle special case: IF keyword parsed as Identifier
 	if ident, ok := node.(*ast.Identifier); ok {
 		keyword := ident.String()
-		if keyword == "IF" {
+		if slices.Contains(identifierKeywords, keyword) {
 			// Convert to lowercase keyword Item
 			lowerItem := ast.NewItem(&token.Token{
 				Kind: token.SQLKeyword,
@@ -481,29 +526,34 @@ func formatMemberIdentifier(node *ast.MemberIdentifier, env *formatEnvironment) 
 	results := []ast.Node{
 		Eval(node.Parent, env),
 		periodNode,
-		Eval(node.Child, env),
+	}
+	// The parser leaves Child nil when a keyword follows the period, as in
+	// "a.active"; that keyword is the next sibling node.
+	if node.Child != nil {
+		results = append(results, Eval(node.Child, env))
 	}
 	return &ast.ItemWith{Toks: results}
 }
 
 func formatOperator(node *ast.Operator, env *formatEnvironment) ast.Node {
-	results := []ast.Node{
-		Eval(node.Left, env),
-		whitespaceNode,
-		node.Operator,
-		whitespaceNode,
-		Eval(node.Right, env),
-	}
-	return &ast.ItemWith{Toks: results}
+	return formatInfix(node.Left, node.Operator, node.Right, env)
 }
 
 func formatComparison(node *ast.Comparison, env *formatEnvironment) ast.Node {
-	results := []ast.Node{
-		Eval(node.Left, env),
-		whitespaceNode,
-		node.Comparison,
-		whitespaceNode,
-		Eval(node.Right, env),
+	return formatInfix(node.Left, node.Comparison, node.Right, env)
+}
+
+// formatInfix tolerates a nil operand: the parser leaves one when it is a
+// parameter, keyword or signed number, as in "id = :id", and that operand is
+// the next sibling node.
+func formatInfix(left, operator, right ast.Node, env *formatEnvironment) ast.Node {
+	results := []ast.Node{}
+	if left != nil {
+		results = append(results, Eval(left, env), whitespaceNode)
+	}
+	results = append(results, operator)
+	if right != nil {
+		results = append(results, whitespaceNode, Eval(right, env))
 	}
 	return &ast.ItemWith{Toks: results}
 }
@@ -536,6 +586,10 @@ func formatParenthesis(node *ast.Parenthesis, env *formatEnvironment) ast.Node {
 	shouldMultiLine := false
 
 	for _, tok := range innerToks {
+		if _, ok := tok.(*ast.IdentifierList); ok {
+			shouldMultiLine = true
+			break
+		}
 		if item, ok := tok.(*ast.Item); ok {
 			tokKind := item.GetToken().Kind
 			// Multi-line if has comma
@@ -613,7 +667,9 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 	results := []ast.Node{}
 	for i, ident := range idents {
 		results = append(results, Eval(ident, env))
-		if i != len(idents)-1 {
+		// A trailing comma precedes a list item the parser left outside the
+		// list, as the keyword in "(1, current_date)".
+		if i != len(idents)-1 || len(identifierList.Commas) >= len(idents) {
 			results = append(results, commaNode, linebreakNode)
 			results = append(results, env.genIndent()...)
 		}
@@ -624,9 +680,16 @@ func formatIdentifierList(identifierList *ast.IdentifierList, env *formatEnviron
 func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 	results := []ast.Node{}
 	reader := astutil.NewNodeReader(list)
+	var previous ast.Node
 	for reader.NextNode(true) {
 		env.reader = reader
-		formatted := Eval(reader.CurNode, env)
+		var formatted ast.Node
+		if item, ok := reader.CurNode.(*ast.Item); ok && isMemberName(previous, item) {
+			formatted = memberKeyword(item)
+		} else {
+			formatted = Eval(reader.CurNode, env)
+		}
+		previous = reader.CurNode
 		results = append(results, formatted)
 
 		// Add whitespace between adjacent tokens when needed
@@ -645,17 +708,44 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 		return false
 	}
 
-	// Don't add space after comment
-	if item, ok := curNode.(*ast.Item); ok {
-		tok := item.GetToken()
-		if tok.Kind == token.Comment || tok.Kind == token.MultilineComment {
-			return false
-		}
-	}
-
 	// Check next node (ignoreWhitespace=true to skip linebreaks)
 	_, nextNode := reader.PeekNode(true)
 	if nextNode == nil {
+		return false
+	}
+
+	// The member's keyword name follows directly: "a.active"
+	if item, ok := nextNode.(*ast.Item); ok && isMemberName(curNode, item) {
+		return false
+	}
+
+	// A line comment ends with its own linebreak; a block comment is
+	// separated from what follows it, and comments from what precedes them.
+	if item, ok := curNode.(*ast.Item); ok && item.GetToken().Kind == token.MultilineComment {
+		return !isItemKind(nextNode, token.Comma, token.RParen, token.Semicolon)
+	}
+	if isItemKind(nextNode, token.Comment, token.MultilineComment) {
+		return true
+	}
+
+	// Comparisons the parser left ungrouped, as in "a.active = 1"
+	if isItemKind(curNode, comparisonKinds...) || isItemKind(nextNode, comparisonKinds...) {
+		return true
+	}
+
+	// "- -1" and "/ *" must not become comments
+	if (isItemKind(curNode, token.Minus) && isItemKind(nextNode, token.Minus)) ||
+		(isItemKind(curNode, token.Div) && isItemKind(nextNode, token.Mult)) {
+		return true
+	}
+
+	// The two characters of "||" stay together; the operator they form is
+	// spaced from its operands. Other unrecognized characters, such as the
+	// "_" of "_utf8'abc'", stay attached to what follows.
+	if isCharItem(curNode, "|") || isCharItem(nextNode, "|") {
+		return !(isCharItem(curNode, "|") && isCharItem(nextNode, "|"))
+	}
+	if last := lastNode(curNode); isItemKind(last, token.Char) && !isCharItem(last, "?") {
 		return false
 	}
 
@@ -664,20 +754,12 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 		return false
 	}
 
-	// Debug: check if nextNode is comment
-	if item, ok := nextNode.(*ast.Item); ok {
-		tok := item.GetToken()
-		if tok.Kind == token.Comment || tok.Kind == token.MultilineComment {
-			return false
-		}
-	}
-
-	// Don't add space before punctuation or comment
+	// Don't add space before punctuation
 	if item, ok := nextNode.(*ast.Item); ok {
 		tok := item.GetToken()
 		if tok.Kind == token.Comma || tok.Kind == token.RParen ||
 			tok.Kind == token.Semicolon || tok.Kind == token.Period ||
-			tok.Kind == token.LParen || tok.Kind == token.Comment {
+			tok.Kind == token.LParen {
 			return false
 		}
 
@@ -738,9 +820,9 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 			}
 		}
 
-		// Only process SQL keywords
+		// A literal is separated from a following word: "2 DESC"
 		if curTok.Kind != token.SQLKeyword {
-			return false
+			return wordLike(curTok.Kind) && startsWithWord(nextNode)
 		}
 
 		// Check if current item is BETWEEN, USING, THEN (handled by whitespaceAroundMatcher)
@@ -794,6 +876,9 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 		if _, ok := nextNode.(*ast.FunctionLiteral); ok {
 			return true
 		}
+		if _, ok := nextNode.(*ast.IdentifierList); ok {
+			return startsWithWord(nextNode)
+		}
 	}
 
 	// Add space after FunctionLiteral if next is Item (keyword)
@@ -827,7 +912,7 @@ func shouldAddSpaceAfter(curNode ast.Node, reader *astutil.NodeReader, formatted
 
 		// Add space before most node types
 		switch nextNode.(type) {
-		case *ast.Identifier, *ast.Item, *ast.Aliased:
+		case *ast.Identifier, *ast.Item, *ast.Aliased, *ast.MemberIdentifier, *ast.FunctionLiteral, *ast.IdentifierList:
 			return true
 		}
 	}

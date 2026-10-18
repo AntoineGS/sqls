@@ -11,7 +11,9 @@ import (
 // Format returns the text edits that reformat req.Document under options,
 // rendered for req.Context's driver variant. It carries no per-connection
 // keyword-case setting of its own; a host supplies its current
-// UppercaseKeywords choice in options for each call.
+// UppercaseKeywords choice in options for each call. It returns an error, and
+// no edits, when the result would differ from the document in anything but
+// whitespace and keyword case.
 func (s *Service) Format(ctx context.Context, req Request, options FormatOptions) (Result[[]TextEdit], error) {
 	if err := ctx.Err(); err != nil {
 		return Result[[]TextEdit]{}, ErrCanceled
