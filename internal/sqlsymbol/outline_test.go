@@ -56,9 +56,11 @@ func TestQueryOutlineClassifiesSubqueryRoles(t *testing.T) {
 	}{
 		{name: "where exists", text: "SELECT * FROM T WHERE EXISTS (SELECT 1 FROM U)", role: "where", predicate: "EXISTS"},
 		{name: "where without from", text: "SELECT 1 WHERE EXISTS (SELECT 1 FROM U)", role: "where", predicate: "EXISTS"},
-		{name: "having", text: "SELECT * FROM T GROUP BY T.ID HAVING (SELECT 1 FROM U) > 0", role: "having"},
+		{name: "having after where and group by", text: "SELECT * FROM T WHERE T.ID > 0 GROUP BY T.ID HAVING (SELECT 1 FROM U) > 0", role: "having"},
+		{name: "group by after where", text: "SELECT * FROM T WHERE T.ID > 0 GROUP BY (SELECT 1 FROM U)", role: "other"},
 		{name: "join condition", text: "SELECT * FROM T JOIN U ON T.ID = (SELECT V.ID FROM V)", role: "join"},
 		{name: "other", text: "SELECT * FROM T ORDER BY (SELECT 1 FROM U)", role: "other"},
+		{name: "order by after where", text: "SELECT * FROM T WHERE T.ID > 0 ORDER BY (SELECT 1 FROM U)", role: "other"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,6 +76,20 @@ func TestQueryOutlineClassifiesSubqueryRoles(t *testing.T) {
 				t.Fatalf("subquery = %+v, want parent=0 role=%q name=%q predicate=%q", got, tt.role, tt.roleName, tt.predicate)
 			}
 		})
+	}
+}
+
+func TestQueryOutlineClauseTransitionFromJoinToWhere(t *testing.T) {
+	text := "SELECT * FROM T JOIN U ON T.ID = (SELECT V.ID FROM V) WHERE EXISTS (SELECT W.ID FROM W)"
+	queries, err := QueryOutline(text, interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(queries) != 3 {
+		t.Fatalf("query count = %d, want 3: %+v", len(queries), queries)
+	}
+	if queries[1].Role != "join" || queries[2].Role != "where" {
+		t.Fatalf("subquery roles = %q, %q, want join then where", queries[1].Role, queries[2].Role)
 	}
 }
 

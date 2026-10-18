@@ -277,6 +277,8 @@ func precedingQueryClause(parent sqlQuery, before int, items []lexeme, depths []
 			clause = "HAVING"
 		case isWord(items[i], "ON"):
 			clause = "ON"
+		case isQueryClause(items[i]), isWord(items[i], "FROM"), isWord(items[i], "JOIN"), isWord(items[i], "ROWS"):
+			clause = ""
 		}
 	}
 	return clause
