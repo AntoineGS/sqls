@@ -1,6 +1,7 @@
 package formatter
 
 import (
+	"os"
 	"testing"
 
 	"github.com/sqls-server/sqls/dialect"
@@ -77,6 +78,21 @@ func TestFormatRegressions(t *testing.T) {
 			input: "select /* keep */ x from t",
 			want:  "SELECT\n  /* keep */ x\nFROM\n  t",
 		},
+		{
+			name:  "block comment after list comma",
+			input: "select a, /* note */ b, c from t",
+			want:  "SELECT\n  a,\n  /* note */ b,\n  c\nFROM\n  t",
+		},
+		{
+			name:  "line comment after list comma",
+			input: "select a, -- note\nb from t",
+			want:  "SELECT\n  a,\n  -- note\n  b\nFROM\n  t",
+		},
+		{
+			name:  "comment after argument comma",
+			input: "select f(a, /* n */ b) from t",
+			want:  "SELECT\n  f(a, /* n */ b)\nFROM\n  t",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -115,5 +131,21 @@ func TestFormatInterBaseCorpus(t *testing.T) {
 	}
 	for _, input := range corpus {
 		formatInterBase(t, input)
+	}
+}
+
+// A generated lookup query: nested derived tables, scalar subqueries, about
+// eighty joins and comments between list items.
+func TestFormatInterBaseLookupSelect(t *testing.T) {
+	input, err := os.ReadFile("testdata/interbase/lookup_select.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := os.ReadFile("testdata/interbase/lookup_select.golden")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := formatInterBase(t, string(input)) + "\n"; got != string(want) {
+		t.Fatalf("formatted =\n%s", got)
 	}
 }
