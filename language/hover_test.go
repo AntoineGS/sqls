@@ -125,6 +125,110 @@ func TestHoverColumnIdentifierReturnsColumnDoc(t *testing.T) {
 	}
 }
 
+func TestHoverColumnReferenceReturnsOnlyItsColumnDoc(t *testing.T) {
+	tests := []struct {
+		name      string
+		text      string
+		field     string
+		fieldPart string
+	}{
+		{name: "bare SELECT", text: "SELECT ID FROM CITY", field: "ID", fieldPart: "ID"},
+		{name: "bare WHERE", text: "SELECT ID FROM CITY WHERE NAME = 'x'", field: "NAME", fieldPart: "NAME"},
+		{name: "alias SELECT", text: "SELECT C.ID FROM CITY C", field: "ID", fieldPart: "C.ID"},
+		{name: "alias WHERE", text: "SELECT ID FROM CITY C WHERE C.NAME = 'x'", field: "NAME", fieldPart: "C.NAME"},
+		{name: "table SELECT", text: "SELECT CITY.ID FROM CITY", field: "ID", fieldPart: "CITY.ID"},
+		{name: "table WHERE", text: "SELECT ID FROM CITY WHERE CITY.NAME = 'x'", field: "NAME", fieldPart: "CITY.NAME"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cache := hoverCache()
+			text := test.text
+			position := strings.LastIndex(text, test.fieldPart)
+			if strings.Contains(test.fieldPart, ".") {
+				position += strings.LastIndex(test.fieldPart, ".") + 1
+			} else if test.name == "bare SELECT" {
+				position = strings.Index(text, test.fieldPart)
+			}
+			req := hoverRequest(cache, text)
+			result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: position + 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			column, ok := cache.Column("CITY", test.field)
+			if !ok {
+				t.Fatalf("test column %q missing from fixture", test.field)
+			}
+			want := catalog.ColumnHoverDoc("CITY", column)
+			if result.Value.Markdown != want {
+				t.Fatalf("hover markdown = %q, want only the column doc %q", result.Value.Markdown, want)
+			}
+		})
+	}
+}
+
+func TestHoverViewColumnReferenceReturnsOnlyItsColumnDoc(t *testing.T) {
+	cache := hoverCache()
+	viewColumns := []*catalog.ColumnDesc{
+		{ColumnBase: catalog.ColumnBase{Table: "CITY_VIEW", Name: "ID"}, Type: "INTEGER", Key: "YES"},
+		{ColumnBase: catalog.ColumnBase{Table: "CITY_VIEW", Name: "NAME"}, Type: "VARCHAR(35)"},
+	}
+	cache.ColumnsWithParent[catalog.ColumnDatabaseKey("", "CITY_VIEW")] = viewColumns
+	cache.Metadata[catalog.MetadataRelations] = catalog.MetadataReady
+	cache.Metadata[catalog.MetadataViews] = catalog.MetadataReady
+	cache.Metadata[catalog.MetadataColumnsCurrent] = catalog.MetadataReady
+	cache.ColumnsByID = map[string][]*catalog.ColumnDesc{
+		(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "CITY"}).Key(): cache.ColumnsWithParent[catalog.ColumnDatabaseKey("", "CITY")],
+	}
+	view := &catalog.ViewDesc{Name: "CITY_VIEW", Columns: viewColumns}
+	cache.Catalog = &catalog.CatalogCache{
+		Views:     map[string]*catalog.ViewDesc{"CITY_VIEW": view},
+		ViewsByID: map[string]*catalog.ViewDesc{(catalog.ObjectID{Kind: catalog.ObjectKindView, Name: "CITY_VIEW"}).Key(): view},
+	}
+	cache.Catalog.RebuildObjects(strings.ToUpper)
+
+	for _, test := range []struct {
+		name      string
+		text      string
+		fieldPart string
+		field     string
+	}{
+		{name: "bare SELECT", text: "SELECT ID FROM CITY_VIEW", fieldPart: "ID", field: "ID"},
+		{name: "bare WHERE", text: "SELECT ID FROM CITY_VIEW WHERE NAME = 'x'", fieldPart: "NAME", field: "NAME"},
+		{name: "alias SELECT", text: "SELECT V.ID FROM CITY_VIEW V", fieldPart: "V.ID", field: "ID"},
+		{name: "alias WHERE", text: "SELECT ID FROM CITY_VIEW V WHERE V.NAME = 'x'", fieldPart: "V.NAME", field: "NAME"},
+		{name: "table SELECT", text: "SELECT CITY_VIEW.ID FROM CITY_VIEW", fieldPart: "CITY_VIEW.ID", field: "ID"},
+		{name: "table WHERE", text: "SELECT ID FROM CITY_VIEW WHERE CITY_VIEW.NAME = 'x'", fieldPart: "CITY_VIEW.NAME", field: "NAME"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			position := strings.LastIndex(test.text, test.fieldPart)
+			if strings.Contains(test.fieldPart, ".") {
+				position += strings.LastIndex(test.fieldPart, ".") + 1
+			}
+			req := hoverRequest(cache, test.text)
+			details := &recordingDetails{}
+			req.Context.Details = details
+			result, err := language.NewService().Hover(context.Background(), req, language.Position{Line: 0, UTF16Column: position + 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var column *catalog.ColumnDesc
+			for _, candidate := range viewColumns {
+				if candidate.Name == test.field {
+					column = candidate
+					break
+				}
+			}
+			want := catalog.ColumnHoverDoc("CITY_VIEW", column)
+			if result.Value.Markdown != want {
+				t.Fatalf("hover markdown = %q, want only the column doc %q", result.Value.Markdown, want)
+			}
+			if len(details.requests) != 0 {
+				t.Fatalf("column hover made relation detail requests: %#v", details.requests)
+			}
+		})
+	}
+}
+
 func TestHoverTableIdentifierReturnsTableDoc(t *testing.T) {
 	text := "SELECT ID FROM CITY"
 	req := hoverRequest(hoverCache(), text)

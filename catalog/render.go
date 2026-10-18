@@ -3,6 +3,7 @@ package catalog
 import (
 	"bytes"
 	"fmt"
+	"strings"
 
 	"github.com/sqls-server/sqls/parser/parseutil"
 )
@@ -14,6 +15,34 @@ func ColumnDoc(tableName string, colDesc *ColumnDesc) string {
 	fmt.Fprintln(buf)
 	fmt.Fprintln(buf, colDesc.OnelineDesc())
 	return buf.String()
+}
+
+// ColumnHoverDoc renders a column's definition facts for hover popups. Unlike
+// ColumnDoc, this also includes known nullability and default metadata.
+func ColumnHoverDoc(tableName string, colDesc *ColumnDesc) string {
+	buf := new(bytes.Buffer)
+	fmt.Fprintf(buf, "`%s`.`%s` column", tableName, colDesc.Name)
+	fmt.Fprintln(buf)
+	fmt.Fprintln(buf)
+	description := colDesc.OnelineDesc()
+	switch strings.ToUpper(colDesc.Null) {
+	case "NO":
+		description = appendColumnFact(description, "NOT NULL")
+	case "YES":
+		description = appendColumnFact(description, "NULL")
+	}
+	if colDesc.Default.Valid && colDesc.Default.String != "" {
+		description = appendColumnFact(description, "DEFAULT "+codeSpan(colDesc.Default.String))
+	}
+	fmt.Fprintln(buf, description)
+	return buf.String()
+}
+
+func appendColumnFact(description, fact string) string {
+	if description == "" {
+		return fact
+	}
+	return description + " " + fact
 }
 
 func Coalesce(str ...string) string {

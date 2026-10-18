@@ -45,6 +45,13 @@ func (s *Service) Hover(ctx context.Context, req Request, position Position) (Re
 	if ctx.Err() != nil {
 		return Result[Hover]{}, ErrCanceled
 	}
+	if analysis != nil {
+		if offset, offsetErr := ByteOffset(req.Document.Text, position); offsetErr == nil && analysis.Resolve(offset).Role == sqlsymbol.Column {
+			// A column hover is already its exact definition; its navigation target is
+			// the owning relation, whose summary/detail must not replace or expand it.
+			return result, cacheErr
+		}
+	}
 	target, selectedRange, ok, err := navigationTargetAtWithAnalysis(req, position, parsed, analysis)
 	if err != nil {
 		return Result[Hover]{}, err
@@ -486,7 +493,7 @@ func hoverContentFromChildIdent(ctx *hoverContext, identName string, cache *cata
 }
 
 func columnHoverInfo(tableName, colName string, colDesc *catalog.ColumnDesc) string {
-	return catalog.ColumnDoc(tableName, colDesc)
+	return catalog.ColumnHoverDoc(tableName, colDesc)
 }
 
 func tableHoverInfo(tableName string, cols []*catalog.ColumnDesc) string {
