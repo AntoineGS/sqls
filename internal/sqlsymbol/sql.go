@@ -168,81 +168,12 @@ func itemWord(item lexeme) string {
 }
 
 func queryRelations(text string, items []lexeme, query sqlQuery, depths []int, matching map[int]int) ([]RelationRef, RelationRef, bool) {
-	if query.start >= query.end {
-		return nil, RelationRef{}, false
+	occurrences, target, hasTarget := queryRelationOccurrences(text, items, query, depths, matching)
+	relations := make([]RelationRef, 0, len(occurrences))
+	for _, occurrence := range occurrences {
+		relations = append(relations, occurrence.ref)
 	}
-	seen := make(map[int]bool)
-	addAt := func(index int, relations *[]RelationRef) int {
-		ref, next, ok := relationAt(text, items, index, query.end, depths, matching, true)
-		if !ok || seen[index] {
-			return index
-		}
-		seen[index] = true
-		*relations = append(*relations, ref)
-		return next - 1
-	}
-
-	var relations []RelationRef
-	var target RelationRef
-	hasTarget := false
-	if query.kind == "UPDATE" {
-		if index := nextName(items, query.start+1, query.end); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
-			if hasTarget {
-				relations = append(relations, target)
-				seen[index] = true
-			}
-		}
-	} else if query.kind == "INSERT" {
-		if index := wordAfter(items, query.start+1, query.end, "INTO"); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
-			if hasTarget {
-				relations = append(relations, target)
-				seen[index] = true
-			}
-		}
-	} else if query.kind == "DELETE" {
-		if index := wordAfter(items, query.start+1, query.end, "FROM"); index >= 0 {
-			target, _, hasTarget = relationAt(text, items, index, query.end, depths, matching, false)
-			if hasTarget {
-				relations = append(relations, target)
-				seen[index] = true
-			}
-		}
-	}
-
-	inFrom := false
-	for i := query.start + 1; i < query.end; i++ {
-		if depths[i] != query.baseDepth {
-			continue
-		}
-		if close, ok := matching[i]; ok {
-			i = close
-			continue
-		}
-		switch {
-		case isWord(items[i], "FROM"), isWord(items[i], "USING"):
-			inFrom = true
-			if isWord(items[i], "FROM") && query.kind == "DELETE" {
-				inFrom = false
-			}
-		case isWord(items[i], "JOIN"):
-			inFrom = true
-			i = addAt(i+1, &relations)
-		case inFrom && items[i].Token.Kind == token.Comma:
-			i = addAt(i+1, &relations)
-		case inFrom && isQueryClause(items[i]):
-			inFrom = false
-		default:
-			if inFrom && query.kind == "SELECT" && i == query.start+1 {
-				i = addAt(i, &relations)
-			}
-		}
-		if isWord(items[i], "FROM") && query.kind == "SELECT" {
-			i = addAt(i+1, &relations)
-		}
-	}
-	return relations, target, hasTarget
+	return relations, target.ref, hasTarget
 }
 
 func isQueryClause(item lexeme) bool {
@@ -279,13 +210,18 @@ func wordAfter(items []lexeme, start, end int, word string) int {
 }
 
 func relationAt(text string, items []lexeme, start, end int, depths []int, matching map[int]int, callable bool) (RelationRef, int, bool) {
+	ref, _, next, ok := relationAtWithNameSpan(text, items, start, end, depths, matching, callable)
+	return ref, next, ok
+}
+
+func relationAtWithNameSpan(text string, items []lexeme, start, end int, depths []int, matching map[int]int, callable bool) (RelationRef, Span, int, bool) {
 	if start < 0 || start >= end {
-		return RelationRef{}, start, false
+		return RelationRef{}, Span{}, start, false
 	}
 	if items[start].Token.Kind == token.LParen {
 		close, ok := matching[start]
 		if !ok || close >= end {
-			return RelationRef{}, start, false
+			return RelationRef{}, Span{}, start, false
 		}
 		next := close + 1
 		if next < end && isWord(items[next], "AS") {
@@ -299,24 +235,26 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 			aliasDeclaration = items[next].Span
 			next++
 		}
-		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
+		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, Span{}, next, true
 	}
 	if !isNameToken(items[start]) {
-		return RelationRef{}, start, false
+		return RelationRef{}, Span{}, start, false
 	}
 	name, ok := nameFromLexeme(text, items[start])
 	if !ok {
-		return RelationRef{}, start, false
+		return RelationRef{}, Span{}, start, false
 	}
+	nameSpan := items[start].Span
 	next := start + 1
 	for next+1 < end && items[next].Token.Kind == token.Period && isNameToken(items[next+1]) {
 		name, _ = nameFromLexeme(text, items[next+1])
+		nameSpan = items[next+1].Span
 		next += 2
 	}
 	if callable && next < end && items[next].Token.Kind == token.LParen {
 		close, ok := matching[next]
 		if !ok || close >= end {
-			return RelationRef{}, start, false
+			return RelationRef{}, Span{}, start, false
 		}
 		next = close + 1
 		if next < end && isWord(items[next], "AS") {
@@ -330,7 +268,7 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 			aliasDeclaration = items[next].Span
 			next++
 		}
-		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
+		return RelationRef{Alias: alias, AliasDeclaration: aliasDeclaration}, Span{}, next, true
 	}
 	var alias *Name
 	var aliasDeclaration Span
@@ -343,5 +281,5 @@ func relationAt(text string, items []lexeme, start, end int, depths []int, match
 		aliasDeclaration = items[next].Span
 		next++
 	}
-	return RelationRef{Name: name, Alias: alias, AliasDeclaration: aliasDeclaration}, next, true
+	return RelationRef{Name: name, Alias: alias, AliasDeclaration: aliasDeclaration}, nameSpan, next, true
 }
