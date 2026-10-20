@@ -41,7 +41,7 @@ func TestFormatRegressions(t *testing.T) {
 		{
 			name:  "values keep every comma",
 			input: "insert into t (a, b, c) values (1, 'x', current_date)",
-			want:  "INSERT INTO t(\n  a,\n  b,\n  c\n)\nVALUES(\n  1,\n  'x',\n  CURRENT_DATE\n)",
+			want:  "INSERT INTO t (\n  a,\n  b,\n  c\n)\nVALUES(\n  1,\n  'x',\n  CURRENT_DATE\n)",
 		},
 		{
 			name:  "order by number and direction",
@@ -56,7 +56,7 @@ func TestFormatRegressions(t *testing.T) {
 		{
 			name:  "column types",
 			input: "create table t (a integer not null, b varchar(10) default 'x', primary key (a))",
-			want:  "CREATE TABLE t(\n  a INTEGER NOT NULL,\n  b VARCHAR(10) DEFAULT 'x',\n  PRIMARY KEY(a)\n)",
+			want:  "CREATE TABLE t (\n  a INTEGER NOT NULL,\n  b VARCHAR(10) DEFAULT 'x',\n  PRIMARY KEY(a)\n)",
 		},
 		{
 			name:  "double minus is not a comment",

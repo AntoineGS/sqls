@@ -54,7 +54,7 @@ func TestFormatLayout(t *testing.T) {
 		{
 			name:  "insert select",
 			input: "insert into t (a, b) select a, b from u",
-			want:  "INSERT INTO t(\n  a,\n  b\n)\nSELECT\n  a,\n  b\nFROM\n  u",
+			want:  "INSERT INTO t (\n  a,\n  b\n)\nSELECT\n  a,\n  b\nFROM\n  u",
 		},
 		{
 			name:  "comments without blank lines or trailing spaces",
@@ -65,7 +65,7 @@ func TestFormatLayout(t *testing.T) {
 			name: "procedure body by block depth",
 			input: "SET TERM ^ ;\nCREATE PROCEDURE P1 RETURNS (X INTEGER) AS\nBEGIN\n  X = 1;\n  IF (X = 1) THEN\n  BEGIN\n" +
 				"    X = CASE WHEN X = 1 THEN 2 ELSE 3 END;\n  END\n  SUSPEND;\nEND^\nSET TERM ; ^",
-			want: "SET TERM ^ ;\nCREATE PROCEDURE P1 RETURNS(X INTEGER) AS\nBEGIN\n  X = 1;\n  IF (X = 1) THEN\n  BEGIN\n" +
+			want: "SET TERM ^ ;\nCREATE PROCEDURE P1 RETURNS (X INTEGER) AS\nBEGIN\n  X = 1;\n  IF (X = 1) THEN\n  BEGIN\n" +
 				"    X = CASE\n      WHEN X = 1 THEN 2\n      ELSE 3\n    END;\n  END\n  SUSPEND;\nEND^\nSET TERM ; ^",
 		},
 		{
@@ -82,6 +82,23 @@ func TestFormatLayout(t *testing.T) {
 			name:  "multi-line literals and comments keep their lines",
 			input: "select 'a  \n   b', x /* c  \n   d */ from t",
 			want:  "SELECT\n  'a  \n   b',\n  x /* c  \n   d */\nFROM\n  t",
+		},
+		{
+			name: "character set in procedure parameters",
+			input: "CREATE PROCEDURE P (A VARCHAR(8) CHARACTER SET NONE, B INTEGER, C CHAR(1) CHARACTER SET NONE) " +
+				"RETURNS (D VARCHAR(4) CHARACTER SET NONE, E INTEGER) AS BEGIN SUSPEND; END",
+			want: "CREATE PROCEDURE P (\n  A VARCHAR(8) CHARACTER SET NONE,\n  B INTEGER,\n  C CHAR(1) CHARACTER SET NONE\n) RETURNS (\n" +
+				"  D VARCHAR(4) CHARACTER SET NONE,\n  E INTEGER\n) AS\nBEGIN\n  SUSPEND;\nEND",
+		},
+		{
+			name:  "character set in table columns",
+			input: "create table t (a varchar(8) character set none not null, b integer)",
+			want:  "CREATE TABLE t (\n  a VARCHAR(8) CHARACTER SET NONE NOT NULL,\n  b INTEGER\n)",
+		},
+		{
+			name:  "character set in a cast stays inline",
+			input: "select cast(a as varchar(8) character set none) from t",
+			want:  "SELECT\n  CAST(a AS VARCHAR(8) CHARACTER SET NONE)\nFROM\n  t",
 		},
 		{
 			name:  "trigger body without set term",
@@ -151,8 +168,12 @@ func TestFormatLayout(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := formatInterBase(t, tt.input); got != tt.want {
+			got := formatInterBase(t, tt.input)
+			if got != tt.want {
 				t.Fatalf("formatted =\n%s\nwant\n%s\n(%q)", got, tt.want, got)
+			}
+			if again := formatInterBase(t, got); again != got {
+				t.Fatalf("formatting the result again changed it to\n%s", again)
 			}
 		})
 	}

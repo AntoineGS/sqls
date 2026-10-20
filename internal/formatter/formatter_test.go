@@ -26,7 +26,7 @@ func TestEval(t *testing.T) {
 		{
 			name:     "InsertIntoFormat",
 			input:    "INSERT INTO users (NAME, email) VALUES ('john doe', 'example@host.com')",
-			expected: "INSERT INTO users(\n\tNAME,\n\temail\n)\nVALUES(\n\t'john doe',\n\t'example@host.com'\n)",
+			expected: "INSERT INTO users (\n\tNAME,\n\temail\n)\nVALUES(\n\t'john doe',\n\t'example@host.com'\n)",
 			params:   lsp.DocumentFormattingParams{},
 			config: &config.Config{
 				LowercaseKeywords: false,
