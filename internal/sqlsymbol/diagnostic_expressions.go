@@ -438,7 +438,35 @@ func (m *diagnosticModel) identifierFact(items []lexeme) (expressionFact, bool) 
 	if resolution.Role == Column && resolution.SQL != nil {
 		return m.sqlColumnFact(resolution.SQL, item.Span.Start)
 	}
+	if reference, ok := m.triggerColumnReference(items, item); ok {
+		return m.sqlColumnFact(reference, item.Span.Start)
+	}
 	return expressionFact{}, false
+}
+
+// triggerColumnReference builds the column reference the binder would have
+// resolved for item, a name in a recognized trigger body's embedded SQL. The
+// binder does not recognize CREATE TRIGGER, so it leaves these names
+// unresolved; the model's own query scope stands in. NEW/OLD row references
+// and names shared with a declared local stay unresolved, as before.
+func (m *diagnosticModel) triggerColumnReference(items []lexeme, item lexeme) (*SQLReference, bool) {
+	at := m.itemIndexAt(item.Span.Start)
+	if at < 0 || at >= len(m.queryAt) || m.queryAt[at] < 0 || !m.inTriggerBody(at) {
+		return nil, false
+	}
+	name, ok := nameFromLexeme(m.analysis.Text, item)
+	if !ok || m.matchesDeclaredLocal(at, name) {
+		return nil, false
+	}
+	reference := &SQLReference{Name: name, Scopes: m.RelationScope(at)}
+	if len(items) == 3 {
+		qualifier, ok := nameFromLexeme(m.analysis.Text, items[0])
+		if !ok || isTriggerRowAlias(qualifier) {
+			return nil, false
+		}
+		reference.Qualifier = &qualifier
+	}
+	return reference, true
 }
 
 // relationColumnFacts resolves name's column list, preferring

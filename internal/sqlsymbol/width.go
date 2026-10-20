@@ -112,20 +112,32 @@ func isTypeWordByte(b byte) bool {
 // expressionWidth infers a proven maximum character width for a complete
 // expression. Unsupported or ambiguous expressions return ok=false.
 func (a *Analysis) expressionWidth(items []lexeme, c Catalog) (int, bool) {
+	return a.expressionWidthIn(items, widthContext{catalog: c})
+}
+
+// widthContext is what width inference resolves names against.
+type widthContext struct {
+	catalog Catalog
+	// columnReference resolves a SQL name the binder left unresolved (a
+	// trigger body's embedded SQL); nil when no such fallback exists.
+	columnReference func(items []lexeme, item lexeme) (*SQLReference, bool)
+}
+
+func (a *Analysis) expressionWidthIn(items []lexeme, w widthContext) (int, bool) {
 	items = significantLexemes(items)
 	if len(items) == 0 {
 		return 0, false
 	}
-	return a.expressionWidthRange(items, c)
+	return a.expressionWidthRange(items, w)
 }
 
-func (a *Analysis) expressionWidthRange(items []lexeme, c Catalog) (int, bool) {
+func (a *Analysis) expressionWidthRange(items []lexeme, w widthContext) (int, bool) {
 	items = trimExpressionParens(items)
 	if len(items) == 0 || !balancedExpression(items) {
 		return 0, false
 	}
 
-	if width, ok := a.concatenationWidth(items, c); ok {
+	if width, ok := a.concatenationWidth(items, w); ok {
 		return width, true
 	} else if hasTopLevelConcatenation(a.Text, items) {
 		return 0, false
@@ -138,11 +150,11 @@ func (a *Analysis) expressionWidthRange(items []lexeme, c Catalog) (int, bool) {
 		}
 	}
 
-	if width, ok, recognized := a.callWidth(items, c); recognized {
+	if width, ok, recognized := a.callWidth(items, w); recognized {
 		return width, ok
 	}
 
-	if width, ok := a.identifierWidth(items, c); ok {
+	if width, ok := a.identifierWidth(items, w); ok {
 		return width, true
 	}
 	return 0, false
@@ -209,7 +221,7 @@ func hasTopLevelConcatenation(text string, items []lexeme) bool {
 	return false
 }
 
-func (a *Analysis) concatenationWidth(items []lexeme, c Catalog) (int, bool) {
+func (a *Analysis) concatenationWidth(items []lexeme, w widthContext) (int, bool) {
 	depth := 0
 	start := 0
 	total := 0
@@ -227,7 +239,7 @@ func (a *Analysis) concatenationWidth(items []lexeme, c Catalog) (int, bool) {
 		if item.Span.End != items[i+1].Span.Start || a.Text[item.Span.Start:items[i+1].Span.End] != "||" {
 			continue
 		}
-		partWidth, ok := a.expressionWidthRange(items[start:i], c)
+		partWidth, ok := a.expressionWidthRange(items[start:i], w)
 		if !ok {
 			return 0, false
 		}
@@ -242,7 +254,7 @@ func (a *Analysis) concatenationWidth(items []lexeme, c Catalog) (int, bool) {
 	if !found {
 		return 0, false
 	}
-	partWidth, ok := a.expressionWidthRange(items[start:], c)
+	partWidth, ok := a.expressionWidthRange(items[start:], w)
 	if !ok {
 		return 0, false
 	}
@@ -282,7 +294,7 @@ func stringLiteralWidth(text string, item lexeme) (int, bool) {
 	return width, true
 }
 
-func (a *Analysis) callWidth(items []lexeme, c Catalog) (int, bool, bool) {
+func (a *Analysis) callWidth(items []lexeme, w widthContext) (int, bool, bool) {
 	if len(items) < 3 || items[0].Token.Kind != token.SQLKeyword || items[1].Token.Kind != token.LParen {
 		return 0, false, false
 	}
@@ -317,7 +329,7 @@ func (a *Analysis) callWidth(items []lexeme, c Catalog) (int, bool, bool) {
 		if !known {
 			return 0, false, true
 		}
-		sourceWidth, ok := a.expressionWidthRange(arguments[:from], c)
+		sourceWidth, ok := a.expressionWidthRange(arguments[:from], w)
 		if !ok {
 			return 0, false, true
 		}
@@ -329,7 +341,7 @@ func (a *Analysis) callWidth(items []lexeme, c Catalog) (int, bool, bool) {
 		if topLevelWordIndex(arguments, "FROM") >= 0 {
 			return 0, false, true
 		}
-		width, known := a.expressionWidthRange(arguments, c)
+		width, known := a.expressionWidthRange(arguments, w)
 		return width, known, true
 	default:
 		return 0, false, true
@@ -389,7 +401,7 @@ func nonnegativeInteger(items []lexeme) (int, bool) {
 	return value, true
 }
 
-func (a *Analysis) identifierWidth(items []lexeme, c Catalog) (int, bool) {
+func (a *Analysis) identifierWidth(items []lexeme, w widthContext) (int, bool) {
 	var item lexeme
 	switch len(items) {
 	case 1:
@@ -415,7 +427,12 @@ func (a *Analysis) identifierWidth(items []lexeme, c Catalog) (int, bool) {
 		return stringTypeWidth(resolution.Symbol.Type)
 	}
 	if resolution.Role == Column && resolution.SQL != nil {
-		return sqlColumnWidth(resolution.SQL, c)
+		return sqlColumnWidth(resolution.SQL, w.catalog)
+	}
+	if w.columnReference != nil {
+		if reference, ok := w.columnReference(items, item); ok {
+			return sqlColumnWidth(reference, w.catalog)
+		}
 	}
 	return 0, false
 }

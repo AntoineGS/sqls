@@ -310,3 +310,59 @@ func TestDiagnosticProcedureArityStringLiteralWithCommaNotMiscounted(t *testing.
 	requireCodeCount(t, "EXECUTE PROCEDURE P('a, b', 2);",
 		newDiagnosticFixtureCatalog(), "interbase-procedure-arity", 0)
 }
+
+// A trigger body's embedded SQL gets the same statement-level checks as a
+// procedure body's, whether or not a declaration's semicolon precedes BEGIN.
+func TestDiagnosticTriggerStatementChecksMatchProcedures(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	options := DiagnosticOptions{Rules: map[string]string{codeLossyAssignment: "warning"}}
+	statements := map[string]string{
+		"insert values count": "INSERT INTO T (ID, V) VALUES (1);",
+		"insert select count": "INSERT INTO U (ID) SELECT ID, V FROM T;",
+		"insert truncation":   "INSERT INTO T (NAME) VALUES ('ABCDEFGHIJKLMNOP');",
+		"update truncation":   "UPDATE T SET NAME = 'ABCDEFGHIJKLMNOP' WHERE ID = 1;",
+		"insert invalid":      "INSERT INTO T (N) VALUES (99999);",
+		"insert select lossy": "INSERT INTO T (N) SELECT V FROM U;",
+		"from callable arity": "SELECT OUT1 FROM P (1) INTO :A;",
+		"select into count":   "SELECT ID, V FROM T INTO :A;",
+		"column truncation":   "INSERT INTO T (NAME) SELECT NAME || NAME FROM T;",
+	}
+	codes := func(sql string) map[string]int {
+		t.Helper()
+		a, err := AnalyzeDiagnostics(sql, interBaseVariant())
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := map[string]int{}
+		for _, f := range a.DiagnosticsWithOptions(c, options) {
+			if f.Code != codeUnused && f.Code != codeUnknownVariable {
+				found[f.Code]++
+			}
+		}
+		return found
+	}
+	for name, statement := range statements {
+		t.Run(name, func(t *testing.T) {
+			want := codes("CREATE PROCEDURE PR1 (A INTEGER) AS\nBEGIN\n  " + statement + "\nEND")
+			if len(want) == 0 {
+				t.Fatalf("procedure fixture reports nothing for %q", statement)
+			}
+			for header, body := range map[string]string{
+				"without declarations": "BEGIN\n  " + statement + "\nEND",
+				"with a declaration":   "DECLARE VARIABLE A INTEGER;\nBEGIN\n  " + statement + "\nEND",
+			} {
+				got := codes("CREATE TRIGGER TR1 FOR U BEFORE UPDATE AS\n" + body)
+				if len(got) != len(want) {
+					t.Errorf("%s: trigger findings %v, procedure findings %v", header, got, want)
+					continue
+				}
+				for code, count := range want {
+					if got[code] != count {
+						t.Errorf("%s: trigger findings %v, procedure findings %v", header, got, want)
+						break
+					}
+				}
+			}
+		})
+	}
+}

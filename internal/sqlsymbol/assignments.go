@@ -53,7 +53,7 @@ func (a *Analysis) widthDiagnostics(c Catalog) []Finding {
 		if model.staleCatalogDestination(edge) {
 			continue
 		}
-		findings = append(findings, a.findingForDestination(edge.source, edge.destination, c)...)
+		findings = append(findings, a.findingForDestination(edge.source, edge.destination, widthContext{catalog: c, columnReference: model.triggerColumnReference})...)
 	}
 	sort.SliceStable(findings, func(i, j int) bool {
 		return findings[i].Span.Start < findings[j].Span.Start
@@ -395,12 +395,12 @@ func (a *Analysis) parseSelectIntoEdges(items []lexeme, selectIndex, end int) ([
 	return edges, true
 }
 
-func (a *Analysis) findingForDestination(source []lexeme, destination widthDestination, c Catalog) []Finding {
+func (a *Analysis) findingForDestination(source []lexeme, destination widthDestination, w widthContext) []Finding {
 	destinationWidth, known := stringTypeWidth(destination.typeName)
 	if !known || len(source) == 0 || !balancedExpression(source) {
 		return nil
 	}
-	sourceWidth, known := a.expressionWidth(source, c)
+	sourceWidth, known := a.expressionWidthIn(source, w)
 	if !known || sourceWidth <= destinationWidth {
 		return nil
 	}
