@@ -46,6 +46,7 @@ func newProvider(ctx context.Context, cfg Config) (metadata.Provider, error) {
 		SQLDialect:       cfg.Dialect,
 		SourceSQLDialect: cfg.Dialect,
 		DatabaseName:     cfg.Target,
+		FormatDDLHeader:  formatDDLHeader,
 	}
 	return &nativeProvider{conn: conn, repo: repo}, nil
 }

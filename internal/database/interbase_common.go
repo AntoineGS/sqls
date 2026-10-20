@@ -310,6 +310,10 @@ type InterBaseDBRepository struct {
 	SourceSQLDialect int
 	// DatabaseName is the attachment string; empty when unknown.
 	DatabaseName string
+	// FormatDDLHeader optionally lays out the header of generated procedure
+	// and view DDL, up to and including its AS, for one SQL dialect. The
+	// stored body stays verbatim; on error the DDL is left as generated.
+	FormatDDLHeader func(header string, sqlDialect int) (string, error)
 
 	// snapshot is set only on a repository returned by CatalogSnapshot. It
 	// binds this repository to one read-only transaction that has already read

@@ -122,6 +122,22 @@ func isKeywordNode(node ast.Node, keywords ...string) bool {
 	return keyword != "" && slices.Contains(keywords, keyword)
 }
 
+// isDeclarationName reports the name a parameter or column list follows: the
+// object of PROCEDURE, TABLE, VIEW or INSERT INTO, or RETURNS.
+func isDeclarationName(node, previous ast.Node) bool {
+	if isKeywordNode(node, "RETURNS") {
+		return true
+	}
+	if _, ok := node.(*ast.Identifier); !ok {
+		return false
+	}
+	if multi, ok := previous.(*ast.MultiKeyword); ok {
+		keywords := multi.GetKeywords()
+		return len(keywords) > 0 && isKeywordNode(keywords[len(keywords)-1], "INTO")
+	}
+	return isKeywordNode(previous, "PROCEDURE", "TABLE", "VIEW")
+}
+
 func isParenthesis(node ast.Node) bool {
 	_, ok := node.(*ast.Parenthesis)
 	return ok

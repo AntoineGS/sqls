@@ -670,6 +670,13 @@ func formatTokenList(list ast.TokenList, env *formatEnvironment) ast.Node {
 			formatted = formatComment(reader.CurNode, results, env)
 		case isKeywordNode(previous, "IN") && isParenthesis(reader.CurNode):
 			formatted = formatInline(reader.CurNode, env)
+		case isKeywordNode(previous, "CHARACTER") && isKeywordNode(reader.CurNode, "SET"):
+			// "CHARACTER SET" of a type, not a SET clause
+			toks := []ast.Node{reader.CurNode, whitespaceNode}
+			if len(results) > 0 && !endsWithWhitespace(results[len(results)-1]) {
+				toks = append([]ast.Node{whitespaceNode}, toks...)
+			}
+			formatted = &ast.ItemWith{Toks: toks}
 		case isKeywordNode(reader.CurNode, "SELECT") && isParenthesis(previous) && env.inline == 0:
 			// INSERT INTO t (...) SELECT
 			formatted = &ast.ItemWith{Toks: []ast.Node{linebreakNode, Eval(reader.CurNode, env)}}
@@ -718,6 +725,11 @@ func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader,
 
 	// "X = CASE", "IF (cond)", "IN (1, 2)"; "INSERT INTO t (a) SELECT"
 	if isDanglingInfix(curNode) || isParenthesis(nextNode) && (isKeywordNode(curNode, "IN") || isIdentifierKeyword(curNode)) {
+		return true
+	}
+	// A declared name stays apart from its list, which would otherwise parse
+	// as a function call: "CREATE TABLE t (", "INSERT INTO t (", "RETURNS ("
+	if isParenthesis(nextNode) && isDeclarationName(curNode, previous) {
 		return true
 	}
 	if isParenthesis(curNode) && isKeywordNode(nextNode, "SELECT") && env.inline == 0 {
