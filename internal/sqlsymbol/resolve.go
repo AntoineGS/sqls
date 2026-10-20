@@ -217,14 +217,21 @@ func isWriteOccurrence(items []lexeme, index int, context tokenContext) bool {
 	if context.outputTarget {
 		return true
 	}
-	if context.kind != contextProcedure || index+1 >= len(items) || items[index+1].Token.Kind != token.Eq || index == 0 {
+	return context.kind == contextProcedure && isProceduralAssignmentTarget(items, index)
+}
+
+// isProceduralAssignmentTarget reports whether the name at index starts a
+// `name = expression;` statement. A name followed by = elsewhere, such as in
+// an IF condition, is a comparison.
+func isProceduralAssignmentTarget(items []lexeme, index int) bool {
+	if index+1 >= len(items) || items[index+1].Token.Kind != token.Eq || index == 0 {
 		return false
 	}
 	previous := items[index-1]
 	if previous.Token.Kind == token.Semicolon {
 		return true
 	}
-	return isWord(previous, "BEGIN") || isWord(previous, "THEN") || isWord(previous, "ELSE") || isWord(previous, "DO")
+	return isWord(previous, "BEGIN") || isWord(previous, "END") || isWord(previous, "THEN") || isWord(previous, "ELSE") || isWord(previous, "DO")
 }
 
 func declarationRole(symbol *Symbol) Role {

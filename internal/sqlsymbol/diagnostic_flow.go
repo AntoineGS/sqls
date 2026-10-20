@@ -641,7 +641,7 @@ func flowTriggerSymbols(text string, items []lexeme, trg triggerModel) ([]*Symbo
 		// input/read even when the following SQL token is `=`. Only the
 		// recognizer's explicit INTO target position is a SQL write. The
 		// adjacent-`=` lvalue rule applies to procedural assignments only.
-		proceduralLValue := !ctx.inSQL[i-trg.bodyStart] && i+1 < trg.bodyEnd && items[i+1].Token.Kind == token.Eq
+		proceduralLValue := !ctx.inSQL[i-trg.bodyStart] && i+1 < trg.bodyEnd && isProceduralAssignmentTarget(items, i)
 		if outputTarget || proceduralLValue {
 			symbol.Writes = append(symbol.Writes, span)
 		} else {

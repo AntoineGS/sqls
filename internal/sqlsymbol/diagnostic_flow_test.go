@@ -103,6 +103,26 @@ func TestDiagnosticFlowNullTestedReadIsNotReadBeforeAssignment(t *testing.T) {
 	}
 }
 
+// Production change caught: only a name at the start of a statement is an
+// assignment target. A name compared with = in a condition is a read, and a
+// statement after a nested block's END is still an assignment.
+func TestDiagnosticFlowAssignmentTargetOnlyAtStatementStart(t *testing.T) {
+	for name, header := range map[string]string{
+		"trigger":   "CREATE TRIGGER TR_T FOR T BEFORE DELETE AS",
+		"procedure": "CREATE PROCEDURE Q AS",
+	} {
+		t.Run(name, func(t *testing.T) {
+			declarations := " DECLARE VARIABLE V INTEGER; DECLARE VARIABLE W INTEGER; BEGIN "
+			for _, condition := range []string{"V = 99", ":V = 99", "W = 1 AND V = 99"} {
+				source := header + declarations + "W = 1; IF (" + condition + ") THEN W = 2; END"
+				requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 1)
+			}
+			afterBlock := header + declarations + "IF (1 = 1) THEN BEGIN W = 1; END V = 2; W = V; END"
+			requireFlowCount(t, flowDiagnostic(t, afterBlock, flowRulesOn), "interbase-read-before-assignment", 0)
+		})
+	}
+}
+
 // Production change caught: an ungrouped aggregate query returns exactly one
 // row, so its SELECT INTO has no zero-row path that leaves targets unassigned.
 func TestDiagnosticFlowAggregateSelectIntoAlwaysAssigns(t *testing.T) {
