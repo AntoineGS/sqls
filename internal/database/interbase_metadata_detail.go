@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/metadata"
@@ -442,7 +443,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
-				acquired.Text = ddl
+				acquired.Text = db.formatDDLHeader(ddl, procedure.Source.String, req.Dialect)
 				acquired.Provenance = "interbase:procedure-ddl"
 				return acquired, nil
 			},
@@ -666,7 +667,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
-				acquired.Text = ddl
+				acquired.Text = db.formatDDLHeader(ddl, view.ViewSource.String, req.Dialect)
 				acquired.Provenance = "interbase:view-ddl"
 				return acquired, nil
 			},
@@ -722,6 +723,25 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 }
 
 // --- retained-fact -> driver value reconstruction --------------------------
+
+// formatDDLHeader lays out the header of ddl, which ends with the stored
+// body, through FormatDDLHeader and appends the body verbatim.
+func (db *InterBaseDBRepository) formatDDLHeader(ddl, body string, dialect int) string {
+	if db.FormatDDLHeader == nil || !strings.HasSuffix(ddl, body) {
+		return ddl
+	}
+	if dialect != 1 {
+		dialect = 3
+	}
+	header, err := db.FormatDDLHeader(strings.TrimRightFunc(strings.TrimSuffix(ddl, body), unicode.IsSpace), dialect)
+	if err != nil {
+		return ddl
+	}
+	if strings.TrimLeftFunc(body, unicode.IsSpace) == body {
+		header += " "
+	}
+	return header + body
+}
 
 func interBaseDDLDialectFor(dialect int) schema.DDLDialect {
 	if dialect == 1 {
@@ -847,6 +867,11 @@ func interBaseSchemaParameter(desc *ProcedureParameterDesc, procedureName string
 	if desc.Facts != nil {
 		parameter.Domain = interBaseSchemaDomainFromFacts(desc.Facts)
 		parameter.FieldSource = desc.Facts.DomainName
+		// InterBase's RDB$PROCEDURE_PARAMETERS has no null flag: a resolved
+		// domain that is not NOT NULL makes the parameter nullable.
+		if !parameter.Nullable.Valid {
+			parameter.Nullable = sql.NullBool{Bool: true, Valid: true}
+		}
 	}
 	return parameter
 }

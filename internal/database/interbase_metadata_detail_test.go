@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -223,6 +224,53 @@ func TestInterBaseMetadataProviderDetailJoinsInFlightBulkLoad(t *testing.T) {
 	}
 }
 
+func TestInterBaseMetadataProviderDetailFormatsDDLHeaders(t *testing.T) {
+	db := openInterBaseSchemaFixture(t)
+	insertInterBaseDetailRegressionFixtures(t, db)
+	var headers []string
+	var dialects []int
+	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3, FormatDDLHeader: func(header string, sqlDialect int) (string, error) {
+		headers = append(headers, header)
+		dialects = append(dialects, sqlDialect)
+		if strings.Contains(header, "CUSTOMER_VIEW") {
+			return "", errors.New("unsafe")
+		}
+		return "<" + header + ">", nil
+	}}
+	_, lease := acquireInterBaseTestLease(t, repo)
+	ctx := context.Background()
+
+	got, err := lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindProcedure, Name: "NULLABLE_PROC"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(procedure ddl) error = %v", err)
+	}
+	if want := "<CREATE PROCEDURE \"NULLABLE_PROC\" (\"ID\" INTEGER) RETURNS (\"STAMP\" TIMESTAMP) AS>\nBEGIN\n  SUSPEND;\nEND"; got.Text != want {
+		t.Fatalf("procedure ddl = %q, want the formatted header and the verbatim body %q", got.Text, want)
+	}
+	if !slices.Equal(dialects, []int{3}) {
+		t.Fatalf("header formatted for dialects %v, want [3]", dialects)
+	}
+
+	got, err = lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindProcedure, Name: "TS_PROC"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(procedure ddl) error = %v", err)
+	}
+	if want := "<CREATE PROCEDURE \"TS_PROC\" (\"TS_PARAM\" TIMESTAMP NOT NULL) AS> BEGIN\n  SELECT 1 FROM RDB$DATABASE;\nEND"; got.Text != want {
+		t.Fatalf("procedure ddl = %q, want a space before a body without leading whitespace %q", got.Text, want)
+	}
+
+	got, err = lease.Detail(ctx, metadata.Request{Object: catalog.ObjectID{Kind: ObjectKindView, Name: "CUSTOMER_VIEW"}, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+	if err != nil {
+		t.Fatalf("Detail(view ddl) error = %v", err)
+	}
+	if !strings.HasPrefix(got.Text, "CREATE VIEW \"CUSTOMER_VIEW\" (") {
+		t.Fatalf("view ddl = %q, want the generated DDL unchanged when the header cannot be formatted", got.Text)
+	}
+	if n := len(headers); n != 3 || !strings.HasPrefix(headers[2], "CREATE VIEW \"CUSTOMER_VIEW\" (") || !strings.HasSuffix(headers[2], ") AS") {
+		t.Fatalf("formatted headers = %q, want the view header ending in AS", headers)
+	}
+}
+
 // TestInterBaseMetadataProviderDetailRichFacts asserts the actual rendered
 // content, not just query counts: long/mixed-case identifiers, Domain
 // nullability/precision/scale, and dialect 1 vs 3 rendering differences all
@@ -268,6 +316,18 @@ func TestInterBaseMetadataProviderDetailRichFacts(t *testing.T) {
 		}
 		if !strings.Contains(d1.Text, "DATE") || strings.Contains(d1.Text, "TIMESTAMP") {
 			t.Fatalf("dialect-1 ddl = %q, want DATE instead of TIMESTAMP", d1.Text)
+		}
+	})
+
+	t.Run("procedure ddl renders parameters nullable through their domains", func(t *testing.T) {
+		procedure := catalog.ObjectID{Kind: ObjectKindProcedure, Name: "NULLABLE_PROC"}
+		got, err := lease.Detail(ctx, metadata.Request{Object: procedure, Facet: "ddl", Dialect: 3, Consistency: metadata.Committed})
+		if err != nil {
+			t.Fatalf("Detail(procedure ddl) error = %v", err)
+		}
+		want := "CREATE PROCEDURE \"NULLABLE_PROC\" (\"ID\" INTEGER) RETURNS (\"STAMP\" TIMESTAMP) AS\nBEGIN\n  SUSPEND;\nEND"
+		if got.Text != want {
+			t.Fatalf("procedure ddl = %q, want %q", got.Text, want)
 		}
 	})
 
@@ -1144,6 +1204,36 @@ func insertInterBaseDetailRegressionFixtures(t *testing.T, db *sql.DB) {
 	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURE_PARAMETERS" VALUES (?,?,?,?,?,?,?)`,
 		interBaseFixed("TS_PARAM"), "TS_PROC", 0, 0, "TS_DOMAIN", nil, 0); err != nil {
 		t.Fatal(err)
+	}
+	// RDB$PROCEDURE_PARAMETERS has no null flag, so these parameters are
+	// nullable through their domains: NULL_FLAG NULL, as InterBase stores an
+	// inline parameter type, and an explicit 0.
+	for _, domain := range []struct {
+		name     string
+		nullFlag any
+	}{{"NULLABLE_INT", nil}, {"NULLABLE_TS", 0}} {
+		fieldType := 8
+		if domain.name == "NULLABLE_TS" {
+			fieldType = 35
+		}
+		if _, err := db.Exec(`INSERT INTO "RDB$FIELDS" ("RDB$FIELD_NAME","RDB$FIELD_LENGTH","RDB$FIELD_TYPE","RDB$SYSTEM_FLAG","RDB$NULL_FLAG") VALUES (?,?,?,?,?)`,
+			domain.name, 4, fieldType, 1, domain.nullFlag); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURES" VALUES (?,?,?,?,?,?,?,?,?)`,
+		"NULLABLE_PROC", 70004, 1, 1, nil, "\nBEGIN\n  SUSPEND;\nEND", nil, interBaseFixed("OWNER"), 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, parameter := range []struct {
+		name      string
+		direction int
+		domain    string
+	}{{"ID", 0, "NULLABLE_INT"}, {"STAMP", 1, "NULLABLE_TS"}} {
+		if _, err := db.Exec(`INSERT INTO "RDB$PROCEDURE_PARAMETERS" VALUES (?,?,?,?,?,?,?)`,
+			interBaseFixed(parameter.name), "NULLABLE_PROC", 0, parameter.direction, parameter.domain, nil, 0); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// A long identifier (>31 bytes), InterBase's classic identifier-length
 	// edge case: pre-Firebird-4 InterBase limits identifiers to 31 bytes,
