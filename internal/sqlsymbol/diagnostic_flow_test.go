@@ -103,6 +103,28 @@ func TestDiagnosticFlowNullTestedReadIsNotReadBeforeAssignment(t *testing.T) {
 	}
 }
 
+// Production change caught: a local is NULL until assigned, so the branch an
+// IS [NOT] NULL test proves non-null has assigned it. Only the branch where
+// every path proves the test is refined; the join keeps the other path.
+func TestDiagnosticFlowNullTestRefinesBranchAssignment(t *testing.T) {
+	head := "CREATE TRIGGER TR_T FOR T BEFORE DELETE AS DECLARE VARIABLE V INTEGER; DECLARE VARIABLE W INTEGER; BEGIN W = 1; SELECT A FROM U INTO :V; "
+	for body, want := range map[string]int{
+		"IF (V IS NOT NULL) THEN W = V; END":                       0,
+		"IF ((:V IS NOT NULL) AND (W = 1)) THEN W = V; END":        0,
+		"IF (V IS NULL) THEN W = 0; ELSE W = V; END":               0,
+		"IF ((V IS NULL) OR (W = 0)) THEN W = 0; ELSE W = V; END":  0,
+		"IF (V IS NULL) THEN W = V; END":                           1,
+		"IF (V IS NOT NULL OR W = 1) THEN W = V; END":              1,
+		"IF (V IS NOT NULL) THEN W = 1; W = V; END":                1,
+		"IF (V IS NOT NULL) THEN W = 1; ELSE W = V; END":           1,
+		"IF ((V IS NULL) AND (W = 0)) THEN W = 0; ELSE W = V; END": 1,
+	} {
+		t.Run(body, func(t *testing.T) {
+			requireFlowCount(t, flowDiagnostic(t, head+body, flowRulesOn), "interbase-read-before-assignment", want)
+		})
+	}
+}
+
 // Production change caught: only a name at the start of a statement is an
 // assignment target. A name compared with = in a condition is a read, and a
 // statement after a nested block's END is still an assignment.

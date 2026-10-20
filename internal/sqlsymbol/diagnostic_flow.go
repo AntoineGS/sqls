@@ -898,18 +898,23 @@ func (r *flowRun) execute(n *flowNode, states []flowState) []flowState {
 				r.invalidateState(st)
 			}
 		}
+		thenNonNull, elseNonNull := r.nullTestFacts(n.condition)
 		var out []flowState
 		for _, st := range states {
 			if st.terminated {
 				out = append(out, st)
 				continue
 			}
-			thenStates := r.executeSequence(n.children, []flowState{cloneFlowState(st)})
+			thenEntry := cloneFlowState(st)
+			markFlowAssigned(&thenEntry, thenNonNull)
+			thenStates := r.executeSequence(n.children, []flowState{thenEntry})
+			elseEntry := cloneFlowState(st)
+			markFlowAssigned(&elseEntry, elseNonNull)
 			var elseStates []flowState
 			if len(n.otherwise) == 0 {
-				elseStates = []flowState{cloneFlowState(st)}
+				elseStates = []flowState{elseEntry}
 			} else {
-				elseStates = r.executeSequence(n.otherwise, []flowState{cloneFlowState(st)})
+				elseStates = r.executeSequence(n.otherwise, []flowState{elseEntry})
 			}
 			out = append(out, thenStates...)
 			out = append(out, elseStates...)
@@ -1233,6 +1238,107 @@ func (r *flowRun) nullTestedIn(symbol *Symbol, start, end int) bool {
 		}
 	}
 	return false
+}
+
+// nullTestFacts returns the locals an IF condition proves non-null in each
+// branch: X IS NOT NULL as a top-level AND term holds in THEN, and X IS NULL
+// as a top-level OR term is false in ELSE. A local is NULL until assigned,
+// so a proven non-null local has been assigned.
+func (r *flowRun) nullTestFacts(condition itemRange) (thenNonNull, elseNonNull []*Symbol) {
+	items := r.model.items
+	terms := flowSplitTopLevel(items, flowStripParens(items, condition), "OR")
+	if len(terms) == 1 {
+		for _, term := range flowSplitTopLevel(items, terms[0], "AND") {
+			if symbol := r.nullTestedSymbol(term, true); symbol != nil {
+				thenNonNull = append(thenNonNull, symbol)
+			}
+		}
+	}
+	for _, term := range terms {
+		if symbol := r.nullTestedSymbol(term, false); symbol != nil {
+			elseNonNull = append(elseNonNull, symbol)
+		}
+	}
+	return thenNonNull, elseNonNull
+}
+
+// nullTestedSymbol returns the local tested by a term that is exactly
+// [(]X IS NULL[)], or X IS NOT NULL when not is true.
+func (r *flowRun) nullTestedSymbol(term itemRange, not bool) *Symbol {
+	items := r.model.items
+	term = flowStripParens(items, term)
+	name := term.start
+	if name < term.end && items[name].Token.Kind == token.Colon {
+		name++
+	}
+	want := 3
+	if not {
+		want = 4
+	}
+	if term.end-name != want || !flowIsNullTestOperand(items, name) || isWord(items[name+2], "NOT") != not {
+		return nil
+	}
+	for _, symbol := range r.symbols {
+		for _, read := range symbol.Reads {
+			r.charge()
+			if r.failed {
+				return nil
+			}
+			if read.Start == items[name].Span.Start {
+				return symbol
+			}
+		}
+	}
+	return nil
+}
+
+func markFlowAssigned(state *flowState, symbols []*Symbol) {
+	for _, symbol := range symbols {
+		state.values[symbol] = flowExplicitlyAssigned
+		state.nulls[symbol] = flowNullUnknown
+	}
+}
+
+// flowStripParens removes parentheses that enclose the whole range.
+func flowStripParens(items []lexeme, rng itemRange) itemRange {
+	for rng.end-rng.start >= 2 && items[rng.start].Token.Kind == token.LParen && items[rng.end-1].Token.Kind == token.RParen {
+		depth := 0
+		for i := rng.start; i < rng.end; i++ {
+			switch items[i].Token.Kind {
+			case token.LParen:
+				depth++
+			case token.RParen:
+				depth--
+			}
+			if depth == 0 && i < rng.end-1 {
+				return rng
+			}
+		}
+		rng = itemRange{rng.start + 1, rng.end - 1}
+	}
+	return rng
+}
+
+// flowSplitTopLevel splits a range at word outside parentheses and CASE.
+func flowSplitTopLevel(items []lexeme, rng itemRange, word string) []itemRange {
+	var terms []itemRange
+	depth, caseDepth, start := 0, 0, rng.start
+	for i := rng.start; i < rng.end; i++ {
+		switch {
+		case items[i].Token.Kind == token.LParen:
+			depth++
+		case items[i].Token.Kind == token.RParen:
+			depth--
+		case depth == 0 && isWord(items[i], "CASE"):
+			caseDepth++
+		case depth == 0 && caseDepth > 0 && isWord(items[i], "END"):
+			caseDepth--
+		case depth == 0 && caseDepth == 0 && isWord(items[i], word):
+			terms = append(terms, itemRange{start, i})
+			start = i + 1
+		}
+	}
+	return append(terms, itemRange{start, rng.end})
 }
 
 // flowIsNullTestOperand reports whether the name at idx is the whole operand
