@@ -1,4 +1,4 @@
-//go:build interbase && cgo && linux && amd64
+//go:build interbase && cgo && (linux || windows) && amd64
 
 package database
 
