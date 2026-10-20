@@ -95,8 +95,10 @@ ORDER BY pp.RDB$PROCEDURE_NAME, pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`,
 		}
 		directionPositions[parameter.Number.Int64] = struct{}{}
 		parameter.Domain = domain
-		if domain != nil && domain.Nullable.Valid && !domain.Nullable.Bool {
-			parameter.Nullable = sql.NullBool{Bool: false, Valid: true}
+		// RDB$PROCEDURE_PARAMETERS has no null flag: the resolved domain,
+		// implicit for an inline type, gives the parameter's nullability.
+		if domain != nil {
+			parameter.Nullable = sql.NullBool{Bool: !domain.Nullable.Valid || domain.Nullable.Bool, Valid: true}
 		}
 		if parameter.Direction == schema.ParameterInput {
 			procedures[parent].InputParameters = append(procedures[parent].InputParameters, parameter)

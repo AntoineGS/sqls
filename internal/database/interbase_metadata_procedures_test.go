@@ -52,6 +52,25 @@ func TestInterBaseMetadataProceduresMatchLegacyAndUseConstantQueries(t *testing.
 			if dateParameter.Type != wantType {
 				t.Fatalf("DATE_VALUE type = %q for Dialect %d, want %q", dateParameter.Type, dialect, wantType)
 			}
+			// RDB$PROCEDURE_PARAMETERS has no null flag: a resolved domain
+			// gives the nullability, NULL_FLAG 0 or NULL meaning nullable.
+			for name, want := range map[string]sql.NullBool{
+				"NULLABLE":   {Bool: true, Valid: true},
+				"DATE_VALUE": {Bool: true, Valid: true},
+				"MISSING":    {},
+			} {
+				var parameter *ProcedureParameterDesc
+				for _, procedure := range got {
+					for _, candidate := range procedure.InputParameters {
+						if procedure.Name == "EDGE_PROC" && candidate.Name == name {
+							parameter = candidate
+						}
+					}
+				}
+				if parameter == nil || parameter.Nullable != want {
+					t.Fatalf("EDGE_PROC %s parameter = %#v, want nullable %#v", name, parameter, want)
+				}
+			}
 			if patch.Count != len(want) {
 				t.Fatalf("Count = %d, want %d", patch.Count, len(want))
 			}

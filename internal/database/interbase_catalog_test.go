@@ -1432,7 +1432,8 @@ func TestInterBaseDescribesProceduresTriggersAndFunctions(t *testing.T) {
 		nullable sql.NullBool
 	}{
 		{name: "EMAIL", position: 0, typ: "VARCHAR(100)", domain: "EMAIL_ADDRESS", nullable: sql.NullBool{Bool: false, Valid: true}},
-		{name: "CODE", position: 1, typ: "INTEGER", domain: "", nullable: sql.NullBool{}},
+		// RDB$1 is the implicit domain of an inline type; it is nullable.
+		{name: "CODE", position: 1, typ: "INTEGER", domain: "", nullable: sql.NullBool{Bool: true, Valid: true}},
 	}
 	for i, want := range wantInputs {
 		got := procedure.InputParameters[i]
@@ -1744,6 +1745,10 @@ func TestInterBaseObjectDDL(t *testing.T) {
 			contains: []string{`CREATE TRIGGER "CUSTOMER_BI" FOR "CUSTOMER"`, "BEFORE INSERT"},
 		},
 		{
+			name: "a procedure with a nullable inline parameter", kind: ObjectKindProcedure, object: "ADD_CUSTOMER",
+			contains: []string{`CREATE PROCEDURE "ADD_CUSTOMER" ("EMAIL" "EMAIL_ADDRESS" NOT NULL, "CODE" INTEGER) RETURNS`, "BEGIN NEW_ID = 1; END"},
+		},
+		{
 			name: "an index", kind: ObjectKindIndex, object: "IDX_PARENT_PK",
 			contains: []string{`CREATE UNIQUE ASCENDING INDEX "IDX_PARENT_PK" ON "PARENT"`, `"PARENT_B", "PARENT_A"`},
 		},
@@ -1774,12 +1779,6 @@ func TestInterBaseObjectDDL(t *testing.T) {
 			// target database, so this is the normal case rather than an edge.
 			name: "a table with a computed column", kind: ObjectKindTable, object: "CUSTOMER",
 			wantObject: "table", wantFeature: "TOTAL",
-		},
-		{
-			// schema/README.md: procedure parameter nullability is unknown
-			// unless a non-nullable domain proves it.
-			name: "a procedure with unknown parameter nullability", kind: ObjectKindProcedure, object: "ADD_CUSTOMER",
-			wantObject: "procedure", wantFeature: "CODE",
 		},
 		{
 			name: "an external function is never reproducible", kind: ObjectKindFunction, object: "F_LTRIM",
