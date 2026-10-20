@@ -36,6 +36,7 @@ type flowNode struct {
 	kind       flowNodeKind
 	start, end int // half-open significant-lexeme indexes
 	condition  itemRange
+	oneRow     bool // a SELECT INTO that always returns exactly one row
 	children   []*flowNode
 	otherwise  []*flowNode
 }
@@ -420,6 +421,7 @@ func (p *flowParser) parseSimple() *flowNode {
 			n.kind = flowUnknown
 		} else if flowHasWord(p.items[start:p.i], "INTO") {
 			n.kind = flowMaybeAssignment
+			n.oneRow = flowAggregateSelect(p.items[start:p.i])
 		} else {
 			n.kind = flowUnknown
 		}
@@ -435,6 +437,52 @@ func (p *flowParser) parseSimple() *flowNode {
 		n.kind = flowUnknown
 	}
 	return n
+}
+
+// flowAggregateSelect reports whether a singleton SELECT is an ungrouped
+// aggregate query, which returns exactly one row even when no row matches.
+// Aggregates inside a subquery do not count, and HAVING may remove the row.
+func flowAggregateSelect(items []lexeme) bool {
+	var subquery []bool // per open parenthesis: whether it opens a subquery
+	subqueries := 0
+	inList, aggregate := true, false
+	for i := 1; i < len(items); i++ {
+		item := items[i]
+		switch item.Token.Kind {
+		case token.LParen:
+			opens := i+1 < len(items) && isWord(items[i+1], "SELECT")
+			subquery = append(subquery, opens)
+			if opens {
+				subqueries++
+			}
+			continue
+		case token.RParen:
+			if len(subquery) == 0 {
+				return false
+			}
+			if subquery[len(subquery)-1] {
+				subqueries--
+			}
+			subquery = subquery[:len(subquery)-1]
+			continue
+		}
+		if len(subquery) == 0 {
+			if isWord(item, "FROM") || isWord(item, "INTO") {
+				inList = false
+			}
+			if isWord(item, "GROUP") || isWord(item, "HAVING") || isWord(item, "UNION") {
+				return false
+			}
+		}
+		if inList && subqueries == 0 && i+1 < len(items) && items[i+1].Token.Kind == token.LParen {
+			for _, word := range []string{"COUNT", "SUM", "AVG", "MIN", "MAX"} {
+				if isWord(item, word) {
+					aggregate = true
+				}
+			}
+		}
+	}
+	return aggregate
 }
 
 func flowAssignmentComplete(items []lexeme) bool {
@@ -944,7 +992,9 @@ func (r *flowRun) execute(n *flowNode, states []flowState) []flowState {
 				continue
 			}
 			r.checkReads(n.start, n.end, st)
-			out = append(out, cloneFlowState(st))
+			if !n.oneRow {
+				out = append(out, cloneFlowState(st))
+			}
 			if !st.terminated {
 				written := cloneFlowState(st)
 				r.applyWritesInRange(n.start, n.end, &written, true)
@@ -1072,7 +1122,7 @@ func (r *flowRun) checkReads(start, end int, state flowState) {
 		return
 	}
 	for _, symbol := range r.symbols {
-		if state.values[symbol] != flowNoExplicitAssignment {
+		if state.values[symbol] != flowNoExplicitAssignment || r.nullTestedIn(symbol, start, end) {
 			continue
 		}
 		for _, read := range symbol.Reads {
@@ -1165,6 +1215,53 @@ func flowWriteRHSIsNull(items []lexeme, lhs, end int) bool {
 		return false
 	}
 	return lhs+3 == end || (lhs+4 == end && items[lhs+3].Token.Kind == token.Semicolon)
+}
+
+// nullTestedIn reports whether the statement or condition in [start, end)
+// tests symbol with IS [NOT] NULL. That test handles a possible initial NULL
+// explicitly, for example after a no-row SELECT INTO, which leaves its
+// targets unchanged, so the statement's reads of symbol are not reported.
+func (r *flowRun) nullTestedIn(symbol *Symbol, start, end int) bool {
+	for _, read := range symbol.Reads {
+		r.charge()
+		if r.failed {
+			return false
+		}
+		idx := flowIndexAt(r.model.items, read.Start)
+		if idx >= start && idx < end && flowIsNullTestOperand(r.model.items, idx) {
+			return true
+		}
+	}
+	return false
+}
+
+// flowIsNullTestOperand reports whether the name at idx is the whole operand
+// of IS [NOT] NULL.
+func flowIsNullTestOperand(items []lexeme, idx int) bool {
+	next := idx + 1
+	if next >= len(items) || !isWord(items[next], "IS") {
+		return false
+	}
+	next++
+	if next < len(items) && isWord(items[next], "NOT") {
+		next++
+	}
+	if next >= len(items) || !isWord(items[next], "NULL") {
+		return false
+	}
+	prev := idx - 1
+	if prev >= 0 && items[prev].Token.Kind == token.Colon {
+		prev--
+	}
+	if prev < 0 || items[prev].Token.Kind == token.LParen {
+		return true
+	}
+	for _, word := range []string{"AND", "OR", "NOT", "WHERE", "ON", "HAVING", "WHEN"} {
+		if isWord(items[prev], word) {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *flowRun) add(code string, item int, message string, severity int) {

@@ -72,6 +72,64 @@ BEGIN V = NULL; O = V; SUSPEND; END`
 	requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 0)
 }
 
+// Production change caught: a statement that tests a local for NULL handles
+// its possible initial NULL explicitly, such as after a no-row SELECT INTO,
+// so neither the test nor the reads it guards are reported. Reads in
+// statements without such a test remain reported.
+func TestDiagnosticFlowNullTestedReadIsNotReadBeforeAssignment(t *testing.T) {
+	for name, condition := range map[string]string{
+		"is null":           "V IS NULL",
+		"is not null":       "V IS NOT NULL",
+		"negated is null":   "NOT V IS NULL",
+		"guarded call":      "(V IS NOT NULL) AND (F_TRIM(V) <> '')",
+		"guarded alternate": "V IS NULL OR V = ''",
+		"bind in sql":       "EXISTS (SELECT 1 FROM U WHERE :V IS NULL)",
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := "CREATE TRIGGER TR_T FOR T BEFORE INSERT AS DECLARE VARIABLE V CHAR(2); BEGIN SELECT A FROM U INTO :V; IF (" + condition + ") THEN NEW.A = 'X'; END"
+			requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 0)
+		})
+	}
+	for name, body := range map[string]string{
+		"comparison":            "IF (V <> 'AB') THEN NEW.A = 'X';",
+		"concatenation operand": "IF ('A' || V IS NULL) THEN NEW.A = 'X';",
+		"compared bind in sql":  "IF (EXISTS (SELECT 1 FROM U WHERE A = :V)) THEN NEW.A = 'X';",
+		"later statement":       "IF (V IS NULL) THEN W = 'X'; W = V;",
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := "CREATE TRIGGER TR_T FOR T BEFORE INSERT AS DECLARE VARIABLE V CHAR(2); DECLARE VARIABLE W CHAR(2); BEGIN SELECT A FROM U INTO :V; " + body + " END"
+			requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 1)
+		})
+	}
+}
+
+// Production change caught: an ungrouped aggregate query returns exactly one
+// row, so its SELECT INTO has no zero-row path that leaves targets unassigned.
+func TestDiagnosticFlowAggregateSelectIntoAlwaysAssigns(t *testing.T) {
+	for name, query := range map[string]string{
+		"count":         "SELECT COUNT(*) FROM T WHERE S IS NOT NULL AND K <> 'E' INTO :C, :D",
+		"into first":    "SELECT COUNT(*) INTO :C, :D FROM T",
+		"wrapped sum":   "SELECT COALESCE(SUM(A), 0), MAX(A) FROM T INTO :C, :D",
+		"nested filter": "SELECT COUNT(*) FROM T WHERE A IN (SELECT A FROM U GROUP BY A HAVING COUNT(*) > 1) INTO :C, :D",
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := "CREATE TRIGGER TR_T FOR T BEFORE DELETE AS DECLARE VARIABLE C INTEGER; DECLARE VARIABLE D INTEGER; BEGIN " + query + "; IF (:C <> :D) THEN EXCEPTION E; END"
+			requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 0)
+		})
+	}
+	for name, query := range map[string]string{
+		"plain column":       "SELECT A FROM T INTO :C",
+		"grouped":            "SELECT COUNT(*) FROM T GROUP BY A INTO :C",
+		"having":             "SELECT COUNT(*) FROM T HAVING COUNT(*) > 1 INTO :C",
+		"aggregate subquery": "SELECT (SELECT MAX(A) FROM U) FROM T INTO :C",
+	} {
+		t.Run(name, func(t *testing.T) {
+			source := "CREATE TRIGGER TR_T FOR T BEFORE DELETE AS DECLARE VARIABLE C INTEGER; BEGIN " + query + "; IF (:C <> 0) THEN EXCEPTION E; END"
+			requireFlowCount(t, flowDiagnostic(t, source, flowRulesOn), "interbase-read-before-assignment", 1)
+		})
+	}
+}
+
 // Production change caught: a recognized local declaration initializer starts
 // with an explicitly assigned value, even though its value may be NULL.
 func TestDiagnosticFlowVerifiedDeclarationDefaultStartsAssigned(t *testing.T) {
