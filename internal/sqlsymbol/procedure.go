@@ -210,7 +210,29 @@ func analyze(text string, dv dialect.DriverVariant, tolerant bool) (*Analysis, e
 		closeProcedure(analysis, current, len(text))
 	}
 	bindOccurrences(analysis, items)
+	if tolerant {
+		markTriggerSQL(analysis, items)
+	}
 	return analysis, nil
+}
+
+// markTriggerSQL classifies each recognized trigger body's embedded SQL
+// statements as SQL for diagnostics. The binder does not recognize CREATE
+// TRIGGER, so without this a trigger's statements were SQL only when a
+// semicolon before BEGIN happened to reset its state, and statement-level
+// rules (target counts, assignments, callable arity) silently skipped them.
+// It runs after binding, so navigation's resolutions are unchanged.
+func markTriggerSQL(analysis *Analysis, items []lexeme) {
+	for _, trg := range discoverTriggers(analysis.Text, items) {
+		ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
+		for idx := trg.bodyStart; idx < trg.bodyEnd && idx < len(analysis.contexts); idx++ {
+			i := idx - trg.bodyStart
+			if ctx.inSQL[i] && !ctx.unsupported[i] {
+				analysis.contexts[idx].kind = contextSQL
+				analysis.contexts[idx].outputTarget = ctx.outputTarget[i]
+			}
+		}
+	}
 }
 
 func declarationTypeStart(item lexeme) bool {

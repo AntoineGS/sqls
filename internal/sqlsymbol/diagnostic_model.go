@@ -411,6 +411,17 @@ func (m *diagnosticModel) Unsupported(i int) bool {
 	return false
 }
 
+// inTriggerBody reports whether item position i lies in a recognized
+// CREATE TRIGGER body.
+func (m *diagnosticModel) inTriggerBody(i int) bool {
+	for _, r := range m.recognizedTriggerBodies {
+		if i >= r.start && i < r.end {
+			return true
+		}
+	}
+	return false
+}
+
 // resolveRelationOutput resolves ref's column list as seen from item
 // position at (used only to evaluate DDLInvalidated against that position;
 // owner identifies the query that ref belongs to). CTE and derived-table
@@ -1039,6 +1050,7 @@ func (m *diagnosticModel) queryChain(i int) []int {
 // unsupported<-procedural<-sql, never sql->unsupported directly), so the
 // end-of-query check below does not need the same guard.
 func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depths []int, matching map[int]int, triggers []triggerModel) {
+	first := len(m.queries)
 	for _, trg := range triggers {
 		m.recognizedTriggerBodies = append(m.recognizedTriggerBodies, itemRange{trg.bodyStart, trg.bodyEnd})
 		ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
@@ -1055,6 +1067,17 @@ func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depth
 		}
 		if start >= 0 {
 			m.addTriggerStatement(text, items, depths, matching, start, trg.bodyEnd)
+		}
+	}
+	if len(m.queries) == first {
+		return
+	}
+	// Bind the trigger queries' FROM-clause callables and derived tables as
+	// the ordinary pass does, then compute their outputs in query order.
+	m.connectRelationSources(text, items, depths, matching)
+	for qi := first; qi < len(m.queries); qi++ {
+		if m.queries[qi].kind == "SELECT" {
+			m.computeSelectOutput(text, qi)
 		}
 	}
 }
@@ -1091,9 +1114,8 @@ func (m *diagnosticModel) addTriggerStatement(text string, items []lexeme, depth
 // computeOutputs have already run over the ordinary top-level queries, so
 // it updates m.queryAt/m.queryByStart/m.relationPositions/
 // m.relationDeclPositions directly here rather than relying on a second
-// pass over those functions, and computes its own output shape directly
-// when it is a SELECT so alias-visibility checking works the same as any
-// other SELECT.
+// pass over those functions. buildTriggerQueries then binds relation
+// sources and computes SELECT outputs once all trigger queries are added.
 func (m *diagnosticModel) addTriggerQuery(text string, items []lexeme, depths []int, matching map[int]int, start, end, parent int) {
 	if start >= end {
 		return
@@ -1135,9 +1157,6 @@ func (m *diagnosticModel) addTriggerQuery(text string, items []lexeme, depths []
 		}
 	}
 
-	if q.kind == "SELECT" {
-		m.computeSelectOutput(text, qi)
-	}
 }
 
 // computeOutputs computes each query's own projected output shape, in
