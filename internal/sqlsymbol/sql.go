@@ -118,6 +118,9 @@ func discoverSQLQueries(items []lexeme, contexts []tokenContext, depths []int) [
 		if !isQueryStart(item) {
 			continue
 		}
+		if i > 0 && isWord(item, "UPDATE") && isWord(items[i-1], "FOR") {
+			continue // a SELECT's FOR UPDATE [OF ...] clause, not an UPDATE
+		}
 		// A query at the same parenthesis depth is a sibling, not a
 		// correlated subquery. This includes UNION arms and an INSERT
 		// ... SELECT source query.

@@ -135,6 +135,40 @@ func TestDiagnosticColumnInsertTarget(t *testing.T) {
 	requireCodeCount(t, "INSERT INTO T (NAME) VALUES ('x');", c, codeUnknownColumn, 0)
 }
 
+// The SELECT arm of an INSERT ... SELECT resolves against its own FROM
+// relations, not the INSERT target, in PSQL bodies as in plain SQL. NAME is a
+// column of T only, so resolving it against the target U was a false finding.
+func TestDiagnosticColumnInsertSelectSourceScope(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	plain := "INSERT INTO U (ID) SELECT ID FROM T WHERE NAME = 'x';"
+	procedure := "CREATE PROCEDURE PR1 AS\nBEGIN\n  " + plain + "\nEND"
+	trigger := "CREATE TRIGGER TR1 FOR U BEFORE UPDATE AS\nBEGIN\n  INSERT INTO U (ID) SELECT NEW.ID FROM T WHERE NAME = 'x';\nEND"
+	for name, sql := range map[string]string{"plain": plain, "procedure": procedure, "trigger": trigger} {
+		t.Run(name, func(t *testing.T) {
+			requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+			requireCodeCount(t, strings.Replace(sql, "NAME = 'x'", "NAEM = 'x'", 1), c, codeUnknownColumn, 1)
+		})
+	}
+}
+
+// A trigger's INSERT column list names the target's columns only, and the
+// SELECT arm's aliases are visible throughout that arm.
+func TestDiagnosticTriggerInsertSelectJoinScope(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	sql := `CREATE TRIGGER TR1 FOR U BEFORE DELETE AS
+BEGIN
+  INSERT INTO U (ID, V)
+  SELECT OLD.ID, A.V
+  FROM T A
+  LEFT JOIN U B ON B.ID = A.ID AND B.V = OLD.V
+  WHERE A.NAME = 'x' AND B.ID IS NULL;
+END`
+	for _, code := range []string{codeUnknownColumn, codeAmbiguousColumn, codeUnknownQualifier} {
+		requireCodeCount(t, sql, c, code, 0)
+	}
+	requireCodeCount(t, strings.Replace(sql, "A.NAME", "C.NAME", 1), c, codeUnknownQualifier, 1)
+}
+
 func TestDiagnosticColumnDeletePredicate(t *testing.T) {
 	c := newDiagnosticFixtureCatalog()
 	requireCodeCount(t, "DELETE FROM T WHERE NAEM = 'x';", c, codeUnknownColumn, 1)
@@ -550,4 +584,20 @@ func TestDiagnosticFixRound2TopLevelMergeAndWithStillSilentAndCorrect(t *testing
 	requireCodeCount(t, "MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = 1;", c, codeUnknownRelation, 0)
 	requireCodeCount(t, "MERGE INTO U USING T ON (T.ID = U.ID) WHEN MATCHED THEN UPDATE SET V = 1;", c, codeUnknownColumn, 0)
 	requireCodeCount(t, "WITH W AS (SELECT ID AS RENAMED FROM U) SELECT RENAMED FROM W;", c, codeUnknownColumn, 0)
+}
+
+// A SELECT's FOR UPDATE [OF ...] clause is part of that SELECT, never the
+// start of an UPDATE statement whose target would be OF.
+func TestDiagnosticSelectForUpdateIsNotAnUpdate(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	body := "DECLARE VARIABLE A INTEGER;\nBEGIN\n  FOR SELECT ID FROM T FOR UPDATE OF ID INTO :A DO\n  BEGIN\n    A = 1;\n  END\nEND"
+	for name, sql := range map[string]string{
+		"trigger":   "CREATE TRIGGER TR1 FOR U BEFORE UPDATE AS\n" + body,
+		"procedure": "CREATE PROCEDURE PR1 AS\n" + body,
+	} {
+		t.Run(name, func(t *testing.T) {
+			requireCodeCount(t, sql, c, codeUnknownRelation, 0)
+			requireCodeCount(t, sql, c, codeUnknownColumn, 0)
+		})
+	}
 }
