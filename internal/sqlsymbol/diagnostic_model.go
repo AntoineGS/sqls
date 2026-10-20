@@ -1049,20 +1049,44 @@ func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depth
 				start = idx
 			}
 			if start >= 0 && !ctx.inSQL[i] {
-				m.addTriggerQuery(text, items, depths, matching, start, idx)
+				m.addTriggerStatement(text, items, depths, matching, start, idx)
 				start = -1
 			}
 		}
 		if start >= 0 {
-			m.addTriggerQuery(text, items, depths, matching, start, trg.bodyEnd)
+			m.addTriggerStatement(text, items, depths, matching, start, trg.bodyEnd)
 		}
 	}
 }
 
-// addTriggerQuery models one trigger-embedded SQL statement's [start, end)
-// span exactly as a standalone top-level statement would be: the same
-// queryRelations scan, no parent (a trigger body is not a lexically
-// enclosing query RelationScope should correlate through). It is appended
+// addTriggerStatement splits one trigger-embedded SQL statement's [start,
+// end) span into queries the way discoverSQLQueries splits ordinary SQL: an
+// INSERT ... SELECT source and UNION arms become siblings, and parenthesized
+// subqueries nest under their enclosing query. Modeling the statement as one
+// flat query would resolve the SELECT arm's names against the INSERT target.
+func (m *diagnosticModel) addTriggerStatement(text string, items []lexeme, depths []int, matching map[int]int, start, end int) {
+	if start >= end {
+		return
+	}
+	contexts := make([]tokenContext, end-start)
+	for i := range contexts {
+		contexts[i].kind = contextSQL
+	}
+	first := len(m.queries)
+	for _, q := range discoverSQLQueries(items[start:end], contexts, depths[start:end]) {
+		parent := -1
+		if q.parent >= 0 {
+			parent = first + q.parent
+		}
+		m.addTriggerQuery(text, items, depths, matching, start+q.start, start+q.end, parent)
+	}
+}
+
+// addTriggerQuery models one trigger-embedded query's [start, end) span
+// exactly as an ordinary statement's query would be: the same
+// queryRelations scan, with parent its enclosing query within the same
+// statement or -1 (a trigger body is not a lexically enclosing query
+// RelationScope should correlate through). It is appended
 // after buildQueryAt/connectRelationSources/computeRelationPositions/
 // computeOutputs have already run over the ordinary top-level queries, so
 // it updates m.queryAt/m.queryByStart/m.relationPositions/
@@ -1070,20 +1094,22 @@ func (m *diagnosticModel) buildTriggerQueries(text string, items []lexeme, depth
 // pass over those functions, and computes its own output shape directly
 // when it is a SELECT so alias-visibility checking works the same as any
 // other SELECT.
-func (m *diagnosticModel) addTriggerQuery(text string, items []lexeme, depths []int, matching map[int]int, start, end int) {
+func (m *diagnosticModel) addTriggerQuery(text string, items []lexeme, depths []int, matching map[int]int, start, end, parent int) {
 	if start >= end {
 		return
 	}
-	q := sqlQuery{start: start, end: end, baseDepth: depths[start], parent: -1, kind: itemWord(items[start])}
+	q := sqlQuery{start: start, end: end, baseDepth: depths[start], parent: parent, kind: itemWord(items[start])}
 	relations, _, _ := queryRelations(text, items, q, depths, matching)
 	qi := len(m.queries)
 	m.queries = append(m.queries, modelQuery{
-		start: start, end: end, parent: -1, kind: q.kind,
+		start: start, end: end, parent: parent, kind: q.kind,
 		baseDepth: q.baseDepth, relations: relations,
 		statementIndex: statementIndexAt(m.statements, start),
 	})
+	// A nested query is discovered after its parent and claims its own
+	// narrower span from it, as buildQueryAt does for ordinary queries.
 	for i := start; i < end && i < len(m.queryAt); i++ {
-		if m.queryAt[i] < 0 {
+		if m.queryAt[i] < 0 || (parent >= 0 && m.queryAt[i] == parent) {
 			m.queryAt[i] = qi
 		}
 	}
