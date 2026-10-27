@@ -259,7 +259,7 @@ var interbaseKeywords = []string{
 // rather than the broader completion inventory in interbaseKeywords.
 func IsInterBaseReservedWord(word string, variant SQLVariant) bool {
 	word = strings.ToUpper(word)
-	if variant == SQLVariantInterBase1 && (word == "TIME" || word == "TIMESTAMP") {
+	if variant.InterBaseSQLDialect() == 1 && (word == "TIME" || word == "TIMESTAMP") {
 		// Dialect 1 keeps the pre-Dialect-3 type vocabulary. The vendor
 		// appendix lists these words, but they remain unavailable as Dialect 1
 		// types and are kept out of the Dialect 1 rename vocabulary.

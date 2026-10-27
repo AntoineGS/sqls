@@ -34,6 +34,18 @@ func TestInterBaseSQLVariantRoundTrip(t *testing.T) {
 	}
 }
 
+func TestFirebirdDialect1UsesInterBaseDialect1LexicalRules(t *testing.T) {
+	variant := SQLVariant("firebird25-dialect-1")
+	if got := variant.InterBaseSQLDialect(); got != 1 {
+		t.Fatalf("Firebird Dialect 1 resolved to InterBase SQL dialect %d, want 1", got)
+	}
+
+	d := DialectForDriverVariant(DriverVariant{Driver: DatabaseDriverInterBase, Variant: variant})
+	if d.IsDelimitedIdentifierStart('"') {
+		t.Fatal("Firebird Dialect 1 must treat double quotes as string delimiters, not identifiers")
+	}
+}
+
 func TestDialectForDriverVariant(t *testing.T) {
 	tests := []struct {
 		name           string
