@@ -25,11 +25,22 @@ func stripScheme(raw string) string {
 	return raw
 }
 
+func rejectSurroundingWhitespace(raw string) error {
+	if raw != strings.TrimSpace(raw) {
+		return fmt.Errorf("%w: Firebird target has surrounding whitespace", metadata.ErrInvalidTarget)
+	}
+	return nil
+}
+
 // NormalizeTarget derives a metadata.Key from a raw Firebird attachment
 // string. It recognizes and strips a case-insensitive "fb://" prefix, then
-// reapplies the canonical lower-case prefix; every other byte of the
-// attachment is preserved exactly.
+// reapplies the canonical lower-case prefix. Like Attachment, it rejects
+// surrounding whitespace so the registry key and connection target cannot
+// identify different attachments.
 func NormalizeTarget(raw string) (metadata.Key, error) {
+	if err := rejectSurroundingWhitespace(raw); err != nil {
+		return metadata.Key{}, err
+	}
 	rest := stripScheme(raw)
 	if strings.TrimSpace(rest) == "" {
 		return metadata.Key{}, fmt.Errorf("%w: blank Firebird target", metadata.ErrInvalidTarget)
@@ -40,10 +51,14 @@ func NormalizeTarget(raw string) (metadata.Key, error) {
 // Attachment splits a classic Firebird attachment string into host, port and
 // database path. Local paths use localhost and the default port. Remote
 // attachments have the form host[:port]:path, with the port written as
-// host/port:path.
+// host/port:path. Surrounding whitespace is rejected, matching
+// NormalizeTarget's key semantics.
 func Attachment(target string) (string, int, string, error) {
-	rest := strings.TrimSpace(stripScheme(target))
-	if rest == "" {
+	if err := rejectSurroundingWhitespace(target); err != nil {
+		return "", 0, "", err
+	}
+	rest := stripScheme(target)
+	if strings.TrimSpace(rest) == "" {
 		return "", 0, "", fmt.Errorf("%w: blank Firebird target", metadata.ErrInvalidTarget)
 	}
 	colon := strings.IndexByte(rest, ':')
@@ -72,8 +87,8 @@ func Attachment(target string) (string, int, string, error) {
 
 // DriverDSN builds a nakagami/firebirdsql DSN from a classic Firebird
 // attachment string. Required Firebird 2.5 metadata attachment options are
-// set here so consumers share the same driver policy; extra may add or replace
-// query options.
+// set here so consumers share the same driver policy. extra may add driver
+// options, but cannot replace values controlled by this package.
 func DriverDSN(target, user, password, role string, sqlDialect int, extra url.Values) (string, error) {
 	host, port, path, err := Attachment(target)
 	if err != nil {
@@ -95,11 +110,14 @@ func DriverDSN(target, user, password, role string, sqlDialect int, extra url.Va
 		q.Set("role", role)
 	}
 	for key, values := range extra {
+		if isReservedDriverOption(key) {
+			return "", fmt.Errorf("fbmeta: extra driver option %q is reserved", key)
+		}
 		q[key] = values
 	}
-	// The driver removes one leading slash for aliases and Windows paths, but
-	// keeps the root slash on multi-segment Unix paths. Add the URL path's
-	// leading slash only to relative and Windows path forms.
+	// The driver requires a leading URL slash for relative names and Windows
+	// paths. Absolute Unix paths already have one; adding another would change
+	// the database name seen by the driver.
 	dsnPath := path
 	if !strings.HasPrefix(dsnPath, "/") {
 		dsnPath = "/" + dsnPath
@@ -111,5 +129,43 @@ func DriverDSN(target, user, password, role string, sqlDialect int, extra url.Va
 		Path:     dsnPath,
 		RawQuery: q.Encode(),
 	}
-	return u.String(), nil
+	dsn := u.String()
+	dbName, err := driverDatabaseName(dsn)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid Firebird database path %q: %v", metadata.ErrInvalidTarget, path, err)
+	}
+	if dbName != path {
+		return "", fmt.Errorf("%w: Firebird database path %q is not preserved by the driver DSN parser", metadata.ErrInvalidTarget, path)
+	}
+	return dsn, nil
+}
+
+func isReservedDriverOption(key string) bool {
+	switch strings.ToLower(key) {
+	case "auth_plugin_name", "auth_plugin_list", "charset", "explicit_tx_only", "sql_type_names", "wire_crypt", "sql_dialect", "role":
+		return true
+	default:
+		return false
+	}
+}
+
+// driverDatabaseName mirrors the URL path handling in
+// firebirdsql/dsn.go:73-81. The driver does not export parseDSN, so checking
+// this transformation keeps paths from silently attaching to another name.
+func driverDatabaseName(dsn string) (string, error) {
+	u, err := url.Parse(dsn)
+	if err != nil {
+		return "", err
+	}
+	dbName := u.Path
+	if len(dbName) > 1 && !strings.ContainsRune(dbName[1:], '/') {
+		dbName = dbName[1:]
+	}
+	if len(dbName) > 2 && strings.ContainsRune(dbName[2:], ':') {
+		dbName = dbName[1:]
+	}
+	if strings.TrimLeft(dbName, "/") == "" {
+		return "", fmt.Errorf("driver DSN has no database name")
+	}
+	return dbName, nil
 }

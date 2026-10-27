@@ -30,6 +30,14 @@ func TestNormalizeTargetRejectsBlank(t *testing.T) {
 	}
 }
 
+func TestNormalizeTargetRejectsSurroundingWhitespace(t *testing.T) {
+	for _, target := range []string{" server:/db.fdb", "server:/db.fdb ", " fb://server:/db.fdb"} {
+		if _, err := NormalizeTarget(target); !errors.Is(err, metadata.ErrInvalidTarget) {
+			t.Errorf("NormalizeTarget(%q) error = %v, want ErrInvalidTarget", target, err)
+		}
+	}
+}
+
 func TestAttachment(t *testing.T) {
 	cases := []struct {
 		in, host string
@@ -52,6 +60,14 @@ func TestAttachment(t *testing.T) {
 	for _, bad := range []string{"", "  ", "server/x:/db", "server/70000:/db", "server:"} {
 		if _, _, _, err := Attachment(bad); !errors.Is(err, metadata.ErrInvalidTarget) {
 			t.Errorf("Attachment(%q) error = %v, want ErrInvalidTarget", bad, err)
+		}
+	}
+}
+
+func TestAttachmentRejectsSurroundingWhitespace(t *testing.T) {
+	for _, target := range []string{" server:/db.fdb", "server:/db.fdb ", " fb://server:/db.fdb"} {
+		if _, _, _, err := Attachment(target); !errors.Is(err, metadata.ErrInvalidTarget) {
+			t.Errorf("Attachment(%q) error = %v, want ErrInvalidTarget", target, err)
 		}
 	}
 }
@@ -100,4 +116,72 @@ func TestDriverDSNDefaultsDialectAndKeepsUnixRoot(t *testing.T) {
 	if got := u.Query().Get("sql_dialect"); got != "3" {
 		t.Errorf("sql_dialect = %q, want 3", got)
 	}
+}
+
+func TestDriverDSNRejectsReservedExtraOptions(t *testing.T) {
+	reserved := []string{
+		"auth_plugin_name", "auth_plugin_list", "charset", "CHARSET", "explicit_tx_only",
+		"sql_type_names", "wire_crypt", "sql_dialect", "role",
+	}
+	for _, key := range reserved {
+		t.Run(key, func(t *testing.T) {
+			if _, err := DriverDSN("server:/db.fdb", "SYSDBA", "secret", "READER", 3, url.Values{key: {"override"}}); err == nil {
+				t.Fatalf("DriverDSN accepted reserved extra option %q", key)
+			}
+		})
+	}
+}
+
+func TestDriverDSNPathMatchesDriverParser(t *testing.T) {
+	cases := []struct {
+		name, target, want, parserWouldSend string
+		wantErr                             bool
+	}{
+		{"Windows absolute", `server:C:\data\db.fdb`, `C:\data\db.fdb`, `C:\data\db.fdb`, false},
+		{"Unix multi-segment absolute", "/srv/db.fdb", "/srv/db.fdb", "/srv/db.fdb", false},
+		{"Firebird fixture absolute", "/firebird/data/fixture.fdb", "/firebird/data/fixture.fdb", "/firebird/data/fixture.fdb", false},
+		{"database alias", "server:employee", "employee", "employee", false},
+		{"Unix root single segment", "/db.fdb", "", "db.fdb", true},
+		{"Unix path containing colon", "/srv/a:b.fdb", "", "srv/a:b.fdb", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dsn, err := DriverDSN(c.target, "SYSDBA", "secret", "", 3, nil)
+			if c.wantErr {
+				if err == nil {
+					t.Fatalf("DriverDSN(%q) = %q, want an unsupported-path error", c.target, dsn)
+				}
+				if got := driverParserDBName(rawPathDSN(c.target)); got != c.parserWouldSend {
+					t.Fatalf("driver parser would send %q, want %q", got, c.parserWouldSend)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := driverParserDBName(dsn); got != c.want || got != c.parserWouldSend {
+				t.Fatalf("driver database name = %q, want %q (DSN %q)", got, c.want, dsn)
+			}
+		})
+	}
+}
+
+// driverParserDBName documents and mirrors the driver's path transformation
+// in firebirdsql/dsn.go:73-80, since parseDSN is unexported and fbmeta
+// deliberately has no driver dependency.
+func driverParserDBName(dsn string) string {
+	u, _ := url.Parse(dsn)
+	dbName := u.Path
+	if len(dbName) > 1 && !strings.ContainsRune(dbName[1:], '/') {
+		dbName = dbName[1:]
+	}
+	if len(dbName) > 2 && strings.ContainsRune(dbName[2:], ':') {
+		dbName = dbName[1:]
+	}
+	return dbName
+}
+
+func rawPathDSN(path string) string {
+	u := url.URL{Scheme: "firebird", User: url.UserPassword("SYSDBA", "secret"), Host: "server:3050", Path: path}
+	return u.String()
 }
