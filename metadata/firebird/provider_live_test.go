@@ -18,11 +18,12 @@ import (
 var seed = []string{
 	"RECREATE TABLE FB_CUSTOMER (ID INTEGER NOT NULL PRIMARY KEY, NAME VARCHAR(40))",
 	"RECREATE GLOBAL TEMPORARY TABLE FB_GTT (ID INTEGER) ON COMMIT PRESERVE ROWS",
+	"RECREATE GLOBAL TEMPORARY TABLE FB_GTT_DELETE (ID INTEGER) ON COMMIT DELETE ROWS",
 	"CREATE DOMAIN FB_DOMAIN AS VARCHAR(40)",
 	"CREATE EXCEPTION FB_EXCEPTION 'Firebird metadata test'",
 	"CREATE OR ALTER VIEW FB_CUSTOMER_VIEW AS SELECT ID, NAME FROM FB_CUSTOMER",
 	"CREATE INDEX FB_CUSTOMER_NAME_IX ON FB_CUSTOMER (NAME)",
-	"CREATE OR ALTER PROCEDURE FB_PROC (P_ID TYPE OF COLUMN FB_CUSTOMER.ID) RETURNS (N VARCHAR(40)) AS BEGIN N = 'caf\u00e9'; SUSPEND; END",
+	"CREATE OR ALTER PROCEDURE FB_PROC (P_ID TYPE OF COLUMN FB_CUSTOMER.ID, P_VALUE TYPE OF FB_DOMAIN) RETURNS (N VARCHAR(40)) AS BEGIN N = 'caf\u00e9'; SUSPEND; END",
 	"CREATE OR ALTER TRIGGER FB_BIU FOR FB_CUSTOMER ACTIVE BEFORE INSERT OR UPDATE POSITION 0 AS BEGIN END",
 	"CREATE OR ALTER TRIGGER FB_ON_CONNECT ACTIVE ON CONNECT POSITION 0 AS BEGIN END",
 	"CREATE SEQUENCE FB_SEQ",
@@ -56,7 +57,6 @@ func TestLiveProviderLoadsFirebird25Catalog(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-
 	registry := metadata.NewRegistry(ctx, metadata.Options{})
 	defer registry.Close(ctx)
 	cfg := Config{Target: "fb://" + attach, User: "SYSDBA", Password: "masterkey", Dialect: 3}
@@ -127,6 +127,24 @@ func TestLiveProviderLoadsFirebird25Catalog(t *testing.T) {
 	ddl := detailText(t, ctx, lease, catalog.ObjectKindProcedure, "FB_PROC", "ddl")
 	if !strings.Contains(ddl, "café") {
 		t.Errorf("procedure DDL lost CP1252 text: %q", ddl)
+	}
+	if !strings.Contains(ddl, `"P_ID" TYPE OF COLUMN "FB_CUSTOMER"."ID"`) {
+		t.Errorf("procedure DDL lost TYPE OF COLUMN declaration: %q", ddl)
+	}
+	if !strings.Contains(ddl, `"P_VALUE" TYPE OF "FB_DOMAIN"`) {
+		t.Errorf("procedure DDL lost TYPE OF domain declaration: %q", ddl)
+	}
+	tableDDL := detailText(t, ctx, lease, catalog.ObjectKindTable, "FB_CUSTOMER", "ddl")
+	if !strings.Contains(tableDDL, `CREATE TABLE "FB_CUSTOMER"`) {
+		t.Errorf("customer table DDL = %q", tableDDL)
+	}
+	preserveRowsDDL := detailText(t, ctx, lease, catalog.ObjectKindTable, "FB_GTT", "ddl")
+	if !strings.Contains(preserveRowsDDL, `CREATE GLOBAL TEMPORARY TABLE "FB_GTT"`) || !strings.Contains(preserveRowsDDL, "ON COMMIT PRESERVE ROWS") {
+		t.Errorf("preserve-rows GTT DDL = %q", preserveRowsDDL)
+	}
+	deleteRowsDDL := detailText(t, ctx, lease, catalog.ObjectKindTable, "FB_GTT_DELETE", "ddl")
+	if !strings.Contains(deleteRowsDDL, `CREATE GLOBAL TEMPORARY TABLE "FB_GTT_DELETE"`) || !strings.Contains(deleteRowsDDL, "ON COMMIT DELETE ROWS") {
+		t.Errorf("delete-rows GTT DDL = %q", deleteRowsDDL)
 	}
 	trigger := detailText(t, ctx, lease, catalog.ObjectKindTrigger, "FB_BIU", "ddl")
 	if !strings.Contains(trigger, "BEFORE INSERT OR UPDATE") {

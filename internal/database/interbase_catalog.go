@@ -616,14 +616,17 @@ func (db *InterBaseDBRepository) parameterDescriptions(parameters []schema.Proce
 			position = int(parameter.Number.Int64)
 		}
 		result = append(result, &ProcedureParameterDesc{
-			Name:        parameter.Name,
-			Position:    position,
-			Direction:   direction,
-			Type:        interBaseTypeName(parameter.Domain, db.SQLDialect),
-			Domain:      interBaseUserDomainName(parameter.FieldSource, parameter.Domain),
-			Nullable:    parameter.Nullable,
-			Description: parameter.Description,
-			Facts:       interBaseParameterFacts(parameter.FieldSource, parameter.Domain),
+			Name:                       parameter.Name,
+			Position:                   position,
+			Direction:                  direction,
+			Type:                       interBaseTypeName(parameter.Domain, db.SQLDialect),
+			Domain:                     interBaseUserDomainName(parameter.FieldSource, parameter.Domain),
+			Nullable:                   parameter.Nullable,
+			Description:                parameter.Description,
+			Facts:                      interBaseParameterFacts(parameter.FieldSource, parameter.Domain),
+			FirebirdParameterMechanism: parameter.FirebirdParameterMechanism,
+			FirebirdTypeOfFieldName:    parameter.FirebirdTypeOfFieldName,
+			FirebirdTypeOfRelationName: parameter.FirebirdTypeOfRelationName,
 		})
 	}
 	return result

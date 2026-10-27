@@ -48,6 +48,12 @@ ORDER BY p.RDB$PROCEDURE_NAME`, procedureName, ownerName)
 	domainName := interBaseMetadataIdentifier("f.RDB$FIELD_NAME", width)
 	characterSetName := interBaseMetadataIdentifier("cs.RDB$CHARACTER_SET_NAME", width)
 	collationName := interBaseMetadataIdentifier("co.RDB$COLLATION_NAME", width)
+	firebirdTypeOfProjection := ""
+	if db.Firebird {
+		firebirdTypeOfProjection = fmt.Sprintf(", pp.RDB$PARAMETER_MECHANISM, %s, %s",
+			interBaseMetadataIdentifier("pp.RDB$FIELD_NAME", width),
+			interBaseMetadataIdentifier("pp.RDB$RELATION_NAME", width))
+	}
 	parametersQuery := fmt.Sprintf(`
 SELECT %s, %s, pp.RDB$PARAMETER_NUMBER, pp.RDB$PARAMETER_TYPE,
        %s, pp.RDB$DESCRIPTION, pp.RDB$SYSTEM_FLAG,
@@ -57,7 +63,7 @@ SELECT %s, %s, pp.RDB$PARAMETER_NUMBER, pp.RDB$PARAMETER_TYPE,
        f.RDB$EXTERNAL_LENGTH, f.RDB$EXTERNAL_SCALE, f.RDB$EXTERNAL_TYPE,
        f.RDB$DIMENSIONS, f.RDB$NULL_FLAG, f.RDB$CHARACTER_LENGTH,
        f.RDB$COLLATION_ID, f.RDB$CHARACTER_SET_ID, f.RDB$FIELD_PRECISION,
-       %s, %s, %s
+       %s, %s, %s%s
 FROM RDB$PROCEDURE_PARAMETERS pp
 JOIN RDB$PROCEDURES p ON p.RDB$PROCEDURE_NAME = pp.RDB$PROCEDURE_NAME
 LEFT JOIN RDB$FIELDS f ON f.RDB$FIELD_NAME = pp.RDB$FIELD_SOURCE
@@ -66,10 +72,10 @@ LEFT JOIN RDB$COLLATIONS co ON co.RDB$CHARACTER_SET_ID = f.RDB$CHARACTER_SET_ID
                          AND co.RDB$COLLATION_ID = f.RDB$COLLATION_ID
 WHERE COALESCE(p.RDB$SYSTEM_FLAG, 0) = 0
 ORDER BY pp.RDB$PROCEDURE_NAME, pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`,
-		parameterName, parameterProcedureName, fieldSource, domainName, characterSetName, collationName)
+		parameterName, parameterProcedureName, fieldSource, domainName, characterSetName, collationName, firebirdTypeOfProjection)
 	positions := make(map[string]map[schema.ParameterDirection]map[int64]struct{})
 	err = interBaseBulkQuery(ctx, q, "procedure parameters", parametersQuery, func(rows *sql.Rows) error {
-		parameter, domain, err := scanInterBaseProcedureParameter(rows)
+		parameter, domain, err := scanInterBaseProcedureParameter(rows, db.Firebird)
 		if err != nil {
 			return err
 		}
@@ -120,13 +126,14 @@ ORDER BY pp.RDB$PROCEDURE_NAME, pp.RDB$PARAMETER_TYPE, pp.RDB$PARAMETER_NUMBER`,
 	return MetadataPatch{Cache: &DBCache{Catalog: &CatalogCache{Procedures: byDescription, ProceduresByID: byID}}, Count: len(descriptions)}, nil
 }
 
-func scanInterBaseProcedureParameter(rows *sql.Rows) (schema.ProcedureParameter, *schema.Domain, error) {
+func scanInterBaseProcedureParameter(rows *sql.Rows, firebird bool) (schema.ProcedureParameter, *schema.Domain, error) {
 	var parameter schema.ProcedureParameter
 	var rawName, rawProcedureName, rawSource sql.NullString
 	var rawDirection sql.NullInt64
+	var rawFirebirdFieldName, rawFirebirdRelationName sql.NullString
 	var domainName sql.NullString
 	var domain schema.Domain
-	if err := rows.Scan(&rawName, &rawProcedureName, &parameter.Number, &rawDirection, &rawSource,
+	scanArgs := []any{&rawName, &rawProcedureName, &parameter.Number, &rawDirection, &rawSource,
 		&parameter.Description, &parameter.SystemFlag,
 		&domain.ValidationSource, &domain.ComputedSource, &domain.DefaultSource,
 		&domain.FieldLength, &domain.FieldScale, &domain.FieldType, &domain.FieldSubType,
@@ -134,7 +141,11 @@ func scanInterBaseProcedureParameter(rows *sql.Rows) (schema.ProcedureParameter,
 		&domain.ExternalLength, &domain.ExternalScale, &domain.ExternalType,
 		&domain.Dimensions, &domain.NullFlag, &domain.CharacterLength,
 		&domain.CollationID, &domain.CharacterSetID, &domain.FieldPrecision,
-		&domainName, &domain.CharacterSetName, &domain.CollationName); err != nil {
+		&domainName, &domain.CharacterSetName, &domain.CollationName}
+	if firebird {
+		scanArgs = append(scanArgs, &parameter.FirebirdParameterMechanism, &rawFirebirdFieldName, &rawFirebirdRelationName)
+	}
+	if err := rows.Scan(scanArgs...); err != nil {
 		return schema.ProcedureParameter{}, nil, err
 	}
 	name, err := interBaseRequiredName(rawName, "parameter name")
@@ -157,6 +168,10 @@ func scanInterBaseProcedureParameter(rows *sql.Rows) (schema.ProcedureParameter,
 	parameter.Name, parameter.ProcedureName = name, procedureName
 	parameter.Direction, parameter.ParameterType = direction, rawDirection
 	parameter.FieldSource = trimInterBaseCatalogName(rawSource)
+	if firebird {
+		parameter.FirebirdTypeOfFieldName = trimInterBaseCatalogName(rawFirebirdFieldName)
+		parameter.FirebirdTypeOfRelationName = trimInterBaseCatalogName(rawFirebirdRelationName)
+	}
 	if !domainName.Valid {
 		return parameter, nil, nil
 	}

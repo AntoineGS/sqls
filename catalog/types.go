@@ -193,6 +193,11 @@ type ProcedureParameterDesc struct {
 	Description sql.NullString
 	// Facts retains the native facts behind Type; see ColumnDesc.Facts.
 	Facts *ColumnTypeFacts
+	// Firebird's procedure-parameter catalog can retain TYPE OF declarations.
+	// InterBase leaves these optional fields empty.
+	FirebirdParameterMechanism sql.NullInt64
+	FirebirdTypeOfFieldName    sql.NullString
+	FirebirdTypeOfRelationName sql.NullString
 }
 
 // TriggerDesc describes a DML or database trigger.

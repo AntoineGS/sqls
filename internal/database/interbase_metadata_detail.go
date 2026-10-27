@@ -702,7 +702,28 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if db == nil || db.Conn == nil {
 					return metadata.Detail{}, fmt.Errorf("interbase: database connection is nil")
 				}
-				table, err := schema.New(db.Conn).Table(ctx, canonicalObject.Name)
+				var queryer schema.Queryer = db.Conn
+				var tx *sql.Tx
+				if db.Firebird {
+					tx, err = db.Conn.BeginTx(ctx, &sql.TxOptions{
+						ReadOnly:  true,
+						Isolation: sql.LevelReadCommitted,
+					})
+					if err != nil {
+						return metadata.Detail{}, err
+					}
+					// Firebird metadata attachments require explicit transactions.
+					// Roll back immediately after materializing the catalog result;
+					// keep the historical InterBase implicit-read path unchanged.
+					defer func() { _ = tx.Rollback() }()
+					queryer = tx
+				}
+				table, err := schema.New(queryer).Table(ctx, canonicalObject.Name)
+				if tx != nil {
+					if rollbackErr := tx.Rollback(); err == nil {
+						err = rollbackErr
+					}
+				}
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -855,12 +876,15 @@ func interBaseSchemaParameter(desc *ProcedureParameterDesc, procedureName string
 		parameterType = sql.NullInt64{Int64: 1, Valid: true}
 	}
 	parameter := schema.ProcedureParameter{
-		Name:          desc.Name,
-		ProcedureName: procedureName,
-		Number:        sql.NullInt64{Int64: int64(desc.Position), Valid: true},
-		Direction:     direction,
-		ParameterType: parameterType,
-		Nullable:      desc.Nullable,
+		Name:                       desc.Name,
+		ProcedureName:              procedureName,
+		Number:                     sql.NullInt64{Int64: int64(desc.Position), Valid: true},
+		Direction:                  direction,
+		ParameterType:              parameterType,
+		Nullable:                   desc.Nullable,
+		FirebirdParameterMechanism: desc.FirebirdParameterMechanism,
+		FirebirdTypeOfFieldName:    desc.FirebirdTypeOfFieldName,
+		FirebirdTypeOfRelationName: desc.FirebirdTypeOfRelationName,
 	}
 	if desc.Facts != nil {
 		parameter.Domain = interBaseSchemaDomainFromFacts(desc.Facts)
