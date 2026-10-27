@@ -132,7 +132,7 @@ func (db *InterBaseDBRepository) ObjectDDL(ctx context.Context, kind ObjectKind,
 		}
 		return ddl, nil
 	}
-	ddl, err := options.GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseSourceDialect(db)})
+	ddl, err := options.GenerateDDLWithOptions(db.ddlOptions(interBaseSourceDialect(db)))
 	if err != nil {
 		return "", interBaseWrapDDLError(err)
 	}

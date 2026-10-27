@@ -804,6 +804,7 @@ func (db *InterBaseDBRepository) CatalogSnapshot(ctx context.Context) (DBReposit
 
 	bound := &InterBaseDBRepository{
 		Conn:             db.Conn,
+		Firebird:         db.Firebird,
 		SQLDialect:       db.SQLDialect,
 		SourceSQLDialect: db.SourceSQLDialect,
 		DatabaseName:     db.DatabaseName,

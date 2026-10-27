@@ -20,7 +20,7 @@ func (db *InterBaseDBRepository) TableDescription(ctx context.Context, name stri
 		return TableDescription{}, ErrObjectNotFound
 	}
 
-	rendered, err := relation.DescribeCatalogWithOptions(schema.DDLOptions{Dialect: interBaseSourceDialect(db)})
+	rendered, err := relation.DescribeCatalogWithOptions(db.ddlOptions(interBaseSourceDialect(db)))
 	if err != nil {
 		return TableDescription{}, err
 	}

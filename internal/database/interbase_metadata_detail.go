@@ -336,7 +336,7 @@ func (db *InterBaseDBRepository) detailPlanDescription(req metadata.Request) (me
 				// shared upper-cased ColumnDescs.
 				columns, _ := cache.ColumnDescsByID(name)
 				relation := interBaseSchemaRelationTable(name, columns)
-				described, err := relation.DescribeCatalogWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				described, err := relation.DescribeCatalogWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -361,7 +361,7 @@ func (db *InterBaseDBRepository) detailPlanDescription(req metadata.Request) (me
 					return metadata.Detail{}, err
 				}
 				relation := interBaseSchemaRelationView(name, view)
-				described, err := relation.DescribeCatalogWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				described, err := relation.DescribeCatalogWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -439,7 +439,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaProcedure(procedure).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaProcedure(procedure).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -463,7 +463,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaDomain(domain).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaDomain(domain).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -487,7 +487,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaTrigger(trigger).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaTrigger(trigger).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -511,7 +511,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaIndex(index).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaIndex(index).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -552,7 +552,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaSequence(generator).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaSequence(generator).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -597,7 +597,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 					return metadata.Detail{}, metadata.ErrUnsupported
 				}
 				sequenceDDL, err := interBaseSchemaSequence(&GeneratorDesc{Name: name}).GenerateDDLWithOptions(
-					schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+					db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, metadata.ErrUnsupported
 				}
@@ -663,7 +663,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				ddl, err := interBaseSchemaRelationView(name, view).GenerateDDLWithOptions(schema.DDLOptions{Dialect: interBaseDDLDialectFor(req.Dialect)})
+				ddl, err := interBaseSchemaRelationView(name, view).GenerateDDLWithOptions(db.ddlOptions(interBaseDDLDialectFor(req.Dialect)))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -709,7 +709,7 @@ func (db *InterBaseDBRepository) detailPlanDDL(req metadata.Request) (metadata.D
 				if table == nil {
 					return metadata.Detail{}, ErrObjectNotFound
 				}
-				ddl, err := table.GenerateDDLWithOptions(schema.DDLOptions{Dialect: dialect})
+				ddl, err := table.GenerateDDLWithOptions(db.ddlOptions(dialect))
 				if err != nil {
 					return metadata.Detail{}, interBaseWrapDDLError(err)
 				}
@@ -765,9 +765,7 @@ func (db *InterBaseDBRepository) generatorValueWithDetailTransaction(ctx context
 	var value int64
 	err := db.withReadOnlyDetailTransaction(ctx, func(tx *sql.Tx) error {
 		var err error
-		value, err = schema.New(tx).GeneratorValueWithOptions(ctx, name, schema.DDLOptions{
-			Dialect: interBaseDDLDialectFor(db.SQLDialect),
-		})
+		value, err = schema.New(tx).GeneratorValueWithOptions(ctx, name, db.ddlOptions(interBaseDDLDialectFor(db.SQLDialect)))
 		return err
 	})
 	if err != nil {

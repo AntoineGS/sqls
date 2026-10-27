@@ -47,9 +47,9 @@ func TestScopeForUsesFixedTextPolicyAndOmitsSecrets(t *testing.T) {
 	}
 }
 
-func TestFactoryIsUnsupportedUntilProviderImplementation(t *testing.T) {
-	provider, err := Factory(Config{})(context.Background())
-	if provider != nil || !errors.Is(err, metadata.ErrUnsupported) {
-		t.Fatalf("Factory() = (%v, %v), want (nil, ErrUnsupported)", provider, err)
+func TestFactoryValidatesTargetBeforeOpeningAttachment(t *testing.T) {
+	_, err := Factory(Config{User: "SYSDBA"})(context.Background())
+	if !errors.Is(err, metadata.ErrInvalidTarget) {
+		t.Fatalf("Factory(blank target) error = %v, want ErrInvalidTarget", err)
 	}
 }

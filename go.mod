@@ -10,6 +10,7 @@ require (
 	github.com/jackc/pgx/v4 v4.18.3
 	github.com/jfcote87/sshdb v0.6.0
 	github.com/k0kubun/colorstring v0.0.0-20150214042306-9440f1994b88 // indirect
+	github.com/nakagami/firebirdsql v0.9.24-0.20261026065950-133255ccd5e3
 	github.com/sourcegraph/jsonrpc2 v0.2.1
 	github.com/urfave/cli/v2 v2.27.7
 	golang.org/x/crypto v0.54.0

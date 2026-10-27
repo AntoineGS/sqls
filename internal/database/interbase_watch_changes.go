@@ -179,7 +179,7 @@ func (db *InterBaseDBRepository) readWatchedCategoryOwners(ctx context.Context, 
 	case catalog.MetadataFunctions:
 		return db.readMetadataFunctions(ctx, scoped, width)
 	default:
-		bound := &InterBaseDBRepository{Conn: db.Conn, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect, DatabaseName: db.DatabaseName, snapshot: &interBaseCatalogSnapshot{catalog: schema.New(scoped)}}
+		bound := &InterBaseDBRepository{Conn: db.Conn, Firebird: db.Firebird, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect, DatabaseName: db.DatabaseName, snapshot: &interBaseCatalogSnapshot{catalog: schema.New(scoped)}}
 		return bound.readMetadataAccessor(ctx, kind)
 	}
 }

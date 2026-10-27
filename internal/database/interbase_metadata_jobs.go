@@ -87,7 +87,7 @@ func (db *InterBaseDBRepository) runMetadataRepositoryRead(ctx context.Context, 
 		result.Queries, result.QueriesKnown = counter.queries, true
 	}()
 	bound := &InterBaseDBRepository{
-		Conn: db.Conn, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect,
+		Conn: db.Conn, Firebird: db.Firebird, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect,
 		DatabaseName: db.DatabaseName,
 		snapshot:     &interBaseCatalogSnapshot{catalog: schema.New(counter)},
 	}

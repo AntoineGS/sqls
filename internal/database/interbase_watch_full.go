@@ -101,7 +101,7 @@ func (db *InterBaseDBRepository) ReadWatchedFull(ctx context.Context) (cache *ca
 				case MetadataFunctions:
 					return db.readMetadataFunctions(ctx, q, width)
 				default:
-					bound := &InterBaseDBRepository{Conn: db.Conn, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect, DatabaseName: db.DatabaseName, snapshot: &interBaseCatalogSnapshot{catalog: schema.New(q)}}
+					bound := &InterBaseDBRepository{Conn: db.Conn, Firebird: db.Firebird, SQLDialect: db.SQLDialect, SourceSQLDialect: db.SourceSQLDialect, DatabaseName: db.DatabaseName, snapshot: &interBaseCatalogSnapshot{catalog: schema.New(q)}}
 					return bound.readMetadataAccessor(ctx, kind)
 				}
 			})

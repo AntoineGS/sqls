@@ -1955,9 +1955,9 @@ func TestInterBaseUnsupportedDDLWithoutDetailStillMatchesTheSentinel(t *testing.
 	}
 }
 
-func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
+func TestInterBaseFamilyCatalogSnapshotPreservesProfileAndServesReadsFromOneTransaction(t *testing.T) {
 	db := openInterBaseSchemaFixture(t)
-	source := &InterBaseDBRepository{Conn: db, SQLDialect: 3, SourceSQLDialect: 1, DatabaseName: "/srv/interbase/example.ib"}
+	source := &InterBaseDBRepository{Conn: db, Firebird: true, SQLDialect: 3, SourceSQLDialect: 1, DatabaseName: "/srv/interbase/example.ib"}
 	ctx := context.Background()
 
 	snapshot, closeSnapshot, err := source.CatalogSnapshot(ctx)
@@ -1982,6 +1982,9 @@ func TestInterBaseCatalogSnapshotServesReadsFromOneTransaction(t *testing.T) {
 	}
 	if bound.snapshot == nil {
 		t.Fatal("the returned repository is not bound to a snapshot")
+	}
+	if !bound.Firebird {
+		t.Fatal("CatalogSnapshot() did not preserve the Firebird profile")
 	}
 	if bound.SQLDialect != source.SQLDialect || bound.SourceSQLDialect != source.SourceSQLDialect || bound.DatabaseName != source.DatabaseName {
 		t.Errorf("snapshot repository = (client dialect %d, source dialect %d, %q), want the source's (%d, %d, %q)",

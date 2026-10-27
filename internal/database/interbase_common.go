@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sqls-server/sqls/dialect"
+	"interbase-go/schema"
 )
 
 const interBaseDefaultPort = 3050
@@ -303,6 +304,9 @@ func interBaseConnectionConfig(cfg *DBConfig) (interBaseConnConfig, error) {
 
 type InterBaseDBRepository struct {
 	Conn *sql.DB
+	// Firebird selects Firebird 2.5 catalog and DDL rules on the shared
+	// InterBase-family repository.
+	Firebird bool
 	// SQLDialect is 1 or 3; zero is treated as 3, matching the driver default.
 	SQLDialect int
 	// SourceSQLDialect is the database's own reported dialect when known.
@@ -320,6 +324,10 @@ type InterBaseDBRepository struct {
 	// the cache-visible catalog in bulk. The source repository is never
 	// mutated; metadata jobs may run concurrently against distinct snapshots.
 	snapshot *interBaseCatalogSnapshot
+}
+
+func (db *InterBaseDBRepository) ddlOptions(dialect schema.DDLDialect) schema.DDLOptions {
+	return schema.DDLOptions{Dialect: dialect, Firebird: db != nil && db.Firebird}
 }
 
 var _ DBRepository = (*InterBaseDBRepository)(nil)
