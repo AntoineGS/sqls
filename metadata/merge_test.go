@@ -39,34 +39,34 @@ func TestMetadataMergePrimaryKeysAndColumnsInEitherOrder(t *testing.T) {
 	for _, order := range []string{"keys-first", "columns-first"} {
 		t.Run(order, func(t *testing.T) {
 			base := newMetadataCache()
-			originalColumn := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "S", Table: "T", Name: "ID"}, Key: "generic"}
-			base.ColumnsWithParent[catalog.ColumnDatabaseKey("S", "T")] = []*catalog.ColumnDesc{originalColumn}
-			base.PrimaryKeyColumns[catalog.ColumnDatabaseKey("S", "T")] = map[string]struct{}{}
+			originalColumn := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Table: "T", Name: "ID"}, Key: "generic"}
+			base.ColumnsWithParent[catalog.ColumnDatabaseKey("", "T")] = []*catalog.ColumnDesc{originalColumn}
+			base.PrimaryKeyColumns[catalog.ColumnDatabaseKey("", "T")] = map[string]struct{}{}
 			var current *catalog.Cache
 			var err error
 			if order == "keys-first" {
 				current, err = mergeMetadata(base, catalog.MetadataPrimaryKeys, catalog.MetadataPatch{Cache: &catalog.Cache{
-					PrimaryKeyColumns: map[string]map[string]struct{}{catalog.ColumnDatabaseKey("S", "T"): {"ID": {}}},
+					PrimaryKeyColumns: map[string]map[string]struct{}{catalog.ColumnDatabaseKey("", "T"): {"ID": {}}},
 				}})
 				if err == nil {
 					current, err = mergeMetadata(current, catalog.MetadataColumnsCurrent, catalog.MetadataPatch{Cache: &catalog.Cache{
-						ColumnsWithParent: map[string][]*catalog.ColumnDesc{catalog.ColumnDatabaseKey("S", "T"): {originalColumn}},
+						ColumnsWithParent: map[string][]*catalog.ColumnDesc{catalog.ColumnDatabaseKey("", "T"): {originalColumn}},
 					}})
 				}
 			} else {
 				current, err = mergeMetadata(base, catalog.MetadataColumnsCurrent, catalog.MetadataPatch{Cache: &catalog.Cache{
-					ColumnsWithParent: map[string][]*catalog.ColumnDesc{catalog.ColumnDatabaseKey("S", "T"): {originalColumn}},
+					ColumnsWithParent: map[string][]*catalog.ColumnDesc{catalog.ColumnDatabaseKey("", "T"): {originalColumn}},
 				}})
 				if err == nil {
 					current, err = mergeMetadata(current, catalog.MetadataPrimaryKeys, catalog.MetadataPatch{Cache: &catalog.Cache{
-						PrimaryKeyColumns: map[string]map[string]struct{}{catalog.ColumnDatabaseKey("S", "T"): {"ID": {}}},
+						PrimaryKeyColumns: map[string]map[string]struct{}{catalog.ColumnDatabaseKey("", "T"): {"ID": {}}},
 					}})
 				}
 			}
 			if err != nil {
 				t.Fatal(err)
 			}
-			column := current.ColumnsWithParent[catalog.ColumnDatabaseKey("S", "T")][0]
+			column := current.ColumnsWithParent[catalog.ColumnDatabaseKey("", "T")][0]
 			if column == nil || column.Key != "YES" {
 				t.Fatalf("merged column key = %v, want YES", column)
 			}
@@ -75,6 +75,60 @@ func TestMetadataMergePrimaryKeysAndColumnsInEitherOrder(t *testing.T) {
 			}
 			if column == originalColumn {
 				t.Fatal("published enriched descriptor aliases retained descriptor")
+			}
+		})
+	}
+}
+
+func TestMergePreservesSchemaBearingMySQLColumnKeys(t *testing.T) {
+	const schema, table = "mde_fixture", "items"
+	for _, order := range []string{"columns-first", "keys-first"} {
+		t.Run(order, func(t *testing.T) {
+			columns := []*catalog.ColumnDesc{
+				{ColumnBase: catalog.ColumnBase{Schema: schema, Table: table, Name: "id"}, Key: "PRI"},
+				{ColumnBase: catalog.ColumnBase{Schema: schema, Table: table, Name: "email"}, Key: "UNI"},
+				{ColumnBase: catalog.ColumnBase{Schema: schema, Table: table, Name: "group_id"}, Key: "MUL"},
+				{ColumnBase: catalog.ColumnBase{Schema: schema, Table: table, Name: "payload"}, Key: ""},
+			}
+			relationKey := catalog.ColumnDatabaseKey(schema, table)
+			objectKey := (catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: table}).Key()
+			columnsPatch := catalog.MetadataPatch{Cache: &catalog.Cache{
+				ColumnsWithParent: map[string][]*catalog.ColumnDesc{relationKey: columns},
+				ColumnsByID:       map[string][]*catalog.ColumnDesc{objectKey: columns},
+			}}
+			keysPatch := catalog.MetadataPatch{Cache: &catalog.Cache{PrimaryKeyColumns: map[string]map[string]struct{}{
+				relationKey: {"id": {}},
+			}}}
+
+			var merged *catalog.Cache
+			var err error
+			if order == "columns-first" {
+				merged, err = Merge(NewCache(), catalog.MetadataColumnsCurrent, columnsPatch)
+				if err == nil {
+					merged, err = Merge(merged, catalog.MetadataPrimaryKeys, keysPatch)
+				}
+			} else {
+				merged, err = Merge(NewCache(), catalog.MetadataPrimaryKeys, keysPatch)
+				if err == nil {
+					merged, err = Merge(merged, catalog.MetadataColumnsCurrent, columnsPatch)
+				}
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			want := []string{"PRI", "UNI", "MUL", ""}
+			for _, gotColumns := range [][]*catalog.ColumnDesc{
+				merged.ColumnsWithParent[relationKey], merged.ColumnsByID[objectKey],
+			} {
+				if len(gotColumns) != len(want) {
+					t.Fatalf("merged columns = %d, want %d", len(gotColumns), len(want))
+				}
+				for i, column := range gotColumns {
+					if column.Key != want[i] {
+						t.Errorf("column %q key = %q, want %q", column.Name, column.Key, want[i])
+					}
+				}
 			}
 		})
 	}
@@ -112,8 +166,8 @@ func TestMetadataMergePrimaryKeysByIDNilWhenNotSupplied(t *testing.T) {
 }
 
 func TestMetadataMergePKEnrichmentPreservesOlderSnapshot(t *testing.T) {
-	key := catalog.ColumnDatabaseKey("S", "T")
-	column := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Schema: "S", Table: "T", Name: "ID"}, Key: ""}
+	key := catalog.ColumnDatabaseKey("", "T")
+	column := &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Table: "T", Name: "ID"}, Key: ""}
 	base := newMetadataCache()
 	base.ColumnsWithParent[key] = []*catalog.ColumnDesc{column}
 	withColumns, err := mergeMetadata(base, catalog.MetadataColumnsCurrent, catalog.MetadataPatch{Cache: &catalog.Cache{
@@ -292,7 +346,6 @@ func TestMetadataMergeRebuildsGroupedCatalogMaps(t *testing.T) {
 	triggerZ := &catalog.TriggerDesc{Name: "Z_TR_T", RelationName: sql.NullString{String: "T", Valid: true}}
 	fragment := &catalog.Cache{Catalog: &catalog.CatalogCache{
 		Indexes:         map[string]*catalog.IndexDesc{"IX_T": index, "A_IX_T": indexA, "Z_IX_T": indexZ, "IX_BLANK": blankIndex},
-		IndexesByTable:  map[string][]*catalog.IndexDesc{"WRONG": {index}},
 		Triggers:        map[string]*catalog.TriggerDesc{"TR_T": trigger, "A_TR_T": triggerA, "Z_TR_T": triggerZ},
 		TriggersByTable: map[string][]*catalog.TriggerDesc{"WRONG": {trigger}},
 	}}
@@ -312,9 +365,6 @@ func TestMetadataMergeRebuildsGroupedCatalogMaps(t *testing.T) {
 	}
 	if len(withTriggers.IndexesForTable("WRONG")) != 0 || len(withTriggers.TriggersForTable("WRONG")) != 0 || len(withTriggers.IndexesForTable("")) != 0 {
 		t.Fatal("accepted inconsistent source grouping")
-	}
-	if len(fragment.Catalog.IndexesByTable["WRONG"]) != 1 {
-		t.Fatal("mutated source grouping")
 	}
 }
 

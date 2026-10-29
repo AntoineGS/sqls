@@ -124,7 +124,11 @@ func mergeMetadata(base *catalog.Cache, kind catalog.MetadataKind, patch catalog
 			catalogHeader.FunctionsByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.FunctionDesc { return c.FunctionsByID }))
 		case catalog.MetadataIndexes:
 			catalogHeader.Indexes = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.IndexDesc { return c.Indexes }))
-			catalogHeader.IndexesByTable = indexGroups(catalogHeader.Indexes)
+			if fragmentCatalog.IndexesByTable != nil {
+				catalogHeader.IndexesByTable = cloneIndexGroups(fragmentCatalog.IndexesByTable)
+			} else {
+				catalogHeader.IndexesByTable = indexGroups(catalogHeader.Indexes)
+			}
 			catalogHeader.IndexesByID = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.IndexDesc { return c.IndexesByID }))
 		case catalog.MetadataTriggers:
 			catalogHeader.Triggers = cloneMap(mapOrEmpty(fragmentCatalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.Triggers }))
@@ -280,11 +284,13 @@ func columnsWithPrimaryKeys(columns map[string][]*catalog.ColumnDesc, primaryKey
 				continue
 			}
 			column := *descriptor
-			column.Key = "NO"
-			for key := range keys {
-				if strings.EqualFold(key, column.Name) {
-					column.Key = "YES"
-					break
+			if column.Schema == "" {
+				column.Key = "NO"
+				for key := range keys {
+					if strings.EqualFold(key, column.Name) {
+						column.Key = "YES"
+						break
+					}
 				}
 			}
 			copied[i] = &column
@@ -307,12 +313,14 @@ func columnsByIDWithPrimaryKeys(columns map[string][]*catalog.ColumnDesc, primar
 				continue
 			}
 			column := *descriptor
-			column.Key = "NO"
-			keys := primaryKeys[catalog.ColumnDatabaseKey(descriptor.Schema, descriptor.Table)]
-			for key := range keys {
-				if strings.EqualFold(key, column.Name) {
-					column.Key = "YES"
-					break
+			if column.Schema == "" {
+				column.Key = "NO"
+				keys := primaryKeys[catalog.ColumnDatabaseKey(descriptor.Schema, descriptor.Table)]
+				for key := range keys {
+					if strings.EqualFold(key, column.Name) {
+						column.Key = "YES"
+						break
+					}
 				}
 			}
 			copied[i] = &column
@@ -333,6 +341,14 @@ func indexGroups(indexes map[string]*catalog.IndexDesc) map[string][]*catalog.In
 	}
 	for _, group := range groups {
 		sort.Slice(group, func(i, j int) bool { return group[i].Name < group[j].Name })
+	}
+	return groups
+}
+
+func cloneIndexGroups(source map[string][]*catalog.IndexDesc) map[string][]*catalog.IndexDesc {
+	groups := make(map[string][]*catalog.IndexDesc, len(source))
+	for table, indexes := range source {
+		groups[table] = append([]*catalog.IndexDesc(nil), indexes...)
 	}
 	return groups
 }
