@@ -33,7 +33,7 @@ func TestMySQLMetadataDetailSupportedFacetsAndCachedValues(t *testing.T) {
 			name:    "table columns",
 			object:  catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "odd`table"},
 			facet:   "columns",
-			wantReq: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
+			wantReq: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataViews},
 			check: func(t *testing.T, got metadata.Detail) {
 				t.Helper()
 				if len(got.Columns) != 2 || got.Columns[0].Name != "first`column" || got.Columns[1].Name != "last_column" {
@@ -57,7 +57,7 @@ func TestMySQLMetadataDetailSupportedFacetsAndCachedValues(t *testing.T) {
 			name:    "table description",
 			object:  catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "odd`table"},
 			facet:   "description",
-			wantReq: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
+			wantReq: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataViews},
 			check: func(t *testing.T, got metadata.Detail) {
 				t.Helper()
 				if len(got.Columns) != 2 {
@@ -209,6 +209,9 @@ func TestMySQLMetadataDetailDDLUsesExactSHOWCreateAndQuotedIdentifiers(t *testin
 			if err != nil {
 				t.Fatalf("MetadataDetailPlan() error = %v", err)
 			}
+			if test.kind == catalog.ObjectKindTable && !reflect.DeepEqual(plan.Requires, []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataViews}) {
+				t.Errorf("table DDL Requires = %v, want relations and views for relation-kind classification", plan.Requires)
+			}
 			got, err := plan.Load(context.Background(), cache)
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
@@ -237,17 +240,44 @@ func TestMySQLMetadataDetailRejectsOtherSchemaBeforeQuery(t *testing.T) {
 	db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
 	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
-	_, err := repo.MetadataDetailPlan(metadata.Request{
+	plan, err := repo.MetadataDetailPlan(metadata.Request{
 		Object: catalog.ObjectID{Schema: "mde_other", Kind: catalog.ObjectKindTable, Name: "odd`table"},
 		Facet:  "ddl", Consistency: metadata.Committed,
 	})
+	if err != nil {
+		t.Fatalf("MetadataDetailPlan() error = %v", err)
+	}
+	_, err = plan.Load(context.Background(), mysqlMetadataDetailCache())
 	if !errors.Is(err, metadata.ErrUnsupported) {
-		t.Fatalf("MetadataDetailPlan(other schema) error = %v, want metadata.ErrUnsupported", err)
+		t.Fatalf("Load(other schema) error = %v, want metadata.ErrUnsupported", err)
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if len(state.queries) != 0 {
 		t.Fatalf("other-schema request ran queries %q, want none", state.queries)
+	}
+}
+
+func TestMySQLMetadataDetailRejectsNonCanonicalSchemaCaseBeforeQuery(t *testing.T) {
+	state := newMySQLMetadataDetailScript()
+	db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
+	t.Cleanup(func() { _ = db.Close() })
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
+	plan, err := repo.MetadataDetailPlan(metadata.Request{
+		Object: catalog.ObjectID{Schema: "MDE_FIXTURE", Kind: catalog.ObjectKindTable, Name: "odd`table"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	})
+	if err != nil {
+		t.Fatalf("MetadataDetailPlan() error = %v", err)
+	}
+	_, err = plan.Load(context.Background(), mysqlMetadataDetailCache())
+	if !errors.Is(err, metadata.ErrUnsupported) {
+		t.Fatalf("Load(non-canonical schema case) error = %v, want metadata.ErrUnsupported", err)
+	}
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if len(state.queries) != 0 {
+		t.Fatalf("non-canonical schema request ran queries %q, want none", state.queries)
 	}
 }
 
@@ -274,6 +304,40 @@ func TestMySQLMetadataDetailResolvesBeforeDDLQuery(t *testing.T) {
 	}
 }
 
+func TestMySQLMetadataDetailRejectsWrongRelationKindBeforeDDLQuery(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		kind      catalog.ObjectKind
+		nameValue string
+	}{
+		{name: "table request for view", kind: catalog.ObjectKindTable, nameValue: "items_view"},
+		{name: "view request for table", kind: catalog.ObjectKindView, nameValue: "odd`table"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := newMySQLMetadataDetailScript()
+			db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
+			t.Cleanup(func() { _ = db.Close() })
+			repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+			plan, err := repo.MetadataDetailPlan(metadata.Request{
+				Object: catalog.ObjectID{Kind: test.kind, Name: test.nameValue},
+				Facet:  "ddl", Consistency: metadata.Committed,
+			})
+			if err != nil {
+				t.Fatalf("MetadataDetailPlan() error = %v", err)
+			}
+			_, err = plan.Load(context.Background(), mysqlMetadataDetailCache())
+			if !errors.Is(err, ErrObjectNotFound) {
+				t.Fatalf("Load(wrong relation kind) error = %v, want ErrObjectNotFound", err)
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if len(state.queries) != 0 {
+				t.Fatalf("wrong relation kind issued DDL queries %q", state.queries)
+			}
+		})
+	}
+}
+
 func mysqlMetadataDetailCache() *catalog.Cache {
 	tableColumns := []*catalog.ColumnDesc{
 		{ColumnBase: catalog.ColumnBase{Schema: "mde_fixture", Table: "odd`table", Name: "first`column"}, Type: "varchar(40)", Null: "NO"},
@@ -288,7 +352,7 @@ func mysqlMetadataDetailCache() *catalog.Cache {
 	trigger := &catalog.TriggerDesc{Schema: "mde_fixture", Name: "items_bi", Source: sql.NullString{String: "SET NEW.email = LOWER(NEW.email)", Valid: true}}
 	return &catalog.Cache{
 		DefaultSchema: "mde_fixture",
-		SchemaTables:  map[string][]string{"MDE_FIXTURE": {"odd`table"}},
+		SchemaTables:  map[string][]string{"MDE_FIXTURE": {"odd`table", "items_view"}},
 		ColumnsByID: map[string][]*catalog.ColumnDesc{
 			(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "odd`table"}).Key():  tableColumns,
 			(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "items_view"}).Key(): viewColumns,

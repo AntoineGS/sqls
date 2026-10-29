@@ -66,8 +66,8 @@ func TestProviderDelegatesPlansAndOwnsPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DetailPlan() error = %v", err)
 	}
-	if len(detailPlan.Requires) != 2 || detailPlan.Requires[0] != catalog.MetadataRelations || detailPlan.Requires[1] != catalog.MetadataColumnsCurrent {
-		t.Fatalf("DetailPlan().Requires = %v, want repository's table-column dependencies", detailPlan.Requires)
+	if len(detailPlan.Requires) != 3 || detailPlan.Requires[0] != catalog.MetadataRelations || detailPlan.Requires[1] != catalog.MetadataColumnsCurrent || detailPlan.Requires[2] != catalog.MetadataViews {
+		t.Fatalf("DetailPlan().Requires = %v, want relation, column, and view metadata for table resolution", detailPlan.Requires)
 	}
 	if err := provider.Close(); err != nil {
 		t.Fatalf("Close() error = %v", err)

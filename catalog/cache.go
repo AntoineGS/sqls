@@ -25,16 +25,16 @@ type Cache struct {
 	ForeignKeys       map[string]map[string][]*ForeignKey
 	Metadata          map[MetadataKind]MetadataState
 	PrimaryKeyColumns map[string]map[string]struct{}
-	// PrimaryKeysByID retains each relation's primary key under the
-	// relation's exact catalog identity — ObjectID{Kind: ObjectKindTable,
-	// Name: <the relation's exact catalog name>}.Key() — never the shared
-	// upper-cased key PrimaryKeyColumns uses, and preserves the columns in
-	// their segment order rather than PrimaryKeyColumns's unordered set. Two
-	// exact-identity relations that fold to the same case (for example a
-	// quoted "Foo" alongside FOO) never merge here. Nil means the active
-	// repository has not supplied this projection; a non-nil map, once the
-	// MetadataPrimaryKeys category is ready, means an absent table entry is
-	// a known no-primary-key result rather than an unknown one.
+	// PrimaryKeysByID retains each relation's primary key under its exact catalog
+	// identity — ObjectID{Schema: <the relation's schema, if present>, Kind:
+	// ObjectKindTable, Name: <the relation's exact catalog name>}.Key() — never
+	// the shared upper-cased key PrimaryKeyColumns uses, and preserves the columns
+	// in their segment order rather than PrimaryKeyColumns's unordered set. Two
+	// exact-identity relations that fold to the same case (for example a quoted
+	// "Foo" alongside FOO) never merge here. Nil means the active repository has
+	// not supplied this projection; a non-nil map, once the MetadataPrimaryKeys
+	// category is ready, means an absent table entry is a known no-primary-key
+	// result rather than an unknown one.
 	PrimaryKeysByID map[string][]string
 	// Catalog holds extended catalog objects. It is nil when the active
 	// repository does not implement CatalogRepository, and also before the

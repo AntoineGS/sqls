@@ -15,7 +15,7 @@ import (
 // schema-scoped cache. DDL is the only detail that performs additional I/O;
 // it uses SHOW CREATE in a short read-only transaction.
 func (db *MySQLMetadataRepository) MetadataDetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
-	if req.Object.Schema != "" && (db == nil || !strings.EqualFold(req.Object.Schema, db.Schema)) {
+	if db == nil || db.Schema == "" {
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
 	}
 	if req.Consistency == metadata.TransactionLocal || req.Consistency == metadata.ConsistentSnapshot {
@@ -43,7 +43,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanColumns(req metadata.Request) 
 	switch req.Object.Kind {
 	case catalog.ObjectKindTable:
 		return metadata.DetailPlan{
-			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
+			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataViews},
 			Coverage: mysqlDetailCoverage(req.Object, "columns"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
 				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
@@ -86,7 +86,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDescription(req metadata.Reque
 	switch req.Object.Kind {
 	case catalog.ObjectKindTable:
 		return metadata.DetailPlan{
-			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
+			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent, catalog.MetadataViews},
 			Coverage: mysqlDetailCoverage(req.Object, "description"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
 				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
@@ -186,7 +186,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDDL(req metadata.Request) (met
 	var requires []catalog.MetadataKind
 	switch req.Object.Kind {
 	case catalog.ObjectKindTable:
-		requires = []catalog.MetadataKind{catalog.MetadataRelations}
+		requires = []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataViews}
 	case catalog.ObjectKindView:
 		requires = []catalog.MetadataKind{catalog.MetadataViews}
 	case catalog.ObjectKindProcedure:
@@ -233,10 +233,12 @@ func (db *MySQLMetadataRepository) mysqlCanonicalDetailSchema(cache *catalog.Cac
 	if cache == nil || cache.DefaultSchema == "" {
 		return "", errors.New("mysql: canonical detail schema is unavailable")
 	}
+	// The configured target may use a different case from the server's
+	// canonical schema spelling, so compare those two case-insensitively.
 	if db == nil || db.Schema == "" || !strings.EqualFold(db.Schema, cache.DefaultSchema) {
 		return "", metadata.ErrUnsupported
 	}
-	if requestSchema != "" && !strings.EqualFold(requestSchema, cache.DefaultSchema) {
+	if requestSchema != "" && requestSchema != cache.DefaultSchema {
 		return "", metadata.ErrUnsupported
 	}
 	return cache.DefaultSchema, nil
@@ -248,7 +250,7 @@ func (db *MySQLMetadataRepository) mysqlResolveObjectName(cache *catalog.Cache, 
 	}
 	switch kind {
 	case catalog.ObjectKindTable:
-		return mysqlResolveName(kind, cache.SchemaTables[strings.ToUpper(schema)], want)
+		return mysqlResolveName(kind, mysqlTableNames(cache, schema), want)
 	case catalog.ObjectKindView:
 		return mysqlResolveDescriptorName(kind, want, schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.ViewDesc { return c.ViewsByID }, func(desc *catalog.ViewDesc) (string, string) { return desc.Schema, desc.Name })
 	case catalog.ObjectKindProcedure:
@@ -260,6 +262,29 @@ func (db *MySQLMetadataRepository) mysqlResolveObjectName(cache *catalog.Cache, 
 	default:
 		return "", metadata.ErrUnsupported
 	}
+}
+
+// mysqlTableNames excludes views because SchemaTables deliberately contains
+// both relation kinds for browsing/completion. The view descriptors provide
+// the exact classification for this cache generation.
+func mysqlTableNames(cache *catalog.Cache, schema string) []string {
+	if cache == nil || cache.Catalog == nil || cache.Catalog.ViewsByID == nil {
+		return nil
+	}
+	views := make(map[string]struct{})
+	for _, view := range cache.Catalog.ViewsByID {
+		if view != nil && view.Schema == schema {
+			views[view.Name] = struct{}{}
+		}
+	}
+	names := cache.SchemaTables[strings.ToUpper(schema)]
+	tables := make([]string, 0, len(names))
+	for _, name := range names {
+		if _, isView := views[name]; !isView {
+			tables = append(tables, name)
+		}
+	}
+	return tables
 }
 
 func (db *MySQLMetadataRepository) mysqlResolveTableName(cache *catalog.Cache, schema, want string) (string, error) {

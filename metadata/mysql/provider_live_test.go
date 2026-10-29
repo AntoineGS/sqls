@@ -252,7 +252,7 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 	for id, columns := range cache.PrimaryKeysByID {
 		found := false
 		for relation := range relations {
-			if id == (catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: relation}).Key() {
+			if id == (catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: relation}).Key() {
 				found = true
 				break
 			}
@@ -261,7 +261,7 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 			t.Errorf("primary key has an unexpected relation identity %q: %v", id, columns)
 		}
 	}
-	if got, want := cache.PrimaryKeysByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "describe_probe"}).Key()], []string{"id"}; !reflect.DeepEqual(got, want) {
+	if got, want := cache.PrimaryKeysByID[(catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: "describe_probe"}).Key()], []string{"id"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("describe_probe primary key columns = %q, want only connected-schema key %q", got, want)
 	}
 	for source, targets := range cache.ForeignKeys {

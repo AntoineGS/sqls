@@ -48,6 +48,10 @@ func TestMySQLMetadataJobsProjectSchemaScopedCatalog(t *testing.T) {
 	assertMySQLProceduresPatch(t, patches[catalog.MetadataProcedures])
 	assertMySQLFunctionsPatch(t, patches[catalog.MetadataFunctions])
 	assertMySQLTriggersPatch(t, patches[catalog.MetadataTriggers])
+	primaryKeyID := catalog.ObjectID{Schema: merged.DefaultSchema, Kind: catalog.ObjectKindTable, Name: "composite_items"}
+	if got, want := merged.PrimaryKeysByID[primaryKeyID.Key()], []string{"tenant_id", "item_id"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("merged composite PK = %v, want schema-qualified columns %v", got, want)
+	}
 	for _, object := range []catalog.ObjectID{
 		{Kind: catalog.ObjectKindView, Name: "items_view"},
 		catalog.IndexObjectID("mde_fixture", "items", "uniq_email"),
@@ -374,8 +378,12 @@ func assertMySQLPrimaryKeysPatch(t *testing.T, patch catalog.MetadataPatch) {
 	t.Helper()
 	relationKey := catalog.ColumnDatabaseKey("mde_fixture", "composite_items")
 	want := []string{"tenant_id", "item_id"}
-	if got := patch.Cache.PrimaryKeysByID[catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "composite_items"}.Key()]; !reflect.DeepEqual(got, want) {
+	id := catalog.ObjectID{Schema: "mde_fixture", Kind: catalog.ObjectKindTable, Name: "composite_items"}
+	if got := patch.Cache.PrimaryKeysByID[id.Key()]; !reflect.DeepEqual(got, want) {
 		t.Fatalf("ordered composite PK = %v, want %v", got, want)
+	}
+	if got := patch.Cache.PrimaryKeysByID[catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "composite_items"}.Key()]; got != nil {
+		t.Fatalf("schema-less composite PK identity unexpectedly published: %v", got)
 	}
 	keys := patch.Cache.PrimaryKeyColumns[relationKey]
 	if len(keys) != 2 {

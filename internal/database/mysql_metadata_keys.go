@@ -154,7 +154,7 @@ ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
 		}
 		seen[relationKey][row.position] = struct{}{}
 		primaryKeys[relationKey][row.column] = struct{}{}
-		id := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: row.table}.Key()
+		id := catalog.ObjectID{Schema: row.schema, Kind: catalog.ObjectKindTable, Name: row.table}.Key()
 		primaryKeysByID[id] = append(primaryKeysByID[id], row.column)
 	}
 	return catalog.MetadataPatch{Cache: &catalog.Cache{PrimaryKeyColumns: primaryKeys, PrimaryKeysByID: primaryKeysByID}, Count: len(primaryKeysByID)}, nil
