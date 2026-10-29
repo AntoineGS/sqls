@@ -246,3 +246,49 @@ func TestDriverDSNUsesAuthorityUserUnlessOverridden(t *testing.T) {
 		})
 	}
 }
+
+func TestDriverDSNUsernameRoundTripsWithMetadataScope(t *testing.T) {
+	tests := []struct {
+		name    string
+		user    string
+		wantErr bool
+	}{
+		{name: "plain username", user: "alice"},
+		{name: "at sign username", user: "alice@admin"},
+		{name: "slash username", user: "alice/admin"},
+		{name: "colon username rejected", user: "alice:admin", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Target: "DB.Example/mde_fixture", User: tt.user, Password: "dsn-secret"}
+			dsn, err := DriverDSN(cfg, nil)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("DriverDSN() accepted a username that mysql.ParseDSN cannot represent")
+				}
+				if !strings.Contains(err.Error(), "username") || !strings.Contains(err.Error(), ":") {
+					t.Fatalf("DriverDSN() error = %v, want a clear unsupported-username error", err)
+				}
+				if strings.Contains(err.Error(), "dsn-secret") {
+					t.Fatalf("DriverDSN() error leaked password: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("DriverDSN(): %v", err)
+			}
+			parsed, err := mysql.ParseDSN(dsn)
+			if err != nil {
+				t.Fatalf("mysql.ParseDSN(): %v", err)
+			}
+			scope, err := ScopeFor(cfg)
+			if err != nil {
+				t.Fatalf("ScopeFor(): %v", err)
+			}
+			if parsed.User != scope.Principal {
+				t.Fatalf("parsed user = %q, scope principal = %q", parsed.User, scope.Principal)
+			}
+		})
+	}
+}

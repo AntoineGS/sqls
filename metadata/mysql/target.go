@@ -84,8 +84,13 @@ func DriverDSN(cfg Config, extra url.Values) (string, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	user := effectiveUser(cfg.User, target.User)
+	if strings.ContainsRune(user, ':') {
+		return "", fmt.Errorf("mymeta: MySQL username cannot contain ':'")
+	}
+
 	driverConfig := mysql.NewConfig()
-	driverConfig.User = effectiveUser(cfg.User, target.User)
+	driverConfig.User = user
 	driverConfig.Passwd = cfg.Password
 	driverConfig.Net = "tcp"
 	driverConfig.Addr = target.Addr()
