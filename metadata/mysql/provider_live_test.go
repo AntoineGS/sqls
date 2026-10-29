@@ -16,7 +16,7 @@ import (
 	"github.com/sqls-server/sqls/metadata/metadatatest"
 )
 
-func TestLiveMySQLMetadataProviderLoadsSchemaScopedCatalogAndDetails(t *testing.T) {
+func TestMySQLMetadataLiveProviderLoadsSchemaScopedCatalogAndDetails(t *testing.T) {
 	cfg := mysql8LiveConfig(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -132,7 +132,7 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 	if got, want := cache.Schemas, map[string]string{strings.ToUpper(schema): schema}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Schemas = %#v, want only %#v", got, want)
 	}
-	wantRelations := []string{"composite_pk", "describe_probe", "no_key", "parent_rows", "unique_nonnull", "v_describe_probe"}
+	wantRelations := []string{"composite_pk", "describe_probe", "no_key", "parent_rows", "unique_nonnull", "unique_single_nonnull", "v_describe_probe"}
 	if got := cache.SortedTables(); !reflect.DeepEqual(got, wantRelations) {
 		t.Errorf("connected-schema relations = %q, want seeded relations %q", got, wantRelations)
 	}
@@ -160,6 +160,11 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 			if column == nil || column.Schema != schema || column.Table != relation {
 				t.Errorf("column for %q has wrong identity: %+v", relation, column)
 			}
+		}
+	}
+	for _, wrongSchemaColumn := range []string{"other_id", "other_label"} {
+		if _, ok := cache.Column("describe_probe", wrongSchemaColumn); ok {
+			t.Errorf("mde_other.describe_probe column %q leaked into the connected-schema table", wrongSchemaColumn)
 		}
 	}
 	for id, columns := range cache.ColumnsByID {
@@ -196,6 +201,26 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 	for name, view := range cache.Catalog.ViewsByID {
 		if view == nil || view.Schema != schema {
 			t.Errorf("view %q has wrong schema: %+v", name, view)
+		}
+	}
+	if got, want := len(cache.Catalog.ViewsByID), 1; got != want {
+		t.Errorf("connected-schema views = %d, want %d (the same-named mde_other view must not leak)", got, want)
+	}
+	view, ok := cache.ViewByID("v_describe_probe")
+	if !ok {
+		t.Error("connected-schema v_describe_probe is absent")
+	} else {
+		var viewColumns []string
+		for _, column := range view.Columns {
+			if column != nil {
+				viewColumns = append(viewColumns, column.Name)
+				if column.Schema != schema {
+					t.Errorf("connected-schema view column has wrong schema: %+v", column)
+				}
+			}
+		}
+		if got, want := viewColumns, []string{"id", "title"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("connected-schema v_describe_probe columns = %q, want %q (not the mde_other version)", got, want)
 		}
 	}
 	for name, procedure := range cache.Catalog.ProceduresByID {
@@ -236,6 +261,9 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 			t.Errorf("primary key has an unexpected relation identity %q: %v", id, columns)
 		}
 	}
+	if got, want := cache.PrimaryKeysByID[(catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "describe_probe"}).Key()], []string{"id"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("describe_probe primary key columns = %q, want only connected-schema key %q", got, want)
+	}
 	for source, targets := range cache.ForeignKeys {
 		if !strings.HasPrefix(source, strings.ToUpper(schema)+"\t") {
 			t.Errorf("foreign-key source is outside connected schema: %q", source)
@@ -266,6 +294,7 @@ func assertMySQLNativeColumnKeys(t *testing.T, ctx context.Context, cache *catal
 	}{
 		{table: "describe_probe", column: "id", key: "PRI"},
 		{table: "unique_nonnull", column: "tenant_id", key: "PRI"},
+		{table: "unique_single_nonnull", column: "unique_code", key: "UNI"},
 		{table: "describe_probe", column: "parent_id", key: "MUL"},
 		{table: "no_key", column: "label", key: ""},
 	} {
@@ -310,13 +339,10 @@ func assertMySQLNativeColumnKeys(t *testing.T, ctx context.Context, cache *catal
 			}
 		}
 	}
-	for _, key := range []string{"PRI", "MUL", ""} {
+	for _, key := range []string{"PRI", "UNI", "MUL", ""} {
 		if !seen[key] {
 			t.Errorf("live MySQL column snapshot has no native %q COLUMN_KEY value", key)
 		}
-	}
-	if !seen["UNI"] {
-		t.Log("fixture seed has no native UNI COLUMN_KEY: its only non-primary unique index is InnoDB's clustered key and MySQL reports PRI")
 	}
 }
 
@@ -338,13 +364,20 @@ func assertMySQLWrongSchemaDetailsDoNotQuery(t *testing.T, ctx context.Context, 
 
 	requestCtx, cancel := context.WithTimeout(ctx, time.Second)
 	defer cancel()
-	for _, name := range []string{"describe_probe", "other_probe"} {
+	for _, object := range []struct {
+		kind catalog.ObjectKind
+		name string
+	}{
+		{kind: catalog.ObjectKindTable, name: "describe_probe"},
+		{kind: catalog.ObjectKindTable, name: "other_probe"},
+		{kind: catalog.ObjectKindView, name: "v_describe_probe"},
+	} {
 		_, err = lease.Detail(requestCtx, metadata.Request{
-			Object: catalog.ObjectID{Schema: "mde_other", Kind: catalog.ObjectKindTable, Name: name},
+			Object: catalog.ObjectID{Schema: "mde_other", Kind: object.kind, Name: object.name},
 			Facet:  "ddl", Consistency: metadata.Committed,
 		})
 		if !errors.Is(err, metadata.ErrUnsupported) {
-			t.Fatalf("wrong-schema Detail(mde_other.%s) error = %v, want immediate metadata.ErrUnsupported without querying", name, err)
+			t.Fatalf("wrong-schema Detail(mde_other.%s %s) error = %v, want immediate metadata.ErrUnsupported without querying", object.kind, object.name, err)
 		}
 	}
 }
@@ -363,6 +396,7 @@ func assertMySQLCreateDetails(t *testing.T, ctx context.Context, provider *mysql
 		{kind: catalog.ObjectKindTable, name: "parent_rows", verb: "TABLE", label: "Create Table"},
 		{kind: catalog.ObjectKindTable, name: "describe_probe", verb: "TABLE", label: "Create Table"},
 		{kind: catalog.ObjectKindTable, name: "unique_nonnull", verb: "TABLE", label: "Create Table"},
+		{kind: catalog.ObjectKindTable, name: "unique_single_nonnull", verb: "TABLE", label: "Create Table"},
 		{kind: catalog.ObjectKindTable, name: "no_key", verb: "TABLE", label: "Create Table"},
 		{kind: catalog.ObjectKindTable, name: "composite_pk", verb: "TABLE", label: "Create Table"},
 		{kind: catalog.ObjectKindView, name: "v_describe_probe", verb: "VIEW", label: "Create View"},
