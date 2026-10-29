@@ -12,39 +12,29 @@ import (
 // MetadataPlan provides the schema-scoped MySQL categories supported by the
 // shared catalog. Unsupported categories are omitted for the loader to mark.
 func (db *MySQLMetadataRepository) MetadataPlan() catalog.MetadataPlan {
+	schemaJob := func(kind catalog.MetadataKind, dependencies []catalog.MetadataKind, read mysqlMetadataSchemaRead) catalog.MetadataJob {
+		dependsOn := append([]catalog.MetadataKind{catalog.MetadataSchemas}, dependencies...)
+		return catalog.MetadataJob{Kind: kind, DependsOn: dependsOn, Run: func(ctx context.Context, cache *catalog.Cache) (catalog.MetadataPatch, error) {
+			return db.withSchemaMetadataRead(ctx, cache, read)
+		}}
+	}
 	return catalog.MetadataPlan{Parallelism: 3, Jobs: []catalog.MetadataJob{
 		{Kind: catalog.MetadataSchemas, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
 			return db.withMetadataRead(ctx, db.readMetadataSchemas)
 		}},
-		{Kind: catalog.MetadataRelations, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataRelations)
-		}},
-		{Kind: catalog.MetadataColumnsCurrent, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataColumns)
-		}},
-		{Kind: catalog.MetadataViews, DependsOn: []catalog.MetadataKind{catalog.MetadataColumnsCurrent}, Run: func(ctx context.Context, cache *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, func(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
-				return db.readMetadataViews(ctx, tx, cache)
+		schemaJob(catalog.MetadataRelations, nil, db.readMetadataRelations),
+		schemaJob(catalog.MetadataColumnsCurrent, nil, db.readMetadataColumns),
+		{Kind: catalog.MetadataViews, DependsOn: []catalog.MetadataKind{catalog.MetadataSchemas, catalog.MetadataColumnsCurrent}, Run: func(ctx context.Context, cache *catalog.Cache) (catalog.MetadataPatch, error) {
+			return db.withSchemaMetadataRead(ctx, cache, func(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
+				return db.readMetadataViews(ctx, tx, schema, cache)
 			})
 		}},
-		{Kind: catalog.MetadataIndexes, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataIndexes)
-		}},
-		{Kind: catalog.MetadataPrimaryKeys, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataPrimaryKeys)
-		}},
-		{Kind: catalog.MetadataForeignKeys, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataForeignKeys)
-		}},
-		{Kind: catalog.MetadataProcedures, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataProcedures)
-		}},
-		{Kind: catalog.MetadataFunctions, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataFunctions)
-		}},
-		{Kind: catalog.MetadataTriggers, Run: func(ctx context.Context, _ *catalog.Cache) (catalog.MetadataPatch, error) {
-			return db.withMetadataRead(ctx, db.readMetadataTriggers)
-		}},
+		schemaJob(catalog.MetadataIndexes, nil, db.readMetadataIndexes),
+		schemaJob(catalog.MetadataPrimaryKeys, nil, db.readMetadataPrimaryKeys),
+		schemaJob(catalog.MetadataForeignKeys, nil, db.readMetadataForeignKeys),
+		schemaJob(catalog.MetadataProcedures, nil, db.readMetadataProcedures),
+		schemaJob(catalog.MetadataFunctions, nil, db.readMetadataFunctions),
+		schemaJob(catalog.MetadataTriggers, nil, db.readMetadataTriggers),
 	}}
 }
 
@@ -59,9 +49,10 @@ WHERE SCHEMA_NAME = ?`
 		if err := rows.Scan(&candidate); err != nil {
 			return err
 		}
-		if candidate == db.Schema {
-			schemaName = candidate
+		if schemaName != "" {
+			return fmt.Errorf("mysql: schema lookup for %q returned more than one row", db.Schema)
 		}
+		schemaName = candidate
 		return nil
 	})
 	if err != nil {

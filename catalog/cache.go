@@ -159,7 +159,9 @@ func (cc *CatalogCache) RebuildObjects(fold func(string) string) {
 		idx.Insert(ObjectID{Kind: ObjectKindFunction, Name: v.Name})
 	}
 	for _, v := range cc.IndexesByID {
-		idx.Insert(ObjectID{Kind: ObjectKindIndex, Name: v.Name})
+		if v != nil {
+			idx.Insert(IndexObjectID(v.Schema, v.RelationName, v.Name))
+		}
 	}
 	for _, v := range cc.TriggersByID {
 		idx.Insert(ObjectID{Kind: ObjectKindTrigger, Name: v.Name})
@@ -235,7 +237,35 @@ func (dc *Cache) IndexByID(name string) (*IndexDesc, bool) {
 		return nil, false
 	}
 	v, ok := dc.Catalog.IndexesByID[objectIDKeyFor(ObjectKindIndex, name)]
-	return v, ok
+	if ok {
+		return v, true
+	}
+	var match *IndexDesc
+	for _, index := range dc.Catalog.IndexesByID {
+		if index == nil || index.Name != name {
+			continue
+		}
+		if match != nil && (match.Schema != index.Schema || match.RelationName != index.RelationName) {
+			return nil, false
+		}
+		match = index
+	}
+	return match, match != nil
+}
+
+// IndexByTableAndID resolves a schema-scoped index by its parent relation and
+// exact index name. Use it when an engine permits duplicate index names on
+// different tables; IndexByID intentionally reports no match for an ambiguous
+// name-only lookup.
+func (dc *Cache) IndexByTableAndID(schema, relation, name string) (*IndexDesc, bool) {
+	if !dc.HasCatalog() {
+		return nil, false
+	}
+	index, ok := dc.Catalog.IndexesByID[IndexObjectID(schema, relation, name).Key()]
+	if !ok || index == nil || index.Schema != schema || index.RelationName != relation || index.Name != name {
+		return nil, false
+	}
+	return index, true
 }
 
 func (dc *Cache) TriggerByID(name string) (*TriggerDesc, bool) {

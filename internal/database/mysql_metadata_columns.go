@@ -14,7 +14,7 @@ type mysqlMetadataColumn struct {
 	ordinal    int64
 }
 
-func (db *MySQLMetadataRepository) readMetadataColumns(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataColumns(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE,
        COLUMN_KEY, COLUMN_DEFAULT, EXTRA, ORDINAL_POSITION
@@ -22,14 +22,14 @@ FROM information_schema.COLUMNS
 WHERE TABLE_SCHEMA = ?
 ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION`
 	columns := make([]mysqlMetadataColumn, 0)
-	err := mysqlMetadataRows(ctx, tx, query, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, query, schema, func(rows *sql.Rows) error {
 		var schemaName, tableName, name, columnType, nullable, key, extra string
 		var defaultValue sql.NullString
 		var ordinal int64
 		if err := rows.Scan(&schemaName, &tableName, &name, &columnType, &nullable, &key, &defaultValue, &extra, &ordinal); err != nil {
 			return err
 		}
-		if schemaName != db.Schema {
+		if schemaName != schema {
 			return nil
 		}
 		if ordinal < 1 {

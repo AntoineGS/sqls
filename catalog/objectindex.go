@@ -16,9 +16,9 @@ var ErrAmbiguous = errors.New("catalog: object name is ambiguous")
 // the object that was inserted under that ObjectID, regardless of how many
 // other objects fold to the same unquoted name. LookupUnquoted deliberately
 // does not pick a winner when more than one object of the same Kind folds to
-// the same name in different namespaces (Catalog/Schema/Owner): it returns
-// every match, so a caller can detect the ambiguity instead of silently
-// resolving to one arbitrary object.
+// the same name in different namespaces (Catalog/Schema/Owner/Parent): it
+// returns every match, so a caller can detect the ambiguity instead of
+// silently resolving to one arbitrary object.
 type ObjectIndex struct {
 	fold   func(string) string
 	exact  map[string]ObjectID

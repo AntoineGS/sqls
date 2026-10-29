@@ -22,20 +22,20 @@ type mysqlMetadataParameter struct {
 	position                              int64
 }
 
-func (db *MySQLMetadataRepository) readMetadataProcedures(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataProcedures(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const routinesQuery = `
 SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION, DEFINER, ROUTINE_COMMENT
 FROM information_schema.ROUTINES
 WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
 ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`
 	routines := make(map[string]*catalog.ProcedureDesc)
-	err := mysqlMetadataRows(ctx, tx, routinesQuery, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, routinesQuery, schema, func(rows *sql.Rows) error {
 		var routine mysqlMetadataRoutine
 		var routineType string
 		if err := rows.Scan(&routine.schema, &routine.name, &routineType, &routine.source, &routine.definer, &routine.comment); err != nil {
 			return err
 		}
-		if routine.schema != db.Schema || routineType != "PROCEDURE" {
+		if routine.schema != schema || routineType != "PROCEDURE" {
 			return nil
 		}
 		if _, exists := routines[routine.name]; exists {
@@ -62,13 +62,13 @@ JOIN information_schema.ROUTINES AS r
  AND r.SPECIFIC_NAME = p.SPECIFIC_NAME
 WHERE p.SPECIFIC_SCHEMA = ? AND r.ROUTINE_TYPE = 'PROCEDURE'
 ORDER BY p.SPECIFIC_SCHEMA, p.SPECIFIC_NAME, p.ORDINAL_POSITION`
-	err = mysqlMetadataRows(ctx, tx, parametersQuery, db.Schema, func(rows *sql.Rows) error {
+	err = mysqlMetadataRows(ctx, tx, parametersQuery, schema, func(rows *sql.Rows) error {
 		var parameter mysqlMetadataParameter
 		var parameterName, mode sql.NullString
 		if err := rows.Scan(&parameter.schema, &parameter.routine, &parameterName, &mode, &parameter.dataType, &parameter.position); err != nil {
 			return err
 		}
-		if parameter.schema != db.Schema {
+		if parameter.schema != schema {
 			return nil
 		}
 		procedure := routines[parameter.routine]
@@ -117,20 +117,20 @@ ORDER BY p.SPECIFIC_SCHEMA, p.SPECIFIC_NAME, p.ORDINAL_POSITION`
 	return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Procedures: byName, ProceduresByID: byID}}, Count: len(routines)}, nil
 }
 
-func (db *MySQLMetadataRepository) readMetadataFunctions(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataFunctions(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const routinesQuery = `
 SELECT ROUTINE_SCHEMA, ROUTINE_NAME, ROUTINE_TYPE, ROUTINE_DEFINITION, DEFINER, ROUTINE_COMMENT
 FROM information_schema.ROUTINES
 WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
 ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`
 	routines := make(map[string]*catalog.FunctionDesc)
-	err := mysqlMetadataRows(ctx, tx, routinesQuery, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, routinesQuery, schema, func(rows *sql.Rows) error {
 		var routine mysqlMetadataRoutine
 		var routineType string
 		if err := rows.Scan(&routine.schema, &routine.name, &routineType, &routine.source, &routine.definer, &routine.comment); err != nil {
 			return err
 		}
-		if routine.schema != db.Schema || routineType != "FUNCTION" {
+		if routine.schema != schema || routineType != "FUNCTION" {
 			return nil
 		}
 		if _, exists := routines[routine.name]; exists {
@@ -155,13 +155,13 @@ JOIN information_schema.ROUTINES AS r
  AND r.SPECIFIC_NAME = p.SPECIFIC_NAME
 WHERE p.SPECIFIC_SCHEMA = ? AND r.ROUTINE_TYPE = 'FUNCTION'
 ORDER BY p.SPECIFIC_SCHEMA, p.SPECIFIC_NAME, p.ORDINAL_POSITION`
-	err = mysqlMetadataRows(ctx, tx, parametersQuery, db.Schema, func(rows *sql.Rows) error {
+	err = mysqlMetadataRows(ctx, tx, parametersQuery, schema, func(rows *sql.Rows) error {
 		var parameter mysqlMetadataParameter
 		var parameterName, mode sql.NullString
 		if err := rows.Scan(&parameter.schema, &parameter.routine, &parameterName, &mode, &parameter.dataType, &parameter.position); err != nil {
 			return err
 		}
-		if parameter.schema != db.Schema {
+		if parameter.schema != schema {
 			return nil
 		}
 		function := routines[parameter.routine]
@@ -201,7 +201,7 @@ ORDER BY p.SPECIFIC_SCHEMA, p.SPECIFIC_NAME, p.ORDINAL_POSITION`
 	return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Functions: byName, FunctionsByID: byID}}, Count: len(routines)}, nil
 }
 
-func (db *MySQLMetadataRepository) readMetadataTriggers(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataTriggers(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT TRIGGER_SCHEMA, TRIGGER_NAME, EVENT_OBJECT_SCHEMA, EVENT_OBJECT_TABLE,
        ACTION_TIMING, EVENT_MANIPULATION, ACTION_STATEMENT
@@ -211,13 +211,13 @@ ORDER BY EVENT_OBJECT_SCHEMA, EVENT_OBJECT_TABLE, ACTION_ORDER, TRIGGER_NAME`
 	triggers := make(map[string]*catalog.TriggerDesc)
 	byID := make(map[string]*catalog.TriggerDesc)
 	byTable := make(map[string][]*catalog.TriggerDesc)
-	err := mysqlMetadataRows(ctx, tx, query, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, query, schema, func(rows *sql.Rows) error {
 		var schemaName, name, objectSchema, table, timing, event string
 		var source sql.NullString
 		if err := rows.Scan(&schemaName, &name, &objectSchema, &table, &timing, &event, &source); err != nil {
 			return err
 		}
-		if schemaName != db.Schema || objectSchema != db.Schema {
+		if schemaName != schema || objectSchema != schema {
 			return nil
 		}
 		if name == "" || table == "" {

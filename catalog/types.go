@@ -313,8 +313,10 @@ type CatalogCache struct {
 	GeneratorsByID map[string]*GeneratorDesc
 	DomainsByID    map[string]*DomainDesc
 	FunctionsByID  map[string]*FunctionDesc
-	IndexesByID    map[string]*IndexDesc
-	TriggersByID   map[string]*TriggerDesc
+	// IndexesByID uses ObjectID.Key; schema-bearing index IDs include
+	// Parent=RelationName so duplicate names on different tables remain exact.
+	IndexesByID  map[string]*IndexDesc
+	TriggersByID map[string]*TriggerDesc
 	// SystemRelationsByID and ExceptionsByID are exact-only category stores.
 	// System relations use ObjectKindTable identities but never enter the user
 	// relation maps or completion candidates.

@@ -17,6 +17,20 @@ type MySQLMetadataRepository struct {
 }
 
 type mysqlMetadataRead func(context.Context, *sql.Tx) (catalog.MetadataPatch, error)
+type mysqlMetadataSchemaRead func(context.Context, *sql.Tx, string) (catalog.MetadataPatch, error)
+
+func (db *MySQLMetadataRepository) withSchemaMetadataRead(ctx context.Context, cache *catalog.Cache, read mysqlMetadataSchemaRead) (catalog.MetadataPatch, error) {
+	if cache == nil || cache.DefaultSchema == "" {
+		return catalog.MetadataPatch{}, errors.New("mysql: canonical metadata schema is unavailable")
+	}
+	if read == nil {
+		return catalog.MetadataPatch{}, errors.New("mysql: metadata schema read is nil")
+	}
+	schema := cache.DefaultSchema
+	return db.withMetadataRead(ctx, func(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+		return read(ctx, tx, schema)
+	})
+}
 
 func (db *MySQLMetadataRepository) withMetadataRead(ctx context.Context, read mysqlMetadataRead) (patch catalog.MetadataPatch, err error) {
 	if db == nil || db.Conn == nil {

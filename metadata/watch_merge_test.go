@@ -6,6 +6,7 @@ import (
 	"errors"
 	"reflect"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -38,9 +39,80 @@ func TestMergeObjectsKeepsCaseCollidingSiblingImmutable(t *testing.T) {
 	}
 }
 
+func TestMergeObjectsPreservesTableQualifiedMySQLIndexes(t *testing.T) {
+	const schema = "mde_fixture"
+	itemsID := catalog.IndexObjectID(schema, "items", "PRIMARY")
+	compositeID := catalog.IndexObjectID(schema, "composite_items", "PRIMARY")
+	items := &catalog.IndexDesc{Schema: schema, Name: "PRIMARY", RelationName: "items", Columns: []string{"id"}}
+	composite := &catalog.IndexDesc{Schema: schema, Name: "PRIMARY", RelationName: "composite_items", Columns: []string{"tenant_id", "item_id"}}
+	base := NewCache()
+	base.Catalog = &catalog.CatalogCache{
+		Indexes:             map[string]*catalog.IndexDesc{"PRIMARY": items},
+		IndexesByID:         map[string]*catalog.IndexDesc{itemsID.Key(): items, compositeID.Key(): composite},
+		IndexesByTable:      map[string][]*catalog.IndexDesc{"ITEMS": {items}, "COMPOSITE_ITEMS": {composite}},
+		ViewsByID:           map[string]*catalog.ViewDesc{},
+		ProceduresByID:      map[string]*catalog.ProcedureDesc{},
+		GeneratorsByID:      map[string]*catalog.GeneratorDesc{},
+		DomainsByID:         map[string]*catalog.DomainDesc{},
+		FunctionsByID:       map[string]*catalog.FunctionDesc{},
+		TriggersByID:        map[string]*catalog.TriggerDesc{},
+		SystemRelationsByID: map[string]*catalog.SystemRelationDesc{},
+		ExceptionsByID:      map[string]*catalog.ExceptionDesc{},
+	}
+	base.Catalog.RebuildObjects(nil)
+	replacement := &catalog.IndexDesc{Schema: schema, Name: "PRIMARY", RelationName: "items", Columns: []string{"id", "new_column"}}
+	delta := ObjectDelta{
+		Owners: map[catalog.MetadataKind][]catalog.ObjectID{catalog.MetadataIndexes: {itemsID}},
+		Patches: map[catalog.MetadataKind]catalog.MetadataPatch{catalog.MetadataIndexes: {Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{
+			Indexes:     map[string]*catalog.IndexDesc{"PRIMARY": replacement},
+			IndexesByID: map[string]*catalog.IndexDesc{itemsID.Key(): replacement},
+		}}}},
+	}
+	got, err := MergeObjects(context.Background(), base, delta)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if index := got.Catalog.IndexesByID[itemsID.Key()]; index == nil || !reflect.DeepEqual(index.Columns, []string{"id", "new_column"}) {
+		t.Fatalf("replaced items PRIMARY = %#v", index)
+	}
+	if index := got.Catalog.IndexesByID[compositeID.Key()]; index != composite {
+		t.Fatalf("unmodified composite PRIMARY = %#v, want original descriptor %#v", index, composite)
+	}
+	if len(got.Catalog.IndexesByTable["ITEMS"]) != 1 || len(got.Catalog.IndexesByTable["COMPOSITE_ITEMS"]) != 1 {
+		t.Fatalf("watch-merged table index groups = %#v", got.Catalog.IndexesByTable)
+	}
+	if _, ok := got.Catalog.Objects.Lookup(itemsID); !ok {
+		t.Fatal("merged object index omitted the items PRIMARY identity")
+	}
+	if _, ok := got.Catalog.Objects.Lookup(compositeID); !ok {
+		t.Fatal("merged object index omitted the composite_items PRIMARY identity")
+	}
+}
+
 func watchID(kind catalog.ObjectKind, name string) catalog.ObjectID {
 	return catalog.ObjectID{Kind: kind, Name: name}
 }
+
+func TestWatchParseIDAcceptsTableQualifiedIndexIdentity(t *testing.T) {
+	key := watchTableQualifiedIndexKey("mde_fixture", "items", "PRIMARY")
+	id, err := watchParseID(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.Key() != key {
+		t.Fatalf("parsed index identity key = %q, want %q", id.Key(), key)
+	}
+}
+
+func watchTableQualifiedIndexKey(schema, table, name string) string {
+	components := []string{"", schema, "", string(catalog.ObjectKindIndex), name, table}
+	key := ""
+	for _, component := range components {
+		key += strconv.Itoa(len(component)) + ":" + component
+	}
+	return key
+}
+
 func watchCol(table, name string) *catalog.ColumnDesc {
 	return &catalog.ColumnDesc{ColumnBase: catalog.ColumnBase{Table: table, Name: name}, Key: "YES", Facts: &catalog.ColumnTypeFacts{UserDomain: true}}
 }

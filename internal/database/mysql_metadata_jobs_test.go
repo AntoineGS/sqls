@@ -18,7 +18,7 @@ func TestMySQLMetadataJobsProjectSchemaScopedCatalog(t *testing.T) {
 	state := newMySQLMetadataScript()
 	db := sql.OpenDB(mysqlMetadataConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
 	plan := repo.MetadataPlan()
 
 	patches := make(map[catalog.MetadataKind]catalog.MetadataPatch, len(plan.Jobs))
@@ -50,7 +50,7 @@ func TestMySQLMetadataJobsProjectSchemaScopedCatalog(t *testing.T) {
 	assertMySQLTriggersPatch(t, patches[catalog.MetadataTriggers])
 	for _, object := range []catalog.ObjectID{
 		{Kind: catalog.ObjectKindView, Name: "items_view"},
-		{Kind: catalog.ObjectKindIndex, Name: "uniq_email"},
+		catalog.IndexObjectID("mde_fixture", "items", "uniq_email"),
 		{Kind: catalog.ObjectKindProcedure, Name: "save_items"},
 		{Kind: catalog.ObjectKindFunction, Name: "item_count"},
 		{Kind: catalog.ObjectKindTrigger, Name: "items_bi"},
@@ -87,9 +87,13 @@ func TestMySQLMetadataJobsProjectSchemaScopedCatalog(t *testing.T) {
 		if !mysqlMetadataHasSchemaPredicate(query) {
 			t.Errorf("metadata query is not schema-scoped: %q", query)
 		}
+		wantSchema := "mde_fixture"
+		if strings.Contains(strings.ToUpper(query), "INFORMATION_SCHEMA.SCHEMATA") {
+			wantSchema = "MDE_FIXTURE"
+		}
 		bound := false
 		for _, argument := range state.args {
-			if strings.Contains(query, "?") && argument.Query == query && argument.Value == "mde_fixture" {
+			if strings.Contains(query, "?") && argument.Query == query && argument.Value == wantSchema {
 				bound = true
 				break
 			}
@@ -115,11 +119,15 @@ func TestMySQLMetadataJobsProjectSchemaScopedCatalog(t *testing.T) {
 func TestMySQLMetadataJobsRollbackAndDiscardFailedPatch(t *testing.T) {
 	wantErr := errors.New("scripted query error")
 	state := newMySQLMetadataScript()
-	state.queryErr = wantErr
 	db := sql.OpenDB(mysqlMetadataConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	job := (&MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}).MetadataPlan().Jobs[1]
-	patch, err := job.Run(context.Background(), nil)
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	plan := repo.MetadataPlan()
+	cache := mysqlMetadataSchemaCache(t, repo)
+	state.mu.Lock()
+	state.queryErr = wantErr
+	state.mu.Unlock()
+	patch, err := plan.Jobs[1].Run(context.Background(), cache)
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("job error = %v, want %v", err, wantErr)
 	}
@@ -128,17 +136,21 @@ func TestMySQLMetadataJobsRollbackAndDiscardFailedPatch(t *testing.T) {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.rollbacks != 1 || state.commits != 0 {
-		t.Fatalf("failed transaction committed=%d rolled back=%d, want 0/1", state.commits, state.rollbacks)
+	if state.rollbacks != 1 || state.commits != 1 {
+		t.Fatalf("transactions committed=%d rolled back=%d, want schema commit plus failed-job rollback", state.commits, state.rollbacks)
 	}
 }
 
 func TestMySQLMetadataJobsCancelInFlightQueryAndDiscardPatch(t *testing.T) {
 	state := newMySQLMetadataScript()
-	state.waitForCancel = true
 	db := sql.OpenDB(mysqlMetadataConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	job := (&MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}).MetadataPlan().Jobs[1]
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	plan := repo.MetadataPlan()
+	cache := mysqlMetadataSchemaCache(t, repo)
+	state.mu.Lock()
+	state.waitForCancel = true
+	state.mu.Unlock()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	type result struct {
@@ -147,7 +159,7 @@ func TestMySQLMetadataJobsCancelInFlightQueryAndDiscardPatch(t *testing.T) {
 	}
 	done := make(chan result, 1)
 	go func() {
-		patch, err := job.Run(ctx, nil)
+		patch, err := plan.Jobs[1].Run(ctx, cache)
 		done <- result{patch: patch, err: err}
 	}()
 	<-state.queryStarted
@@ -161,8 +173,8 @@ func TestMySQLMetadataJobsCancelInFlightQueryAndDiscardPatch(t *testing.T) {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.rollbacks != 1 || state.commits != 0 {
-		t.Fatalf("cancelled transaction committed=%d rolled back=%d, want 0/1", state.commits, state.rollbacks)
+	if state.rollbacks != 1 || state.commits != 1 {
+		t.Fatalf("transactions committed=%d rolled back=%d, want schema commit plus cancelled-job rollback", state.commits, state.rollbacks)
 	}
 }
 
@@ -186,6 +198,13 @@ func TestMySQLMetadataPlanHasOnlySupportedBoundedJobs(t *testing.T) {
 		if job.Run == nil {
 			t.Errorf("%s job has nil Run", job.Kind)
 		}
+		if job.Kind == catalog.MetadataSchemas {
+			if len(job.DependsOn) != 0 {
+				t.Errorf("schema job dependencies = %v, want none", job.DependsOn)
+			}
+		} else if !containsMySQLMetadataKind(job.DependsOn, catalog.MetadataSchemas) {
+			t.Errorf("%s job dependencies = %v, want schema discovery", job.Kind, job.DependsOn)
+		}
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("job kinds = %v, want %v", got, want)
@@ -198,6 +217,81 @@ func TestMySQLMetadataPlanHasOnlySupportedBoundedJobs(t *testing.T) {
 			if job.Kind == unsupported {
 				t.Errorf("unsupported MySQL category %s was scheduled", unsupported)
 			}
+		}
+	}
+}
+
+func containsMySQLMetadataKind(kinds []catalog.MetadataKind, want catalog.MetadataKind) bool {
+	for _, kind := range kinds {
+		if kind == want {
+			return true
+		}
+	}
+	return false
+}
+
+func TestMySQLMetadataIndexesRetainSameNamedIndexesByTable(t *testing.T) {
+	state := newMySQLMetadataScript()
+	db := sql.OpenDB(mysqlMetadataConnector{state: state})
+	t.Cleanup(func() { _ = db.Close() })
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	plan := repo.MetadataPlan()
+	var schemaJob, indexJob catalog.MetadataJob
+	for _, job := range plan.Jobs {
+		switch job.Kind {
+		case catalog.MetadataSchemas:
+			schemaJob = job
+		case catalog.MetadataIndexes:
+			indexJob = job
+		}
+	}
+	schemaPatch, err := schemaJob.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache, err := mergeMetadata(newMetadataCache(), catalog.MetadataSchemas, schemaPatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	patch, err := indexJob.Run(context.Background(), cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	indexesByID := patch.Cache.Catalog.IndexesByID
+	if len(indexesByID) != 3 {
+		t.Fatalf("indexes by identity = %#v, want 3 fixture indexes including both table PRIMARY indexes", indexesByID)
+	}
+	primaryTables := make(map[string]bool)
+	for _, index := range indexesByID {
+		if index.Name == "PRIMARY" {
+			primaryTables[index.RelationName] = true
+		}
+	}
+	if !primaryTables["items"] || !primaryTables["composite_items"] || len(primaryTables) != 2 {
+		t.Fatalf("PRIMARY indexes by table = %#v, want items and composite_items", primaryTables)
+	}
+	for table := range primaryTables {
+		if index, ok := patch.Cache.IndexByTableAndID("mde_fixture", table, "PRIMARY"); !ok || index.RelationName != table {
+			t.Errorf("IndexByTableAndID(%q, %q, PRIMARY) = %#v, %v", "mde_fixture", table, index, ok)
+		}
+	}
+	if _, ok := patch.Cache.IndexByID("PRIMARY"); ok {
+		t.Fatal("name-only PRIMARY lookup returned an arbitrary table's index")
+	}
+	if index, ok := patch.Cache.IndexByID("uniq_email"); !ok || index.RelationName != "items" {
+		t.Fatalf("unique name-only index lookup = %#v, %v", index, ok)
+	}
+	merged, err := mergeMetadata(cache, catalog.MetadataIndexes, patch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := merged.Catalog.Objects.LookupUnquoted(catalog.ObjectKindIndex, "PRIMARY"); len(got) != 2 {
+		t.Fatalf("merged PRIMARY index identities = %#v, want one per table", got)
+	}
+	for table := range primaryTables {
+		want := catalog.IndexObjectID("mde_fixture", table, "PRIMARY")
+		if got, ok := merged.Catalog.Objects.Lookup(want); !ok || got != want {
+			t.Errorf("merged exact index identity = %+v, %v; want %+v", got, ok, want)
 		}
 	}
 }
@@ -268,7 +362,7 @@ func assertMySQLIndexesPatch(t *testing.T, patch catalog.MetadataPatch) {
 	if len(patch.Cache.Catalog.IndexesByTable[catalog.CatalogCacheKey("items")]) != 2 {
 		t.Fatalf("indexes by table = %#v, want primary and unique indexes", patch.Cache.Catalog.IndexesByTable)
 	}
-	if _, ok := patch.Cache.Catalog.IndexesByID[catalog.ObjectID{Kind: catalog.ObjectKindIndex, Name: "uniq_email"}.Key()]; !ok {
+	if _, ok := patch.Cache.Catalog.IndexesByID[catalog.IndexObjectID("mde_fixture", "items", "uniq_email").Key()]; !ok {
 		t.Fatal("exact-identity index was not published")
 	}
 	if got := patch.Cache.Catalog.Indexes[catalog.CatalogCacheKey("uniq_email")]; got == nil || got.Schema != "mde_fixture" {
@@ -400,6 +494,30 @@ func newMySQLMetadataScript() *mysqlMetadataScript {
 	return &mysqlMetadataScript{queryStarted: make(chan struct{})}
 }
 
+func mysqlMetadataSchemaCache(t *testing.T, repo *MySQLMetadataRepository) *catalog.Cache {
+	t.Helper()
+	var schemaJob *catalog.MetadataJob
+	for _, job := range repo.MetadataPlan().Jobs {
+		if job.Kind == catalog.MetadataSchemas {
+			copy := job
+			schemaJob = &copy
+			break
+		}
+	}
+	if schemaJob == nil {
+		t.Fatal("metadata plan has no schema job")
+	}
+	patch, err := schemaJob.Run(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("schema job: %v", err)
+	}
+	cache, err := mergeMetadata(newMetadataCache(), catalog.MetadataSchemas, patch)
+	if err != nil {
+		t.Fatalf("merge schema patch: %v", err)
+	}
+	return cache
+}
+
 type mysqlMetadataConnector struct{ state *mysqlMetadataScript }
 
 func (c mysqlMetadataConnector) Connect(context.Context) (driver.Conn, error) {
@@ -488,7 +606,7 @@ func mysqlMetadataRowsFor(query string) driver.Rows {
 	switch {
 	case strings.Contains(upper, "INFORMATION_SCHEMA.SCHEMATA"):
 		columns = []string{"SCHEMA_NAME"}
-		rows = [][]driver.Value{{"mde_fixture"}, {"mde_other"}}
+		rows = [][]driver.Value{{"mde_fixture"}}
 	case strings.Contains(upper, "INFORMATION_SCHEMA.TABLES"):
 		columns = []string{"TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE"}
 		rows = [][]driver.Value{{"mde_fixture", "composite_items", "BASE TABLE"}, {"mde_fixture", "items", "BASE TABLE"}, {"mde_fixture", "items_view", "VIEW"}, {"mde_other", "items", "BASE TABLE"}}

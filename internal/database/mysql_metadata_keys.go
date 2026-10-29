@@ -14,21 +14,21 @@ type mysqlMetadataIndex struct {
 	positions map[int64]string
 }
 
-func (db *MySQLMetadataRepository) readMetadataIndexes(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataIndexes(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, NON_UNIQUE, SEQ_IN_INDEX, COLUMN_NAME
 FROM information_schema.STATISTICS
 WHERE TABLE_SCHEMA = ?
 ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`
 	indexesByIdentity := make(map[string]*mysqlMetadataIndex)
-	err := mysqlMetadataRows(ctx, tx, query, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, query, schema, func(rows *sql.Rows) error {
 		var schemaName, tableName, name string
 		var nonUnique, position int64
 		var column sql.NullString
 		if err := rows.Scan(&schemaName, &tableName, &name, &nonUnique, &position, &column); err != nil {
 			return err
 		}
-		if schemaName != db.Schema {
+		if schemaName != schema {
 			return nil
 		}
 		if position < 1 || (nonUnique != 0 && nonUnique != 1) {
@@ -89,7 +89,7 @@ ORDER BY TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX`
 	byTable := make(map[string][]*catalog.IndexDesc)
 	for _, index := range indexes {
 		byName[catalog.CatalogCacheKey(index.Name)] = index
-		byID[catalog.ObjectID{Kind: catalog.ObjectKindIndex, Name: index.Name}.Key()] = index
+		byID[catalog.IndexObjectID(index.Schema, index.RelationName, index.Name).Key()] = index
 		byTable[catalog.CatalogCacheKey(index.RelationName)] = append(byTable[catalog.CatalogCacheKey(index.RelationName)], index)
 	}
 	fragment := &catalog.CatalogCache{Indexes: byName, IndexesByTable: byTable, IndexesByID: byID}
@@ -101,7 +101,7 @@ type mysqlMetadataPrimaryKeyRow struct {
 	position              int64
 }
 
-func (db *MySQLMetadataRepository) readMetadataPrimaryKeys(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataPrimaryKeys(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
 FROM information_schema.TABLE_CONSTRAINTS AS tc
@@ -114,12 +114,12 @@ WHERE tc.TABLE_SCHEMA = ?
   AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
 ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
 	primaryRows := make([]mysqlMetadataPrimaryKeyRow, 0)
-	err := mysqlMetadataRows(ctx, tx, query, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, query, schema, func(rows *sql.Rows) error {
 		var key mysqlMetadataPrimaryKeyRow
 		if err := rows.Scan(&key.schema, &key.table, &key.column, &key.position); err != nil {
 			return err
 		}
-		if key.schema != db.Schema {
+		if key.schema != schema {
 			return nil
 		}
 		if key.position < 1 {
@@ -171,7 +171,7 @@ type mysqlMetadataForeignKeyIdentity struct {
 	schema, table, name string
 }
 
-func (db *MySQLMetadataRepository) readMetadataForeignKeys(ctx context.Context, tx *sql.Tx) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataForeignKeys(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT rc.CONSTRAINT_SCHEMA, kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME,
        kcu.REFERENCED_TABLE_SCHEMA, kcu.REFERENCED_TABLE_NAME,
@@ -186,14 +186,14 @@ WHERE rc.CONSTRAINT_SCHEMA = ?
   AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
 ORDER BY kcu.TABLE_SCHEMA, rc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION`
 	fkRows := make([]mysqlMetadataForeignKeyRow, 0)
-	err := mysqlMetadataRows(ctx, tx, query, db.Schema, func(rows *sql.Rows) error {
+	err := mysqlMetadataRows(ctx, tx, query, schema, func(rows *sql.Rows) error {
 		var constraintSchema string
 		var key mysqlMetadataForeignKeyRow
 		if err := rows.Scan(&constraintSchema, &key.sourceSchema, &key.sourceTable, &key.sourceColumn,
 			&key.targetSchema, &key.targetTable, &key.targetColumn, &key.name, &key.position); err != nil {
 			return err
 		}
-		if constraintSchema != db.Schema || key.sourceSchema != db.Schema {
+		if constraintSchema != schema || key.sourceSchema != schema {
 			return nil
 		}
 		if key.targetSchema == "" || key.targetTable == "" || key.targetColumn == "" || key.position < 1 {

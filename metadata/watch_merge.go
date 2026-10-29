@@ -252,7 +252,7 @@ func validateWatchFragment(k catalog.MetadataKind, c *catalog.Cache) error {
 		}
 		for key, group := range cc.IndexesByTable {
 			for _, v := range group {
-				if v == nil || catalog.CatalogCacheKey(v.RelationName) != key || cc.IndexesByID[catalog.ObjectID{Kind: catalog.ObjectKindIndex, Schema: v.Schema, Name: v.Name}.Key()] == nil {
+				if v == nil || catalog.CatalogCacheKey(v.RelationName) != key || cc.IndexesByID[catalog.IndexObjectID(v.Schema, v.RelationName, v.Name).Key()] == nil {
 					return incomplete("unknown index group row")
 				}
 			}
@@ -494,14 +494,14 @@ func mergeWatchCatalog(next, base *catalog.Cache, d ObjectDelta, deleted map[cat
 			})
 		case catalog.MetadataIndexes:
 			n.IndexesByID, n.Indexes, touch, err = replaceDescriptors(b.IndexesByID, b.Indexes, p.IndexesByID, p.Indexes, owners, has, deleted, func(v *catalog.IndexDesc) (catalog.ObjectID, string) {
-				return catalog.ObjectID{Kind: catalog.ObjectKindIndex, Schema: v.Schema, Name: v.Name}, v.RelationName
+				return catalog.IndexObjectID(v.Schema, v.RelationName, v.Name), v.RelationName
 			}, func(v *catalog.IndexDesc) *catalog.IndexDesc {
 				x := *v
 				x.Columns = append([]string(nil), v.Columns...)
 				return &x
 			})
 			if touch {
-				n.IndexesByTable = indexGroups(n.Indexes)
+				n.IndexesByTable = indexGroups(n.IndexesByID)
 			}
 		case catalog.MetadataTriggers:
 			n.TriggersByID, n.Triggers, touch, err = replaceDescriptors(b.TriggersByID, b.Triggers, p.TriggersByID, p.Triggers, owners, has, deleted, func(v *catalog.TriggerDesc) (catalog.ObjectID, string) {
@@ -617,24 +617,37 @@ func mergeWatchRelations(next, base *catalog.Cache, d ObjectDelta, deleted map[c
 }
 
 // Exact keys are opaque to consumers. Internally validating/decoding the five
-// length-prefixed components lets empty PK/column rows retain exact ownership.
+// required length-prefixed components plus the optional parent component lets
+// empty PK/column rows retain exact ownership and schema-scoped indexes retain
+// their relation-qualified identity.
 func watchParseID(key string) (catalog.ObjectID, error) {
-	var parts [5]string
+	var parts [6]string
 	rest := key
-	for i := range parts {
+	parseComponent := func(i int) error {
 		sep := strings.IndexByte(rest, ':')
 		if sep < 1 {
-			return catalog.ObjectID{}, incomplete("invalid exact identity")
+			return incomplete("invalid exact identity")
 		}
 		n, err := strconv.Atoi(rest[:sep])
 		rest = rest[sep+1:]
 		if err != nil || n < 0 || n > len(rest) {
-			return catalog.ObjectID{}, incomplete("invalid exact identity")
+			return incomplete("invalid exact identity")
 		}
 		parts[i] = rest[:n]
 		rest = rest[n:]
+		return nil
 	}
-	id := catalog.ObjectID{Catalog: parts[0], Schema: parts[1], Owner: parts[2], Kind: catalog.ObjectKind(parts[3]), Name: parts[4]}
+	for i := 0; i < 5; i++ {
+		if err := parseComponent(i); err != nil {
+			return catalog.ObjectID{}, err
+		}
+	}
+	if rest != "" {
+		if err := parseComponent(5); err != nil {
+			return catalog.ObjectID{}, err
+		}
+	}
+	id := catalog.ObjectID{Catalog: parts[0], Schema: parts[1], Owner: parts[2], Kind: catalog.ObjectKind(parts[3]), Name: parts[4], Parent: parts[5]}
 	if rest != "" || !validID(id) || id.Key() != key {
 		return catalog.ObjectID{}, incomplete("invalid exact identity")
 	}
