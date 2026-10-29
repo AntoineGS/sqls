@@ -19,7 +19,7 @@ func TestMySQLMetadataDetailSupportedFacetsAndCachedValues(t *testing.T) {
 	state := newMySQLMetadataDetailScript()
 	db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
 	cache := mysqlMetadataDetailCache()
 
 	tests := []struct {
@@ -138,8 +138,8 @@ func TestMySQLMetadataDetailSupportedFacetsAndCachedValues(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Load() error = %v", err)
 			}
-			if got.Object.Schema != "mde_fixture" {
-				t.Fatalf("detail object schema = %q, want connected schema mde_fixture", got.Object.Schema)
+			if got.Object.Schema != cache.DefaultSchema {
+				t.Fatalf("detail object schema = %q, want canonical cache schema %q", got.Object.Schema, cache.DefaultSchema)
 			}
 			test.check(t, got)
 		})
@@ -151,12 +151,19 @@ func TestMySQLMetadataDetailUnsupportedFacetsAndConsistency(t *testing.T) {
 	kinds := []catalog.ObjectKind{
 		catalog.ObjectKindTable, catalog.ObjectKindView, catalog.ObjectKindProcedure,
 		catalog.ObjectKindFunction, catalog.ObjectKindTrigger, catalog.ObjectKindDomain,
+		catalog.ObjectKindIndex, catalog.ObjectKindGenerator, catalog.ObjectKindException,
 	}
 	for _, kind := range kinds {
 		for _, facet := range []string{"columns", "description", "source", "ddl"} {
-			supported := facet == "ddl" ||
-				(facet == "columns" || facet == "description") && (kind == catalog.ObjectKindTable || kind == catalog.ObjectKindView) ||
-				facet == "source" && (kind == catalog.ObjectKindView || kind == catalog.ObjectKindProcedure || kind == catalog.ObjectKindTrigger)
+			supported := false
+			switch facet {
+			case "columns", "description":
+				supported = kind == catalog.ObjectKindTable || kind == catalog.ObjectKindView
+			case "source":
+				supported = kind == catalog.ObjectKindView || kind == catalog.ObjectKindProcedure || kind == catalog.ObjectKindTrigger
+			case "ddl":
+				supported = kind == catalog.ObjectKindTable || kind == catalog.ObjectKindView || kind == catalog.ObjectKindProcedure || kind == catalog.ObjectKindFunction || kind == catalog.ObjectKindTrigger
+			}
 			if supported {
 				continue
 			}
@@ -181,7 +188,7 @@ func TestMySQLMetadataDetailDDLUsesExactSHOWCreateAndQuotedIdentifiers(t *testin
 	state := newMySQLMetadataDetailScript()
 	db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
 	cache := mysqlMetadataDetailCache()
 
 	cases := []struct {
@@ -229,7 +236,7 @@ func TestMySQLMetadataDetailRejectsOtherSchemaBeforeQuery(t *testing.T) {
 	state := newMySQLMetadataDetailScript()
 	db := sql.OpenDB(mysqlMetadataDetailConnector{state: state})
 	t.Cleanup(func() { _ = db.Close() })
-	repo := &MySQLMetadataRepository{Conn: db, Schema: "mde_fixture"}
+	repo := &MySQLMetadataRepository{Conn: db, Schema: "MDE_FIXTURE"}
 	_, err := repo.MetadataDetailPlan(metadata.Request{
 		Object: catalog.ObjectID{Schema: "mde_other", Kind: catalog.ObjectKindTable, Name: "odd`table"},
 		Facet:  "ddl", Consistency: metadata.Committed,

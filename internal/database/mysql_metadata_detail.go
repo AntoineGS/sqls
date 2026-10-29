@@ -15,7 +15,7 @@ import (
 // schema-scoped cache. DDL is the only detail that performs additional I/O;
 // it uses SHOW CREATE in a short read-only transaction.
 func (db *MySQLMetadataRepository) MetadataDetailPlan(req metadata.Request) (metadata.DetailPlan, error) {
-	if req.Object.Schema != "" && (db == nil || req.Object.Schema != db.Schema) {
+	if req.Object.Schema != "" && (db == nil || !strings.EqualFold(req.Object.Schema, db.Schema)) {
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
 	}
 	if req.Consistency == metadata.TransactionLocal || req.Consistency == metadata.ConsistentSnapshot {
@@ -46,7 +46,11 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanColumns(req metadata.Request) 
 			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
 			Coverage: mysqlDetailCoverage(req.Object, "columns"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, err := db.mysqlResolveTableName(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				name, err := db.mysqlResolveTableName(cache, schema, req.Object.Name)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -54,7 +58,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanColumns(req metadata.Request) 
 				if !ok {
 					return metadata.Detail{}, ErrObjectNotFound
 				}
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindTable, name), Columns: columns}, nil
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindTable, name), Columns: columns}, nil
 			},
 		}, nil
 	case catalog.ObjectKindView:
@@ -62,11 +66,15 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanColumns(req metadata.Request) 
 			Requires: []catalog.MetadataKind{catalog.MetadataViews},
 			Coverage: mysqlDetailCoverage(req.Object, "columns"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, view, err := db.mysqlResolveView(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindView, name), Columns: view.Columns}, nil
+				name, view, err := db.mysqlResolveView(cache, schema, req.Object.Name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindView, name), Columns: view.Columns}, nil
 			},
 		}, nil
 	default:
@@ -81,7 +89,11 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDescription(req metadata.Reque
 			Requires: []catalog.MetadataKind{catalog.MetadataRelations, catalog.MetadataColumnsCurrent},
 			Coverage: mysqlDetailCoverage(req.Object, "description"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, err := db.mysqlResolveTableName(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				name, err := db.mysqlResolveTableName(cache, schema, req.Object.Name)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
@@ -90,7 +102,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDescription(req metadata.Reque
 					return metadata.Detail{}, ErrObjectNotFound
 				}
 				description := mysqlMetadataDescription(catalog.ObjectKindTable, name, columns)
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindTable, name), Columns: columns, Description: description}, nil
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindTable, name), Columns: columns, Description: description}, nil
 			},
 		}, nil
 	case catalog.ObjectKindView:
@@ -98,12 +110,16 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDescription(req metadata.Reque
 			Requires: []catalog.MetadataKind{catalog.MetadataViews},
 			Coverage: mysqlDetailCoverage(req.Object, "description"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, view, err := db.mysqlResolveView(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				name, view, err := db.mysqlResolveView(cache, schema, req.Object.Name)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
 				description := mysqlMetadataDescription(catalog.ObjectKindView, name, view.Columns)
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindView, name), Columns: view.Columns, Description: description}, nil
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindView, name), Columns: view.Columns, Description: description}, nil
 			},
 		}, nil
 	default:
@@ -118,11 +134,15 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanSource(req metadata.Request) (
 			Requires: []catalog.MetadataKind{catalog.MetadataViews},
 			Coverage: mysqlDetailCoverage(req.Object, "source"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, view, err := db.mysqlResolveView(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindView, name), Text: view.ViewSource.String, Provenance: "mysql:view-source"}, nil
+				name, view, err := db.mysqlResolveView(cache, schema, req.Object.Name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindView, name), Text: view.ViewSource.String, Provenance: "mysql:view-source"}, nil
 			},
 		}, nil
 	case catalog.ObjectKindProcedure:
@@ -130,11 +150,15 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanSource(req metadata.Request) (
 			Requires: []catalog.MetadataKind{catalog.MetadataProcedures},
 			Coverage: mysqlDetailCoverage(req.Object, "source"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, procedure, err := db.mysqlResolveProcedure(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindProcedure, name), Text: procedure.Source.String, Provenance: "mysql:procedure-source"}, nil
+				name, procedure, err := db.mysqlResolveProcedure(cache, schema, req.Object.Name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindProcedure, name), Text: procedure.Source.String, Provenance: "mysql:procedure-source"}, nil
 			},
 		}, nil
 	case catalog.ObjectKindTrigger:
@@ -142,11 +166,15 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanSource(req metadata.Request) (
 			Requires: []catalog.MetadataKind{catalog.MetadataTriggers},
 			Coverage: mysqlDetailCoverage(req.Object, "source"),
 			Load: func(_ context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-				name, trigger, err := db.mysqlResolveTrigger(cache, req.Object.Name)
+				schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
 				if err != nil {
 					return metadata.Detail{}, err
 				}
-				return metadata.Detail{Object: db.mysqlDetailObject(catalog.ObjectKindTrigger, name), Text: trigger.Source.String, Provenance: "mysql:trigger-source"}, nil
+				name, trigger, err := db.mysqlResolveTrigger(cache, schema, req.Object.Name)
+				if err != nil {
+					return metadata.Detail{}, err
+				}
+				return metadata.Detail{Object: mysqlDetailObject(schema, catalog.ObjectKindTrigger, name), Text: trigger.Source.String, Provenance: "mysql:trigger-source"}, nil
 			},
 		}, nil
 	default:
@@ -174,11 +202,15 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDDL(req metadata.Request) (met
 		Requires: requires,
 		Coverage: mysqlDetailCoverage(req.Object, "ddl"),
 		Load: func(ctx context.Context, cache *catalog.Cache) (metadata.Detail, error) {
-			name, err := db.mysqlResolveObjectName(cache, req.Object.Kind, req.Object.Name)
+			schema, err := db.mysqlCanonicalDetailSchema(cache, req.Object.Schema)
 			if err != nil {
 				return metadata.Detail{}, err
 			}
-			statement, ddlLabel := mysqlShowCreateStatement(req.Object.Kind, db.Schema, name)
+			name, err := db.mysqlResolveObjectName(cache, schema, req.Object.Kind, req.Object.Name)
+			if err != nil {
+				return metadata.Detail{}, err
+			}
+			statement, ddlLabel := mysqlShowCreateStatement(req.Object.Kind, schema, name)
 			var ddl string
 			err = db.withMetadataDetailRead(ctx, func(tx *sql.Tx) error {
 				var readErr error
@@ -189,7 +221,7 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDDL(req metadata.Request) (met
 				return metadata.Detail{}, err
 			}
 			return metadata.Detail{
-				Object:     db.mysqlDetailObject(req.Object.Kind, name),
+				Object:     mysqlDetailObject(schema, req.Object.Kind, name),
 				Text:       ddl,
 				Provenance: "mysql:" + string(req.Object.Kind) + "-ddl",
 			}, nil
@@ -197,32 +229,45 @@ func (db *MySQLMetadataRepository) mysqlDetailPlanDDL(req metadata.Request) (met
 	}, nil
 }
 
-func (db *MySQLMetadataRepository) mysqlResolveObjectName(cache *catalog.Cache, kind catalog.ObjectKind, want string) (string, error) {
+func (db *MySQLMetadataRepository) mysqlCanonicalDetailSchema(cache *catalog.Cache, requestSchema string) (string, error) {
+	if cache == nil || cache.DefaultSchema == "" {
+		return "", errors.New("mysql: canonical detail schema is unavailable")
+	}
+	if db == nil || db.Schema == "" || !strings.EqualFold(db.Schema, cache.DefaultSchema) {
+		return "", metadata.ErrUnsupported
+	}
+	if requestSchema != "" && !strings.EqualFold(requestSchema, cache.DefaultSchema) {
+		return "", metadata.ErrUnsupported
+	}
+	return cache.DefaultSchema, nil
+}
+
+func (db *MySQLMetadataRepository) mysqlResolveObjectName(cache *catalog.Cache, schema string, kind catalog.ObjectKind, want string) (string, error) {
 	if cache == nil {
 		return "", ErrObjectNotFound
 	}
 	switch kind {
 	case catalog.ObjectKindTable:
-		return mysqlResolveName(kind, cache.SchemaTables[strings.ToUpper(db.Schema)], want)
+		return mysqlResolveName(kind, cache.SchemaTables[strings.ToUpper(schema)], want)
 	case catalog.ObjectKindView:
-		return mysqlResolveDescriptorName(kind, want, db.Schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.ViewDesc { return c.ViewsByID }, func(desc *catalog.ViewDesc) (string, string) { return desc.Schema, desc.Name })
+		return mysqlResolveDescriptorName(kind, want, schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.ViewDesc { return c.ViewsByID }, func(desc *catalog.ViewDesc) (string, string) { return desc.Schema, desc.Name })
 	case catalog.ObjectKindProcedure:
-		return mysqlResolveDescriptorName(kind, want, db.Schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.ProcedureDesc { return c.ProceduresByID }, func(desc *catalog.ProcedureDesc) (string, string) { return desc.Schema, desc.Name })
+		return mysqlResolveDescriptorName(kind, want, schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.ProcedureDesc { return c.ProceduresByID }, func(desc *catalog.ProcedureDesc) (string, string) { return desc.Schema, desc.Name })
 	case catalog.ObjectKindFunction:
-		return mysqlResolveDescriptorName(kind, want, db.Schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.FunctionDesc { return c.FunctionsByID }, func(desc *catalog.FunctionDesc) (string, string) { return desc.Schema, desc.Name })
+		return mysqlResolveDescriptorName(kind, want, schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.FunctionDesc { return c.FunctionsByID }, func(desc *catalog.FunctionDesc) (string, string) { return desc.Schema, desc.Name })
 	case catalog.ObjectKindTrigger:
-		return mysqlResolveDescriptorName(kind, want, db.Schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.TriggersByID }, func(desc *catalog.TriggerDesc) (string, string) { return desc.Schema, desc.Name })
+		return mysqlResolveDescriptorName(kind, want, schema, cache.Catalog, func(c *catalog.CatalogCache) map[string]*catalog.TriggerDesc { return c.TriggersByID }, func(desc *catalog.TriggerDesc) (string, string) { return desc.Schema, desc.Name })
 	default:
 		return "", metadata.ErrUnsupported
 	}
 }
 
-func (db *MySQLMetadataRepository) mysqlResolveTableName(cache *catalog.Cache, want string) (string, error) {
-	return db.mysqlResolveObjectName(cache, catalog.ObjectKindTable, want)
+func (db *MySQLMetadataRepository) mysqlResolveTableName(cache *catalog.Cache, schema, want string) (string, error) {
+	return db.mysqlResolveObjectName(cache, schema, catalog.ObjectKindTable, want)
 }
 
-func (db *MySQLMetadataRepository) mysqlResolveView(cache *catalog.Cache, want string) (string, *catalog.ViewDesc, error) {
-	name, err := db.mysqlResolveObjectName(cache, catalog.ObjectKindView, want)
+func (db *MySQLMetadataRepository) mysqlResolveView(cache *catalog.Cache, schema, want string) (string, *catalog.ViewDesc, error) {
+	name, err := db.mysqlResolveObjectName(cache, schema, catalog.ObjectKindView, want)
 	if err != nil {
 		return "", nil, err
 	}
@@ -230,8 +275,8 @@ func (db *MySQLMetadataRepository) mysqlResolveView(cache *catalog.Cache, want s
 	return name, view, nil
 }
 
-func (db *MySQLMetadataRepository) mysqlResolveProcedure(cache *catalog.Cache, want string) (string, *catalog.ProcedureDesc, error) {
-	name, err := db.mysqlResolveObjectName(cache, catalog.ObjectKindProcedure, want)
+func (db *MySQLMetadataRepository) mysqlResolveProcedure(cache *catalog.Cache, schema, want string) (string, *catalog.ProcedureDesc, error) {
+	name, err := db.mysqlResolveObjectName(cache, schema, catalog.ObjectKindProcedure, want)
 	if err != nil {
 		return "", nil, err
 	}
@@ -239,8 +284,8 @@ func (db *MySQLMetadataRepository) mysqlResolveProcedure(cache *catalog.Cache, w
 	return name, procedure, nil
 }
 
-func (db *MySQLMetadataRepository) mysqlResolveTrigger(cache *catalog.Cache, want string) (string, *catalog.TriggerDesc, error) {
-	name, err := db.mysqlResolveObjectName(cache, catalog.ObjectKindTrigger, want)
+func (db *MySQLMetadataRepository) mysqlResolveTrigger(cache *catalog.Cache, schema, want string) (string, *catalog.TriggerDesc, error) {
+	name, err := db.mysqlResolveObjectName(cache, schema, catalog.ObjectKindTrigger, want)
 	if err != nil {
 		return "", nil, err
 	}
@@ -288,8 +333,8 @@ func mysqlResolveName(kind catalog.ObjectKind, candidates []string, want string)
 	}
 }
 
-func (db *MySQLMetadataRepository) mysqlDetailObject(kind catalog.ObjectKind, name string) catalog.ObjectID {
-	return catalog.ObjectID{Schema: db.Schema, Kind: kind, Name: name}
+func mysqlDetailObject(schema string, kind catalog.ObjectKind, name string) catalog.ObjectID {
+	return catalog.ObjectID{Schema: schema, Kind: kind, Name: name}
 }
 
 func mysqlMetadataDescription(kind catalog.ObjectKind, name string, columns []*catalog.ColumnDesc) catalog.TableDescription {
