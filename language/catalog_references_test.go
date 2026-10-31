@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/dialect"
@@ -106,4 +107,35 @@ func TestCatalogReferencesNeedCurrentInterBaseMetadata(t *testing.T) {
 	other := navigationRequest(text, catalogReferencesCache())
 	other.Context.Variant = dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL}
 	expectReferences(t, referenceTexts(t, other, itemTable, ""))
+}
+
+func TestCatalogReferencesSkipTriggerLocalsNamedLikeTheTarget(t *testing.T) {
+	text := "CREATE TRIGGER TR FOR ITEM BEFORE INSERT AS\nDECLARE VARIABLE SET_ITEM INTEGER;\nDECLARE VARIABLE ID INTEGER;\nBEGIN\n" +
+		"SET_ITEM = 0;\nEXECUTE PROCEDURE SET_ITEM :SET_ITEM;\nSELECT i.NAME FROM ITEM i\nWHERE :ID = i.ID INTO :ID;\nEND"
+	procedure := catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "SET_ITEM"}
+	expectReferences(t, referenceTexts(t, navigationRequest(text, catalogReferencesCache()), procedure, ""), "EXECUTE PROCEDURE|SET_ITEM")
+	expectReferences(t, referenceTexts(t, navigationRequest(text, catalogReferencesCache()), itemTable, "ID"), "WHERE :ID = i.|ID")
+}
+
+func TestCatalogReferencesStayLinearInLargeSources(t *testing.T) {
+	const repeats = 4000
+	for _, tc := range []struct {
+		name, text, column string
+		want               int
+	}{
+		{name: "trigger row columns", column: "ID", want: 1,
+			text: "CREATE TRIGGER TR FOR ITEM BEFORE INSERT AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\n" + strings.Repeat("  ID = ID + 1;\n", repeats) + "  NEW.ID = ID;\nEND"},
+		{name: "unqualified columns beside a local", column: "ID", want: repeats,
+			text: "ALTER PROCEDURE P AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\n" + strings.Repeat("  SELECT ID FROM ITEM INTO :ID;\n", repeats) + "END"},
+		{name: "relations", want: repeats,
+			text: "ALTER PROCEDURE P AS\nDECLARE VARIABLE N INTEGER;\nBEGIN\n" + strings.Repeat("  SELECT COUNT(*) FROM ITEM INTO :N;\n", repeats) + "END"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			result, err := language.NewService().CatalogReferences(context.Background(), navigationRequest(tc.text, catalogReferencesCache()), itemTable, tc.column)
+			if elapsed := time.Since(start); err != nil || len(result.Value) != tc.want || elapsed > 10*time.Second {
+				t.Fatalf("%d bytes: %d references in %s, err %v; want %d well within 10s", len(tc.text), len(result.Value), elapsed, err, tc.want)
+			}
+		})
+	}
 }

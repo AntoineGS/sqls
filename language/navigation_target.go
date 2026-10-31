@@ -77,20 +77,29 @@ func navigationTargetAtWithAnalysis(req Request, position Position, parsed ast.T
 	if err != nil || !ok {
 		return catalog.ObjectID{}, Range{}, false, err
 	}
-	cache := req.Context.SnapshotCache()
-	if cache == nil || !cache.MetadataReady(catalog.MetadataProcedures, catalog.MetadataViews, catalog.MetadataTriggers) {
+	target, found := catalogObjectByName(sqlsymbol.Name{Text: name, Quoted: quoted}, req.Context.SnapshotCache())
+	if !found {
 		return catalog.ObjectID{}, Range{}, false, nil
 	}
+	return target, span, true, nil
+}
+
+// catalogObjectByName resolves name to exactly one procedure, view or trigger,
+// in that precedence; an ambiguous fold match resolves to nothing.
+func catalogObjectByName(name sqlsymbol.Name, cache *catalog.Cache) (catalog.ObjectID, bool) {
+	if cache == nil || !cache.MetadataReady(catalog.MetadataProcedures, catalog.MetadataViews, catalog.MetadataTriggers) {
+		return catalog.ObjectID{}, false
+	}
 	for _, kind := range []catalog.ObjectKind{catalog.ObjectKindProcedure, catalog.ObjectKindView, catalog.ObjectKindTrigger} {
-		resolved, found, ambiguous := resolveCatalogObjectName(kind, sqlsymbol.Name{Text: name, Quoted: quoted}, cache)
+		resolved, found, ambiguous := resolveCatalogObjectName(kind, name, cache)
 		if len(ambiguous) != 0 {
-			return catalog.ObjectID{}, Range{}, false, nil
+			return catalog.ObjectID{}, false
 		}
 		if found {
-			return catalog.ObjectID{Kind: kind, Name: resolved}, span, true, nil
+			return catalog.ObjectID{Kind: kind, Name: resolved}, true
 		}
 	}
-	return catalog.ObjectID{}, Range{}, false, nil
+	return catalog.ObjectID{}, false
 }
 
 func (c Context) SnapshotCache() *catalog.Cache {

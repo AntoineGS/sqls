@@ -117,12 +117,25 @@ func provenDefinitionColumnAt(req Request, position Position) (catalog.ObjectID,
 		return catalog.ObjectID{}, sqlsymbol.Name{}, false, err
 	}
 	proof, ok := analysis.ProvenDefinitionColumn(offset, snapshotSemanticCatalog{snapshot: req.Context.Snapshot})
-	if !ok || !exactBaseTable(req.Context.Snapshot, proof.Relation) {
+	if !ok {
 		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
 	}
-	columns, complete := exactTableColumns(req.Context.Snapshot.Cache, proof.Relation)
-	if !complete {
+	target, ok := provenBaseTableColumn(req.Context.Snapshot, proof)
+	if !ok {
 		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+	}
+	return target, proof.Column, true, nil
+}
+
+// provenBaseTableColumn returns proof's table when the snapshot lists it as an
+// exact base table whose complete columns include proof's column exactly once.
+func provenBaseTableColumn(snapshot *catalog.MetadataSnapshot, proof sqlsymbol.DefinitionColumn) (catalog.ObjectID, bool) {
+	if !exactBaseTable(snapshot, proof.Relation) {
+		return catalog.ObjectID{}, false
+	}
+	columns, complete := exactTableColumns(snapshot.Cache, proof.Relation)
+	if !complete {
+		return catalog.ObjectID{}, false
 	}
 	matches := 0
 	for _, candidate := range columns {
@@ -131,9 +144,9 @@ func provenDefinitionColumnAt(req Request, position Position) (catalog.ObjectID,
 		}
 	}
 	if matches != 1 {
-		return catalog.ObjectID{}, sqlsymbol.Name{}, false, nil
+		return catalog.ObjectID{}, false
 	}
-	return catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: proof.Relation.Key()}, proof.Column, true, nil
+	return catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: proof.Relation.Key()}, true
 }
 
 // References returns same-document procedure-local symbol references.

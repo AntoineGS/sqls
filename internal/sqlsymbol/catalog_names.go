@@ -2,52 +2,71 @@ package sqlsymbol
 
 import "github.com/sqls-server/sqls/token"
 
-// CatalogNameSpans returns, in source order, the spans of identifier words
-// whose SQL identity is the catalog spelling name. Comments and literals are
-// never words, so they are excluded.
-func (a *Analysis) CatalogNameSpans(name string) []Span {
+// NameOccurrence is one identifier word and its decoded SQL name.
+type NameOccurrence struct {
+	Name Name
+	Span Span
+}
+
+// CatalogNameSpans returns, in source order, the identifier words whose SQL
+// identity is the catalog spelling name. Comments and literals are never
+// words, and a :variable reference never names a catalog object, so both are
+// excluded.
+func (a *Analysis) CatalogNameSpans(name string) []NameOccurrence {
 	if a == nil {
 		return nil
 	}
-	var spans []Span
-	for _, item := range a.lexemes {
-		if !isNameToken(item) {
+	var occurrences []NameOccurrence
+	items := significantLexemes(a.lexemes)
+	for i, item := range items {
+		if !isNameToken(item) || (i > 0 && items[i-1].Token.Kind == token.Colon) {
 			continue
 		}
 		if word, ok := nameFromLexeme(a.Text, item); ok && word.MatchesCatalogName(name) {
-			spans = append(spans, item.Span)
+			occurrences = append(occurrences, NameOccurrence{Name: word, Span: item.Span})
 		}
 	}
-	return spans
+	return occurrences
 }
 
-// TriggerRowRelation returns the FOR relation of the trigger whose body holds
-// the column word at offset in a NEW.<column> or OLD.<column> row reference.
-func (a *Analysis) TriggerRowRelation(offset int) (Name, bool) {
+// Trigger is a recognized CREATE TRIGGER statement.
+type Trigger struct {
+	// Span runs from CREATE through the body's END.
+	Span     Span
+	Relation Name
+	// RowColumns are the column words of NEW.<column> and OLD.<column> row
+	// references in the body, which belong to Relation.
+	RowColumns []Span
+	// Locals holds the keys of the declared variables.
+	Locals map[string]bool
+}
+
+// Triggers returns the recognized CREATE TRIGGER statements in source order.
+func (a *Analysis) Triggers() []Trigger {
 	if a == nil {
-		return Name{}, false
+		return nil
 	}
+	var triggers []Trigger
 	items := significantLexemes(a.lexemes)
-	index := -1
-	for i, item := range items {
-		if item.Span.Start <= offset && offset < item.Span.End {
-			index = i
-			break
+	for i := 0; i+1 < len(items); i++ {
+		if !isWord(items[i], "CREATE") || !isWord(items[i+1], "TRIGGER") {
+			continue
 		}
-	}
-	if index < 2 || !isNameToken(items[index]) || items[index-1].Token.Kind != token.Period ||
-		!isTriggerRowAlias(nameOrEmpty(a.Text, items[index-2])) {
-		return Name{}, false
-	}
-	for _, trg := range discoverTriggers(a.Text, items) {
-		if trg.bodyStart < index && index < trg.bodyEnd {
-			return trg.relation, true
+		model, ok := parseTrigger(a.Text, items, i)
+		if !ok {
+			continue
 		}
+		trg := Trigger{Span: Span{Start: items[i].Span.Start, End: items[model.bodyEnd].Span.End}, Relation: model.relation, Locals: make(map[string]bool, len(model.locals))}
+		for key := range model.locals {
+			trg.Locals[key] = true
+		}
+		for idx := model.bodyStart + 1; idx+2 < model.bodyEnd; idx++ {
+			alias, ok := nameFromLexeme(a.Text, items[idx])
+			if ok && isTriggerRowAlias(alias) && items[idx+1].Token.Kind == token.Period && isNameToken(items[idx+2]) {
+				trg.RowColumns = append(trg.RowColumns, items[idx+2].Span)
+			}
+		}
+		triggers = append(triggers, trg)
 	}
-	return Name{}, false
-}
-
-func nameOrEmpty(text string, item lexeme) Name {
-	name, _ := nameFromLexeme(text, item)
-	return name
+	return triggers
 }

@@ -16,14 +16,29 @@ type DefinitionColumn struct {
 // Unsupported, correlated, derived, callable, CTE, stale, or ambiguous shapes
 // return false. The result never changes Analysis.Resolve's Role.
 func (a *Analysis) ProvenDefinitionColumn(offset int, catalog SemanticCatalog) (DefinitionColumn, bool) {
-	if a == nil || catalog == nil {
-		return DefinitionColumn{}, false
+	return a.DefinitionColumnProver(catalog)(offset)
+}
+
+// DefinitionColumnProver answers ProvenDefinitionColumn for many offsets of
+// the same analysis, building the shared statement model once.
+func (a *Analysis) DefinitionColumnProver(catalog SemanticCatalog) func(offset int) (DefinitionColumn, bool) {
+	var model *diagnosticModel
+	return func(offset int) (DefinitionColumn, bool) {
+		if a == nil || catalog == nil {
+			return DefinitionColumn{}, false
+		}
+		resolution := a.Resolve(offset)
+		if resolution.Role != Ambiguous || !resolution.DefinitionColumnCandidate || resolution.SQL == nil {
+			return DefinitionColumn{}, false
+		}
+		if model == nil {
+			model = a.diagnosticModel(catalog)
+		}
+		return provenDefinitionColumn(model, catalog, resolution)
 	}
-	resolution := a.Resolve(offset)
-	if resolution.Role != Ambiguous || !resolution.DefinitionColumnCandidate || resolution.SQL == nil {
-		return DefinitionColumn{}, false
-	}
-	model := a.diagnosticModel(catalog)
+}
+
+func provenDefinitionColumn(model *diagnosticModel, catalog SemanticCatalog, resolution Resolution) (DefinitionColumn, bool) {
 	item := model.itemIndexAt(resolution.Span.Start)
 	if item < 0 || model.Unsupported(item) {
 		return DefinitionColumn{}, false
