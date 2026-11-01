@@ -379,3 +379,44 @@ func TestSemanticSnapshotProcedureAndDomainFacts(t *testing.T) {
 		t.Fatalf("domain fact=%+v knowledge=%v", domain, knowledge)
 	}
 }
+
+func TestSemanticSnapshotTriggerRelation(t *testing.T) {
+	exact := catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: "TRG1"}.Key()
+	cc := &catalog.CatalogCache{
+		TriggersByID: map[string]*catalog.TriggerDesc{
+			exact: {Name: "TRG1", RelationName: sql.NullString{String: "Orders", Valid: true}, Event: "BEFORE UPDATE"},
+			catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: "DBTRG"}.Key(): {Name: "DBTRG"},
+		},
+		Triggers: map[string]*catalog.TriggerDesc{
+			"LEGACY": {Name: "LEGACY", RelationName: sql.NullString{String: "T", Valid: true}},
+			"MIXED":  {Name: "Mixed", RelationName: sql.NullString{String: "T", Valid: true}},
+		},
+	}
+	ready := map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataTriggers: catalog.MetadataReady}
+	view := snapshotSemanticCatalog{snapshot: readySnapshot(ready, cc)}
+	for _, tc := range []struct {
+		name sqlsymbol.Name
+		want sqlsymbol.Name
+		ok   bool
+	}{
+		{sqlsymbol.Name{Text: "trg1"}, sqlsymbol.Name{Text: "Orders", Quoted: true}, true},
+		{sqlsymbol.Name{Text: "LEGACY"}, sqlsymbol.Name{Text: "T"}, true},
+		{sqlsymbol.Name{Text: "Mixed", Quoted: true}, sqlsymbol.Name{Text: "T"}, true},
+		{sqlsymbol.Name{Text: "MIXED"}, sqlsymbol.Name{}, false},
+		{sqlsymbol.Name{Text: "trg1", Quoted: true}, sqlsymbol.Name{}, false},
+		{sqlsymbol.Name{Text: "DBTRG"}, sqlsymbol.Name{}, false},
+		{sqlsymbol.Name{Text: "ABSENT"}, sqlsymbol.Name{}, false},
+	} {
+		if got, ok := view.TriggerRelation(tc.name); got != tc.want || ok != tc.ok {
+			t.Errorf("TriggerRelation(%+v) = (%+v, %v), want (%+v, %v)", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	for _, snapshot := range []*catalog.MetadataSnapshot{
+		readySnapshot(map[catalog.MetadataKind]catalog.MetadataState{catalog.MetadataTriggers: catalog.MetadataLoading}, cc),
+		{Cache: &catalog.Cache{Catalog: cc, Metadata: ready}, Stale: true},
+	} {
+		if _, ok := (snapshotSemanticCatalog{snapshot: snapshot}).TriggerRelation(sqlsymbol.Name{Text: "TRG1"}); ok {
+			t.Errorf("incomplete or stale trigger metadata reported a relation")
+		}
+	}
+}

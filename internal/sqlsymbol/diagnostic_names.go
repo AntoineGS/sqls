@@ -653,6 +653,22 @@ func isTriggerRowAlias(name Name) bool {
 	return key == "NEW" || key == "OLD"
 }
 
+// triggerRelation returns the relation whose row NEW/OLD name in trg: its
+// own FOR relation, or for ALTER TRIGGER the relation a TriggerCatalog
+// reports, unless an earlier statement in this document created, altered or
+// dropped that trigger. ok=false means NEW/OLD columns cannot be checked.
+func (m *diagnosticModel) triggerRelation(trg triggerModel) (Name, bool) {
+	if trg.relation.Key() != "" {
+		return trg.relation, true
+	}
+	triggers, ok := m.catalog.(TriggerCatalog)
+	if !ok || m.DDLInvalidated(trg.start, trg.name) {
+		return Name{}, false
+	}
+	relation, ok := triggers.TriggerRelation(trg.name)
+	return relation, ok && relation.Key() != ""
+}
+
 // triggerRowColumnFindings checks every NEW.<col>/OLD.<col> reference in
 // each discovered trigger body against that trigger's own FOR-relation
 // columns. Task 3 (diagnostic_locals.go) discovers and stores the
@@ -666,6 +682,10 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 	a := m.analysis
 	var findings []Finding
 	for _, trg := range discoverTriggers(a.Text, m.items) {
+		relation, ok := m.triggerRelation(trg)
+		if !ok {
+			continue
+		}
 		ctx := newTriggerBodyContext(m.items, trg.bodyStart, trg.bodyEnd)
 		for idx := trg.bodyStart; idx < trg.bodyEnd; idx++ {
 			if !isWord(m.items[idx], "NEW") && !isWord(m.items[idx], "OLD") {
@@ -682,14 +702,14 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 			if m.Unsupported(idx) || ctx.unsupported[idx-trg.bodyStart] {
 				continue
 			}
-			if m.DDLInvalidated(idx, trg.relation) {
+			if m.DDLInvalidated(idx, relation) {
 				continue
 			}
 			colName, ok := nameFromLexeme(a.Text, m.items[idx+2])
 			if !ok {
 				continue
 			}
-			fact, knowledge := m.semantic.RelationInfo(trg.relation)
+			fact, knowledge := m.semantic.RelationInfo(relation)
 			if knowledge != Present || !fact.ColumnsKnown {
 				continue
 			}
@@ -704,7 +724,7 @@ func (m *diagnosticModel) triggerRowColumnFindings() []Finding {
 				findings = append(findings, Finding{
 					Span:     m.items[idx+2].Span,
 					Code:     codeUnknownColumn,
-					Message:  fmt.Sprintf("%s is not a column of %s", colName.Text, trg.relation.Text),
+					Message:  fmt.Sprintf("%s is not a column of %s", colName.Text, relation.Text),
 					Severity: 1,
 				})
 			}
