@@ -120,6 +120,22 @@ func TestTriggersWithholdAlterTriggerCreatedEarlierInTheDocument(t *testing.T) {
 	}
 }
 
+// An ALTER TRIGGER's catalog relation is stale once the document earlier
+// creates, alters or drops that relation, so its row columns are withheld.
+func TestTriggersWithholdAlterTriggerRowColumnsOfARelationChangedEarlier(t *testing.T) {
+	body := "ALTER TRIGGER TR AS BEGIN NEW.ID = 1; END"
+	catalog := newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})
+	for _, prefix := range []string{"DROP TABLE ITEM;\n", "ALTER TABLE ITEM ADD X INTEGER;\n", "CREATE TABLE ITEM (ID INTEGER);\n"} {
+		trg := analyzeInterBase(t, prefix+body).Triggers(catalog)
+		if len(trg) != 1 || len(trg[0].RowColumns) != 0 {
+			t.Fatalf("%q: triggers = %#v, want no row columns", prefix, trg)
+		}
+	}
+	if got := alterTriggerRowColumns(t, "DROP TABLE OTHER;\n"+body, catalog); strings.Join(got, ",") != "ITEM: NEW.ID" {
+		t.Fatalf("unrelated DDL: triggers = %q", got)
+	}
+}
+
 func TestTriggersMatchAQuotedAlterTriggerNameExactly(t *testing.T) {
 	text := `ALTER TRIGGER "tr" AS BEGIN NEW.ID = 1; END`
 	got := alterTriggerRowColumns(t, text, newTriggerFixtureCatalog(map[string]Name{"tr": {Text: "ITEM"}}))

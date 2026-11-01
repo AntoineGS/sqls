@@ -79,9 +79,15 @@ func (a *Analysis) Triggers(relations TriggerCatalog) []Trigger {
 		relation, ok := triggerRelation(model, relations, invalidated)
 		if ok {
 			trg.Relation = relation
+			// Diagnostics' per-reference gate, applied to ALTER only: its
+			// catalog relation is stale once the document changes it.
+			alter := model.relation.Key() == ""
 			for idx := model.bodyStart + 1; idx+2 < model.bodyEnd; idx++ {
 				alias, ok := nameFromLexeme(a.Text, items[idx])
 				if ok && isTriggerRowAlias(alias) && items[idx+1].Token.Kind == token.Period && isNameToken(items[idx+2]) {
+					if alter && invalidated(idx, relation) {
+						continue
+					}
 					trg.RowColumns = append(trg.RowColumns, items[idx+2].Span)
 				}
 			}
