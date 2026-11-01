@@ -2,6 +2,7 @@ package language_test
 
 import (
 	"context"
+	"database/sql"
 	"testing"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -181,4 +182,49 @@ func TestPublicDiagnosticsReportsTooManyProcedureArgumentsWhenMinimumIsUnknown(t
 		}
 	}
 	t.Fatalf("too-many-arguments finding missing; diagnostics=%+v", result.Value)
+}
+
+func TestPublicDiagnosticsCheckAlterTriggerRowColumnsAgainstCatalogRelation(t *testing.T) {
+	text := "ALTER TRIGGER TRG1 ACTIVE BEFORE UPDATE POSITION 1 AS\nDECLARE VARIABLE X INTEGER;\nBEGIN\n  X = NEW.BOGUS;\n  NEW.ID = X;\nEND"
+	diagnose := func(triggers map[string]*catalog.TriggerDesc) []string {
+		snapshot := &catalog.MetadataSnapshot{Cache: &catalog.Cache{
+			Catalog: &catalog.CatalogCache{
+				ViewsByID:      map[string]*catalog.ViewDesc{},
+				ProceduresByID: map[string]*catalog.ProcedureDesc{},
+				TriggersByID:   triggers,
+			},
+			SchemaTables: map[string][]string{"": {"T"}},
+			ColumnsByID: map[string][]*catalog.ColumnDesc{
+				catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "T"}.Key(): {{ColumnBase: catalog.ColumnBase{Name: "ID", Table: "T"}, Type: "INTEGER", Null: "NO"}},
+			},
+			Metadata: map[catalog.MetadataKind]catalog.MetadataState{
+				catalog.MetadataRelations: catalog.MetadataReady, catalog.MetadataViews: catalog.MetadataReady,
+				catalog.MetadataProcedures: catalog.MetadataReady, catalog.MetadataColumnsAll: catalog.MetadataReady,
+				catalog.MetadataTriggers: catalog.MetadataReady,
+			},
+		}}
+		result, err := language.NewService().Diagnostics(context.Background(), language.Request{
+			Document: language.Document{URI: "memory:alter-trigger", Text: text},
+			Context: language.Context{
+				Snapshot: snapshot, Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}, DialectResolved: true,
+			},
+		})
+		if err != nil {
+			t.Fatalf("Diagnostics() error = %v", err)
+		}
+		var messages []string
+		for _, diagnostic := range result.Value {
+			if diagnostic.Code == "interbase-unknown-column" {
+				messages = append(messages, diagnostic.Message)
+			}
+		}
+		return messages
+	}
+	key := catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: "TRG1"}.Key()
+	if got := diagnose(map[string]*catalog.TriggerDesc{key: {Name: "TRG1", RelationName: sql.NullString{String: "T", Valid: true}, Event: "BEFORE UPDATE"}}); len(got) != 1 || got[0] != "BOGUS is not a column of T" {
+		t.Fatalf("unknown-column findings with trigger metadata = %q, want only BOGUS of T", got)
+	}
+	if got := diagnose(map[string]*catalog.TriggerDesc{}); len(got) != 0 {
+		t.Fatalf("unknown-column findings without trigger metadata = %q, want none", got)
+	}
 }

@@ -485,6 +485,10 @@ func (m *diagnosticModel) procedureOutputLossyFindings(matching map[int]int) []F
 // local's own write position. OLD is always read-only and never scanned:
 // only NEW is a legal trigger-body assignment target.
 func (m *diagnosticModel) triggerNewFieldEdges(trg triggerModel, items []lexeme) []assignmentEdge {
+	relation, ok := m.triggerRelation(trg)
+	if !ok {
+		return nil
+	}
 	ctx := newTriggerBodyContext(items, trg.bodyStart, trg.bodyEnd)
 	var edges []assignmentEdge
 	for idx := trg.bodyStart + 1; idx < trg.bodyEnd; idx++ {
@@ -504,7 +508,7 @@ func (m *diagnosticModel) triggerNewFieldEdges(trg triggerModel, items []lexeme)
 		if !isTriggerAssignmentBoundary(items[idx-1]) {
 			continue
 		}
-		if m.Unsupported(idx) || m.DDLInvalidated(idx, trg.relation) {
+		if m.Unsupported(idx) || m.DDLInvalidated(idx, relation) {
 			continue
 		}
 		colName, ok := nameFromLexeme(m.analysis.Text, items[idx+2])
@@ -515,7 +519,7 @@ func (m *diagnosticModel) triggerNewFieldEdges(trg triggerModel, items []lexeme)
 		if !complete || end == idx+4 || !balancedExpression(items[idx+4:end]) {
 			continue
 		}
-		typeName, known := catalogColumnType(m.catalog, trg.relation, colName)
+		typeName, known := catalogColumnType(m.catalog, relation, colName)
 		if !known {
 			continue
 		}

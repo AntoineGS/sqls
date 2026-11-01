@@ -182,8 +182,8 @@ type triggerSymbol struct {
 	declaration Span
 }
 
-// triggerModel is one recognized CREATE TRIGGER statement: a supported
-// subset of InterBase's trigger grammar (see parseTrigger). Triggers whose
+// triggerModel is one recognized CREATE or ALTER TRIGGER statement: a
+// supported subset of InterBase's trigger grammar (see parseTrigger). Triggers whose
 // header or body do not match this subset are never added to the discovered
 // list, so their content never produces a finding. A trigger whose own
 // DECLARE VARIABLE section is malformed is entirely excluded this same way
@@ -193,16 +193,17 @@ type triggerSymbol struct {
 // to selectively report on.
 type triggerModel struct {
 	name      Name
-	relation  Name
-	bodyStart int // item index of the outer BEGIN
-	bodyEnd   int // item index of the matching END
+	relation  Name // zero for ALTER TRIGGER, whose text does not name it
+	start     int  // item index of CREATE/ALTER
+	bodyStart int  // item index of the outer BEGIN
+	bodyEnd   int  // item index of the matching END
 	locals    map[string][]*triggerSymbol
 }
 
 func discoverTriggers(text string, items []lexeme) []triggerModel {
 	var triggers []triggerModel
 	for i := 0; i < len(items); i++ {
-		if !isWord(items[i], "CREATE") || i+1 >= len(items) || !isWord(items[i+1], "TRIGGER") {
+		if !(isWord(items[i], "CREATE") || isWord(items[i], "ALTER")) || i+1 >= len(items) || !isWord(items[i+1], "TRIGGER") {
 			continue
 		}
 		if trg, ok := parseTrigger(text, items, i); ok {
@@ -222,11 +223,14 @@ func discoverTriggers(text string, items []lexeme) []triggerModel {
 //	  (DECLARE VARIABLE name type;)*
 //	BEGIN ... END
 //
-// Any deviation -- a schema-qualified relation, INSTEAD OF, a malformed
-// declaration, an unbalanced body -- reports ok=false and the whole trigger
-// is withheld from findings, never guessed at.
+// and the same shape introduced by ALTER TRIGGER name, without FOR relation
+// and with the event clause optional. Any deviation -- a schema-qualified
+// relation, INSTEAD OF, a malformed declaration, an unbalanced body --
+// reports ok=false and the whole trigger is withheld from findings, never
+// guessed at.
 func parseTrigger(text string, items []lexeme, start int) (triggerModel, bool) {
-	i := start + 2 // past CREATE TRIGGER
+	alter := isWord(items[start], "ALTER")
+	i := start + 2 // past CREATE/ALTER TRIGGER
 	if i >= len(items) || !isNameToken(items[i]) {
 		return triggerModel{}, false
 	}
@@ -235,34 +239,38 @@ func parseTrigger(text string, items []lexeme, start int) (triggerModel, bool) {
 		return triggerModel{}, false
 	}
 	i++
-	if i >= len(items) || !isWord(items[i], "FOR") {
-		return triggerModel{}, false
-	}
-	i++
-	if i >= len(items) || !isNameToken(items[i]) {
-		return triggerModel{}, false
-	}
-	relation, ok := nameFromLexeme(text, items[i])
-	if !ok {
-		return triggerModel{}, false
-	}
-	i++
-	if i < len(items) && items[i].Token.Kind == token.Period {
-		return triggerModel{}, false // schema-qualified relation: unsupported
+	var relation Name
+	if !alter {
+		if i >= len(items) || !isWord(items[i], "FOR") {
+			return triggerModel{}, false
+		}
+		i++
+		if i >= len(items) || !isNameToken(items[i]) {
+			return triggerModel{}, false
+		}
+		relation, ok = nameFromLexeme(text, items[i])
+		if !ok {
+			return triggerModel{}, false
+		}
+		i++
+		if i < len(items) && items[i].Token.Kind == token.Period {
+			return triggerModel{}, false // schema-qualified relation: unsupported
+		}
 	}
 	if i < len(items) && (isWord(items[i], "ACTIVE") || isWord(items[i], "INACTIVE")) {
 		i++
 	}
-	if i >= len(items) || !(isWord(items[i], "BEFORE") || isWord(items[i], "AFTER")) {
+	if i < len(items) && (isWord(items[i], "BEFORE") || isWord(items[i], "AFTER")) {
+		i++
+		if i >= len(items) || !isTriggerEventWord(items[i]) {
+			return triggerModel{}, false
+		}
+		i++
+		for i+1 < len(items) && isWord(items[i], "OR") && isTriggerEventWord(items[i+1]) {
+			i += 2
+		}
+	} else if !alter {
 		return triggerModel{}, false
-	}
-	i++
-	if i >= len(items) || !isTriggerEventWord(items[i]) {
-		return triggerModel{}, false
-	}
-	i++
-	for i+1 < len(items) && isWord(items[i], "OR") && isTriggerEventWord(items[i+1]) {
-		i += 2
 	}
 	if i < len(items) && isWord(items[i], "POSITION") {
 		i++
@@ -276,7 +284,7 @@ func parseTrigger(text string, items []lexeme, start int) (triggerModel, bool) {
 	}
 	i++
 
-	trg := triggerModel{name: name, relation: relation, locals: make(map[string][]*triggerSymbol)}
+	trg := triggerModel{name: name, relation: relation, start: start, locals: make(map[string][]*triggerSymbol)}
 	for i < len(items) && isWord(items[i], "DECLARE") {
 		if i+2 >= len(items) || !isWord(items[i+1], "VARIABLE") {
 			return triggerModel{}, false

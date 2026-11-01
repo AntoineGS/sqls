@@ -69,3 +69,11 @@ type SemanticCatalog interface {
 	ProcedureInfo(name Name) (ProcedureFact, Knowledge)
 	DomainInfo(name Name) (DomainFact, Knowledge)
 }
+
+// TriggerCatalog optionally supplies the relation of an existing trigger,
+// which ALTER TRIGGER text does not name. TriggerRelation reports ok=false
+// when the trigger, or its relation, is not known; the returned Name holds
+// the catalog spelling.
+type TriggerCatalog interface {
+	TriggerRelation(name Name) (relation Name, ok bool)
+}

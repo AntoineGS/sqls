@@ -1,6 +1,8 @@
 package language
 
 import (
+	"strings"
+
 	"github.com/sqls-server/sqls/catalog"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
 )
@@ -12,7 +14,10 @@ type snapshotSemanticCatalog struct {
 	snapshot *catalog.MetadataSnapshot
 }
 
-var _ sqlsymbol.SemanticCatalog = snapshotSemanticCatalog{}
+var (
+	_ sqlsymbol.SemanticCatalog = snapshotSemanticCatalog{}
+	_ sqlsymbol.TriggerCatalog  = snapshotSemanticCatalog{}
+)
 
 func categoryReady(s *catalog.MetadataSnapshot, kind catalog.MetadataKind) bool {
 	if s == nil || s.Stale || s.Cache == nil {
@@ -413,4 +418,24 @@ func (c snapshotSemanticCatalog) DomainInfo(name sqlsymbol.Name) (sqlsymbol.Doma
 		return sqlsymbol.DomainFact{}, sqlsymbol.Missing
 	}
 	return sqlsymbol.DomainFact{Type: domain.Type, Nullability: nullabilityFromCatalog(domain.Nullable.Valid, domain.Nullable.Bool)}, sqlsymbol.Present
+}
+
+// TriggerRelation names the relation of a catalog trigger so diagnostics can
+// check an ALTER TRIGGER body's NEW/OLD columns. A database-level trigger,
+// incomplete or stale trigger metadata, or a folded spelling that does not
+// match a quoted name reports ok=false.
+func (c snapshotSemanticCatalog) TriggerRelation(name sqlsymbol.Name) (sqlsymbol.Name, bool) {
+	s := c.snapshot
+	if s == nil || s.Stale || s.Cache == nil || s.Cache.Catalog == nil || !namespaceReady(s, catalog.MetadataTriggers) {
+		return sqlsymbol.Name{}, false
+	}
+	trigger, ok := s.Cache.Catalog.TriggersByID[catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: name.Key()}.Key()]
+	if !ok {
+		trigger = s.Cache.Catalog.Triggers[catalog.CatalogCacheKey(name.Key())]
+	}
+	if trigger == nil || trigger.Name != name.Key() || !trigger.RelationName.Valid || trigger.RelationName.String == "" {
+		return sqlsymbol.Name{}, false
+	}
+	relation := trigger.RelationName.String
+	return sqlsymbol.Name{Text: relation, Quoted: relation != strings.ToUpper(relation)}, true
 }
