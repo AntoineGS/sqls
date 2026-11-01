@@ -658,11 +658,17 @@ func isTriggerRowAlias(name Name) bool {
 // reports, unless an earlier statement in this document created, altered or
 // dropped that trigger. ok=false means NEW/OLD columns cannot be checked.
 func (m *diagnosticModel) triggerRelation(trg triggerModel) (Name, bool) {
+	triggers, _ := m.catalog.(TriggerCatalog)
+	return triggerRelation(trg, triggers, m.DDLInvalidated)
+}
+
+// triggerRelation applies diagnosticModel.triggerRelation's rules with an
+// explicit TriggerCatalog (nil when absent) and DDL invalidation check.
+func triggerRelation(trg triggerModel, triggers TriggerCatalog, invalidated func(int, Name) bool) (Name, bool) {
 	if trg.relation.Key() != "" {
 		return trg.relation, true
 	}
-	triggers, ok := m.catalog.(TriggerCatalog)
-	if !ok || m.DDLInvalidated(trg.start, trg.name) {
+	if triggers == nil || invalidated(trg.start, trg.name) {
 		return Name{}, false
 	}
 	relation, ok := triggers.TriggerRelation(trg.name)

@@ -29,7 +29,7 @@ func TestCatalogNameSpansSkipCommentsLiteralsVariablesAndOtherNames(t *testing.T
 
 func TestTriggersReportForRelationRowColumnsAndLocals(t *testing.T) {
 	text := "SELECT NEW.ID FROM NEW;\nCREATE TRIGGER TR FOR ITEM ACTIVE BEFORE INSERT POSITION 0 AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\nID = NEW.ID + OLD.ID;\nEND"
-	triggers := analyzeInterBase(t, text).Triggers()
+	triggers := analyzeInterBase(t, text).Triggers(nil)
 	if len(triggers) != 1 {
 		t.Fatalf("triggers = %#v, want one", triggers)
 	}
@@ -46,6 +46,101 @@ func TestTriggersReportForRelationRowColumnsAndLocals(t *testing.T) {
 	}
 	if !trg.Locals["ID"] || len(trg.Locals) != 1 {
 		t.Fatalf("locals = %v, want ID", trg.Locals)
+	}
+}
+
+// alterTriggerRowColumns returns, per recognized trigger, its relation key
+// and the text before each row column, so a test can tell NEW from OLD.
+func alterTriggerRowColumns(t *testing.T, text string, relations TriggerCatalog) []string {
+	t.Helper()
+	var got []string
+	for _, trg := range analyzeInterBase(t, text).Triggers(relations) {
+		entry := trg.Relation.Key() + ":"
+		for _, span := range trg.RowColumns {
+			entry += " " + text[span.Start-4:span.End]
+		}
+		got = append(got, entry)
+	}
+	return got
+}
+
+func TestTriggersReportAlterTriggerRowColumnsOfTheCatalogRelation(t *testing.T) {
+	text := "ALTER TRIGGER TR ACTIVE BEFORE UPDATE POSITION 1 AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\nID = NEW.ID + OLD.ID;\nEND"
+	triggers := analyzeInterBase(t, text).Triggers(newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}}))
+	if len(triggers) != 1 {
+		t.Fatalf("triggers = %#v, want one", triggers)
+	}
+	trg := triggers[0]
+	if trg.Relation.Key() != "ITEM" || trg.Span.Start != 0 || trg.Span.End != len(text) {
+		t.Fatalf("trigger = %#v", trg)
+	}
+	if got := alterTriggerRowColumns(t, text, newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})); strings.Join(got, ",") != "ITEM: NEW.ID OLD.ID" {
+		t.Fatalf("row columns = %q", got)
+	}
+	if !trg.Locals["ID"] || len(trg.Locals) != 1 {
+		t.Fatalf("locals = %v, want ID", trg.Locals)
+	}
+}
+
+// Without a proven relation an ALTER TRIGGER keeps its span and locals but
+// reports no row columns.
+func TestTriggersWithholdAlterTriggerRowColumnsWithoutACatalogRelation(t *testing.T) {
+	body := " AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\nID = NEW.ID;\nEND"
+	for name, tc := range map[string]struct {
+		text      string
+		relations TriggerCatalog
+	}{
+		"no catalog":        {"ALTER TRIGGER TR" + body, nil},
+		"unknown trigger":   {"ALTER TRIGGER TR" + body, newTriggerFixtureCatalog(map[string]Name{"OTHER": {Text: "ITEM"}})},
+		"empty relation":    {"ALTER TRIGGER TR" + body, newTriggerFixtureCatalog(map[string]Name{"TR": {}})},
+		"dropped earlier":   {"DROP TRIGGER TR;\nALTER TRIGGER TR" + body, newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})},
+		"altered earlier":   {"ALTER TRIGGER TR INACTIVE;\nALTER TRIGGER TR" + body, newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})},
+		"quoted not folded": {`ALTER TRIGGER "tr"` + body, newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})},
+	} {
+		t.Run(name, func(t *testing.T) {
+			triggers := analyzeInterBase(t, tc.text).Triggers(tc.relations)
+			if len(triggers) == 0 {
+				t.Fatalf("ALTER TRIGGER not recognized")
+			}
+			trg := triggers[len(triggers)-1]
+			if trg.Relation.Key() != "" || len(trg.RowColumns) != 0 || !trg.Locals["ID"] {
+				t.Fatalf("trigger = %#v, want no relation or row columns, local ID", trg)
+			}
+		})
+	}
+}
+
+// An earlier CREATE of the same trigger supplies its own FOR relation, not
+// the catalog's, to that CREATE; the later ALTER is withheld.
+func TestTriggersWithholdAlterTriggerCreatedEarlierInTheDocument(t *testing.T) {
+	text := "CREATE TRIGGER TR FOR OTHER BEFORE INSERT AS\nBEGIN\nNEW.ID = 1;\nEND;\nALTER TRIGGER TR AS\nBEGIN\nNEW.ID = 2;\nEND"
+	got := alterTriggerRowColumns(t, text, newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}}))
+	if strings.Join(got, ",") != "OTHER: NEW.ID,:" {
+		t.Fatalf("triggers = %q", got)
+	}
+}
+
+// An ALTER TRIGGER's catalog relation is stale once the document earlier
+// creates, alters or drops that relation, so its row columns are withheld.
+func TestTriggersWithholdAlterTriggerRowColumnsOfARelationChangedEarlier(t *testing.T) {
+	body := "ALTER TRIGGER TR AS BEGIN NEW.ID = 1; END"
+	catalog := newTriggerFixtureCatalog(map[string]Name{"TR": {Text: "ITEM"}})
+	for _, prefix := range []string{"DROP TABLE ITEM;\n", "ALTER TABLE ITEM ADD X INTEGER;\n", "CREATE TABLE ITEM (ID INTEGER);\n"} {
+		trg := analyzeInterBase(t, prefix+body).Triggers(catalog)
+		if len(trg) != 1 || len(trg[0].RowColumns) != 0 {
+			t.Fatalf("%q: triggers = %#v, want no row columns", prefix, trg)
+		}
+	}
+	if got := alterTriggerRowColumns(t, "DROP TABLE OTHER;\n"+body, catalog); strings.Join(got, ",") != "ITEM: NEW.ID" {
+		t.Fatalf("unrelated DDL: triggers = %q", got)
+	}
+}
+
+func TestTriggersMatchAQuotedAlterTriggerNameExactly(t *testing.T) {
+	text := `ALTER TRIGGER "tr" AS BEGIN NEW.ID = 1; END`
+	got := alterTriggerRowColumns(t, text, newTriggerFixtureCatalog(map[string]Name{"tr": {Text: "ITEM"}}))
+	if strings.Join(got, ",") != "ITEM: NEW.ID" {
+		t.Fatalf("triggers = %q", got)
 	}
 }
 

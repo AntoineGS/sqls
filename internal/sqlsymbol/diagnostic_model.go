@@ -367,8 +367,12 @@ func (m *diagnosticModel) UnionOutput(i int) (modelOutput, bool) {
 // name, column list, or body) report false: invalidation begins with the
 // next statement, not partway through the statement that causes it.
 func (m *diagnosticModel) DDLInvalidated(i int, name Name) bool {
+	return ddlInvalidated(m.ddl, i, name)
+}
+
+func ddlInvalidated(ddl []modelDDL, i int, name Name) bool {
 	key := name.Key()
-	for _, d := range m.ddl {
+	for _, d := range ddl {
 		if d.key == key && i >= d.end {
 			return true
 		}
