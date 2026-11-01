@@ -52,9 +52,11 @@ func TestDiagnosticAlterTriggerUnsupportedHeadersWithheld(t *testing.T) {
 		"ALTER TRIGGER TRG1 POSITION X AS BEGIN BADVAR = 1; END",
 		"ALTER TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN BADVAR = 1; END",
 		"ALTER TRIGGER AS BEGIN BADVAR = 1; END",
+		"CREATE OR ALTER TRIGGER TRG1 FOR T BEFORE INSERT AS BEGIN BADVAR = 1; NEW.BOGUS = 1; END",
 	} {
 		t.Run(sql, func(t *testing.T) {
 			requireCodeCount(t, sql, nil, codeUnknownVariable, 0)
+			requireCodeCount(t, sql, newTriggerFixtureCatalog(map[string]Name{"TRG1": {Text: "T"}}), codeUnknownColumn, 0)
 		})
 	}
 }

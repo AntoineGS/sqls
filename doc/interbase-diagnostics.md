@@ -1,8 +1,11 @@
 # InterBase SQL diagnostics
 
 `sqls` performs static analysis of InterBase SQL (SELECT/DML, `CREATE
-PROCEDURE`, `CREATE TRIGGER`) and publishes findings as LSP
-`textDocument/publishDiagnostics` notifications. Diagnostics are computed
+PROCEDURE`, `CREATE TRIGGER`, `ALTER TRIGGER`) and publishes findings as LSP
+`textDocument/publishDiagnostics` notifications. `ALTER TRIGGER` bodies are
+analyzed like `CREATE TRIGGER` bodies, but the statement does not name its
+table, so NEW/OLD column checks run only when the trigger's metadata (its
+table) is loaded. Diagnostics are computed
 entirely from the document's own text plus whatever catalog metadata has
 already loaded; they never issue additional database queries.
 
