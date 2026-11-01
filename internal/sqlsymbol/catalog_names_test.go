@@ -136,6 +136,21 @@ func TestTriggersWithholdAlterTriggerRowColumnsOfARelationChangedEarlier(t *test
 	}
 }
 
+// A CREATE TRIGGER's relation may be redefined earlier in the document, so its
+// row columns are withheld exactly as diagnostics skip them.
+func TestTriggersWithholdCreateTriggerRowColumnsOfARelationChangedEarlier(t *testing.T) {
+	body := "CREATE TRIGGER TR FOR ITEM BEFORE INSERT AS BEGIN NEW.ID = 1; END"
+	for _, prefix := range []string{"DROP TABLE ITEM;\n", "ALTER TABLE ITEM ADD X INTEGER;\n", "CREATE TABLE ITEM (ID INTEGER);\n"} {
+		trg := analyzeInterBase(t, prefix+body).Triggers(nil)
+		if len(trg) != 1 || len(trg[0].RowColumns) != 0 {
+			t.Fatalf("%q: triggers = %#v, want no row columns", prefix, trg)
+		}
+	}
+	if got := alterTriggerRowColumns(t, "DROP TABLE OTHER;\n"+body, nil); strings.Join(got, ",") != "ITEM: NEW.ID" {
+		t.Fatalf("unrelated DDL: triggers = %q", got)
+	}
+}
+
 func TestTriggersMatchAQuotedAlterTriggerNameExactly(t *testing.T) {
 	text := `ALTER TRIGGER "tr" AS BEGIN NEW.ID = 1; END`
 	got := alterTriggerRowColumns(t, text, newTriggerFixtureCatalog(map[string]Name{"tr": {Text: "ITEM"}}))

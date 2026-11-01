@@ -75,6 +75,15 @@ func TestCatalogReferencesFindTriggerRowColumns(t *testing.T) {
 	expectReferences(t, referenceTexts(t, navigationRequest(text, catalogReferencesCache()), other, "ID"))
 }
 
+func TestCatalogReferencesSkipCreateTriggerRowColumnsOfARelationChangedEarlier(t *testing.T) {
+	text := "CREATE TRIGGER TR FOR ITEM ACTIVE BEFORE UPDATE POSITION 0 AS\nBEGIN\nIF (NEW.ID <> OLD.ID) THEN EXIT;\nEND"
+	for _, prefix := range []string{"DROP TABLE ITEM;\n", "ALTER TABLE ITEM ADD X INTEGER;\n"} {
+		expectReferences(t, referenceTexts(t, navigationRequest(prefix+text, catalogReferencesCache()), itemTable, "ID"))
+	}
+	got := referenceTexts(t, navigationRequest("DROP TABLE OTHER_ITEM;\n"+text, catalogReferencesCache()), itemTable, "ID")
+	expectReferences(t, got, "IF (NEW.|ID", "IF (NEW.ID <> OLD.|ID")
+}
+
 // withItemTrigger adds trigger TR on ITEM to the catalog with metadata state.
 func withItemTrigger(cache *catalog.Cache, state catalog.MetadataState) *catalog.Cache {
 	trigger := &catalog.TriggerDesc{Name: "TR", RelationName: sql.NullString{String: "ITEM", Valid: true}, Event: "BEFORE UPDATE"}
