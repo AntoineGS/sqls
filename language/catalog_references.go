@@ -13,7 +13,8 @@ import (
 // refer to object, or to its column when column is not empty. Each occurrence
 // is resolved with Definition's rules, so procedure and trigger locals,
 // :variables, comments, literals and other relations' columns are excluded;
-// trigger NEW/OLD row columns belong to the trigger's FOR relation. Object and
+// trigger NEW/OLD row columns belong to the trigger's FOR relation, or for
+// ALTER TRIGGER to the relation trigger metadata names. Object and
 // column use exact catalog spellings. Only InterBase with current metadata
 // resolves. The document is analyzed once, so the cost stays linear in its size.
 func (s *Service) CatalogReferences(ctx context.Context, req Request, object catalog.ObjectID, column string) (Result[[]Range], error) {
@@ -31,7 +32,8 @@ func (s *Service) CatalogReferences(ctx context.Context, req Request, object cat
 		return Result[[]Range]{}, err
 	}
 	same := func(id catalog.ObjectID, ok bool) bool { return ok && id.Kind == object.Kind && id.Name == object.Name }
-	triggers := analysis.Triggers()
+	semantic := snapshotSemanticCatalog{snapshot: req.Context.Snapshot}
+	triggers := analysis.Triggers(semantic)
 	rowRelations := make(map[sqlsymbol.Span]sqlsymbol.Name)
 	for _, trg := range triggers {
 		for _, span := range trg.RowColumns {
@@ -46,7 +48,7 @@ func (s *Service) CatalogReferences(ctx context.Context, req Request, object cat
 		}
 		return false
 	}
-	prove := analysis.DefinitionColumnProver(snapshotSemanticCatalog{snapshot: req.Context.Snapshot})
+	prove := analysis.DefinitionColumnProver(semantic)
 	name := object.Name
 	if column != "" {
 		name = column

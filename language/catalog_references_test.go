@@ -2,6 +2,7 @@ package language_test
 
 import (
 	"context"
+	"database/sql"
 	"strings"
 	"testing"
 	"time"
@@ -72,6 +73,45 @@ func TestCatalogReferencesFindTriggerRowColumns(t *testing.T) {
 
 	other := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "OTHER_ITEM"}
 	expectReferences(t, referenceTexts(t, navigationRequest(text, catalogReferencesCache()), other, "ID"))
+}
+
+// withItemTrigger adds trigger TR on ITEM to the catalog with metadata state.
+func withItemTrigger(cache *catalog.Cache, state catalog.MetadataState) *catalog.Cache {
+	trigger := &catalog.TriggerDesc{Name: "TR", RelationName: sql.NullString{String: "ITEM", Valid: true}, Event: "BEFORE UPDATE"}
+	cache.Catalog.Triggers["TR"] = trigger
+	cache.Catalog.TriggersByID[(catalog.ObjectID{Kind: catalog.ObjectKindTrigger, Name: "TR"}).Key()] = trigger
+	cache.Metadata[catalog.MetadataTriggers] = state
+	return cache
+}
+
+func TestCatalogReferencesFindAlterTriggerRowColumnsOfTheCatalogRelation(t *testing.T) {
+	body := " ACTIVE BEFORE UPDATE POSITION 0 AS\nDECLARE VARIABLE ID INTEGER;\nBEGIN\nID = 1;\nIF (NEW.ID <> OLD.ID) THEN EXIT;\nEND"
+	text := "ALTER TRIGGER TR" + body
+	got := referenceTexts(t, navigationRequest(text, withItemTrigger(catalogReferencesCache(), catalog.MetadataReady)), itemTable, "ID")
+	expectReferences(t, got, "IF (NEW.|ID", "IF (NEW.ID <> OLD.|ID")
+
+	other := catalog.ObjectID{Kind: catalog.ObjectKindTable, Name: "OTHER_ITEM"}
+	expectReferences(t, referenceTexts(t, navigationRequest(text, withItemTrigger(catalogReferencesCache(), catalog.MetadataReady)), other, "ID"))
+
+	for name, req := range map[string]language.Request{
+		"no trigger metadata": navigationRequest(text, catalogReferencesCache()),
+		"unready triggers":    navigationRequest(text, withItemTrigger(catalogReferencesCache(), catalog.MetadataLoading)),
+		"quoted name":         navigationRequest(`ALTER TRIGGER "tr"`+body, withItemTrigger(catalogReferencesCache(), catalog.MetadataReady)),
+		"dropped earlier":     navigationRequest("DROP TRIGGER TR;\n"+text, withItemTrigger(catalogReferencesCache(), catalog.MetadataReady)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			expectReferences(t, referenceTexts(t, req, itemTable, "ID"))
+		})
+	}
+	stale := navigationRequest(text, withItemTrigger(catalogReferencesCache(), catalog.MetadataReady))
+	stale.Context.Snapshot.Stale = true
+	expectReferences(t, referenceTexts(t, stale, itemTable, "ID"))
+}
+
+func TestCatalogReferencesSkipAlterTriggerLocalsNamedLikeTheTarget(t *testing.T) {
+	text := "ALTER TRIGGER TR AS\nDECLARE VARIABLE SET_ITEM INTEGER;\nBEGIN\nSET_ITEM = 0;\nEXECUTE PROCEDURE SET_ITEM :SET_ITEM;\nEND"
+	procedure := catalog.ObjectID{Kind: catalog.ObjectKindProcedure, Name: "SET_ITEM"}
+	expectReferences(t, referenceTexts(t, navigationRequest(text, catalogReferencesCache()), procedure, ""), "EXECUTE PROCEDURE|SET_ITEM")
 }
 
 func TestCatalogReferencesFindInsertColumns(t *testing.T) {
