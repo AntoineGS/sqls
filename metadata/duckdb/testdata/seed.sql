@@ -53,6 +53,11 @@ CREATE TABLE main.child_rows (
 	    CONSTRAINT fk_child_parent FOREIGN KEY (parent_tenant_id, parent_id)
 	        REFERENCES main.parent_rows(tenant_id, id)
 );
+CREATE TABLE main."p.dot" (id INTEGER PRIMARY KEY);
+CREATE TABLE main.dot_child (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER REFERENCES main."p.dot"(id)
+);
 
 CREATE SEQUENCE main.seq_id;
 CREATE TABLE main.seq_t (
@@ -64,3 +69,4 @@ CREATE VIEW main.v_orders AS SELECT id, customer_id, total FROM main.orders;
 
 CREATE MACRO main.add1(x) AS x + 1;
 CREATE MACRO main.top_orders(n) AS TABLE SELECT * FROM main.orders LIMIT n;
+CREATE MACRO main.overloaded(a) AS a, (a, b) AS a + b;

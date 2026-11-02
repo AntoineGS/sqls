@@ -71,6 +71,7 @@ func TestDuckDBMetadataLiveProviderLoadsAllSchemasAndDetails(t *testing.T) {
 	assertDuckDBMetadataStates(t, snapshot)
 	assertDuckDBSchemaAndColumns(t, snapshot.Cache)
 	assertDuckDBKeysIndexesAndObjects(t, snapshot.Cache)
+	assertDuckDBOverloadedMacro(t, ctx, db, snapshot.Cache, lease)
 	assertDuckDBDetails(t, ctx, db, lease)
 	assertDuckDBUnsupportedDetails(t, provider)
 
@@ -212,7 +213,7 @@ func assertDuckDBKeysIndexesAndObjects(t *testing.T, cache *catalog.Cache) {
 	}) {
 		t.Error("sequence main.seq_id is missing from generators")
 	}
-	for _, macro := range []string{"add1", "top_orders"} {
+	for _, macro := range []string{"add1", "top_orders", "overloaded"} {
 		if !hasNamedSchema(cache.Catalog.FunctionsByID, "main", macro, func(v any) (string, string) {
 			desc := v.(*catalog.FunctionDesc)
 			return desc.Schema, desc.Name
@@ -236,6 +237,17 @@ func assertDuckDBKeysIndexesAndObjects(t *testing.T, cache *catalog.Cache) {
 			t.Errorf("foreign key pair %d = %v, want %v", i, got, wantPairs[i])
 		}
 	}
+
+	dottedSource := catalog.ColumnDatabaseKey("main", "dot_child")
+	dottedTarget := catalog.ColumnDatabaseKey("main", "p.dot")
+	dottedKeys := cache.ForeignKeys[dottedSource][dottedTarget]
+	if len(dottedKeys) != 1 || len(*dottedKeys[0]) != 1 {
+		t.Fatalf("dot_child → p.dot foreign keys = %#v, want one one-column key", dottedKeys)
+	}
+	if pair := (*dottedKeys[0])[0]; pair[0] == nil || pair[1] == nil ||
+		pair[1].Schema != "main" || pair[1].Table != "p.dot" || pair[1].Name != "id" {
+		t.Errorf("dotted target = %#v, want main.p.dot.id", pair[1])
+	}
 }
 
 func assertDuckDBDetails(t *testing.T, ctx context.Context, db *sql.DB, lease *metadata.Lease) {
@@ -256,9 +268,24 @@ func assertDuckDBDetails(t *testing.T, ctx context.Context, db *sql.DB, lease *m
 			args:   []any{"main", "v_orders"},
 		},
 		{
+			object: catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindIndex, Name: "idx_lower"},
+			query:  `SELECT sql FROM duckdb_indexes() WHERE database_name = current_database() AND schema_name = ? AND index_name = ?`,
+			args:   []any{"main", "idx_lower"},
+		},
+		{
+			object: catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindGenerator, Name: "seq_id"},
+			query:  `SELECT sql FROM duckdb_sequences() WHERE database_name = current_database() AND schema_name = ? AND sequence_name = ?`,
+			args:   []any{"main", "seq_id"},
+		},
+		{
 			object: catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindFunction, Name: "add1"},
 			query:  `SELECT macro_definition FROM duckdb_functions() WHERE database_name = current_database() AND schema_name = ? AND function_name = ? AND function_type IN ('macro', 'table_macro')`,
 			args:   []any{"main", "add1"},
+		},
+		{
+			object: catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindFunction, Name: "overloaded"},
+			query:  `SELECT macro_definition FROM duckdb_functions() WHERE database_name = current_database() AND schema_name = ? AND function_name = ? AND function_type IN ('macro', 'table_macro') ORDER BY macro_definition LIMIT 1`,
+			args:   []any{"main", "overloaded"},
 		},
 	} {
 		var want string
@@ -274,6 +301,39 @@ func assertDuckDBDetails(t *testing.T, ctx context.Context, db *sql.DB, lease *m
 		if detail.Text != want {
 			t.Errorf("Detail(%s %s ddl) = %q, want catalog sql %q", tc.object.Kind, tc.object.Name, detail.Text, want)
 		}
+	}
+}
+
+func assertDuckDBOverloadedMacro(t *testing.T, ctx context.Context, db *sql.DB, cache *catalog.Cache, lease *metadata.Lease) {
+	t.Helper()
+	var wantDefinition string
+	var wantArguments int
+	if err := db.QueryRowContext(ctx, `
+SELECT macro_definition, array_length(parameters)
+FROM duckdb_functions()
+WHERE database_name = current_database() AND schema_name = 'main'
+  AND function_name = 'overloaded' AND function_type = 'macro'
+ORDER BY macro_definition, CAST(parameters AS VARCHAR)
+LIMIT 1`).Scan(&wantDefinition, &wantArguments); err != nil {
+		t.Fatalf("read canonical overloaded macro: %v", err)
+	}
+	id := catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindFunction, Name: "overloaded"}.Key()
+	desc := cache.Catalog.FunctionsByID[id]
+	if desc == nil {
+		t.Fatal("overloaded macro is missing from FunctionsByID")
+	}
+	if got := len(desc.Arguments); got != wantArguments {
+		t.Errorf("overloaded macro arguments = %d, want canonical overload's %d", got, wantArguments)
+	}
+	detail, err := lease.Detail(ctx, metadata.Request{
+		Object: catalog.ObjectID{Schema: "main", Kind: catalog.ObjectKindFunction, Name: "overloaded"},
+		Facet:  "ddl", Consistency: metadata.Committed,
+	})
+	if err != nil {
+		t.Fatalf("Detail(overloaded): %v", err)
+	}
+	if detail.Text != wantDefinition {
+		t.Errorf("overloaded macro detail = %q, want canonical overload definition %q", detail.Text, wantDefinition)
 	}
 }
 

@@ -28,6 +28,10 @@ func (db *DuckDBMetadataRepository) MetadataDetailPlan(req metadata.Request) (me
 		required = catalog.MetadataViews
 	case catalog.ObjectKindFunction:
 		required = catalog.MetadataFunctions
+	case catalog.ObjectKindIndex:
+		required = catalog.MetadataIndexes
+	case catalog.ObjectKindGenerator:
+		required = catalog.MetadataGenerators
 	default:
 		return metadata.DetailPlan{}, metadata.ErrUnsupported
 	}
@@ -54,7 +58,11 @@ func (db *DuckDBMetadataRepository) MetadataDetailPlan(req metadata.Request) (me
 			case catalog.ObjectKindView:
 				statement = `SELECT sql FROM duckdb_views() WHERE database_name = ? AND schema_name = ? AND view_name = ? AND NOT internal AND NOT temporary`
 			case catalog.ObjectKindFunction:
-				statement = `SELECT macro_definition FROM duckdb_functions() WHERE database_name = ? AND schema_name = ? AND function_name = ? AND function_type IN ('macro', 'table_macro') AND NOT internal`
+				statement = `SELECT macro_definition FROM duckdb_functions() WHERE database_name = ? AND schema_name = ? AND function_name = ? AND function_type IN ('macro', 'table_macro') AND NOT internal ORDER BY macro_definition, CAST(parameters AS VARCHAR) LIMIT 1`
+			case catalog.ObjectKindIndex:
+				statement = `SELECT i.sql FROM duckdb_indexes() AS i JOIN duckdb_tables() AS t ON t.database_name = i.database_name AND t.schema_name = i.schema_name AND t.table_name = i.table_name WHERE i.database_name = ? AND i.schema_name = ? AND i.index_name = ? AND NOT t.internal AND NOT t.temporary`
+			case catalog.ObjectKindGenerator:
+				statement = `SELECT sql FROM duckdb_sequences() WHERE database_name = ? AND schema_name = ? AND sequence_name = ? AND NOT temporary`
 			}
 			var text string
 			_, err = db.withMetadataRead(ctx, func(ctx context.Context, conn *sql.Conn) (catalog.MetadataPatch, error) {
@@ -121,6 +129,22 @@ func duckDBResolveDetailName(cache *catalog.Cache, schema string, kind catalog.O
 			for _, function := range cache.Catalog.FunctionsByID {
 				if function != nil && function.Schema == schema {
 					candidates = append(candidates, function.Name)
+				}
+			}
+		}
+	case catalog.ObjectKindIndex:
+		if cache.Catalog != nil {
+			for _, index := range cache.Catalog.IndexesByID {
+				if index != nil && index.Schema == schema {
+					candidates = append(candidates, index.Name)
+				}
+			}
+		}
+	case catalog.ObjectKindGenerator:
+		if cache.Catalog != nil {
+			for _, generator := range cache.Catalog.GeneratorsByID {
+				if generator != nil && generator.Schema == schema {
+					candidates = append(candidates, generator.Name)
 				}
 			}
 		}

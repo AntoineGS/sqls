@@ -491,7 +491,8 @@ func (t *Tokenizer) supportsEscapeStringLiterals() bool {
 func (t *Tokenizer) tokenizeEscapeQuotedString() string {
 	var str []rune
 	t.Scanner.Next()
-	cols := 1
+	lastWasCR := false
+	t.advanceQuotedRune('\'', &lastWasCR)
 	isClosed := false
 
 	for {
@@ -502,34 +503,33 @@ func (t *Tokenizer) tokenizeEscapeQuotedString() string {
 		if n == '\\' {
 			t.Scanner.Next()
 			str = append(str, n)
-			cols++
+			t.advanceQuotedRune(n, &lastWasCR)
 			escaped := t.Scanner.Peek()
 			if escaped == scanner.EOF {
 				break
 			}
 			t.Scanner.Next()
 			str = append(str, escaped)
-			cols++
+			t.advanceQuotedRune(escaped, &lastWasCR)
 			continue
 		}
 		if n == '\'' {
 			t.Scanner.Next()
+			t.advanceQuotedRune(n, &lastWasCR)
 			if t.Scanner.Peek() == '\'' {
 				t.Scanner.Next()
 				str = append(str, '\'', '\'')
-				cols += 2
+				t.advanceQuotedRune('\'', &lastWasCR)
 				continue
 			}
-			cols++
 			isClosed = true
 			break
 		}
 		t.Scanner.Next()
 		str = append(str, n)
-		cols++
+		t.advanceQuotedRune(n, &lastWasCR)
 	}
 
-	t.Col += cols
 	if isClosed {
 		return "'" + string(str) + "'"
 	}
@@ -569,13 +569,14 @@ func (t *Tokenizer) tokenizeDollarQuotedString() (Kind, string) {
 	}
 
 	var body, pending []rune
+	lastWasCR := false
 	for {
 		r := t.Scanner.Next()
 		if r == scanner.EOF {
 			body = append(body, pending...)
 			return SingleQuotedString, string(delimiter) + string(body)
 		}
-		t.Col++
+		t.advanceQuotedRune(r, &lastWasCR)
 		pending = append(pending, r)
 		for len(pending) > 0 && !runesPrefix(pending, delimiter) {
 			body = append(body, pending[0])
@@ -584,6 +585,24 @@ func (t *Tokenizer) tokenizeDollarQuotedString() (Kind, string) {
 		if len(pending) == len(delimiter) {
 			return SingleQuotedString, string(delimiter) + string(body) + string(delimiter)
 		}
+	}
+}
+
+func (t *Tokenizer) advanceQuotedRune(r rune, lastWasCR *bool) {
+	switch r {
+	case '\r':
+		t.Line++
+		t.Col = 0
+		*lastWasCR = true
+	case '\n':
+		if !*lastWasCR {
+			t.Line++
+		}
+		t.Col = 0
+		*lastWasCR = false
+	default:
+		t.Col++
+		*lastWasCR = false
 	}
 }
 

@@ -56,6 +56,13 @@ func CanonicalPath(path string) (string, error) {
 		canonical := path
 		if runtime.GOOS == "windows" {
 			canonical = filepath.Clean(canonical)
+			if _, err := os.Stat(canonical); err == nil {
+				resolved, err := filepath.EvalSymlinks(canonical)
+				if err != nil {
+					return "", err
+				}
+				canonical = resolved
+			}
 		}
 		return strings.ToLower(canonical), nil
 	}

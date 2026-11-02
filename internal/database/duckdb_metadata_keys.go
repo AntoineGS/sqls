@@ -119,7 +119,7 @@ type duckDBForeignKeyRow struct {
 	position                             int64
 }
 
-func (db *DuckDBMetadataRepository) readMetadataForeignKeys(ctx context.Context, conn *sql.Conn, _ *catalog.Cache) (catalog.MetadataPatch, error) {
+func (db *DuckDBMetadataRepository) readMetadataForeignKeys(ctx context.Context, conn *sql.Conn, cache *catalog.Cache) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT c.schema_name, c.table_name, c.constraint_name, c.referenced_table,
        source.column_name, source.position, target.column_name
@@ -170,7 +170,7 @@ ORDER BY c.schema_name, c.table_name, c.constraint_name, source.position`
 	for _, identity := range identities {
 		parts := groupedRows[identity]
 		schema := parts[0].schema
-		targetSchema, targetTable := duckDBReferencedTable(schema, parts[0].referencedTable)
+		targetSchema, targetTable := duckDBReferencedTable(schema, parts[0].referencedTable, cache)
 		key := new(catalog.ForeignKey)
 		for _, part := range parts {
 			if part.referencedTable != parts[0].referencedTable {
@@ -199,11 +199,54 @@ ORDER BY c.schema_name, c.table_name, c.constraint_name, source.position`
 	return catalog.MetadataPatch{Cache: &catalog.Cache{ForeignKeys: grouped}, Count: len(groupedRows)}, nil
 }
 
-func duckDBReferencedTable(sourceSchema, referencedTable string) (string, string) {
-	if schema, table, ok := strings.Cut(referencedTable, "."); ok {
-		return strings.Trim(schema, `"`), strings.Trim(table, `"`)
+func duckDBReferencedTable(sourceSchema, referencedTable string, cache *catalog.Cache) (string, string) {
+	if table, ok := duckDBRelationInSchema(cache, sourceSchema, duckDBUnquoteIdentifier(referencedTable)); ok {
+		return sourceSchema, table
 	}
-	return sourceSchema, referencedTable
+	for index := strings.IndexByte(referencedTable, '.'); index >= 0; {
+		schemaName := duckDBUnquoteIdentifier(referencedTable[:index])
+		tableName := duckDBUnquoteIdentifier(referencedTable[index+1:])
+		if schema, ok := duckDBSchemaName(cache, schemaName); ok {
+			if table, ok := duckDBRelationInSchema(cache, schema, tableName); ok {
+				return schema, table
+			}
+		}
+		next := strings.IndexByte(referencedTable[index+1:], '.')
+		if next < 0 {
+			break
+		}
+		index += next + 1
+	}
+	return sourceSchema, duckDBUnquoteIdentifier(referencedTable)
+}
+
+func duckDBSchemaName(cache *catalog.Cache, requested string) (string, bool) {
+	if cache == nil {
+		return "", false
+	}
+	if schema, ok := cache.Schemas[strings.ToUpper(requested)]; ok {
+		return schema, true
+	}
+	return "", false
+}
+
+func duckDBRelationInSchema(cache *catalog.Cache, schema, requested string) (string, bool) {
+	if cache == nil {
+		return "", false
+	}
+	for _, relation := range cache.SchemaTables[strings.ToUpper(schema)] {
+		if relation == requested || strings.EqualFold(relation, requested) {
+			return relation, true
+		}
+	}
+	return "", false
+}
+
+func duckDBUnquoteIdentifier(identifier string) string {
+	if len(identifier) >= 2 && identifier[0] == '"' && identifier[len(identifier)-1] == '"' {
+		return strings.ReplaceAll(identifier[1:len(identifier)-1], `""`, `"`)
+	}
+	return identifier
 }
 
 type duckDBMetadataIndex struct {

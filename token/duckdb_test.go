@@ -42,3 +42,29 @@ func TestDuckDBUsesPostgreSQLQuotedSyntax(t *testing.T) {
 		})
 	}
 }
+
+func TestDuckDBMultilineLiteralsKeepFollowingTokenPositions(t *testing.T) {
+	d := dialect.DialectForDriverVariant(dialect.DriverVariant{Driver: dialect.DatabaseDriverDuckDB})
+	for _, tc := range []struct {
+		name     string
+		sql      string
+		wantFrom Pos
+		wantTo   Pos
+	}{
+		{name: "escape string LF", sql: "E'line1\nline2' id", wantFrom: Pos{Line: 1, Col: 7}, wantTo: Pos{Line: 1, Col: 9}},
+		{name: "dollar string CRLF", sql: "$$line1\r\nline2$$ id", wantFrom: Pos{Line: 1, Col: 8}, wantTo: Pos{Line: 1, Col: 10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tokens, err := NewTokenizer(strings.NewReader(tc.sql), d).Tokenize()
+			if err != nil {
+				t.Fatalf("Tokenize() error = %v", err)
+			}
+			if len(tokens) != 3 {
+				t.Fatalf("Tokenize() produced %d tokens, want literal, whitespace and identifier: %#v", len(tokens), tokens)
+			}
+			if got := tokens[2]; got.From != tc.wantFrom || got.To != tc.wantTo {
+				t.Fatalf("following identifier position = %v..%v, want %v..%v", got.From, got.To, tc.wantFrom, tc.wantTo)
+			}
+		})
+	}
+}

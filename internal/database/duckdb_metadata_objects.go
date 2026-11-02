@@ -46,6 +46,7 @@ type duckDBMacroArgument struct {
 func (db *DuckDBMetadataRepository) readMetadataFunctions(ctx context.Context, conn *sql.Conn, _ *catalog.Cache) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT f.schema_name, f.function_name, f.macro_definition,
+       COALESCE(CAST(f.parameters AS VARCHAR), '[]'),
        p.parameter_name, p.position
 FROM duckdb_functions() AS f
 LEFT JOIN UNNEST(f.parameters) WITH ORDINALITY AS p(parameter_name, position) ON TRUE
@@ -53,27 +54,36 @@ WHERE f.database_name = ?
   AND f.function_type IN ('macro', 'table_macro')
   AND NOT f.internal
   AND f.schema_name NOT IN ('information_schema', 'pg_catalog')
-ORDER BY f.schema_name, f.function_name, p.position`
+ORDER BY f.schema_name, f.function_name, f.macro_definition,
+         COALESCE(CAST(f.parameters AS VARCHAR), '[]'), p.position`
 	type macro struct {
 		desc       *catalog.FunctionDesc
 		definition string
+		signature  string
 		arguments  []duckDBMacroArgument
 	}
 	macros := make(map[string]*macro)
 	err := duckDBMetadataRows(ctx, conn, query, []any{db.Catalog}, func(rows *sql.Rows) error {
-		var schema, name, definition string
+		var schema, name, definition, signature string
 		var parameter sql.NullString
 		var position sql.NullInt64
-		if err := rows.Scan(&schema, &name, &definition, &parameter, &position); err != nil {
+		if err := rows.Scan(&schema, &name, &definition, &signature, &parameter, &position); err != nil {
 			return err
 		}
 		id := catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindFunction, Name: name}.Key()
 		entry := macros[id]
 		if entry == nil {
-			entry = &macro{desc: &catalog.FunctionDesc{Schema: schema, Name: name, Arguments: make([]*catalog.FunctionArgumentDesc, 0)}, definition: definition}
+			entry = &macro{
+				desc:       &catalog.FunctionDesc{Schema: schema, Name: name, Arguments: make([]*catalog.FunctionArgumentDesc, 0)},
+				definition: definition,
+				signature:  signature,
+			}
 			macros[id] = entry
-		} else if entry.definition != definition {
-			return fmt.Errorf("macro %s.%s has inconsistent definitions", schema, name)
+		} else if entry.definition != definition || entry.signature != signature {
+			// The shared catalog models one function descriptor per name. Keep a
+			// deterministic representative overload instead of failing this whole
+			// metadata category when DuckDB exposes several definitions.
+			return nil
 		}
 		if parameter.Valid || position.Valid {
 			if !parameter.Valid || !position.Valid || parameter.String == "" || position.Int64 < 1 {

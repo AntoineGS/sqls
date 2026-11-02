@@ -31,7 +31,7 @@ func (db *DuckDBMetadataRepository) MetadataPlan() catalog.MetadataPlan {
 		job(catalog.MetadataViews, []catalog.MetadataKind{catalog.MetadataColumnsCurrent}, db.readMetadataViews),
 		job(catalog.MetadataIndexes, nil, db.readMetadataIndexes),
 		job(catalog.MetadataPrimaryKeys, nil, db.readMetadataPrimaryKeys),
-		job(catalog.MetadataForeignKeys, nil, db.readMetadataForeignKeys),
+		job(catalog.MetadataForeignKeys, []catalog.MetadataKind{catalog.MetadataRelations}, db.readMetadataForeignKeys),
 		job(catalog.MetadataGenerators, nil, db.readMetadataGenerators),
 		job(catalog.MetadataFunctions, nil, db.readMetadataFunctions),
 	}}
