@@ -52,6 +52,7 @@ func TestDialectForDriverVariant(t *testing.T) {
 		dv             DriverVariant
 		wantSQLDialect int
 		wantGeneric    bool
+		wantPostgreSQL bool
 	}{
 		{
 			name:           "interbase default variant is dialect 3",
@@ -74,9 +75,14 @@ func TestDialectForDriverVariant(t *testing.T) {
 			wantGeneric: true,
 		},
 		{
-			name:        "postgresql stays generic",
-			dv:          DriverVariant{Driver: DatabaseDriverPostgreSQL},
-			wantGeneric: true,
+			name:           "postgresql uses shared PostgreSQL lexical rules",
+			dv:             DriverVariant{Driver: DatabaseDriverPostgreSQL},
+			wantPostgreSQL: true,
+		},
+		{
+			name:           "duckdb uses shared PostgreSQL lexical rules",
+			dv:             DriverVariant{Driver: DatabaseDriverDuckDB},
+			wantPostgreSQL: true,
 		},
 	}
 
@@ -86,6 +92,14 @@ func TestDialectForDriverVariant(t *testing.T) {
 			if tt.wantGeneric {
 				if _, ok := got.(*GenericSQLDialect); !ok {
 					t.Fatalf("DialectForDriverVariant(%#v) = %T, want *GenericSQLDialect", tt.dv, got)
+				}
+				return
+			}
+			if tt.wantPostgreSQL {
+				switch got.(type) {
+				case *postgreSQLDialect, *duckDBDialect:
+				default:
+					t.Fatalf("DialectForDriverVariant(%#v) = %T, want shared PostgreSQL lexical dialect", tt.dv, got)
 				}
 				return
 			}

@@ -391,6 +391,7 @@ const (
 	DatabaseDriverVertica    DatabaseDriver = "vertica"
 	DatabaseDriverClickhouse DatabaseDriver = "clickhouse"
 	DatabaseDriverInterBase  DatabaseDriver = "interbase"
+	DatabaseDriverDuckDB     DatabaseDriver = "duckdb"
 )
 
 // DataBaseKeywords returns the completion keyword list for a driver's default
@@ -418,6 +419,8 @@ func dataBaseKeywords(driver DatabaseDriver) []string {
 		return mysql56Keyword
 	case DatabaseDriverPostgreSQL:
 		return postgresql13Keywords
+	case DatabaseDriverDuckDB:
+		return mergeSortedUnique(postgresql13Keywords, duckdbKeywords)
 	case DatabaseDriverSQLite3:
 		return sqliteKeywords
 	case DatabaseDriverMssql:
@@ -449,6 +452,8 @@ func dataBaseFunctions(driver DatabaseDriver) []string {
 		return mysql56Function
 	case DatabaseDriverPostgreSQL:
 		return []string{}
+	case DatabaseDriverDuckDB:
+		return duckdbFunctions
 	case DatabaseDriverSQLite3:
 		return []string{}
 	case DatabaseDriverMssql:

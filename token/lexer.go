@@ -227,6 +227,15 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 		v := t.makeKeyword(s, 0)
 		return SQLKeyword, v, nil
 
+	case (r == 'E' || r == 'e') && t.supportsEscapeStringLiterals():
+		t.Scanner.Next()
+		if t.Scanner.Peek() == '\'' {
+			t.Col++
+			return SingleQuotedString, string(r) + t.tokenizeEscapeQuotedString(), nil
+		}
+		s := t.tokenizeWord(r)
+		return SQLKeyword, t.makeKeyword(s, 0), nil
+
 	case t.Dialect.IsIdentifierStart(r):
 		t.Scanner.Next()
 		s := t.tokenizeWord(r)
@@ -411,6 +420,9 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 		t.Scanner.Next()
 		t.Col++
 		return Ampersand, "&", nil
+	case r == '$' && t.supportsDollarQuotedStrings():
+		kind, value := t.tokenizeDollarQuotedString()
+		return kind, value, nil
 	case r == '{':
 		t.Scanner.Next()
 		t.Col++
@@ -465,6 +477,134 @@ func (t *Tokenizer) tokenizeSingleQuotedString() string {
 		preserve = p.PreservesQuotedStringEscapes()
 	}
 	return t.tokenizeQuotedString('\'', preserve)
+}
+
+type escapeStringLiteralDialect interface {
+	SupportsEscapeStringLiterals() bool
+}
+
+func (t *Tokenizer) supportsEscapeStringLiterals() bool {
+	d, ok := t.Dialect.(escapeStringLiteralDialect)
+	return ok && d.SupportsEscapeStringLiterals()
+}
+
+func (t *Tokenizer) tokenizeEscapeQuotedString() string {
+	var str []rune
+	t.Scanner.Next()
+	cols := 1
+	isClosed := false
+
+	for {
+		n := t.Scanner.Peek()
+		if n == scanner.EOF {
+			break
+		}
+		if n == '\\' {
+			t.Scanner.Next()
+			str = append(str, n)
+			cols++
+			escaped := t.Scanner.Peek()
+			if escaped == scanner.EOF {
+				break
+			}
+			t.Scanner.Next()
+			str = append(str, escaped)
+			cols++
+			continue
+		}
+		if n == '\'' {
+			t.Scanner.Next()
+			if t.Scanner.Peek() == '\'' {
+				t.Scanner.Next()
+				str = append(str, '\'', '\'')
+				cols += 2
+				continue
+			}
+			cols++
+			isClosed = true
+			break
+		}
+		t.Scanner.Next()
+		str = append(str, n)
+		cols++
+	}
+
+	t.Col += cols
+	if isClosed {
+		return "'" + string(str) + "'"
+	}
+	return "'" + string(str)
+}
+
+type dollarQuotedStringDialect interface {
+	SupportsDollarQuotedStrings() bool
+}
+
+func (t *Tokenizer) supportsDollarQuotedStrings() bool {
+	d, ok := t.Dialect.(dollarQuotedStringDialect)
+	return ok && d.SupportsDollarQuotedStrings()
+}
+
+func (t *Tokenizer) tokenizeDollarQuotedString() (Kind, string) {
+	t.Scanner.Next()
+	t.Col++
+	delimiter := []rune{'$'}
+	first := t.Scanner.Peek()
+	if first == '$' {
+		t.Scanner.Next()
+		t.Col++
+		delimiter = append(delimiter, '$')
+	} else if isDollarTagStart(first) {
+		for isDollarTagPart(t.Scanner.Peek()) {
+			delimiter = append(delimiter, t.Scanner.Next())
+			t.Col++
+		}
+		if t.Scanner.Peek() != '$' {
+			return Char, string(delimiter)
+		}
+		delimiter = append(delimiter, t.Scanner.Next())
+		t.Col++
+	} else {
+		return Char, "$"
+	}
+
+	var body, pending []rune
+	for {
+		r := t.Scanner.Next()
+		if r == scanner.EOF {
+			body = append(body, pending...)
+			return SingleQuotedString, string(delimiter) + string(body)
+		}
+		t.Col++
+		pending = append(pending, r)
+		for len(pending) > 0 && !runesPrefix(pending, delimiter) {
+			body = append(body, pending[0])
+			pending = pending[1:]
+		}
+		if len(pending) == len(delimiter) {
+			return SingleQuotedString, string(delimiter) + string(body) + string(delimiter)
+		}
+	}
+}
+
+func isDollarTagStart(r rune) bool {
+	return r == '_' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z')
+}
+
+func isDollarTagPart(r rune) bool {
+	return isDollarTagStart(r) || ('0' <= r && r <= '9')
+}
+
+func runesPrefix(value, prefix []rune) bool {
+	if len(value) > len(prefix) {
+		return false
+	}
+	for i := range value {
+		if value[i] != prefix[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func (t *Tokenizer) tokenizeQuotedString(quote rune, preserveEscapes bool) string {

@@ -56,10 +56,16 @@ func (v SQLVariant) InterBaseSQLDialect() int {
 
 // DialectForDriverVariant returns the lexical rules for a driver and variant.
 func DialectForDriverVariant(dv DriverVariant) Dialect {
-	if dv.Driver == DatabaseDriverInterBase {
+	switch dv.Driver {
+	case DatabaseDriverInterBase:
 		return &InterBaseDialect{SQLDialect: dv.Variant.InterBaseSQLDialect()}
+	case DatabaseDriverPostgreSQL:
+		return &postgreSQLDialect{}
+	case DatabaseDriverDuckDB:
+		return &duckDBDialect{}
+	default:
+		return &GenericSQLDialect{}
 	}
-	return &GenericSQLDialect{}
 }
 
 // DataBaseKeywordsForVariant returns the completion keyword list for a driver
