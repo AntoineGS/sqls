@@ -134,8 +134,8 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 		t.Errorf("Schemas = %#v, want only %#v", got, want)
 	}
 	wantRelations := []string{
-		"RESULT_EDIT_CASE_LOWER", "browse_auto", "composite_pk", "describe_probe", "no_key", "parent_rows",
-		"result_edit", "result_edit_case_lower", "result_edit_nontransactional", "unique_nonnull", "unique_nullable",
+		"PK_COLLISION", "RESULT_EDIT_CASE_LOWER", "browse_auto", "composite_pk", "describe_probe", "no_key", "parent_rows",
+		"pk_collision", "result_edit", "result_edit_case_lower", "result_edit_nontransactional", "unique_nonnull", "unique_nullable",
 		"unique_single_nonnull", "v_describe_probe",
 	}
 	if got := cache.SortedTables(); !reflect.DeepEqual(got, wantRelations) {
@@ -299,15 +299,21 @@ func assertMySQLCaseDistinctPrimaryKeys(t *testing.T, cache *catalog.Cache, sche
 	}{
 		{table: "result_edit_case_lower", column: "id"},
 		{table: "RESULT_EDIT_CASE_LOWER", column: "upper_id"},
+		{table: "pk_collision", column: "id"},
 	} {
 		id := catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: test.table}.Key()
 		if got, want := cache.PrimaryKeysByID[id], []string{test.column}; !reflect.DeepEqual(got, want) {
 			t.Errorf("exact primary key for %s.%s = %q, want %q", schema, test.table, got, want)
 		}
 	}
-	folded := catalog.ColumnDatabaseKey(schema, "result_edit_case_lower")
-	if _, ok := cache.PrimaryKeyColumns[folded]; ok {
-		t.Errorf("ambiguous folded primary key %q was published; exact identities must remain separate", folded)
+	if got := cache.PrimaryKeysByID[catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: "PK_COLLISION"}.Key()]; got != nil {
+		t.Errorf("no-PK case-colliding relation unexpectedly has exact keys %q", got)
+	}
+	for _, table := range []string{"result_edit_case_lower", "pk_collision"} {
+		folded := catalog.ColumnDatabaseKey(schema, table)
+		if _, ok := cache.PrimaryKeyColumns[folded]; ok {
+			t.Errorf("ambiguous folded primary key %q was published; exact identities must remain separate", folded)
+		}
 	}
 }
 

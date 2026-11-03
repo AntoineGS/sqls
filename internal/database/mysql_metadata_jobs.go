@@ -30,7 +30,11 @@ func (db *MySQLMetadataRepository) MetadataPlan() catalog.MetadataPlan {
 			})
 		}},
 		schemaJob(catalog.MetadataIndexes, nil, db.readMetadataIndexes),
-		schemaJob(catalog.MetadataPrimaryKeys, nil, db.readMetadataPrimaryKeys),
+		{Kind: catalog.MetadataPrimaryKeys, DependsOn: []catalog.MetadataKind{catalog.MetadataSchemas, catalog.MetadataRelations}, Run: func(ctx context.Context, cache *catalog.Cache) (catalog.MetadataPatch, error) {
+			return db.withSchemaMetadataRead(ctx, cache, func(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
+				return db.readMetadataPrimaryKeys(ctx, tx, schema, cache)
+			})
+		}},
 		schemaJob(catalog.MetadataForeignKeys, nil, db.readMetadataForeignKeys),
 		schemaJob(catalog.MetadataProcedures, nil, db.readMetadataProcedures),
 		schemaJob(catalog.MetadataFunctions, nil, db.readMetadataFunctions),

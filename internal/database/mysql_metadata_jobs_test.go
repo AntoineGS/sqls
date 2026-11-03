@@ -209,6 +209,9 @@ func TestMySQLMetadataPlanHasOnlySupportedBoundedJobs(t *testing.T) {
 		} else if !containsMySQLMetadataKind(job.DependsOn, catalog.MetadataSchemas) {
 			t.Errorf("%s job dependencies = %v, want schema discovery", job.Kind, job.DependsOn)
 		}
+		if job.Kind == catalog.MetadataPrimaryKeys && !containsMySQLMetadataKind(job.DependsOn, catalog.MetadataRelations) {
+			t.Errorf("%s job dependencies = %v, want relation identities for folded-key ambiguity", job.Kind, job.DependsOn)
+		}
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("job kinds = %v, want %v", got, want)

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/sqls-server/sqls/catalog"
 )
@@ -101,15 +102,15 @@ type mysqlMetadataPrimaryKeyRow struct {
 	position              int64
 }
 
-func (db *MySQLMetadataRepository) readMetadataPrimaryKeys(ctx context.Context, tx *sql.Tx, schema string) (catalog.MetadataPatch, error) {
+func (db *MySQLMetadataRepository) readMetadataPrimaryKeys(ctx context.Context, tx *sql.Tx, schema string, cache *catalog.Cache) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.COLUMN_NAME, kcu.ORDINAL_POSITION
 FROM information_schema.TABLE_CONSTRAINTS AS tc
 JOIN information_schema.KEY_COLUMN_USAGE AS kcu
-  ON kcu.CONSTRAINT_SCHEMA = tc.CONSTRAINT_SCHEMA
- AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
- AND kcu.TABLE_NAME = tc.TABLE_NAME
- AND kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME
+  ON BINARY kcu.CONSTRAINT_SCHEMA = BINARY tc.CONSTRAINT_SCHEMA
+ AND BINARY kcu.TABLE_SCHEMA = BINARY tc.TABLE_SCHEMA
+ AND BINARY kcu.TABLE_NAME = BINARY tc.TABLE_NAME
+ AND BINARY kcu.CONSTRAINT_NAME = BINARY tc.CONSTRAINT_NAME
 WHERE tc.TABLE_SCHEMA = ?
   AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
 ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
@@ -143,6 +144,26 @@ ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
 	seen := make(map[string]map[int64]struct{})
 	foldedOwners := make(map[string]string)
 	ambiguousFolded := make(map[string]struct{})
+	addFoldedOwner := func(table string) {
+		relationKey := catalog.ColumnDatabaseKey(schema, table)
+		if _, ambiguous := ambiguousFolded[relationKey]; ambiguous {
+			return
+		}
+		if owner, exists := foldedOwners[relationKey]; exists && owner != table {
+			delete(foldedOwners, relationKey)
+			ambiguousFolded[relationKey] = struct{}{}
+			return
+		}
+		foldedOwners[relationKey] = table
+	}
+	if cache != nil {
+		for _, relation := range cache.SchemaTables[strings.ToUpper(schema)] {
+			addFoldedOwner(relation)
+		}
+	}
+	for _, row := range primaryRows {
+		addFoldedOwner(row.table)
+	}
 	for _, row := range primaryRows {
 		id := catalog.ObjectID{Schema: row.schema, Kind: catalog.ObjectKindTable, Name: row.table}.Key()
 		if seen[id] == nil {
@@ -155,19 +176,13 @@ ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
 		primaryKeysByID[id] = append(primaryKeysByID[id], row.column)
 
 		// PrimaryKeyColumns is a legacy case-folded lookup. Keep it for a
-		// unique exact relation identity, but omit folded collisions rather
-		// than merging different tables' key columns or rejecting the category.
+		// unique exact relation identity, but omit folded collisions among all
+		// schema relations rather than merging different identities or rejecting
+		// the category.
 		relationKey := catalog.ColumnDatabaseKey(row.schema, row.table)
 		if _, ambiguous := ambiguousFolded[relationKey]; ambiguous {
 			continue
 		}
-		if owner, exists := foldedOwners[relationKey]; exists && owner != id {
-			delete(primaryKeys, relationKey)
-			delete(foldedOwners, relationKey)
-			ambiguousFolded[relationKey] = struct{}{}
-			continue
-		}
-		foldedOwners[relationKey] = id
 		if primaryKeys[relationKey] == nil {
 			primaryKeys[relationKey] = make(map[string]struct{})
 		}
