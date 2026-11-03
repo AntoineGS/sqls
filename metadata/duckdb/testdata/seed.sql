@@ -1,5 +1,8 @@
 CREATE SCHEMA sales;
 
+CREATE TYPE main.mood AS ENUM ('calm', 'busy');
+CREATE TYPE sales.order_state AS ENUM ('open', 'closed');
+
 CREATE TABLE main.orders (
     id INTEGER PRIMARY KEY,
     customer_id INTEGER,

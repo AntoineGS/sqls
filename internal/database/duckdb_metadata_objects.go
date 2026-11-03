@@ -9,6 +9,40 @@ import (
 	"github.com/sqls-server/sqls/catalog"
 )
 
+func (db *DuckDBMetadataRepository) readMetadataDomains(ctx context.Context, conn *sql.Conn, _ *catalog.Cache) (catalog.MetadataPatch, error) {
+	const query = `
+SELECT schema_name, type_name, logical_type
+FROM duckdb_types()
+WHERE database_name = ? AND NOT internal
+  AND schema_name NOT IN ('information_schema', 'pg_catalog')
+ORDER BY schema_name, type_name`
+	byName := make(map[string]*catalog.DomainDesc)
+	byID := make(map[string]*catalog.DomainDesc)
+	err := duckDBMetadataRows(ctx, conn, query, []any{db.Catalog}, func(rows *sql.Rows) error {
+		var schema, name, logicalType string
+		if err := rows.Scan(&schema, &name, &logicalType); err != nil {
+			return err
+		}
+		id := catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindDomain, Name: name}.Key()
+		if _, exists := byID[id]; exists {
+			return fmt.Errorf("duplicate DuckDB type %s.%s", schema, name)
+		}
+		desc := &catalog.DomainDesc{
+			Schema: schema,
+			Name:   name,
+			Type:   logicalType,
+			Facts:  &catalog.ColumnTypeFacts{UserDomain: true},
+		}
+		byName[catalog.CatalogCacheKey(name)] = desc
+		byID[id] = desc
+		return nil
+	})
+	if err != nil {
+		return catalog.MetadataPatch{}, err
+	}
+	return catalog.MetadataPatch{Cache: &catalog.Cache{Catalog: &catalog.CatalogCache{Domains: byName, DomainsByID: byID}}, Count: len(byID)}, nil
+}
+
 func (db *DuckDBMetadataRepository) readMetadataGenerators(ctx context.Context, conn *sql.Conn, _ *catalog.Cache) (catalog.MetadataPatch, error) {
 	const query = `
 SELECT schema_name, sequence_name

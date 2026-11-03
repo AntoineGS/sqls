@@ -83,6 +83,51 @@ func TestDuckDBMetadataLiveProviderLoadsAllSchemasAndDetails(t *testing.T) {
 	}
 }
 
+func TestDuckDBTypesExposeUserDefinedEnums(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "types.duckdb")
+	db, err := sql.Open("duckdb", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	seed, err := os.ReadFile("testdata/seed.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(seed)); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT schema_name, type_name, logical_type, internal, labels FROM duckdb_types() WHERE type_name IN ('mood', 'order_state') ORDER BY schema_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	want := map[string]any{
+		"main\x00mood":         []any{"calm", "busy"},
+		"sales\x00order_state": []any{"open", "closed"},
+	}
+	seen := make(map[string]bool, len(want))
+	for rows.Next() {
+		var schema, name, logicalType string
+		var internal bool
+		var labels any
+		if err := rows.Scan(&schema, &name, &logicalType, &internal, &labels); err != nil {
+			t.Fatal(err)
+		}
+		key := schema + "\x00" + name
+		seen[key] = true
+		if internal || logicalType != "ENUM" || !reflect.DeepEqual(labels, want[key]) {
+			t.Errorf("duckdb_types row %q = {logical_type:%q internal:%t labels:%#v}, want a user-defined ENUM with labels %#v", key, logicalType, internal, labels, want[key])
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(seen, map[string]bool{"main\x00mood": true, "sales\x00order_state": true}) {
+		t.Errorf("DuckDB 2.0 user-defined type rows = %#v, want both seeded ENUMs", seen)
+	}
+}
+
 func assertDuckDBMetadataStates(t *testing.T, snapshot *catalog.MetadataSnapshot) {
 	t.Helper()
 	for _, kind := range []catalog.MetadataKind{
@@ -93,6 +138,7 @@ func assertDuckDBMetadataStates(t *testing.T, snapshot *catalog.MetadataSnapshot
 		catalog.MetadataForeignKeys,
 		catalog.MetadataViews,
 		catalog.MetadataGenerators,
+		catalog.MetadataDomains,
 		catalog.MetadataFunctions,
 		catalog.MetadataIndexes,
 	} {
@@ -105,7 +151,6 @@ func assertDuckDBMetadataStates(t *testing.T, snapshot *catalog.MetadataSnapshot
 		catalog.MetadataColumnsAll,
 		catalog.MetadataDependencies,
 		catalog.MetadataProcedures,
-		catalog.MetadataDomains,
 		catalog.MetadataExceptions,
 		catalog.MetadataSystemRelations,
 		catalog.MetadataTriggers,
@@ -212,6 +257,17 @@ func assertDuckDBKeysIndexesAndObjects(t *testing.T, cache *catalog.Cache) {
 		return desc.Schema, desc.Name
 	}) {
 		t.Error("sequence main.seq_id is missing from generators")
+	}
+	for _, tc := range []struct{ schema, name string }{{"main", "mood"}, {"sales", "order_state"}} {
+		id := catalog.ObjectID{Schema: tc.schema, Kind: catalog.ObjectKindDomain, Name: tc.name}.Key()
+		desc := cache.Catalog.DomainsByID[id]
+		if desc == nil {
+			t.Errorf("user-defined type %s.%s is missing from domains", tc.schema, tc.name)
+			continue
+		}
+		if desc.Schema != tc.schema || desc.Name != tc.name || desc.Type != "ENUM" || desc.Facts == nil || !desc.Facts.UserDomain {
+			t.Errorf("DuckDB type descriptor %s.%s = %+v, want exact identity, ENUM and user-defined type fact", tc.schema, tc.name, desc)
+		}
 	}
 	for _, macro := range []string{"add1", "top_orders", "overloaded"} {
 		if !hasNamedSchema(cache.Catalog.FunctionsByID, "main", macro, func(v any) (string, string) {
