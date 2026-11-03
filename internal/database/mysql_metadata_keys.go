@@ -141,21 +141,37 @@ ORDER BY kcu.TABLE_SCHEMA, kcu.TABLE_NAME, kcu.ORDINAL_POSITION`
 	primaryKeys := make(map[string]map[string]struct{})
 	primaryKeysByID := make(map[string][]string)
 	seen := make(map[string]map[int64]struct{})
+	foldedOwners := make(map[string]string)
+	ambiguousFolded := make(map[string]struct{})
 	for _, row := range primaryRows {
+		id := catalog.ObjectID{Schema: row.schema, Kind: catalog.ObjectKindTable, Name: row.table}.Key()
+		if seen[id] == nil {
+			seen[id] = make(map[int64]struct{})
+		}
+		if _, duplicate := seen[id][row.position]; duplicate {
+			return catalog.MetadataPatch{}, fmt.Errorf("primary key on %s has duplicate segment position %d", row.table, row.position)
+		}
+		seen[id][row.position] = struct{}{}
+		primaryKeysByID[id] = append(primaryKeysByID[id], row.column)
+
+		// PrimaryKeyColumns is a legacy case-folded lookup. Keep it for a
+		// unique exact relation identity, but omit folded collisions rather
+		// than merging different tables' key columns or rejecting the category.
 		relationKey := catalog.ColumnDatabaseKey(row.schema, row.table)
+		if _, ambiguous := ambiguousFolded[relationKey]; ambiguous {
+			continue
+		}
+		if owner, exists := foldedOwners[relationKey]; exists && owner != id {
+			delete(primaryKeys, relationKey)
+			delete(foldedOwners, relationKey)
+			ambiguousFolded[relationKey] = struct{}{}
+			continue
+		}
+		foldedOwners[relationKey] = id
 		if primaryKeys[relationKey] == nil {
 			primaryKeys[relationKey] = make(map[string]struct{})
 		}
-		if seen[relationKey] == nil {
-			seen[relationKey] = make(map[int64]struct{})
-		}
-		if _, duplicate := seen[relationKey][row.position]; duplicate {
-			return catalog.MetadataPatch{}, fmt.Errorf("primary key on %s has duplicate segment position %d", row.table, row.position)
-		}
-		seen[relationKey][row.position] = struct{}{}
 		primaryKeys[relationKey][row.column] = struct{}{}
-		id := catalog.ObjectID{Schema: row.schema, Kind: catalog.ObjectKindTable, Name: row.table}.Key()
-		primaryKeysByID[id] = append(primaryKeysByID[id], row.column)
 	}
 	return catalog.MetadataPatch{Cache: &catalog.Cache{PrimaryKeyColumns: primaryKeys, PrimaryKeysByID: primaryKeysByID}, Count: len(primaryKeysByID)}, nil
 }

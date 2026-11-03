@@ -70,6 +70,7 @@ func TestMySQLMetadataLiveProviderLoadsSchemaScopedCatalogAndDetails(t *testing.
 	}
 	assertMySQLMetadataStates(t, snapshot)
 	assertMySQLSchemaScope(t, snapshot.Cache, target.Schema)
+	assertMySQLCaseDistinctPrimaryKeys(t, snapshot.Cache, target.Schema)
 	assertMySQLNativeColumnKeys(t, ctx, snapshot.Cache, liveProvider.conn)
 	assertMySQLWrongSchemaDetailsDoNotQuery(t, ctx, liveProvider, lease)
 	assertMySQLCreateDetails(t, ctx, liveProvider, lease, target.Schema)
@@ -132,7 +133,11 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 	if got, want := cache.Schemas, map[string]string{strings.ToUpper(schema): schema}; !reflect.DeepEqual(got, want) {
 		t.Errorf("Schemas = %#v, want only %#v", got, want)
 	}
-	wantRelations := []string{"composite_pk", "describe_probe", "no_key", "parent_rows", "unique_nonnull", "unique_single_nonnull", "v_describe_probe"}
+	wantRelations := []string{
+		"RESULT_EDIT_CASE_LOWER", "browse_auto", "composite_pk", "describe_probe", "no_key", "parent_rows",
+		"result_edit", "result_edit_case_lower", "result_edit_nontransactional", "unique_nonnull", "unique_nullable",
+		"unique_single_nonnull", "v_describe_probe",
+	}
 	if got := cache.SortedTables(); !reflect.DeepEqual(got, wantRelations) {
 		t.Errorf("connected-schema relations = %q, want seeded relations %q", got, wantRelations)
 	}
@@ -287,6 +292,25 @@ func assertMySQLSchemaScope(t *testing.T, cache *catalog.Cache, schema string) {
 	}
 }
 
+func assertMySQLCaseDistinctPrimaryKeys(t *testing.T, cache *catalog.Cache, schema string) {
+	t.Helper()
+	for _, test := range []struct {
+		table, column string
+	}{
+		{table: "result_edit_case_lower", column: "id"},
+		{table: "RESULT_EDIT_CASE_LOWER", column: "upper_id"},
+	} {
+		id := catalog.ObjectID{Schema: schema, Kind: catalog.ObjectKindTable, Name: test.table}.Key()
+		if got, want := cache.PrimaryKeysByID[id], []string{test.column}; !reflect.DeepEqual(got, want) {
+			t.Errorf("exact primary key for %s.%s = %q, want %q", schema, test.table, got, want)
+		}
+	}
+	folded := catalog.ColumnDatabaseKey(schema, "result_edit_case_lower")
+	if _, ok := cache.PrimaryKeyColumns[folded]; ok {
+		t.Errorf("ambiguous folded primary key %q was published; exact identities must remain separate", folded)
+	}
+}
+
 func assertMySQLNativeColumnKeys(t *testing.T, ctx context.Context, cache *catalog.Cache, db *sql.DB) {
 	t.Helper()
 	for _, test := range []struct {
@@ -318,7 +342,7 @@ func assertMySQLNativeColumnKeys(t *testing.T, ctx context.Context, cache *catal
 	}
 	seen := make(map[string]bool)
 	for _, table := range cache.SortedTables() {
-		columns, ok := cache.ColumnDescs(table)
+		columns, ok := cache.ColumnDescsByID(table)
 		if !ok {
 			t.Errorf("merged columns are absent for relation %q", table)
 			continue
