@@ -41,7 +41,7 @@ func TestFormatRegressions(t *testing.T) {
 		{
 			name:  "values keep every comma",
 			input: "insert into t (a, b, c) values (1, 'x', current_date)",
-			want:  "INSERT INTO t (\n  a,\n  b,\n  c\n)\nVALUES(\n  1,\n  'x',\n  CURRENT_DATE\n)",
+			want:  "INSERT INTO t (\n  a,\n  b,\n  c\n)\nVALUES (\n  1,\n  'x',\n  CURRENT_DATE\n)",
 		},
 		{
 			name:  "order by number and direction",

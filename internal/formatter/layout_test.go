@@ -1,6 +1,12 @@
 package formatter
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/sqls-server/sqls/dialect"
+	"github.com/sqls-server/sqls/internal/config"
+	"github.com/sqls-server/sqls/internal/lsp"
+)
 
 func TestFormatLayout(t *testing.T) {
 	tests := []struct {
@@ -55,6 +61,11 @@ func TestFormatLayout(t *testing.T) {
 			name:  "insert select",
 			input: "insert into t (a, b) select a, b from u",
 			want:  "INSERT INTO t (\n  a,\n  b\n)\nSELECT\n  a,\n  b\nFROM\n  u",
+		},
+		{
+			name:  "multi-row values list",
+			input: "insert into t (a, b) values (1, 'x'), (2, 'y')",
+			want:  "INSERT INTO t (\n  a,\n  b\n)\nVALUES (\n  1,\n  'x'\n),\n(\n  2,\n  'y'\n)",
 		},
 		{
 			name:  "comments without blank lines or trailing spaces",
@@ -177,4 +188,47 @@ func TestFormatLayout(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatLayoutIdempotentAcrossDriverVariants(t *testing.T) {
+	variants := []struct {
+		name    string
+		variant dialect.DriverVariant
+	}{
+		{
+			name:    "InterBase",
+			variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3},
+		},
+		{
+			name:    "MySQL",
+			variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL},
+		},
+		{
+			name:    "DuckDB",
+			variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverDuckDB},
+		},
+	}
+	const input = "insert into t (a, b) values (1, 'x'), (2, 'y')"
+	for _, tt := range variants {
+		t.Run(tt.name, func(t *testing.T) {
+			formatted := formatDriverVariant(t, input, tt.variant)
+			if again := formatDriverVariant(t, formatted, tt.variant); again != formatted {
+				t.Fatalf("formatting the result again changed it to\n%s", again)
+			}
+		})
+	}
+}
+
+func formatDriverVariant(t *testing.T, input string, variant dialect.DriverVariant) string {
+	t.Helper()
+	got, err := FormatWithDriverVariant(input,
+		lsp.DocumentFormattingParams{Options: lsp.FormattingOptions{TabSize: 2, InsertSpaces: true}},
+		&config.Config{LowercaseKeywords: false}, variant)
+	if err != nil {
+		t.Fatalf("format %q: %v", input, err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("format %q: got %d edits, want 1", input, len(got))
+	}
+	return got[0].NewText
 }

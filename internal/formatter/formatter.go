@@ -728,8 +728,9 @@ func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader,
 		return true
 	}
 	// A declared name stays apart from its list, which would otherwise parse
-	// as a function call: "CREATE TABLE t (", "INSERT INTO t (", "RETURNS ("
-	if isParenthesis(nextNode) && isDeclarationName(curNode, previous) {
+	// as a function call: "CREATE TABLE t (", "INSERT INTO t (", "RETURNS (".
+	// VALUES likewise stays apart so its row list does not parse as a call.
+	if isParenthesis(nextNode) && (isDeclarationName(curNode, previous) || isKeywordNode(curNode, "VALUES")) {
 		return true
 	}
 	if isParenthesis(curNode) && isKeywordNode(nextNode, "SELECT") && env.inline == 0 {
@@ -850,7 +851,7 @@ func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader,
 			}
 		}
 
-		// Don't add space before Parenthesis (e.g., VALUES(...))
+		// Don't add space before Parenthesis after function names.
 		if _, ok := nextNode.(*ast.Parenthesis); ok {
 			return false
 		}
@@ -917,7 +918,7 @@ func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader,
 			}
 		}
 
-		// Don't add space before Parenthesis (e.g., VALUES(...))
+		// Don't add space before Parenthesis after function names.
 		if _, ok := nextNode.(*ast.Parenthesis); ok {
 			return false
 		}
