@@ -787,3 +787,16 @@ func TestInterBaseSubQueryExpressionColumns(t *testing.T) {
 		t.Fatalf("missing aliased expression columns of sub query s: %v", labels)
 	}
 }
+
+// A derived table inside a scalar sub query that is not the first select
+// item offers all of its columns, as the lkp_N lookups of a generated query do.
+func TestInterBaseDerivedTableInLaterSelectItem(t *testing.T) {
+	const text = "select s.id, (select min(k.) from (select id, name, (id || name) ext from city) k where k.id = s.id) as lk from city s"
+	req := interBaseCompletionRequest(interBaseBaseCompletionCache(), text, dialect.SQLVariantInterBase3)
+	labels := completionLabels(completeAt(t, req, strings.Index(text, "k.)")+2))
+	for _, want := range []string{"id", "name", "ext"} {
+		if !labels[want] {
+			t.Fatalf("missing column %q of derived table k: %v", want, labels)
+		}
+	}
+}
