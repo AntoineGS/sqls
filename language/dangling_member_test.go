@@ -20,6 +20,9 @@ func TestDanglingMemberIdentifierDoesNotPanic(t *testing.T) {
 		"select * from city s where s.",
 		"select s. , s.id from city s",
 		"select .id from city s",
+		"select x. from (select s.id, s., s.id from city s) x",
+		"select c.id, (select min(k.id) from (select s.id, s., s.id from city s) k) as y from city c",
+		"select x. from (select s. as top from city s) x",
 	}
 	requests := map[string]func(string) language.Request{
 		"interbase": func(text string) language.Request {
@@ -77,6 +80,43 @@ func TestHoverDanglingQualifierDescribesItsRelation(t *testing.T) {
 		}
 		if !strings.HasPrefix(res.Value.Markdown, "# `CITY` table") {
 			t.Fatalf("Hover(%q) = %q, want the CITY table", text, res.Value.Markdown)
+		}
+	}
+}
+
+// A table list item the parser cannot name, as the "1" left by typing a
+// comma into "lkp_1", is skipped instead of failing the request: the
+// completion matches that of the same list with a real table there.
+func TestCompletionSkipsUnnamedTableListItems(t *testing.T) {
+	want := completionLabels(completeAt(t, interBaseCompletionRequest(interBaseBaseCompletionCache(), "select c. from city c, myview", dialect.SQLVariantInterBase3), len("select c.")))
+	for _, text := range []string{"select c. from city c, 1", "select c. from city c, myview,_"} {
+		req := interBaseCompletionRequest(interBaseBaseCompletionCache(), text, dialect.SQLVariantInterBase3)
+		got := completionLabels(completeAt(t, req, len("select c.")))
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("Complete(%q) = %v, want %v", text, got, want)
+		}
+	}
+}
+
+// A query ending in the separator before its next relation, as while typing
+// "FROM city c," or "FROM city c JOIN", must not panic the InterBase analysis.
+func TestTrailingRelationSeparatorDoesNotPanic(t *testing.T) {
+	svc := language.NewService()
+	ctx := context.Background()
+	for _, text := range []string{"select c.id from city c,", "select c.id from city c join", "select c.id from city c, myview m,"} {
+		req := interBaseCompletionRequest(interBaseBaseCompletionCache(), text, dialect.SQLVariantInterBase3)
+		for col := 0; col <= len(text); col++ {
+			pos := language.Position{UTF16Column: col}
+			for name, call := range map[string]func(){
+				"Hover":       func() { _, _ = svc.Hover(ctx, req, pos) },
+				"Complete":    func() { _, _ = svc.Complete(ctx, req, pos) },
+				"Definition":  func() { _, _ = svc.Definition(ctx, req, pos) },
+				"Diagnostics": func() { _, _ = svc.Diagnostics(ctx, req) },
+			} {
+				if err := recoverPanic(call); err != nil {
+					t.Fatalf("%s(%q) at %d: %v", name, text, col, err)
+				}
+			}
 		}
 	}
 }

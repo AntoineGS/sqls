@@ -905,7 +905,9 @@ func queryRelationDetails(text string, items []lexeme, query sqlQuery, depths []
 		case inFrom && isQueryClause(items[i]):
 			inFrom = false
 		}
-		if isWord(items[i], "FROM") && query.kind == "SELECT" {
+		// addAt returns the next index when no relation follows, which is
+		// past the query when it ends in "FROM t," or "JOIN".
+		if i < query.end && isWord(items[i], "FROM") && query.kind == "SELECT" {
 			i = addAt(i+1, true)
 		}
 	}

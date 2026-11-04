@@ -323,7 +323,10 @@ func (e *hoverEnvironment) getColumnRealName(aliasedName string) (string, bool) 
 			case *ast.Identifier:
 				return v.String(), true
 			case *ast.MemberIdentifier:
-				return v.Child.String(), true
+				// A dangling "s. AS top" has no column to resolve to.
+				if v.Child != nil {
+					return v.Child.String(), true
+				}
 			}
 		}
 	}
