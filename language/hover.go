@@ -262,15 +262,13 @@ func (s *Service) hoverCached(ctx context.Context, req Request, position Positio
 	switch {
 	case ident != nil && memIdent != nil:
 		identName := ident.NoQuoteString()
-		parentName := memIdent.ParentTok.NoQuoteString()
-		childName := memIdent.ChildTok.NoQuoteString()
 		switch identName {
-		case parentName:
+		case memberPartName(memIdent.ParentTok):
 			hoverContent, hasContent = hoverContentFromParentIdent(hctx, identName, cache, hoverEnv)
-		case childName:
+		case memberPartName(memIdent.ChildTok):
 			hoverContent, hasContent = hoverContentFromChildIdent(hctx, identName, cache, hoverEnv)
 		}
-	case ident == nil && memIdent != nil:
+	case ident == nil && memIdent != nil && memIdent.ChildTok != nil:
 		hoverContent, hasContent = hoverContentFromChildIdent(hctx, memIdent.ChildTok.NoQuoteString(), cache, hoverEnv)
 	case ident != nil && memIdent == nil:
 		hoverContent, hasContent = hoverContentFromIdent(hctx, ident.NoQuoteString(), cache, hoverEnv)
@@ -369,6 +367,15 @@ func collectHoverEnvironment(parsed ast.TokenList, pos token.Pos) (*hoverEnviron
 		subQueries: subQueries,
 	}
 	return environment, nil
+}
+
+// memberPartName names one side of a member identifier. A qualifier typed
+// before its column ("s.") has no child token.
+func memberPartName(tok *ast.SQLToken) string {
+	if tok == nil {
+		return ""
+	}
+	return tok.NoQuoteString()
 }
 
 func findIdent(nodes []ast.Node) (*ast.Identifier, *ast.MemberIdentifier) {

@@ -649,6 +649,11 @@ func legacyRelationAt(req Request, position Position) (catalog.ObjectID, Range, 
 	for _, candidate := range nodes {
 		switch n := candidate.(type) {
 		case *ast.MemberIdentifier:
+			if n.ChildTok == nil || n.ParentTok == nil {
+				// A dangling "s." names no relation; its qualifier identifier
+				// is still a candidate below.
+				continue
+			}
 			name = n.ChildTok.NoQuoteString()
 			schema = n.ParentTok.NoQuoteString()
 			node = n
