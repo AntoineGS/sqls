@@ -333,7 +333,9 @@ func extractSubQueryColumns(selectStmt ast.TokenList) ([]*SubQueryColumn, []*Tab
 		}
 		for _, innerIdent := range innerIdents {
 			if ident.ColumnName == innerIdent.ColumnName {
-				ident.ParentTable.SubQueryColumns = innerIdents
+				if ident.ParentTable != nil {
+					ident.ParentTable.SubQueryColumns = innerIdents
+				}
 				realIdents = append(realIdents, ident)
 			}
 		}
@@ -515,15 +517,15 @@ func parseSubQueryColumns(idents ast.Node, tables []*TableInfo) ([]*SubQueryColu
 			},
 		)
 	case *ast.Aliased:
-		subqueryCol, err := aliasedToSubQueryColumn(v)
-		if err != nil {
-			return nil, err
+		subqueryCol, ok := aliasedToSubQueryColumn(v)
+		if !ok {
+			return subqueryCols, nil
 		}
 		subqueryCols = append(subqueryCols, subqueryCol)
-	// TODO Add case of function:
-	// case *ast.Function:
 	default:
-		return nil, fmt.Errorf("failed parse sub query columns, unknown node type %T, value %q", idents, idents)
+		// An unaliased expression (function, operator, literal, CASE...)
+		// exposes no name a reference to the sub query could use.
+		return subqueryCols, nil
 	}
 
 	for _, subqueryCol := range subqueryCols {
@@ -536,28 +538,28 @@ func parseSubQueryColumns(idents ast.Node, tables []*TableInfo) ([]*SubQueryColu
 	return subqueryCols, nil
 }
 
-func aliasedToSubQueryColumn(aliased *ast.Aliased) (*SubQueryColumn, error) {
-	// fetch table schema and name
-	aliasedName := aliased.GetAliasedNameIdent().NoQuoteString()
+func aliasedToSubQueryColumn(aliased *ast.Aliased) (*SubQueryColumn, bool) {
+	alias, ok := aliased.AliasedName.(*ast.Identifier)
+	if !ok {
+		return nil, false
+	}
+	aliasedName := alias.NoQuoteString()
 	switch v := aliased.RealName.(type) {
 	case *ast.Identifier:
 		subqueryCol := &SubQueryColumn{
 			ColumnName: v.NoQuoteString(),
 			AliasName:  aliasedName,
 		}
-		return subqueryCol, nil
+		return subqueryCol, true
 	case *ast.MemberIdentifier:
 		subqueryCol := &SubQueryColumn{
 			ParentName: v.GetParentIdent().NoQuoteString(),
 			ColumnName: v.GetChildIdent().NoQuoteString(),
 			AliasName:  aliasedName,
 		}
-		return subqueryCol, nil
+		return subqueryCol, true
 	default:
-		return nil, fmt.Errorf(
-			"failed trans alias to column, unknown node type %T, value %q",
-			aliased.AliasedName,
-			aliased.AliasedName,
-		)
+		// An aliased expression is known only by its alias.
+		return &SubQueryColumn{ColumnName: aliasedName, AliasName: aliasedName}, true
 	}
 }
