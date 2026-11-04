@@ -827,6 +827,32 @@ func TestParseOperator(t *testing.T) {
 			},
 		},
 		{
+			name:  "concatenation operator",
+			input: "foo||'x'",
+			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
+				testStatement(t, stmts[0], 1, input)
+				list := stmts[0].GetTokens()
+				testOperator(t, list[0], input, "foo", "||", "'x'")
+			},
+		},
+		{
+			name:  "multiple concatenation operator",
+			input: "a.code || ' - ' || a.name",
+			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
+				testStatement(t, stmts[0], 1, input)
+				list := stmts[0].GetTokens()
+				operator := testOperator(t, list[0], input, "a.code || ' - '", "||", "a.name")
+				testOperator(t, operator.GetLeft(), "a.code || ' - '", "a.code", "||", "' - '")
+			},
+		},
+		{
+			name:  "separated pipes are not concatenation",
+			input: "foo| |100",
+			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
+				testStatement(t, stmts[0], 5, input)
+			},
+		},
+		{
 			name:  "in parenthesis",
 			input: "(100+foo)",
 			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {

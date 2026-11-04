@@ -74,6 +74,11 @@ func TestFormatRegressions(t *testing.T) {
 			want:  "SELECT\n  a || ' ' || b\nFROM\n  t",
 		},
 		{
+			name:  "concatenation the parser leaves ungrouped",
+			input: "select null || a, current_date || 'x', case when a = 1 then 'x' end || 'z' from t",
+			want:  "SELECT\n  NULL || a,\n  CURRENT_DATE || 'x',\n  CASE\n    WHEN a = 1 THEN 'x'\n  END || 'z'\nFROM\n  t",
+		},
+		{
 			name:  "comment before word",
 			input: "select /* keep */ x from t",
 			want:  "SELECT\n  /* keep */ x\nFROM\n  t",

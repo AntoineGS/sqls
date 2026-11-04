@@ -769,7 +769,7 @@ func TestInterBaseDialect3DelimitedIdentifierPrefix(t *testing.T) {
 // (MIN(...), ||, CASE...) must not fail completion anywhere in the document:
 // unaliased expressions are skipped and aliased ones are offered by alias.
 func TestInterBaseSubQueryExpressionColumns(t *testing.T) {
-	const tail = " from (select max(c.id) top, (c.id || ' - ') ext from city c) s"
+	const tail = " from (select max(c.id) top, (c.id || ' - ') ext, c.id || ' - ' || c.id ext2, c.id from city c) s"
 	const text = "select s.top, (select min(x.id) from (select id from city) x where x.id = s.top) as lk" + tail
 	req := interBaseCompletionRequest(interBaseBaseCompletionCache(), text, dialect.SQLVariantInterBase3)
 	svc := language.NewService()
@@ -783,7 +783,7 @@ func TestInterBaseSubQueryExpressionColumns(t *testing.T) {
 	}
 	dangling := interBaseCompletionRequest(interBaseBaseCompletionCache(), "select s."+tail, dialect.SQLVariantInterBase3)
 	labels := completionLabels(completeAt(t, dangling, len("select s.")))
-	if !labels["top"] || !labels["ext"] {
+	if !labels["top"] || !labels["ext"] || !labels["ext2"] || !labels["id"] {
 		t.Fatalf("missing aliased expression columns of sub query s: %v", labels)
 	}
 }
