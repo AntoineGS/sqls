@@ -764,3 +764,26 @@ func TestInterBaseDialect3DelimitedIdentifierPrefix(t *testing.T) {
 		})
 	}
 }
+
+// A derived table or scalar sub query whose select list holds an expression
+// (MIN(...), ||, CASE...) must not fail completion anywhere in the document:
+// unaliased expressions are skipped and aliased ones are offered by alias.
+func TestInterBaseSubQueryExpressionColumns(t *testing.T) {
+	const tail = " from (select max(c.id) top, (c.id || ' - ') ext from city c) s"
+	const text = "select s.top, (select min(x.id) from (select id from city) x where x.id = s.top) as lk" + tail
+	req := interBaseCompletionRequest(interBaseBaseCompletionCache(), text, dialect.SQLVariantInterBase3)
+	svc := language.NewService()
+	for col := 0; col <= len(text); col++ {
+		if _, err := svc.Complete(context.Background(), req, language.Position{UTF16Column: col}); err != nil {
+			t.Fatalf("Complete at %d: %v", col, err)
+		}
+		if _, err := svc.Hover(context.Background(), req, language.Position{UTF16Column: col}); err != nil && err != language.ErrNoHover {
+			t.Fatalf("Hover at %d: %v", col, err)
+		}
+	}
+	dangling := interBaseCompletionRequest(interBaseBaseCompletionCache(), "select s."+tail, dialect.SQLVariantInterBase3)
+	labels := completionLabels(completeAt(t, dangling, len("select s.")))
+	if !labels["top"] || !labels["ext"] {
+		t.Fatalf("missing aliased expression columns of sub query s: %v", labels)
+	}
+}

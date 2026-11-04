@@ -86,6 +86,9 @@ func SubqueryDoc(name string, views []*parseutil.SubQueryView, dbCache *Cache) s
 	fmt.Fprintln(buf)
 	for _, view := range views {
 		for _, colmun := range view.SubQueryColumns {
+			if colmun.ParentTable == nil {
+				continue
+			}
 			if colmun.ColumnName == "*" {
 				tableCols, ok := dbCache.ColumnDescs(colmun.ParentTable.Name)
 				if !ok {
@@ -116,6 +119,9 @@ func SubqueryColumnDoc(identName string, views []*parseutil.SubQueryView, dbCach
 	fmt.Fprintln(buf)
 	for _, view := range views {
 		for _, colmun := range view.SubQueryColumns {
+			if colmun.ParentTable == nil {
+				continue
+			}
 			if colmun.ColumnName == "*" {
 				tableCols, ok := dbCache.ColumnDescs(colmun.ParentTable.Name)
 				if !ok {

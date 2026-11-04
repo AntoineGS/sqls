@@ -481,6 +481,9 @@ func (c *completionEngine) subQueryColumnCandidates(infos []*parseutil.SubQueryI
 		for _, view := range info.Views {
 			for _, col := range view.SubQueryColumns {
 				if col.ColumnName == "*" {
+					if col.ParentTable == nil {
+						continue
+					}
 					tableCols, ok := c.cache.ColumnDescs(col.ParentTable.Name)
 					if !ok {
 						continue

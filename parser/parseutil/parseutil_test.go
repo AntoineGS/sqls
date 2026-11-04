@@ -568,6 +568,73 @@ func TestExtractSubQueryViews(t *testing.T) {
 				},
 			},
 		},
+		{
+			name:  "expression columns",
+			input: "select * from (select min(t.id), max(t.id) top, (t.code || ' - ' || t.name) ext, t.name from a as t) as sub",
+			pos:   token.Pos{Line: 0, Col: 1},
+			want: []*SubQueryInfo{
+				{
+					Name: "sub",
+					Views: []*SubQueryView{
+						{
+							SubQueryColumns: []*SubQueryColumn{
+								{
+									ColumnName: "top",
+									AliasName:  "top",
+								},
+								{
+									ColumnName: "ext",
+									AliasName:  "ext",
+								},
+								{
+									ParentTable: &TableInfo{
+										DatabaseSchema: "",
+										Name:           "a",
+										Alias:          "t",
+									},
+									ParentName: "t",
+									ColumnName: "name",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "scalar sub query with function over derived table",
+			input: "select (select min(x.id) from (select id from a) x where x.id = b.id) as c from b",
+			pos:   token.Pos{Line: 0, Col: 1},
+			want: []*SubQueryInfo{
+				{
+					Name: "c",
+					Views: []*SubQueryView{
+						{
+							SubQueryColumns: []*SubQueryColumn{},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:  "outer column matching an inner expression alias",
+			input: "select * from (select top from (select max(t.id) top from a t) x join b y on y.id = x.top) as sub",
+			pos:   token.Pos{Line: 0, Col: 1},
+			want: []*SubQueryInfo{
+				{
+					Name: "sub",
+					Views: []*SubQueryView{
+						{
+							SubQueryColumns: []*SubQueryColumn{
+								{
+									ColumnName: "top",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
 	}
 	for _, tt := range testcases {
 		t.Run(tt.name, func(t *testing.T) {
