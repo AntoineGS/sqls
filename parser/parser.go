@@ -119,6 +119,7 @@ func (p *Parser) Parse() (ast.TokenList, error) {
 	root = parsePrefixGroup(astutil.NewNodeReader(root), expressionPrefixMatcher, parseExpressionInParenthesis)
 
 	root = parsePrefixGroup(astutil.NewNodeReader(root), genMultiKeywordPrefixMatcher(), parseMultiKeyword)
+	root = parsePrefixGroup(astutil.NewNodeReader(root), concatPrefixMatcher, parseConcat)
 	root = parseInfixGroup(astutil.NewNodeReader(root), operatorInfixMatcher, true, parseOperator)
 	root = parseInfixGroup(astutil.NewNodeReader(root), comparisonInfixMatcher, true, parseComparison)
 	root = parsePrefixGroup(astutil.NewNodeReader(root), aliasLeftMatcher, parseAliasedWithoutAs)
@@ -331,6 +332,33 @@ func parseIdentifier(reader *astutil.NodeReader) ast.Node {
 	return &ast.Identifier{Tok: token.GetToken()}
 }
 
+var concatPrefixMatcher = astutil.NodeMatcher{
+	ExpectTokens: []token.Kind{
+		token.Char,
+	},
+}
+
+// parseConcat joins the two adjacent "|" characters the lexer emits for the
+// "||" operator into one item, so that it groups like the other operators.
+func parseConcat(reader *astutil.NodeReader) ast.Node {
+	first, ok := reader.CurNode.(*ast.Item)
+	if !ok || first.GetToken().Value != "|" {
+		return reader.CurNode
+	}
+	_, next := reader.PeekNode(false)
+	second, ok := next.(*ast.Item)
+	if !ok || second.GetToken().Kind != token.Char || second.GetToken().Value != "|" {
+		return reader.CurNode
+	}
+	reader.NextNode(false)
+	return ast.NewItem(&token.Token{
+		Kind:  token.Char,
+		Value: "||",
+		From:  first.GetToken().From,
+		To:    second.GetToken().To,
+	})
+}
+
 var operatorInfixMatcher = astutil.NodeMatcher{
 	ExpectTokens: []token.Kind{
 		token.Plus,
@@ -339,6 +367,9 @@ var operatorInfixMatcher = astutil.NodeMatcher{
 		token.Div,
 		token.Mod,
 		token.Caret,
+	},
+	ExpectKeyword: []string{
+		"||",
 	},
 }
 var operatorTargetMatcher = astutil.NodeMatcher{

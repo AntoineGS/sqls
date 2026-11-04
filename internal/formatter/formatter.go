@@ -753,13 +753,17 @@ func shouldAddSpaceAfter(curNode, previous ast.Node, reader *astutil.NodeReader,
 		return true
 	}
 
-	// The two characters of "||" stay together; the operator they form is
-	// spaced from its operands. Other unrecognized characters, such as the
-	// "_" of "_utf8'abc'", stay attached to what follows.
+	// The "||" operator is spaced from its operands, also where the parser
+	// left it ungrouped, as in "NULL || a"; two "|" it did not join stay
+	// together. Other unrecognized characters, such as the "_" of
+	// "_utf8'abc'", stay attached to what follows.
+	if isCharItem(curNode, "||") || isCharItem(nextNode, "||") {
+		return true
+	}
 	if isCharItem(curNode, "|") || isCharItem(nextNode, "|") {
 		return !(isCharItem(curNode, "|") && isCharItem(nextNode, "|"))
 	}
-	if last := lastNode(curNode); isItemKind(last, token.Char) && !isCharItem(last, "?") {
+	if last := lastNode(curNode); isItemKind(last, token.Char) && !isCharItem(last, "?") && !isCharItem(last, "||") {
 		return false
 	}
 

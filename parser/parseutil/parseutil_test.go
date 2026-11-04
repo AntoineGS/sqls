@@ -570,7 +570,7 @@ func TestExtractSubQueryViews(t *testing.T) {
 		},
 		{
 			name:  "expression columns",
-			input: "select * from (select min(t.id), max(t.id) top, (t.code || ' - ' || t.name) ext, t.name from a as t) as sub",
+			input: "select * from (select min(t.id), max(t.id) top, (t.code || ' - ' || t.name) ext, t.code || t.name ext2, t.name from a as t) as sub",
 			pos:   token.Pos{Line: 0, Col: 1},
 			want: []*SubQueryInfo{
 				{
@@ -585,6 +585,10 @@ func TestExtractSubQueryViews(t *testing.T) {
 								{
 									ColumnName: "ext",
 									AliasName:  "ext",
+								},
+								{
+									ColumnName: "ext2",
+									AliasName:  "ext2",
 								},
 								{
 									ParentTable: &TableInfo{
