@@ -621,6 +621,35 @@ func TestExtractSubQueryViews(t *testing.T) {
 			},
 		},
 		{
+			name:  "derived table in a scalar sub query after the first select item",
+			input: "select x.a, (select min(k.b) from (select a, b, c || d ext from t2) k) as y from t x",
+			pos:   token.Pos{Line: 0, Col: 24},
+			want: []*SubQueryInfo{
+				{
+					Name: "k",
+					Views: []*SubQueryView{
+						{
+							SubQueryColumns: []*SubQueryColumn{
+								{
+									ParentTable: &TableInfo{Name: "t2"},
+									ColumnName:  "a",
+								},
+								{
+									ParentTable: &TableInfo{Name: "t2"},
+									ColumnName:  "b",
+								},
+								{
+									ParentTable: &TableInfo{Name: "t2"},
+									ColumnName:  "ext",
+									AliasName:   "ext",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name:  "outer column matching an inner expression alias",
 			input: "select * from (select top from (select max(t.id) top from a t) x join b y on y.id = x.top) as sub",
 			pos:   token.Pos{Line: 0, Col: 1},

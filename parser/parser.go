@@ -706,7 +706,7 @@ func parseIdentifierList(reader *astutil.NodeReader) ast.Node {
 			}
 		}
 
-		idents = append(idents, peekNode)
+		idents = append(idents, groupNestedIdentifierLists(peekNode))
 		endIndex = peekIndex
 
 		tmpReader.NextNode(true)
@@ -724,6 +724,17 @@ func parseIdentifierList(reader *astutil.NodeReader) ast.Node {
 		Identifiers: idents,
 		Commas:      commas,
 	}
+}
+
+// groupNestedIdentifierLists groups the lists inside an item that a list
+// takes after its first: parseInfixGroup descends only into the nodes it
+// visits, and it never visits those items, so "x, (SELECT a, b FROM t) y"
+// would keep "a, b" ungrouped.
+func groupNestedIdentifierLists(node ast.Node) ast.Node {
+	if list, ok := node.(ast.TokenList); ok {
+		parseInfixGroup(astutil.NewNodeReader(list), identifierListInfixMatcher, true, parseIdentifierList)
+	}
+	return node
 }
 
 var switchCaseOpenMatcher = astutil.NodeMatcher{

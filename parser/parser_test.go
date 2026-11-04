@@ -1173,6 +1173,27 @@ func TestParseIdentifierList(t *testing.T) {
 			},
 		},
 		{
+			name:  "lists nested in later items",
+			input: "foo, (select a, b from t) sub, f(c, d)",
+			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
+				testStatement(t, stmts[0], 1, input)
+				il := testIdentifierList(t, stmts[0].GetTokens()[0], input)
+				idents := il.GetIdentifiers()
+				if len(idents) != 3 {
+					t.Fatalf("got %d identifiers, want 3", len(idents))
+				}
+				sub, ok := idents[1].(*ast.Aliased)
+				if !ok {
+					t.Fatalf("second item is %T, want *ast.Aliased", idents[1])
+				}
+				subquery := testParenthesis(t, sub.RealName, "(select a, b from t)").Inner().GetTokens()
+				testIdentifierList(t, subquery[2], "a, b")
+				fn := testTokenList(t, idents[2], 2).GetTokens()
+				args := testParenthesis(t, fn[1], "(c, d)").Inner().GetTokens()
+				testIdentifierList(t, args[0], "c, d")
+			},
+		},
+		{
 			name:  "with null",
 			input: "foo, null, foobar",
 			checkFn: func(t *testing.T, stmts []*ast.Statement, input string) {
