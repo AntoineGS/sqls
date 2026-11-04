@@ -271,6 +271,61 @@ func TestDiagnosticSelectListAliasVisibleInGroupByHavingOrderBy(t *testing.T) {
 	requireCodeCount(t, "SELECT NAME AS ALIASED FROM T ORDER BY ALIASED;", c, codeUnknownColumn, 0)
 }
 
+// A select-list alias written without AS declares the output column's name;
+// it is never a column reference of its own.
+func TestDiagnosticSelectListAliasWithoutAS(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	for _, sql := range []string{
+		"SELECT T.NAME V FROM T, U;",
+		"SELECT T.ID, T.NAME V, T.N FROM T, U;",
+		"SELECT NAME ALIASED FROM T;",
+		"SELECT T.NAME ALIASED FROM T;",
+		"SELECT UPPER(NAME) ALIASED FROM T;",
+		"SELECT 'x' ALIASED, 1 OTHER FROM T;",
+		"SELECT NAME || 'x' ALIASED FROM T;",
+		"SELECT NAME || T.NAME ALIASED FROM T;",
+		"SELECT CASE WHEN ID = 1 THEN 'a' END ALIASED FROM T;",
+		"SELECT NULL ALIASED FROM T;",
+		"SELECT DISTINCT NAME ALIASED FROM T;",
+		"SELECT (SELECT MAX(U.ID) FROM U) ALIASED FROM T;",
+		"SELECT NAME ALIASED FROM T ORDER BY ALIASED;",
+		"SELECT NAME ALIASED FROM T GROUP BY ALIASED;",
+		"SELECT D.ALIASED FROM (SELECT NAME ALIASED FROM T) D;",
+	} {
+		for _, code := range []string{codeUnknownColumn, codeAmbiguousColumn} {
+			t.Run(sql+" "+code, func(t *testing.T) {
+				requireCodeCount(t, sql, c, code, 0)
+			})
+		}
+	}
+}
+
+// Only the final name of a complete projection expression is an implicit
+// alias: a name after an operator, a qualifier's period, or a FIRST/SKIP
+// argument is still a column reference.
+func TestDiagnosticSelectListAliasWithoutASKeepsColumnChecks(t *testing.T) {
+	c := newDiagnosticFixtureCatalog()
+	for _, tc := range []struct {
+		sql  string
+		code string
+	}{
+		{"SELECT NAEM FROM T;", codeUnknownColumn},
+		{"SELECT T.NAEM FROM T;", codeUnknownColumn},
+		{"SELECT NAME || NAEM FROM T;", codeUnknownColumn},
+		{"SELECT 1 + NAEM FROM T;", codeUnknownColumn},
+		{"SELECT FIRST 10 NAEM FROM T;", codeUnknownColumn},
+		{"SELECT FIRST 10 SKIP 5 NAEM FROM T;", codeUnknownColumn},
+		{"SELECT NAEM ALIASED FROM T;", codeUnknownColumn},
+		{"SELECT V ALIASED FROM T, U;", codeAmbiguousColumn},
+		{"SELECT NAME ALIASED FROM T WHERE ALIASED = 'x';", codeUnknownColumn},
+		{"SELECT D.NAME FROM (SELECT NAME ALIASED FROM T) D;", codeUnknownColumn},
+	} {
+		t.Run(tc.sql, func(t *testing.T) {
+			requireCodeCount(t, tc.sql, c, tc.code, 1)
+		})
+	}
+}
+
 // --- repeat complete-metadata cases with incomplete metadata, to prove gating ---
 
 func TestDiagnosticColumnWithheldWhenRelationColumnsUnknown(t *testing.T) {

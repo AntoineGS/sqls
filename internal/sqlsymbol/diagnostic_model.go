@@ -48,6 +48,11 @@ type diagnosticModel struct {
 	// concept, built directly from the already-parsed RelationRef list.
 	relationDeclPositions map[int]bool
 
+	// selectAliasPositions marks every item index that is a SELECT-list
+	// column alias written without AS (SELECT T.NAME N); like an AS alias,
+	// it declares an output name and is never a column reference.
+	selectAliasPositions map[int]bool
+
 	// relationPositions maps a query index to its own q.relations, paired
 	// 1:1 with the item index where each relation reference's own text
 	// begins (queryRelationDetails' scan) -- the actual, query-boundary-
@@ -1212,11 +1217,15 @@ func (m *diagnosticModel) computeSelectOutput(text string, qi int) {
 	}
 	q.targetStart = q.start + 1
 	q.targetEnd = q.start + 1 + columnEnd
-	q.output = m.computeProjection(text, qi, body[:columnEnd], q.relations)
+	q.output = m.computeProjection(text, qi, body[:columnEnd], q.targetStart, q.relations)
 }
 
-func (m *diagnosticModel) computeProjection(text string, owner int, items []lexeme, relations []RelationRef) modelOutput {
-	items = trimSetQuantifier(items)
+// computeProjection models the SELECT list items, whose first token is item
+// index start.
+func (m *diagnosticModel) computeProjection(text string, owner int, items []lexeme, start int, relations []RelationRef) modelOutput {
+	trimmed := trimSetQuantifier(items)
+	start += len(items) - len(trimmed)
+	items = trimmed
 	if len(items) == 0 {
 		return modelOutput{}
 	}
@@ -1231,11 +1240,19 @@ func (m *diagnosticModel) computeProjection(text string, owner int, items []lexe
 		return modelOutput{}
 	}
 	var columns []modelOutputColumn
+	partStart := start
 	for _, part := range parts {
 		if len(part) == 0 {
 			m.queries[owner].malformedProjection = true
 			return modelOutput{}
 		}
+		if alias := implicitAliasIndex(part); alias >= 0 {
+			if m.selectAliasPositions == nil {
+				m.selectAliasPositions = make(map[int]bool)
+			}
+			m.selectAliasPositions[partStart+alias] = true
+		}
+		partStart += len(part) + 1 // the part and its separating comma
 		if isStarProjection(part) {
 			expanded, ok := m.expandStar(text, owner, part, relations)
 			if !ok {
@@ -1317,6 +1334,10 @@ func singleProjectionColumn(text string, part []lexeme) modelOutputColumn {
 		name, ok := nameFromLexeme(text, part[len(part)-1])
 		return modelOutputColumn{Name: name, NameKnown: ok}
 	}
+	if alias := implicitAliasIndex(part); alias >= 0 {
+		name, ok := nameFromLexeme(text, part[alias])
+		return modelOutputColumn{Name: name, NameKnown: ok}
+	}
 	if len(part) == 1 && isNameToken(part[0]) {
 		name, ok := nameFromLexeme(text, part[0])
 		return modelOutputColumn{Name: name, NameKnown: ok}
@@ -1326,6 +1347,60 @@ func singleProjectionColumn(text string, part []lexeme) modelOutputColumn {
 		return modelOutputColumn{Name: name, NameKnown: ok}
 	}
 	return modelOutputColumn{}
+}
+
+// implicitAliasIndex returns the index in a SELECT-list item of a column
+// alias written without AS (T.NAME N, UPPER(NAME) N, 'x' N, CASE ... END N),
+// or -1. The alias is the item's last name, directly after a token that can
+// end a value expression; a name after an operator, a qualifier's period, a
+// ':' or a FIRST/SKIP argument is part of the expression instead.
+func implicitAliasIndex(part []lexeme) int {
+	expr := skipRowLimits(part)
+	last := len(part) - 1
+	if last-expr < 1 || !isNameToken(part[last]) || isReservedWordToken(part[last]) {
+		return -1
+	}
+	prev := part[last-1]
+	switch {
+	case prev.Token.Kind == token.RParen,
+		prev.Token.Kind == token.Number,
+		prev.Token.Kind == token.SingleQuotedString,
+		prev.Token.Kind == token.NationalStringLiteral,
+		isWord(prev, "END"), isWord(prev, "NULL"),
+		isNameToken(prev) && !isReservedWordToken(prev):
+		return last
+	}
+	return -1
+}
+
+// skipRowLimits returns the index after a leading FIRST n / SKIP n of a
+// SELECT list's first item, where n is a number, :variable or (expression).
+func skipRowLimits(part []lexeme) int {
+	i := 0
+	for i < len(part) && (isWord(part[i], "FIRST") || isWord(part[i], "SKIP")) {
+		i++
+		switch {
+		case i < len(part) && part[i].Token.Kind == token.Number:
+			i++
+		case i+1 < len(part) && part[i].Token.Kind == token.Colon:
+			i += 2
+		case i < len(part) && part[i].Token.Kind == token.LParen:
+			depth := 0
+			for ; i < len(part); i++ {
+				switch part[i].Token.Kind {
+				case token.LParen:
+					depth++
+				case token.RParen:
+					depth--
+				}
+				if depth == 0 {
+					break
+				}
+			}
+			i++
+		}
+	}
+	return min(i, len(part))
 }
 
 func (m *diagnosticModel) detectUnionGroups(items []lexeme, depths []int) {
