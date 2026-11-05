@@ -244,7 +244,7 @@ func extractTables(parsed ast.TokenList, pos token.Pos, stopOnPos bool) ([]*Tabl
 	cleanTables := []*TableInfo{}
 
 	for _, table := range tables {
-		tableKey := table.DatabaseSchema + "\t" + table.Name
+		tableKey := table.DatabaseSchema + "\t" + table.Name + "\t" + table.Alias
 		if _, ok := tableMap[tableKey]; !ok {
 			tableMap[tableKey] = table
 			cleanTables = append(cleanTables, table)
@@ -432,7 +432,11 @@ func identifierListToTableInfo(il *ast.IdentifierList) ([]*TableInfo, error) {
 			}
 			tis = append(tis, ti)
 		case *ast.Aliased:
-			// pass
+			ti, err := aliasedToTableInfo(v)
+			if err != nil {
+				return nil, err
+			}
+			tis = append(tis, ti)
 		default:
 			// An item that names no table, as the "1" a comma typed into
 			// "lkp_1" leaves, does not fail the whole list.
