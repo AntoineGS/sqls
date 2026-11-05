@@ -24,7 +24,7 @@ func TestInterBaseMetadataViewsMatchLegacyAndUseConstantQueries(t *testing.T) {
 				t.Fatal(err)
 			}
 			count := interBaseFixtureCountPrepares(t)
-			patch, err := repo.runMetadataRead(ctx, repo.readMetadataViews)
+			patch, err := repo.runMetadataSnapshotRead(ctx, repo.readMetadataViews)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -129,7 +129,7 @@ func TestInterBaseMetadataIndexesMatchLegacyAndUseConstantQueries(t *testing.T) 
 				t.Fatal(err)
 			}
 			count := interBaseFixtureCountPrepares(t)
-			patch, err := repo.runMetadataRead(ctx, repo.readMetadataIndexes)
+			patch, err := repo.runMetadataSnapshotRead(ctx, repo.readMetadataIndexes)
 			if err != nil {
 				t.Fatal(err)
 			}

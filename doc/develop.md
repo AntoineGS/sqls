@@ -270,18 +270,31 @@ one place instead of at each call site:
 ### InterBase metadata jobs
 
 InterBase's `MetadataPlan` executes independent category jobs with a plan
-parallelism of three; each catalog job owns one read-only snapshot transaction
-and therefore at most one connection. Identifier-width discovery is part of
-that job's budget, not hidden setup. The fixture-backed set-based readers have
-these measured fixture-reader statement budgets (including discovery): views, indexes,
-procedures, and functions each use **3 statements** (two data reads plus one
-identifier-width read), independent of whether the fixture has 1 or 100 parent
-objects. No Plan-level statement-count budgets are published for simple
-categories or repository-accessor jobs: end-to-end category query accounting
-waits for Plan 4 instrumentation. The fixture's reader tests can assert local
-statement behavior, but do not establish a complete live per-category budget.
-These counts are statements prepared/executed by the fixture catalog path, not
-a claim about wire-level packets. `TestInterBaseMetadataLive` is opt-in and
+parallelism of three; each catalog job owns one read-only transaction and
+therefore at most one connection. Single-data-query bulk categories use
+read-committed isolation. Categories that assemble one result from multiple
+data reads use snapshot isolation: procedures (headers and parameters), indexes
+(headers and segments), functions (headers and arguments), and dependencies
+(check mappings, computed fields, and dependency edges). The coordinated Views
+job reuses the already-loaded ColumnsCurrent category and reads only view
+headers, so it uses read-committed isolation; the standalone legacy view reader
+still reads headers and columns in one snapshot transaction. Repository
+accessor jobs retain snapshot isolation because their schema accessors perform
+multi-query identifier-width discovery before building the category query.
+These are category-local transactions, not one database-wide snapshot.
+
+Identifier-width discovery is part of a job's query budget, not hidden setup.
+The fixture-backed bulk readers have measured statement budgets independent of
+whether the fixture has 1 or 100 parent objects: relations, current columns,
+primary keys, views, and foreign keys use **2 statements** (one width and one
+data read); procedures, indexes, and functions use **3** (two data reads plus
+one width read); dependencies uses **4** (three data reads plus one width
+read). No Plan-level statement-count budgets are published for repository-
+accessor jobs: end-to-end category query accounting waits for Plan 4
+instrumentation. The fixture's reader tests can assert local statement
+behavior, but do not establish a complete live per-category budget. These
+counts are statements prepared/executed by the fixture catalog path, not a
+claim about wire-level packets. `TestInterBaseMetadataLive` is opt-in and
 read-only; missing per-dialect configuration is explicitly not native
 equivalence verification.
 

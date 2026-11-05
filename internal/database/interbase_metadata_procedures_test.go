@@ -21,7 +21,7 @@ func TestInterBaseMetadataProceduresMatchLegacyAndUseConstantQueries(t *testing.
 				t.Fatal(err)
 			}
 			count := interBaseFixtureCountPrepares(t)
-			patch, err := repo.runMetadataRead(context.Background(), repo.readMetadataProcedures)
+			patch, err := repo.runMetadataSnapshotRead(context.Background(), repo.readMetadataProcedures)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -128,7 +128,7 @@ func TestInterBaseMetadataProceduresUseConstantQueries(t *testing.T) {
 			insertMetadataProcedureFixtures(t, db, size)
 			repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
 			count := interBaseFixtureCountPrepares(t)
-			patch, err := repo.runMetadataRead(context.Background(), repo.readMetadataProcedures)
+			patch, err := repo.runMetadataSnapshotRead(context.Background(), repo.readMetadataProcedures)
 			if err != nil {
 				t.Fatal(err)
 			}
