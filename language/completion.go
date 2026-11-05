@@ -161,6 +161,12 @@ func (s *Service) Complete(ctx context.Context, req Request, position Position) 
 	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column}
 
 	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
+	if cursorInUnterminatedComment(nodeWalker) {
+		return Result[CompletionList]{
+			Value: CompletionList{Items: []CompletionItem{}, Incomplete: CompletionIncomplete(req.Context.Snapshot)},
+			Stamp: stampFor(req),
+		}, nil
+	}
 	completionCtx := getCompletionTypes(nodeWalker)
 
 	definedTables, err := parseutil.ExtractTable(parsed, pos)

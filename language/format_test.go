@@ -48,3 +48,14 @@ func TestFormatRefusesUnsafeOutput(t *testing.T) {
 		t.Fatalf("Format() = %#v, %v; want no edits and an error", result.Value, err)
 	}
 }
+
+func TestFormatRefusesUnclosedBlockComment(t *testing.T) {
+	req := language.Request{
+		Document: language.Document{URI: "memory:unclosed-comment", Text: "select 1 /* unfinished", Version: 1},
+		Context:  language.Context{Variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}},
+	}
+	result, err := language.NewService().Format(context.Background(), req, language.FormatOptions{TabSize: 2, InsertSpaces: true})
+	if err == nil || len(result.Value) != 0 {
+		t.Fatalf("Format() = %#v, %v; want no edits and an error", result.Value, err)
+	}
+}

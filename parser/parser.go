@@ -2,6 +2,7 @@ package parser
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -90,7 +91,7 @@ type Parser struct {
 func NewParser(src io.Reader, d dialect.Dialect) (*Parser, error) {
 	tokenizer := token.NewTokenizer(src, d)
 	tokens, err := tokenizer.Tokenize()
-	if err != nil {
+	if err != nil && !errors.Is(err, token.ErrUnclosedMultilineComment) {
 		return nil, fmt.Errorf("tokenize err failed: %w", err)
 	}
 

@@ -10,6 +10,8 @@ import (
 	"github.com/sqls-server/sqls/dialect"
 )
 
+var ErrUnclosedMultilineComment = errors.New("unclosed multiline comment")
+
 type SQLWord struct {
 	Value      string
 	QuoteStyle rune
@@ -91,10 +93,11 @@ type delimitedIdentifierScanner interface {
 }
 
 type Token struct {
-	Kind  Kind
-	Value interface{}
-	From  Pos
-	To    Pos
+	Kind         Kind
+	Value        interface{}
+	From         Pos
+	To           Pos
+	Unterminated bool
 }
 
 func NewPos(line, col int) Pos {
@@ -157,6 +160,10 @@ func (t *Tokenizer) Tokenize() ([]*Token, error) {
 			break
 		}
 		if err != nil {
+			if t != nil && t.Unterminated {
+				tokenset = append(tokenset, t)
+				return tokenset, err
+			}
 			return nil, err
 		}
 		tokenset = append(tokenset, t)
@@ -172,6 +179,9 @@ func (t *Tokenizer) NextToken() (*Token, error) {
 		return nil, io.EOF
 	}
 	if err != nil {
+		if errors.Is(err, ErrUnclosedMultilineComment) {
+			return &Token{Kind: MultilineComment, Value: str, From: pos, To: t.Pos(), Unterminated: true}, fmt.Errorf("tokenize failed: %w", err)
+		}
 		return &Token{Kind: ILLEGAL, Value: "", From: pos, To: t.Pos()}, fmt.Errorf("tokenize failed: %w", err)
 	}
 
@@ -322,7 +332,7 @@ func (t *Tokenizer) next() (Kind, interface{}, error) {
 			t.Scanner.Next()
 			str, err := t.tokenizeMultilineComment()
 			if err != nil {
-				return ILLEGAL, str, err
+				return MultilineComment, str, err
 			}
 			return MultilineComment, str, nil
 		}
@@ -729,7 +739,10 @@ func (t *Tokenizer) tokenizeMultilineComment() (string, error) {
 			t.Col = 0
 			t.Line++
 		case scanner.EOF:
-			return "", fmt.Errorf("unclosed multiline comment: %s at %+v", string(str), t.Pos())
+			if mayBeClosingComment {
+				str = append(str, '*')
+			}
+			return string(str), fmt.Errorf("%w: %s at %+v", ErrUnclosedMultilineComment, string(str), t.Pos())
 		default:
 			t.Col++
 		}

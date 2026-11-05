@@ -42,6 +42,9 @@ func (s *Service) SignatureHelp(ctx context.Context, req Request, position Posit
 	}
 	pos := token.Pos{Line: parserPos.Line, Col: parserPos.UTF16Column}
 	nodeWalker := parseutil.NewNodeWalker(parsed, pos)
+	if cursorInUnterminatedComment(nodeWalker) {
+		return Result[SignatureHelp]{Stamp: stampFor(req)}, nil
+	}
 	types := getSignatureHelpTypes(nodeWalker)
 
 	var sh *SignatureHelp
