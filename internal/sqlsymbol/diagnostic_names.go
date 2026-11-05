@@ -263,7 +263,7 @@ func (m *diagnosticModel) columnFindings(excludedPositions map[int]bool) []Findi
 		if isNonColumnIdentifierPosition(m.items, i) {
 			continue // a generator, character set, or collation name
 		}
-		if i > 0 && isWord(m.items[i-1], "AS") {
+		if i > 0 && isWord(m.items[i-1], "AS") || m.selectAliasPositions[i] {
 			continue // a column or relation alias declaration, never a reference
 		}
 		if i > 0 && m.items[i-1].Token.Kind == token.Colon {
