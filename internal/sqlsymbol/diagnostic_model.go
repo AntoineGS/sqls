@@ -1241,13 +1241,10 @@ func (m *diagnosticModel) computeProjection(text string, owner int, items []lexe
 		m.queries[owner].malformedProjection = true
 		return modelOutput{}
 	}
-	var columns []modelOutputColumn
+	// Aliases are recorded for every item before the output shape is built,
+	// which can give up early (an unexpandable star).
 	partStart := start
 	for _, part := range parts {
-		if len(part) == 0 {
-			m.queries[owner].malformedProjection = true
-			return modelOutput{}
-		}
 		if alias := implicitAliasIndex(part); alias >= 0 {
 			if m.selectAliasPositions == nil {
 				m.selectAliasPositions = make(map[int]bool)
@@ -1255,6 +1252,13 @@ func (m *diagnosticModel) computeProjection(text string, owner int, items []lexe
 			m.selectAliasPositions[partStart+alias] = true
 		}
 		partStart += len(part) + 1 // the part and its separating comma
+	}
+	var columns []modelOutputColumn
+	for _, part := range parts {
+		if len(part) == 0 {
+			m.queries[owner].malformedProjection = true
+			return modelOutput{}
+		}
 		if isStarProjection(part) {
 			expanded, ok := m.expandStar(text, owner, part, relations)
 			if !ok {

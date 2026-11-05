@@ -291,6 +291,7 @@ func TestDiagnosticSelectListAliasWithoutAS(t *testing.T) {
 		"SELECT NAME ALIASED FROM T ORDER BY ALIASED;",
 		"SELECT NAME ALIASED FROM T GROUP BY ALIASED;",
 		"SELECT D.ALIASED FROM (SELECT NAME ALIASED FROM T) D;",
+		"SELECT D.*, T.NAME ALIASED FROM (SELECT ID FROM U) D, T;",
 	} {
 		for _, code := range []string{codeUnknownColumn, codeAmbiguousColumn} {
 			t.Run(sql+" "+code, func(t *testing.T) {
