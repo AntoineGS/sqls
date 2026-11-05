@@ -473,18 +473,20 @@ func (sc *SwitchCase) End() token.Pos        { return findTo(sc) }
 
 type SQLToken struct {
 	Node
-	Kind  token.Kind
-	Value interface{}
-	From  token.Pos
-	To    token.Pos
+	Kind         token.Kind
+	Value        interface{}
+	From         token.Pos
+	To           token.Pos
+	Unterminated bool
 }
 
 func NewSQLToken(tok *token.Token) *SQLToken {
 	return &SQLToken{
-		Kind:  tok.Kind,
-		Value: tok.Value,
-		From:  tok.From,
-		To:    tok.To,
+		Kind:         tok.Kind,
+		Value:        tok.Value,
+		From:         tok.From,
+		To:           tok.To,
+		Unterminated: tok.Unterminated,
 	}
 }
 
@@ -526,6 +528,9 @@ func (t *SQLToken) String() string {
 			return "--" + v
 		}
 		if t.Kind == token.MultilineComment {
+			if t.Unterminated {
+				return "/*" + v
+			}
 			return "/*" + v + "*/"
 		}
 		return v
@@ -543,6 +548,9 @@ func (t *SQLToken) NoQuoteString() string {
 			return "--" + v
 		}
 		if t.Kind == token.MultilineComment {
+			if t.Unterminated {
+				return "/*" + v
+			}
 			return "/*" + v + "*/"
 		}
 		return v
@@ -560,6 +568,9 @@ func (t *SQLToken) Render(opts *RenderOptions) string {
 			return "--" + v
 		}
 		if t.Kind == token.MultilineComment {
+			if t.Unterminated {
+				return "/*" + v
+			}
 			return "/*" + v + "*/"
 		}
 		return v

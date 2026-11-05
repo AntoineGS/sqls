@@ -137,6 +137,11 @@ func lexRaw(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 			break
 		}
 		if err != nil {
+			if errors.Is(err, token.ErrUnclosedMultilineComment) {
+				end := tokenizer.Scanner.Pos().Offset
+				result = append(result, lexeme{Token: tok, Span: Span{Start: start, End: end}})
+				break
+			}
 			return nil, err
 		}
 		end := tokenizer.Scanner.Pos().Offset
@@ -193,7 +198,7 @@ func nextDelimiter(text string, offset int, delimiter string) (int, string, erro
 					i++
 				}
 				if !closed {
-					return 0, "", fmt.Errorf("unclosed multiline comment")
+					return len(text), "", nil
 				}
 				i--
 			}

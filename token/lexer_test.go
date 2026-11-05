@@ -907,6 +907,23 @@ test
 	})
 }
 
+func TestTokenizerPreservesTrailingStarInUnclosedMultilineComment(t *testing.T) {
+	tokens, err := NewTokenizer(strings.NewReader("select 1 /* unfinished*"), &dialect.GenericSQLDialect{}).Tokenize()
+	if err == nil {
+		t.Fatal("Tokenize() error = nil, want the unclosed-comment signal")
+	}
+	if len(tokens) == 0 {
+		t.Fatal("Tokenize() returned no partial tokens")
+	}
+	comment := tokens[len(tokens)-1]
+	if comment.Kind != MultilineComment || !comment.Unterminated {
+		t.Fatalf("last token = %+v, want an unterminated multiline comment", comment)
+	}
+	if got, _ := comment.Value.(string); got != " unfinished*" {
+		t.Fatalf("comment value = %q, want %q", got, " unfinished*")
+	}
+}
+
 func TestTokenizer_InterBaseDialect1(t *testing.T) {
 	src := `"a""b" 'c''d' RDB$DATABASE ?`
 	tokenizer := NewTokenizer(bytes.NewBufferString(src), &dialect.InterBaseDialect{SQLDialect: 1})
