@@ -434,7 +434,8 @@ func identifierListToTableInfo(il *ast.IdentifierList) ([]*TableInfo, error) {
 		case *ast.Aliased:
 			// pass
 		default:
-			return nil, fmt.Errorf("failed parse table info, unknown node type %T, value %q in %q", ident, ident, il)
+			// An item that names no table, as the "1" a comma typed into
+			// "lkp_1" leaves, does not fail the whole list.
 		}
 	}
 	return tis, nil
@@ -509,11 +510,15 @@ func parseSubQueryColumns(idents ast.Node, tables []*TableInfo) ([]*SubQueryColu
 			subqueryCols = append(subqueryCols, resSubqueryCols...)
 		}
 	case *ast.MemberIdentifier:
+		if v.ChildIdent == nil {
+			// A dangling "t." names no column yet.
+			return subqueryCols, nil
+		}
 		subqueryCols = append(
 			subqueryCols,
 			&SubQueryColumn{
-				ParentName: v.GetParentIdent().NoQuoteString(),
-				ColumnName: v.GetChildIdent().NoQuoteString(),
+				ParentName: identName(v.ParentIdent),
+				ColumnName: v.ChildIdent.NoQuoteString(),
 			},
 		)
 	case *ast.Aliased:
@@ -538,6 +543,15 @@ func parseSubQueryColumns(idents ast.Node, tables []*TableInfo) ([]*SubQueryColu
 	return subqueryCols, nil
 }
 
+// identName names an identifier the parser may have left out, as the
+// qualifier of ".id".
+func identName(ident *ast.Identifier) string {
+	if ident == nil {
+		return ""
+	}
+	return ident.NoQuoteString()
+}
+
 func aliasedToSubQueryColumn(aliased *ast.Aliased) (*SubQueryColumn, bool) {
 	alias, ok := aliased.AliasedName.(*ast.Identifier)
 	if !ok {
@@ -552,9 +566,13 @@ func aliasedToSubQueryColumn(aliased *ast.Aliased) (*SubQueryColumn, bool) {
 		}
 		return subqueryCol, true
 	case *ast.MemberIdentifier:
+		if v.ChildIdent == nil {
+			// "t. top" names its column only by the alias.
+			return &SubQueryColumn{ColumnName: aliasedName, AliasName: aliasedName}, true
+		}
 		subqueryCol := &SubQueryColumn{
-			ParentName: v.GetParentIdent().NoQuoteString(),
-			ColumnName: v.GetChildIdent().NoQuoteString(),
+			ParentName: identName(v.ParentIdent),
+			ColumnName: v.ChildIdent.NoQuoteString(),
 			AliasName:  aliasedName,
 		}
 		return subqueryCol, true

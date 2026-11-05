@@ -650,6 +650,36 @@ func TestExtractSubQueryViews(t *testing.T) {
 			},
 		},
 		{
+			name:  "dangling qualifier in a sub query select list",
+			input: "select * from (select t.id, t., t.name, t. as top from a t) as sub",
+			pos:   token.Pos{Line: 0, Col: 1},
+			want: []*SubQueryInfo{
+				{
+					Name: "sub",
+					Views: []*SubQueryView{
+						{
+							SubQueryColumns: []*SubQueryColumn{
+								{
+									ParentTable: &TableInfo{Name: "a", Alias: "t"},
+									ParentName:  "t",
+									ColumnName:  "id",
+								},
+								{
+									ParentTable: &TableInfo{Name: "a", Alias: "t"},
+									ParentName:  "t",
+									ColumnName:  "name",
+								},
+								{
+									ColumnName: "top",
+									AliasName:  "top",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
 			name:  "outer column matching an inner expression alias",
 			input: "select * from (select top from (select max(t.id) top from a t) x join b y on y.id = x.top) as sub",
 			pos:   token.Pos{Line: 0, Col: 1},
