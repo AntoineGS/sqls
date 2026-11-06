@@ -148,7 +148,7 @@ func TestInterBaseMetadataTransactionOwnsReadOnlySnapshot(t *testing.T) {
 	state := &metadataTxState{width: int64(127)}
 	db := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
 	called := false
-	patch, err := db.runMetadataRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+	patch, err := db.runMetadataSnapshotRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 		called = true
 		if state.opens != 1 {
 			t.Fatalf("open connections while reading = %d, want one", state.opens)
@@ -176,6 +176,92 @@ func TestInterBaseMetadataTransactionOwnsReadOnlySnapshot(t *testing.T) {
 	}
 	if state.opens != 1 || state.begins != 1 || state.rollbacks != 1 || !state.queryInTx || state.queries != 2 {
 		t.Fatalf("tx state = %+v", state)
+	}
+}
+
+func TestInterBaseMetadataPlanUsesSnapshotOnlyForMultiQueryBulkCategories(t *testing.T) {
+	tests := []struct {
+		kind      MetadataKind
+		isolation sql.IsolationLevel
+		queries   int
+	}{
+		{kind: MetadataRelations, isolation: sql.LevelReadCommitted, queries: 2},
+		{kind: MetadataColumnsCurrent, isolation: sql.LevelReadCommitted, queries: 2},
+		{kind: MetadataProcedures, isolation: sql.LevelSnapshot, queries: 3},
+		{kind: MetadataPrimaryKeys, isolation: sql.LevelReadCommitted, queries: 2},
+		{kind: MetadataViews, isolation: sql.LevelReadCommitted, queries: 2},
+		{kind: MetadataDependencies, isolation: sql.LevelSnapshot, queries: 4},
+		{kind: MetadataIndexes, isolation: sql.LevelSnapshot, queries: 3},
+		{kind: MetadataForeignKeys, isolation: sql.LevelReadCommitted, queries: 2},
+		{kind: MetadataFunctions, isolation: sql.LevelSnapshot, queries: 3},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.kind), func(t *testing.T) {
+			state := &metadataTxState{width: int64(127)}
+			repo := &InterBaseDBRepository{Conn: openMetadataTxDB(t, state)}
+			var selected *MetadataJob
+			for i := range repo.MetadataPlan().Jobs {
+				job := repo.MetadataPlan().Jobs[i]
+				if job.Kind == test.kind {
+					selected = &job
+					break
+				}
+			}
+			if selected == nil {
+				t.Fatalf("MetadataPlan() has no %s job", test.kind)
+			}
+			patch, err := selected.Run(context.Background(), &DBCache{})
+			if err != nil {
+				t.Fatalf("run %s job: %v", test.kind, err)
+			}
+			if !patch.QueriesKnown || patch.Queries != test.queries {
+				t.Errorf("query accounting = (%d, known=%t), want %d known queries", patch.Queries, patch.QueriesKnown, test.queries)
+			}
+			if !state.options.ReadOnly || state.options.Isolation != driver.IsolationLevel(test.isolation) {
+				t.Errorf("BeginTx options = %+v, want read-only isolation %v", state.options, test.isolation)
+			}
+			if state.begins != 1 || state.rollbacks != 1 {
+				t.Errorf("transaction lifecycle = begins %d, rollbacks %d; want one each", state.begins, state.rollbacks)
+			}
+		})
+	}
+}
+
+func TestInterBaseMetadataRepositoryJobsUseSnapshotForProjectionDiscovery(t *testing.T) {
+	tests := []MetadataKind{
+		MetadataGenerators,
+		MetadataSystemRelations,
+		MetadataExceptions,
+		MetadataDomains,
+		MetadataTriggers,
+	}
+	fault := &interBaseFixtureFault{}
+	db := openInterBaseSchemaFixtureWithFault(t, fault)
+	repo := &InterBaseDBRepository{Conn: db}
+	jobs := make(map[MetadataKind]MetadataJob)
+	for _, job := range repo.MetadataPlan().Jobs {
+		jobs[job.Kind] = job
+	}
+
+	for _, kind := range tests {
+		t.Run(string(kind), func(t *testing.T) {
+			fault.resetTransactions()
+			job, ok := jobs[kind]
+			if !ok {
+				t.Fatalf("MetadataPlan() has no %s job", kind)
+			}
+			if _, err := job.Run(context.Background(), &DBCache{}); err != nil {
+				t.Fatalf("run %s job: %v", kind, err)
+			}
+			options, commits, rollbacks := fault.transactionSnapshot()
+			if len(options) != 1 || !options[0].ReadOnly || options[0].Isolation != driver.IsolationLevel(sql.LevelSnapshot) {
+				t.Fatalf("transaction options = %+v, want one read-only snapshot transaction", options)
+			}
+			if commits != 0 || rollbacks != 1 {
+				t.Fatalf("transaction finish = commits %d, rollbacks %d; want one rollback", commits, rollbacks)
+			}
+		})
 	}
 }
 

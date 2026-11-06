@@ -47,7 +47,7 @@ func TestInterBaseMetadataDependenciesResolveObjects(t *testing.T) {
 		interBaseByIDKey(ObjectKindView, "CUSTOMER_VIEW"): {Name: "CUSTOMER_VIEW"},
 	}}}
 	repo := &InterBaseDBRepository{Conn: db, SQLDialect: 3}
-	patch, err := repo.runMetadataRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+	patch, err := repo.runMetadataSnapshotRead(context.Background(), func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 		return repo.readMetadataDependencies(ctx, q, width, cache)
 	})
 	if err != nil {

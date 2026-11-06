@@ -11,25 +11,41 @@ import (
 
 type interBaseMetadataRead func(context.Context, schema.Queryer, int) (MetadataPatch, error)
 
-// runMetadataRead gives one metadata job ownership of a read-only snapshot
-// transaction. Every query, including width discovery, runs through that tx.
-func (db *InterBaseDBRepository) runMetadataRead(ctx context.Context, read interBaseMetadataRead) (result MetadataPatch, err error) {
+// runMetadataRead gives a self-contained category query a short read-only,
+// read-committed transaction. Identifier-width discovery and the category's
+// single data query both run through that transaction.
+func (db *InterBaseDBRepository) runMetadataRead(ctx context.Context, read interBaseMetadataRead) (MetadataPatch, error) {
+	return db.runMetadataReadWithIsolation(ctx, sql.LevelReadCommitted, read)
+}
+
+// runMetadataSnapshotRead is for category readers that assemble one result
+// from multiple data queries. A single database snapshot keeps their client-
+// side joins (for example procedure headers and parameters) transaction-local.
+func (db *InterBaseDBRepository) runMetadataSnapshotRead(ctx context.Context, read interBaseMetadataRead) (MetadataPatch, error) {
+	return db.runMetadataReadWithIsolation(ctx, sql.LevelSnapshot, read)
+}
+
+func (db *InterBaseDBRepository) runMetadataReadWithIsolation(ctx context.Context, isolation sql.IsolationLevel, read interBaseMetadataRead) (result MetadataPatch, err error) {
 	if db == nil || db.Conn == nil {
 		return MetadataPatch{}, errors.New("interbase: metadata database is nil")
 	}
 	if read == nil {
 		return MetadataPatch{}, errors.New("interbase: metadata read is nil")
 	}
-	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: sql.LevelSnapshot})
+	isolationName := "read-committed"
+	if isolation == sql.LevelSnapshot {
+		isolationName = "snapshot"
+	}
+	tx, err := db.Conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true, Isolation: isolation})
 	if err != nil {
-		return MetadataPatch{QueriesKnown: true}, fmt.Errorf("interbase: begin metadata snapshot: %w", err)
+		return MetadataPatch{QueriesKnown: true}, fmt.Errorf("interbase: begin metadata %s transaction: %w", isolationName, err)
 	}
 	counter := &metadataQueryCounter{queryer: tx}
 	result.QueriesKnown = true
 	defer func() {
 		rollbackErr := tx.Rollback()
 		if rollbackErr != nil && !(errors.Is(rollbackErr, sql.ErrTxDone) && ctx.Err() != nil) {
-			err = errors.Join(err, fmt.Errorf("interbase: rollback metadata snapshot: %w", rollbackErr))
+			err = errors.Join(err, fmt.Errorf("interbase: rollback metadata %s transaction: %w", isolationName, rollbackErr))
 			result.Cache = nil
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -58,8 +74,9 @@ func (db *InterBaseDBRepository) runMetadataRead(ctx context.Context, read inter
 }
 
 // runMetadataRepositoryRead binds a normal repository accessor to one
-// transaction without doing the bulk reader's separate identifier-width
-// discovery. The driver accessors perform their own projection discovery.
+// read-only snapshot transaction. The schema accessors perform multi-query
+// identifier-width discovery to build their projections; the snapshot keeps
+// those widths and the resulting category read on one catalog version.
 func (db *InterBaseDBRepository) runMetadataRepositoryRead(ctx context.Context, read func(context.Context, *InterBaseDBRepository) (MetadataPatch, error)) (result MetadataPatch, err error) {
 	if db == nil || db.Conn == nil {
 		return MetadataPatch{}, errors.New("interbase: metadata database is nil")
@@ -117,7 +134,7 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 			return db.runMetadataRead(ctx, db.readMetadataColumns)
 		}},
 		{Kind: MetadataProcedures, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
-			return db.runMetadataRead(ctx, db.readMetadataProcedures)
+			return db.runMetadataSnapshotRead(ctx, db.readMetadataProcedures)
 		}},
 		{Kind: MetadataPrimaryKeys, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataPrimaryKeys)
@@ -133,18 +150,18 @@ func (db *InterBaseDBRepository) MetadataPlan() MetadataPlan {
 		// Dependencies resolves relation dependencies to tables or views,
 		// so it reads the already-loaded view namespace.
 		{Kind: MetadataDependencies, DependsOn: []MetadataKind{MetadataViews}, Run: func(ctx context.Context, cache *DBCache) (MetadataPatch, error) {
-			return db.runMetadataRead(ctx, func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
+			return db.runMetadataSnapshotRead(ctx, func(ctx context.Context, q schema.Queryer, width int) (MetadataPatch, error) {
 				return db.readMetadataDependencies(ctx, q, width, cache)
 			})
 		}},
 		{Kind: MetadataIndexes, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
-			return db.runMetadataRead(ctx, db.readMetadataIndexes)
+			return db.runMetadataSnapshotRead(ctx, db.readMetadataIndexes)
 		}},
 		{Kind: MetadataForeignKeys, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRead(ctx, db.readMetadataForeignKeys)
 		}},
 		{Kind: MetadataFunctions, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
-			return db.runMetadataRead(ctx, db.readMetadataFunctions)
+			return db.runMetadataSnapshotRead(ctx, db.readMetadataFunctions)
 		}},
 		{Kind: MetadataGenerators, Run: func(ctx context.Context, _ *DBCache) (MetadataPatch, error) {
 			return db.runMetadataRepositoryRead(ctx, func(ctx context.Context, bound *InterBaseDBRepository) (MetadataPatch, error) {
