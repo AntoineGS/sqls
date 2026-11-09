@@ -4,9 +4,47 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 )
+
+func TestGetConfigLoadsServerCheckSettingsAndDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	if err := os.WriteFile(path, []byte("diagnostics:\n  serverCheck:\n    enabled: false\n    delayMs: 300\n  rules:\n    interbase-syntax: off\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := GetConfig(path)
+	if err != nil {
+		t.Fatalf("GetConfig() error = %v, want valid server-check settings", err)
+	}
+	if got.Diagnostics.ServerCheckEnabled() {
+		t.Fatal("ServerCheckEnabled() = true, want false from YAML")
+	}
+	if got.Diagnostics.ServerCheckDelay() != 300*time.Millisecond {
+		t.Fatalf("ServerCheckDelay() = %s, want 300ms", got.Diagnostics.ServerCheckDelay())
+	}
+	if got.Diagnostics.Rules["interbase-syntax"] != "off" {
+		t.Fatalf("interbase-syntax rule = %q, want off", got.Diagnostics.Rules["interbase-syntax"])
+	}
+
+	defaults := DiagnosticsConfig{}
+	if !defaults.ServerCheckEnabled() {
+		t.Fatal("zero-value ServerCheckEnabled() = false, want the default true")
+	}
+	if defaults.ServerCheckDelay() != 750*time.Millisecond {
+		t.Fatalf("zero-value ServerCheckDelay() = %s, want 750ms", defaults.ServerCheckDelay())
+	}
+}
+
+func TestDiagnosticsConfigRejectsServerCheckDelayBelowMinimum(t *testing.T) {
+	cfg := &Config{Diagnostics: DiagnosticsConfig{ServerCheck: ServerCheckConfig{DelayMs: 50}}}
+	err := cfg.Validate()
+	if err == nil || err.Error() != "diagnostics.serverCheck.delayMs must be at least 100" {
+		t.Fatalf("Validate() error = %v, want minimum-delay validation error", err)
+	}
+}
 
 func diagnosticsTestdataPath(t *testing.T, fp string) string {
 	t.Helper()

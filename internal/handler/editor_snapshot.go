@@ -47,6 +47,7 @@ type editorSnapshot struct {
 	Repository          database.DBRepository
 	LowercaseKeywords   bool
 	DiagnosticPolicy    language.DiagnosticPolicy
+	ServerCheckEnabled  bool
 	PolicyRevision      uint64
 	Attaching           bool
 	ConnectionReady     bool
@@ -77,11 +78,12 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
 		CacheEpoch: s.languageService.CacheEpoch(),
 		Generation: s.connGeneration, Cache: &database.DBCache{},
-		LowercaseKeywords: configSnapshot.LowercaseKeywords,
-		DiagnosticPolicy:  language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
-		PolicyRevision:    s.policyRevision,
-		Attaching:         s.connectionState == connectionConnecting,
-		ConnectionReady:   s.connectionState == connectionReady,
+		LowercaseKeywords:  configSnapshot.LowercaseKeywords,
+		DiagnosticPolicy:   language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
+		ServerCheckEnabled: configSnapshot.Diagnostics.ServerCheckEnabled(),
+		PolicyRevision:     s.policyRevision,
+		Attaching:          s.connectionState == connectionConnecting,
+		ConnectionReady:    s.connectionState == connectionReady,
 	}
 	if cfg != nil {
 		snapshot.SourceContext = snapshotContextForConfig(snapshot.Generation, cfg)

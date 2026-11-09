@@ -37,6 +37,7 @@ type documentDiagnosticsSnapshot struct {
 	metadata            *database.MetadataSnapshot
 	dialectResolved     bool
 	policy              language.DiagnosticPolicy
+	serverCheckEnabled  bool
 	policyRevision      uint64
 	metadataLease       *metadata.Lease
 	metadataKey         metadata.Key
@@ -62,6 +63,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		metadata:            editor.Metadata,
 		dialectResolved:     editor.DialectResolved,
 		policy:              editor.DiagnosticPolicy,
+		serverCheckEnabled:  editor.ServerCheckEnabled,
 		policyRevision:      editor.PolicyRevision,
 		metadataLease:       editor.MetadataLease,
 		metadataKey:         editor.MetadataKey,
@@ -159,14 +161,7 @@ func diagnosticsForSnapshot(ctx context.Context, snapshot documentDiagnosticsSna
 }
 
 func diagnosticsForSnapshotWithService(ctx context.Context, snapshot documentDiagnosticsSnapshot, service *language.Service) []lsp.Diagnostic {
-	editor := editorSnapshot{URI: snapshot.uri, Text: snapshot.text, Version: snapshot.version,
-		Revision: snapshot.revision, Generation: snapshot.generation, Variant: snapshot.variant,
-		CacheEpoch:      snapshot.cacheEpoch,
-		DialectResolved: snapshot.dialectResolved, Metadata: snapshot.metadata,
-		MetadataKey:   snapshot.metadataKey,
-		MetadataLease: snapshot.metadataLease, MetadataIncarnation: snapshot.metadataIncarnation,
-		MetadataGeneration: snapshot.metadataGeneration, DiagnosticPolicy: snapshot.policy,
-		PolicyRevision: snapshot.policyRevision}
+	editor := editorSnapshotFromDiagnosticsSnapshot(snapshot)
 	req := languageRequest(editor)
 	res, err := service.Diagnostics(ctx, req)
 	if err != nil {
@@ -175,7 +170,59 @@ func diagnosticsForSnapshotWithService(ctx context.Context, snapshot documentDia
 		log.Printf("sqls: static diagnostics skipped for %s: %v", snapshot.uri, err)
 		return []lsp.Diagnostic{}
 	}
-	return lspDiagnostics(res.Value)
+	diagnostics := lspDiagnostics(res.Value)
+	if snapshot.serverCheckEnabled && snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
+		cached, err := service.ServerDiagnostics(ctx, req, nil, language.ServerDiagnosticsOptions{CachedOnly: true})
+		if err == nil {
+			diagnostics = append(diagnostics, lspDiagnostics(cached.Value)...)
+			sortLSPDiagnostics(diagnostics)
+		}
+	}
+	return diagnostics
+}
+
+func sortLSPDiagnostics(diagnostics []lsp.Diagnostic) {
+	sort.SliceStable(diagnostics, func(i, j int) bool {
+		left, right := diagnostics[i], diagnostics[j]
+		if left.Range.Start.Line != right.Range.Start.Line {
+			return left.Range.Start.Line < right.Range.Start.Line
+		}
+		if left.Range.Start.Character != right.Range.Start.Character {
+			return left.Range.Start.Character < right.Range.Start.Character
+		}
+		if left.Range.End.Line != right.Range.End.Line {
+			return left.Range.End.Line < right.Range.End.Line
+		}
+		if left.Range.End.Character != right.Range.End.Character {
+			return left.Range.End.Character < right.Range.End.Character
+		}
+		if lspDiagnosticCode(left) != lspDiagnosticCode(right) {
+			return lspDiagnosticCode(left) < lspDiagnosticCode(right)
+		}
+		if left.Message != right.Message {
+			return left.Message < right.Message
+		}
+		return left.Severity < right.Severity
+	})
+}
+
+func lspDiagnosticCode(diagnostic lsp.Diagnostic) string {
+	if diagnostic.Code == nil {
+		return ""
+	}
+	return *diagnostic.Code
+}
+
+func editorSnapshotFromDiagnosticsSnapshot(snapshot documentDiagnosticsSnapshot) editorSnapshot {
+	return editorSnapshot{
+		URI: snapshot.uri, Text: snapshot.text, Version: snapshot.version, Revision: snapshot.revision,
+		Generation: snapshot.generation, Variant: snapshot.variant, CacheEpoch: snapshot.cacheEpoch,
+		DialectResolved: snapshot.dialectResolved, Metadata: snapshot.metadata,
+		MetadataKey: snapshot.metadataKey, MetadataLease: snapshot.metadataLease,
+		MetadataIncarnation: snapshot.metadataIncarnation, MetadataGeneration: snapshot.metadataGeneration,
+		DiagnosticPolicy: snapshot.policy, ServerCheckEnabled: snapshot.serverCheckEnabled,
+		PolicyRevision: snapshot.policyRevision,
+	}
 }
 
 func lspDiagnostics(diags []language.Diagnostic) []lsp.Diagnostic {

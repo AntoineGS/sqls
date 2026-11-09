@@ -1,16 +1,18 @@
 # InterBase SQL diagnostics
 
 `sqls` performs static analysis of InterBase SQL (SELECT/DML, `CREATE
-PROCEDURE`, `CREATE TRIGGER`, `ALTER TRIGGER`) and publishes findings as LSP
+PROCEDURE`, `CREATE TRIGGER`, `ALTER TRIGGER`) and can optionally prepare
+statements with the InterBase server. Findings are published as LSP
 `textDocument/publishDiagnostics` notifications. `ALTER TRIGGER` bodies are
 analyzed like `CREATE TRIGGER` bodies, but the statement does not name its
 table, so NEW/OLD column checks run only when the trigger's metadata (its
-table) is loaded. Diagnostics are computed
-entirely from the document's own text plus whatever catalog metadata has
-already loaded; they never issue additional database queries.
+table) is loaded. Static diagnostics are computed entirely from the document's
+own text plus whatever catalog metadata has already loaded; static analysis
+never performs database I/O.
 
-Diagnostics only run for connections whose driver is `interbase`. Every
-other driver always publishes an empty `diagnostics` array.
+Static diagnostics only run for connections whose driver is `interbase`. Every
+other driver always publishes an empty `diagnostics` array. Server-prepare
+diagnostics also require a native InterBase build and a live connection.
 
 ## Rule codes
 
@@ -38,6 +40,8 @@ absent or set to `default`.
 | `interbase-output-not-assigned` | `off` | A procedure output reaches `SUSPEND`, `EXIT`, or procedure completion on a modeled path without an explicit assignment. This does not assert that the value is necessarily `NULL`; a prior output value can be carried across `SUSPEND`. |
 | `interbase-dead-store` | `off` | A modeled assignment is overwritten before its value is read or, for procedure outputs, observed at `SUSPEND`/exit. Reports only within reachable, supported basic-block paths, including independently modeled branch and loop bodies; proofs are not carried across joins or loop back-edges. |
 | `interbase-unreachable` | `off` | A statement follows an unconditional `EXIT` on every modeled incoming path. |
+| `interbase-syntax` | `error` | The InterBase server rejected a prepared statement with SQLCODE -104. |
+| `interbase-server-check` | `error` | The InterBase server rejected a prepared statement with another SQLCODE, such as an unknown table or column. |
 
 `interbase-unused`, `interbase-dead-store`, and `interbase-unreachable` findings
 also carry the LSP `Unnecessary` diagnostic tag, whatever their configured
@@ -56,8 +60,8 @@ Procedural-flow rules are opt-in and deliberately conservative. Supported
 fixed point. Unsupported statements and unknown function effects invalidate
 flow facts; malformed or over-budget procedures produce no flow conclusions.
 Exception handlers are treated as unknown-effect edges until their semantics
-are modeled. Diagnostics use only source/binding facts and perform no database
-I/O.
+are modeled. These procedural-flow diagnostics use only source/binding facts
+and perform no database I/O.
 
 Analysis is performed independently for complete, supported statements and
 procedural regions. An incomplete or unsupported neighboring statement (for
@@ -83,7 +87,7 @@ can be structurally NULL after an outer join even when its base catalog column
 is `NOT NULL`; this query-local fact does not change the column's catalog
 nullability or expression facts used elsewhere.
 
-Every check withholds a finding rather than guessing: a code is reported
+Every static check withholds a finding rather than guessing: a code is reported
 only when the relevant catalog metadata has finished loading and proves the
 condition. As metadata categories (relations, columns, procedures,
 domains, views, indexes) become ready, previously withheld findings appear
@@ -114,6 +118,37 @@ range -- this notably includes `FLOAT`/`DOUBLE PRECISION` and other
 approximate-numeric types, whose storage layout is not currently modeled
 (see [interbase-diagnostic-semantics.md](interbase-diagnostic-semantics.md)
 for the full list of rules left disabled for lack of a verified rule).
+
+## Server-prepare diagnostics
+
+Server checks are enabled by default for connected InterBase documents in a
+native InterBase build. sqls prepares each statement after a 750 ms trailing
+edit debounce; opening or saving a document triggers a check immediately. Each
+prepare runs in a read-only transaction that is rolled back. sqls never
+executes the statement. The server's first prepare-time rejection is reported
+as `interbase-syntax` for SQLCODE -104 or `interbase-server-check` for any
+other SQLCODE. Connection failures, cancellations, and other errors that do
+not establish that the SQL is invalid are logged and do not produce a finding.
+
+Results are cached by statement text and metadata generation. Publications
+combine those cached server findings with static findings without performing
+database I/O. Unchanged statements retain their findings when other text is
+edited; an edited statement has no server finding until its next check. An
+overlapping static diagnostic takes precedence over a server finding.
+
+`diagnostics.serverCheck.delayMs` defaults to 750 and must be at least 100 when
+set. Set `enabled: false` to disable both server-check scheduling and cached
+server findings:
+
+```yaml
+diagnostics:
+  serverCheck:
+    enabled: true
+    delayMs: 750
+  rules:
+    interbase-syntax: error
+    interbase-server-check: error
+```
 
 ## Configuring rule levels
 
@@ -147,10 +182,9 @@ rule policy, and diagnostics already published under the previous policy
 are superseded even if the underlying connection and catalog metadata are
 unchanged.
 
-The parser and semantic checks are intentionally bounded and conservative;
-they are not a server-side prepare/execute pass or a complete InterBase SQL
-validator. Database-dependent findings require same-generation metadata that
-is complete for the relevant category. Editor diagnostics never perform
-database I/O. Native semantic confirmation is a separate opt-in activity and
-must use an explicitly disposable Dialect 1/3 database; benchmark fixture
-results are comparative local measurements, not production latency claims.
+The static parser and semantic checks are intentionally bounded and
+conservative; they are not a complete InterBase SQL validator. Database-
+dependent static findings require same-generation metadata that is complete
+for the relevant category. Static editor diagnostics perform no database
+I/O; the optional server-prepare check is the only path described here that
+contacts InterBase, and it never executes SQL.

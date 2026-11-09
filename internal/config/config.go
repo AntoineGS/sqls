@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"time"
 
 	"github.com/sqls-server/sqls/internal/database"
 	"github.com/sqls-server/sqls/internal/sqlsymbol"
@@ -30,10 +31,30 @@ type Config struct {
 // DiagnosticsConfig is validated by sqlsymbol so the internal host and the
 // public language service share one rule-code and level registry.
 type DiagnosticsConfig struct {
-	Rules map[string]string `json:"rules" yaml:"rules"`
+	Rules       map[string]string `json:"rules" yaml:"rules"`
+	ServerCheck ServerCheckConfig `json:"serverCheck" yaml:"serverCheck"`
+}
+
+type ServerCheckConfig struct {
+	Enabled *bool `json:"enabled" yaml:"enabled"`
+	DelayMs int   `json:"delayMs" yaml:"delayMs"`
+}
+
+func (d DiagnosticsConfig) ServerCheckEnabled() bool {
+	return d.ServerCheck.Enabled == nil || *d.ServerCheck.Enabled
+}
+
+func (d DiagnosticsConfig) ServerCheckDelay() time.Duration {
+	if d.ServerCheck.DelayMs == 0 {
+		return 750 * time.Millisecond
+	}
+	return time.Duration(d.ServerCheck.DelayMs) * time.Millisecond
 }
 
 func (d DiagnosticsConfig) Validate() error {
+	if d.ServerCheck.DelayMs != 0 && d.ServerCheck.DelayMs < 100 {
+		return errors.New("diagnostics.serverCheck.delayMs must be at least 100")
+	}
 	if len(d.Rules) == 0 {
 		return nil
 	}
