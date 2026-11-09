@@ -56,6 +56,7 @@ type Service struct {
 	documentMu sync.Mutex
 	documents  map[string]*documentAnalysis
 	cacheEpoch uint64
+	server     serverCache
 }
 
 // NewService returns a Service with an empty per-document syntax cache.

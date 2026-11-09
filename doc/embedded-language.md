@@ -150,6 +150,41 @@ generation/revision. Hosts should also capture text/dialect revision inputs
 not represented by those public stamp fields where applicable, and fence
 publication against their live state.
 
+## Server-prepare diagnostics
+
+The language package can supplement static `Diagnostics` with findings from
+the connected InterBase server. The host supplies a `language.StatementChecker`
+that prepares one statement without executing it. Implementations must use a
+read-only transaction and roll it back; connection, timeout, and cancellation
+errors are not SQL findings. The package itself never attaches to a database.
+A `StatementChecker` implements
+`CheckStatement(context.Context, string) (*language.StatementError, error)`,
+returning `(nil, nil)` for accepted SQL, a `StatementError` for a server
+rejection, or a non-nil error for an infrastructure failure.
+
+Call `Service.ServerDiagnostics` with a checker to prepare uncached statement
+texts. It returns `interbase-syntax` for SQLCODE -104 and
+`interbase-server-check` for other server rejections. Findings use the same
+request `Stamp` and can be published with static findings. The service caches
+accepted statements and rejections by database identity, metadata generation
+and revision, and statement text; each full run prepares at most 200 statements,
+with a 2-second timeout per prepare.
+
+For an immediate editor publication, request cached findings only. This mode
+does no I/O, accepts a nil checker, and remaps findings for unchanged statements
+to their current document offsets. A debounced full check can then refresh the
+cache:
+
+```go
+cached, err := service.ServerDiagnostics(ctx, request, nil,
+    language.ServerDiagnosticsOptions{CachedOnly: true})
+// Publish cached.Value together with the static Diagnostics result.
+
+fresh, err := service.ServerDiagnostics(ctx, request, checker,
+    language.ServerDiagnosticsOptions{})
+// Publish fresh.Value only if fresh.Stamp is still current.
+```
+
 ## Host ownership requirements
 
 - Use one `metadata.Registry` owned by the host runtime. Acquire leases with
