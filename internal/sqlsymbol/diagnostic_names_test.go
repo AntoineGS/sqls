@@ -398,6 +398,20 @@ func TestDiagnosticFixRound1PlanClauseRelationNameNotFlaggedAsColumn(t *testing.
 	c := newDiagnosticFixtureCatalog()
 	requireCodeCount(t, "SELECT NAME FROM T PLAN (T NATURAL);", c, codeUnknownColumn, 0)
 	requireCodeCount(t, "SELECT NAME FROM T PLAN JOIN (T NATURAL);", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT A.NAME FROM T A JOIN T B ON B.ID = A.ID PLAN SORT (JOIN (B NATURAL, A NATURAL));", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT A.NAME FROM T A JOIN T B ON B.ID = A.ID PLAN MERGE (SORT (B NATURAL), SORT (A NATURAL));", c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT A.NAME FROM T A JOIN T B ON B.ID = A.ID PLAN SORT MERGE (B NATURAL, A NATURAL);", c, codeUnknownColumn, 0)
+	requireCodeCount(t, `CREATE PROCEDURE PR1 RETURNS (X VARCHAR(10)) AS
+BEGIN
+  FOR
+    SELECT DISTINCT A.NAME FROM T A
+      JOIN T B ON B.ID = A.ID AND B.V > A.V
+      PLAN SORT (JOIN (B NATURAL, A NATURAL))
+    ORDER BY A.NAME
+    INTO :X
+  DO SUSPEND;
+END`, c, codeUnknownColumn, 0)
+	requireCodeCount(t, "SELECT NAME FROM T A PLAN SORT (A NATURAL) ORDER BY MISSING_COL;", c, codeUnknownColumn, 1)
 }
 
 // --- Fix round 1: C1(b) FROM inside function-call syntax must not be

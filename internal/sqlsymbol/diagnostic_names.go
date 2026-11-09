@@ -108,8 +108,9 @@ func isNonColumnIdentifierPosition(items []lexeme, i int) bool {
 	return false
 }
 
-// planClauseExclusions marks every item position inside a PLAN (...) or
-// PLAN JOIN (...) clause's parentheses. PLAN is InterBase's query-plan
+// planClauseExclusions marks every item position of a PLAN (...) clause after
+// PLAN itself, including the JOIN/SORT/MERGE/SORT MERGE prefixes (SORT and
+// MERGE are not dialect keywords) and everything inside the parentheses. PLAN is InterBase's query-plan
 // optimizer hint: the identifiers inside it name relations/aliases/indexes
 // in that mini-language's own terms (for example PLAN (T NATURAL) or PLAN
 // JOIN (A NATURAL, B INDEX IX1)), not column expressions -- a relation
@@ -124,11 +125,14 @@ func planClauseExclusions(items []lexeme) map[int]bool {
 			continue
 		}
 		j := i + 1
-		if j < len(items) && isWord(items[j], "JOIN") {
+		for j < len(items) && (isWord(items[j], "JOIN") || isWord(items[j], "SORT") || isWord(items[j], "MERGE")) {
 			j++
 		}
 		if j >= len(items) || items[j].Token.Kind != token.LParen {
 			continue
+		}
+		for k := i + 1; k < j; k++ {
+			excluded[k] = true
 		}
 		depth := 0
 		for k := j; k < len(items); k++ {
