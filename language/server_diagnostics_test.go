@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/sqls-server/sqls/catalog"
@@ -21,6 +24,26 @@ type fakeChecker struct {
 	err           error
 	errs          map[string]error
 	onCall        func(context.Context, string, int)
+}
+
+type generationRaceChecker struct {
+	calls        atomic.Int32
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+	firstResult  *language.StatementError
+}
+
+func (c *generationRaceChecker) CheckStatement(ctx context.Context, _ string) (*language.StatementError, error) {
+	if c.calls.Add(1) == 1 {
+		close(c.firstStarted)
+		select {
+		case <-c.releaseFirst:
+			return c.firstResult, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return nil, nil
 }
 
 func (f *fakeChecker) CheckStatement(ctx context.Context, sql string) (*language.StatementError, error) {
@@ -321,6 +344,63 @@ func TestServerDiagnosticsInvalidatesCacheOnMetadataAndIncarnationChanges(t *tes
 	}
 	if len(checker.calls) != 4 {
 		t.Fatalf("checker calls after generation, revision and incarnation changes = %d, want 4", len(checker.calls))
+	}
+}
+
+func TestServerDiagnosticsDoesNotCacheStaleGenerationResult(t *testing.T) {
+	service := language.NewService()
+	request := serverRequest("SELECT _STALE")
+	request.Context.Snapshot = &catalog.MetadataSnapshot{Generation: 1, Revision: 1}
+	newerRequest := request
+	newerRequest.Context.Snapshot = &catalog.MetadataSnapshot{Generation: 2, Revision: 1}
+	checker := &generationRaceChecker{
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+		firstResult:  &language.StatementError{SQLCode: -104, Message: "Token unknown\n_STALE", Token: "_STALE"},
+	}
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(checker.releaseFirst) }) }
+	defer release()
+
+	staleDone := make(chan error, 1)
+	go func() {
+		result, err := service.ServerDiagnostics(context.Background(), request, checker, language.ServerDiagnosticsOptions{})
+		if err == nil && len(result.Value) != 1 {
+			err = fmt.Errorf("generation-1 run returned %d findings, want its server rejection", len(result.Value))
+		}
+		staleDone <- err
+	}()
+	select {
+	case <-checker.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("generation-1 checker did not start")
+	}
+
+	newerResult, err := service.ServerDiagnostics(context.Background(), newerRequest, checker, language.ServerDiagnosticsOptions{})
+	if err != nil {
+		release()
+		t.Fatalf("generation-2 ServerDiagnostics() error = %v", err)
+	}
+	if len(newerResult.Value) != 0 {
+		release()
+		t.Fatalf("generation-2 accepted statement produced findings: %+v", newerResult.Value)
+	}
+	release()
+	select {
+	case err := <-staleDone:
+		if err != nil {
+			t.Fatalf("generation-1 ServerDiagnostics() error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("generation-1 checker did not finish after release")
+	}
+
+	cached, err := service.ServerDiagnostics(context.Background(), newerRequest, nil, language.ServerDiagnosticsOptions{CachedOnly: true})
+	if err != nil {
+		t.Fatalf("generation-2 CachedOnly ServerDiagnostics() error = %v", err)
+	}
+	if len(cached.Value) != 0 {
+		t.Fatalf("generation-2 cached result was poisoned by stale write: %+v", cached.Value)
 	}
 }
 

@@ -64,9 +64,12 @@ func (c *serverCache) get(key serverCacheKey) (serverOutcome, bool) {
 	return cloneServerOutcome(element.Value.(serverCacheEntry).outcome), true
 }
 
-func (c *serverCache) put(key serverCacheKey, outcome serverOutcome) {
+func (c *serverCache) put(key serverCacheKey, generation serverGen, outcome serverOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if active, ok := c.gens[key.id]; !ok || active != generation {
+		return
+	}
 	c.initializeLocked()
 	if element, ok := c.entries[key]; ok {
 		element.Value = serverCacheEntry{key: key, outcome: cloneServerOutcome(outcome)}

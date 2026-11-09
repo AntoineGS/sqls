@@ -109,7 +109,7 @@ func (s *Service) ServerDiagnostics(ctx context.Context, req Request, checker St
 				continue
 			}
 			outcome = serverOutcome{err: statementErr}
-			s.server.put(key, outcome)
+			s.server.put(key, generation, outcome)
 		}
 		if outcome.err == nil {
 			continue
