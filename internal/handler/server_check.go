@@ -44,18 +44,20 @@ func (c *serverCheckLoggingChecker) CheckStatement(ctx context.Context, query st
 }
 
 type serverCheckState struct {
-	mu      sync.Mutex
-	timers  map[string]*time.Timer
-	cancels map[string]context.CancelFunc
-	runMu   sync.Mutex
-	after   func(time.Duration, func()) *time.Timer
+	mu       sync.Mutex
+	timers   map[string]*time.Timer
+	cancels  map[string]context.CancelFunc
+	contexts map[string]context.Context
+	runMu    sync.Mutex
+	after    func(time.Duration, func()) *time.Timer
 }
 
 func newServerCheckState() *serverCheckState {
 	return &serverCheckState{
-		timers:  make(map[string]*time.Timer),
-		cancels: make(map[string]context.CancelFunc),
-		after:   time.AfterFunc,
+		timers:   make(map[string]*time.Timer),
+		cancels:  make(map[string]context.CancelFunc),
+		contexts: make(map[string]context.Context),
+		after:    time.AfterFunc,
 	}
 }
 
@@ -85,6 +87,7 @@ func (s *Server) scheduleServerCheck(uri string, delay time.Duration) {
 	if cancel := state.cancels[uri]; cancel != nil {
 		cancel()
 		delete(state.cancels, uri)
+		delete(state.contexts, uri)
 	}
 	after := state.after
 	if after == nil {
@@ -126,6 +129,7 @@ func (s *Server) cancelServerCheck(uri string) {
 	if cancel := state.cancels[uri]; cancel != nil {
 		cancel()
 		delete(state.cancels, uri)
+		delete(state.contexts, uri)
 	}
 	state.mu.Unlock()
 }
@@ -165,6 +169,7 @@ func (s *Server) cancelAllServerChecks() {
 	for uri, cancel := range state.cancels {
 		cancel()
 		delete(state.cancels, uri)
+		delete(state.contexts, uri)
 	}
 	state.mu.Unlock()
 }
@@ -202,25 +207,26 @@ func (s *Server) runServerCheck(uri string) {
 		return
 	}
 
-	state.runMu.Lock()
-	defer state.runMu.Unlock()
-	if s.lifecycleCtx.Err() != nil || !s.diagnosticsSnapshotCurrent(snapshot) {
-		return
-	}
 	ctx, cancel := context.WithCancel(s.lifecycleCtx)
 	state.mu.Lock()
 	if previous := state.cancels[uri]; previous != nil {
 		previous()
 	}
 	state.cancels[uri] = cancel
+	state.contexts[uri] = ctx
 	state.mu.Unlock()
+	state.runMu.Lock()
 	defer func() {
 		cancel()
 		state.mu.Lock()
-		delete(state.cancels, uri)
+		if state.contexts[uri] == ctx {
+			delete(state.contexts, uri)
+			delete(state.cancels, uri)
+		}
 		state.mu.Unlock()
+		state.runMu.Unlock()
 	}()
-	if !s.diagnosticsSnapshotCurrent(snapshot) {
+	if ctx.Err() != nil || s.lifecycleCtx.Err() != nil || !s.diagnosticsSnapshotCurrent(snapshot) {
 		return
 	}
 

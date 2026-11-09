@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,6 +188,88 @@ func TestServerCheckChangedDocumentDoesNotQueueStaleRun(t *testing.T) {
 	tx.server.diagnosticWorkMu.Unlock()
 	if queued {
 		t.Fatal("stale server-check completion queued a diagnostics publish")
+	}
+}
+
+func TestServerCheckQueuedRunCanBeCancelledBeforeCheckerRuns(t *testing.T) {
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	const uriA = "file:///server-check-queued-a.sql"
+	const uriB = "file:///server-check-queued-b.sql"
+	tx.server.stateMu.Lock()
+	tx.server.files[uriA] = &File{Text: "SELECT 1", Version: 1, Revision: 1}
+	tx.server.files[uriB] = &File{Text: "SELECT 2", Version: 1, Revision: 2}
+	tx.server.stateMu.Unlock()
+
+	enteredA := make(chan struct{})
+	releaseA := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseA) }) }
+	defer release()
+	var callsB atomic.Int32
+	tx.server.stateMu.Lock()
+	tx.server.serverCheckerOverride = func() language.StatementChecker {
+		return serverCheckFunc(func(_ context.Context, query string) (*language.StatementError, error) {
+			if query == "SELECT 1" {
+				close(enteredA)
+				<-releaseA
+				return nil, nil
+			}
+			if query == "SELECT 2" {
+				callsB.Add(1)
+			}
+			return nil, nil
+		})
+	}
+	tx.server.stateMu.Unlock()
+
+	doneA := make(chan struct{})
+	go func() {
+		tx.server.runServerCheck(uriA)
+		close(doneA)
+	}()
+	select {
+	case <-enteredA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("document A checker did not start")
+	}
+
+	doneB := make(chan struct{})
+	go func() {
+		tx.server.runServerCheck(uriB)
+		close(doneB)
+	}()
+	deadline := time.NewTimer(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer deadline.Stop()
+	defer ticker.Stop()
+	for {
+		tx.server.serverCheck.mu.Lock()
+		registered := tx.server.serverCheck.cancels[uriB] != nil
+		tx.server.serverCheck.mu.Unlock()
+		if registered {
+			break
+		}
+		select {
+		case <-ticker.C:
+		case <-deadline.C:
+			t.Fatal("queued document B run was not registered for cancellation")
+		}
+	}
+
+	tx.server.scheduleServerCheck(uriB, time.Hour)
+	release()
+	select {
+	case <-doneA:
+	case <-time.After(5 * time.Second):
+		t.Fatal("document A checker did not finish after release")
+	}
+	select {
+	case <-doneB:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cancelled document B run did not leave the global queue")
+	}
+	if got := callsB.Load(); got != 0 {
+		t.Fatalf("document B checker calls = %d, want 0 after cancelling its queued run", got)
 	}
 }
 
