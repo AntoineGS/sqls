@@ -58,8 +58,8 @@ func TestDiagnosticsWithOptionsDefaultKeepsRegistryLevel(t *testing.T) {
 	if found == nil {
 		t.Fatal("missing interbase-null-comparison finding")
 	}
-	if found.Severity != 2 {
-		t.Fatalf("severity = %d, want 2 (warning, the registry default)", found.Severity)
+	if found.Severity != 1 {
+		t.Fatalf("severity = %d, want 1 (error, the registry default)", found.Severity)
 	}
 }
 
@@ -68,13 +68,25 @@ func TestDiagnosticsWithOptionsOverridesSeverity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := DiagnosticOptions{Rules: map[string]string{codeNullComparison: "error"}}
+	options := DiagnosticOptions{Rules: map[string]string{codeNullComparison: "hint"}}
 	found := findByCode(a.DiagnosticsWithOptions(nil, options), codeNullComparison)
 	if found == nil {
 		t.Fatal("missing interbase-null-comparison finding")
 	}
-	if found.Severity != 1 {
-		t.Fatalf("severity = %d, want 1 (error, per rule override)", found.Severity)
+	if found.Severity != 4 {
+		t.Fatalf("severity = %d, want 4 (hint, per rule override)", found.Severity)
+	}
+}
+
+func TestUnnecessaryCodeMarksOnlyRemovableCode(t *testing.T) {
+	unnecessary := map[string]bool{codeUnused: true, codeDeadStore: true, codeUnreachable: true}
+	for code := range diagnosticRegistry {
+		if got := UnnecessaryCode(code); got != unnecessary[code] {
+			t.Errorf("UnnecessaryCode(%q) = %v, want %v", code, got, unnecessary[code])
+		}
+	}
+	if UnnecessaryCode("interbase-not-a-real-code") {
+		t.Error("UnnecessaryCode(unregistered) = true, want false")
 	}
 }
 

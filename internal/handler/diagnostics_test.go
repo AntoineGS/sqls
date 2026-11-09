@@ -418,6 +418,9 @@ func TestInterBaseDiagnosticsAcceptanceWithoutCatalog(t *testing.T) {
 	if notification.Diagnostics[0].Severity != 4 {
 		t.Errorf("unused severity = %d, want 4", notification.Diagnostics[0].Severity)
 	}
+	if tags := notification.Diagnostics[0].Tags; len(tags) != 1 || tags[0] != lsp.DiagnosticTagUnnecessary {
+		t.Errorf("published unused tags = %v, want [Unnecessary]", tags)
+	}
 }
 
 func TestPublishDiagnosticsUsesFreshCacheSnapshot(t *testing.T) {

@@ -175,13 +175,15 @@ type SignatureHelp struct {
 	ActiveParameter int
 }
 
-// Diagnostic is one document diagnostic.
+// Diagnostic is one document diagnostic. Unnecessary marks unused or
+// unreachable code, independent of the configured severity.
 type Diagnostic struct {
-	Range    Range
-	Severity int
-	Code     string
-	Message  string
-	Source   string
+	Range       Range
+	Severity    int
+	Code        string
+	Message     string
+	Source      string
+	Unnecessary bool
 }
 
 // FormatOptions controls document formatting.

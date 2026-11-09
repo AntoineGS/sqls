@@ -15,6 +15,22 @@ func TestDiagnosticSQLNames(t *testing.T) {
 	requireCodeCount(t, "SELECT T.ID FROM T JOIN U ON T.ID=U.ID;", c, "interbase-ambiguous-column", 0)
 }
 
+// InterBase prepares and runs an ambiguous unqualified column (it binds the
+// first matching relation), so the finding is a warning, not an error.
+func TestDiagnosticAmbiguousColumnSeverityIsWarning(t *testing.T) {
+	a, err := AnalyzeDiagnostics("SELECT ID FROM T JOIN U ON T.ID=U.ID;", interBaseVariant())
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := findByCode(a.Diagnostics(newDiagnosticFixtureCatalog()), codeAmbiguousColumn)
+	if found == nil {
+		t.Fatal("missing interbase-ambiguous-column finding")
+	}
+	if found.Severity != 2 {
+		t.Fatalf("severity = %d, want 2 (warning)", found.Severity)
+	}
+}
+
 // --- unknown relation ---
 
 func TestDiagnosticUnknownRelation(t *testing.T) {

@@ -22,7 +22,9 @@ const codeUnknownColumn = "interbase-unknown-column"
 const codeUnknownQualifier = "interbase-unknown-qualifier"
 
 // codeAmbiguousColumn marks an unqualified column reference matched by more
-// than one relation in the innermost, fully known scope level.
+// than one relation in the innermost, fully known scope level. InterBase
+// prepares and runs such a query (binding the first matching relation), so
+// this is a warning about fragile code rather than an engine error.
 const codeAmbiguousColumn = "interbase-ambiguous-column"
 
 // nameFindings reports unknown relations, unknown/ambiguous columns, and
@@ -385,7 +387,7 @@ func (m *diagnosticModel) unqualifiedColumnFindings(i, qi int, name Name) []Find
 			Span:     m.items[i].Span,
 			Code:     codeAmbiguousColumn,
 			Message:  fmt.Sprintf("%s matches more than one relation in scope", name.Text),
-			Severity: 1,
+			Severity: 2,
 		}}
 	}
 	if matches == 1 {

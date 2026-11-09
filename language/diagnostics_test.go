@@ -39,16 +39,16 @@ func TestMergedDiagnosticPolicyControlsNullComparison(t *testing.T) {
 		}
 		return 0, false
 	}
-	if severity, ok := find(base); !ok || severity != 2 {
-		t.Fatalf("default null-comparison = (%d, %v), want warning severity 2", severity, ok)
+	if severity, ok := find(base); !ok || severity != 1 {
+		t.Fatalf("default null-comparison = (%d, %v), want error severity 1", severity, ok)
 	}
 	base.Policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-null-comparison": "off"}}
 	if severity, ok := find(base); ok {
 		t.Fatalf("off null-comparison emitted severity %d", severity)
 	}
-	base.Policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-null-comparison": "error"}}
-	if severity, ok := find(base); !ok || severity != 1 {
-		t.Fatalf("error null-comparison = (%d, %v), want error severity 1", severity, ok)
+	base.Policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-null-comparison": "warning"}}
+	if severity, ok := find(base); !ok || severity != 2 {
+		t.Fatalf("warning null-comparison = (%d, %v), want warning severity 2", severity, ok)
 	}
 }
 

@@ -23,13 +23,13 @@ absent or set to `default`.
 | `interbase-unused` | `hint` | A declared local variable or parameter that is never read. |
 | `interbase-string-truncation` | `warning` | A provable width mismatch assigning a wider source expression to a narrower destination column or variable. |
 | `interbase-singleton-select` | `warning` | A singleton `SELECT` (`SELECT ... INTO`, or a query expected to return at most one row) whose predicates do not provably constrain a complete primary key or unique index for every relation it reads. |
-| `interbase-null-comparison` | `warning` | A direct `= NULL` / `<> NULL` / `!= NULL` comparison, which InterBase always evaluates to `UNKNOWN` rather than true/false. Use `IS [NOT] NULL` instead. |
+| `interbase-null-comparison` | `error` | A direct `= NULL` / `<> NULL` / `!= NULL` comparison. InterBase rejects it at prepare time (`SQLCODE -104`, `Token unknown ... NULL`), unlike Firebird and standard SQL, which evaluate it to `UNKNOWN`. Use `IS [NOT] NULL` instead. |
 | `interbase-unknown-variable` | `error` | A procedural-variable position (an assignment target, or a `SELECT ... INTO` / `EXECUTE ... RETURNING_VALUES` target) that does not match any declaration in scope. |
 | `interbase-duplicate-declaration` | `error` | A local variable or parameter declaration that reuses a name already declared earlier in the same procedure or trigger. |
 | `interbase-unknown-relation` | `error` | A name in a relation position (`FROM`/`JOIN`/`UPDATE` target/`INSERT INTO` target/`DELETE FROM` target) that does not match any known table, view, or procedure. |
 | `interbase-unknown-column` | `error` | A qualified or unqualified column reference that does not match any column of any relation it could plausibly belong to. |
 | `interbase-unknown-qualifier` | `error` | A qualifier (`alias.column`) that does not match any relation alias or table name in scope. |
-| `interbase-ambiguous-column` | `error` | An unqualified column reference matched by more than one relation in the innermost scope. |
+| `interbase-ambiguous-column` | `warning` | An unqualified column reference matched by more than one relation in the innermost scope. InterBase accepts and runs such a query, silently binding the first matching relation, so the reference is fragile rather than invalid. |
 | `interbase-target-count` | `error` | A mismatch between a statement's own target list (`INSERT` column list, `SELECT ... INTO` targets, a `UNION` arm's projection, or an `EXECUTE PROCEDURE RETURNING_VALUES` list) and the number of values/columns/outputs it is matched against. |
 | `interbase-procedure-arity` | `error` | A mismatch between the number of arguments supplied to a procedure call and its known declared input count. |
 | `interbase-invalid-assignment` | `error` | An assignment (procedure local, `UPDATE`/`INSERT` target, `SELECT ... INTO`, `EXECUTE PROCEDURE` input, or trigger `NEW.<col>` write) whose source is proven to never fit its destination's engine-enforced storage range. Also reports an explicit `CAST(... AS type)` whose own inner conversion is proven invalid, at the `CAST`'s own span, even when the assignment's outer destination would otherwise accept the `CAST`'s result. `RETURNING_VALUES` targets are listed among this rule's contexts structurally but can never actually produce a finding for it: a procedure's declared `OUTPUT` type has no source expression of its own to judge (see `interbase-lossy-assignment`, which can and does fire there). |
@@ -38,6 +38,14 @@ absent or set to `default`.
 | `interbase-output-not-assigned` | `off` | A procedure output reaches `SUSPEND`, `EXIT`, or procedure completion on a modeled path without an explicit assignment. This does not assert that the value is necessarily `NULL`; a prior output value can be carried across `SUSPEND`. |
 | `interbase-dead-store` | `off` | A modeled assignment is overwritten before its value is read or, for procedure outputs, observed at `SUSPEND`/exit. Reports only within reachable, supported basic-block paths, including independently modeled branch and loop bodies; proofs are not carried across joins or loop back-edges. |
 | `interbase-unreachable` | `off` | A statement follows an unconditional `EXIT` on every modeled incoming path. |
+
+`interbase-unused`, `interbase-dead-store`, and `interbase-unreachable` findings
+also carry the LSP `Unnecessary` diagnostic tag, whatever their configured
+level, so editors that support it can render that code faded out.
+
+Default levels follow one convention: `error` when InterBase rejects the
+statement or it fails on every execution, `warning` when it is likely a bug or
+can fail depending on data, and `hint` for code that has no effect.
 | `interbase-nullable-assignment` | `off` | A possibly NULL source flows into a catalog-proven `NOT NULL` database column. This is a risk advisory, not a prediction of engine rejection: defaults, triggers, or other engine-side logic may supply or change the value. Unknown or stale nullability metadata suppresses the finding. |
 | `interbase-nullable-not-in` | `off` | A supported `NOT IN` subquery projects a possibly NULL value, so the predicate can evaluate to `UNKNOWN` and filter rows unexpectedly. A same-subquery `IS NOT NULL` refinement suppresses the warning. |
 | `interbase-outer-join-filter` | `off` | A supported null-rejecting `WHERE` predicate filters the NULL-extended rows from a simple `LEFT [OUTER] JOIN`, which may make it behave like an inner join. This can be intentional. |
@@ -122,7 +130,7 @@ rule code to a level:
 diagnostics:
   rules:
     interbase-unknown-variable: error
-    interbase-null-comparison: warning
+    interbase-singleton-select: information
     interbase-ambiguous-column: error
 ```
 
