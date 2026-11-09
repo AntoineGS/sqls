@@ -16,6 +16,8 @@ func TestDiagnosticOptionsValidateAcceptsKnownCodesAndLevels(t *testing.T) {
 		codeOutputNotAssigned:    "warning",
 		codeDeadStore:            "hint",
 		codeUnreachable:          "hint",
+		CodeServerSyntax:         "warning",
+		CodeServerCheck:          "off",
 	}}
 	if err := options.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil for known codes/levels", err)
@@ -84,6 +86,9 @@ func TestUnnecessaryCodeMarksOnlyRemovableCode(t *testing.T) {
 		if got := UnnecessaryCode(code); got != unnecessary[code] {
 			t.Errorf("UnnecessaryCode(%q) = %v, want %v", code, got, unnecessary[code])
 		}
+	}
+	if UnnecessaryCode(CodeServerSyntax) || UnnecessaryCode(CodeServerCheck) {
+		t.Error("server diagnostic codes must not be marked unnecessary")
 	}
 	if UnnecessaryCode("interbase-not-a-real-code") {
 		t.Error("UnnecessaryCode(unregistered) = true, want false")
@@ -243,6 +248,7 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 		codeTargetCount, codeProcedureArity, codeInvalidAssignment, codeLossyAssignment,
 		codeReadBeforeAssignment, codeOutputNotAssigned, codeDeadStore, codeUnreachable,
 		codeNullableAssignment, codeNullableNotIn, codeOuterJoinFilter,
+		CodeServerSyntax, CodeServerCheck,
 	}
 	for _, code := range codes {
 		if _, ok := diagnosticRegistry[code]; !ok {
@@ -251,6 +257,30 @@ func TestDiagnosticRegistryCoversEveryCurrentCode(t *testing.T) {
 	}
 	if len(diagnosticRegistry) != len(codes) {
 		t.Errorf("diagnosticRegistry has %d entries, want exactly %d known codes (found an extra or stale entry)", len(diagnosticRegistry), len(codes))
+	}
+}
+
+func TestDiagnosticOptionsLevel(t *testing.T) {
+	tests := []struct {
+		name     string
+		code     string
+		options  DiagnosticOptions
+		fallback int
+		want     int
+		wantOn   bool
+	}{
+		{name: "registered default severity", code: CodeServerSyntax, options: DiagnosticOptions{}, fallback: 4, want: 1, wantOn: true},
+		{name: "off", code: CodeServerSyntax, options: DiagnosticOptions{Rules: map[string]string{CodeServerSyntax: "off"}}, fallback: 1, want: 0, wantOn: false},
+		{name: "override", code: CodeServerSyntax, options: DiagnosticOptions{Rules: map[string]string{CodeServerSyntax: "warning"}}, fallback: 1, want: 2, wantOn: true},
+		{name: "unregistered fallback", code: "interbase-unknown", options: DiagnosticOptions{}, fallback: 3, want: 3, wantOn: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, on := tt.options.Level(tt.code, tt.fallback)
+			if got != tt.want || on != tt.wantOn {
+				t.Fatalf("Level(%q, %d) = (%d, %t), want (%d, %t)", tt.code, tt.fallback, got, on, tt.want, tt.wantOn)
+			}
+		})
 	}
 }
 
