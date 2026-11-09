@@ -111,6 +111,9 @@ func TestDiagnosticViewUnusedDeclarationFromFixture(t *testing.T) {
 			if diagnostic.Severity != 4 {
 				t.Errorf("unused severity = %d, want 4", diagnostic.Severity)
 			}
+			if !diagnostic.Unnecessary {
+				t.Error("unused diagnostic is not marked Unnecessary")
+			}
 		}
 	}
 	if !found {
@@ -204,6 +207,9 @@ func TestParityDiagnosticsRoutesThroughLSPAdapter(t *testing.T) {
 			found = true
 			if diagnostic.Severity != 4 {
 				t.Errorf("LSP unused severity = %v, want 4", diagnostic.Severity)
+			}
+			if len(diagnostic.Tags) != 1 || diagnostic.Tags[0] != lsp.DiagnosticTagUnnecessary {
+				t.Errorf("LSP unused tags = %v, want [Unnecessary]", diagnostic.Tags)
 			}
 		}
 	}

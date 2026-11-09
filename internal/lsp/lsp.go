@@ -284,12 +284,19 @@ type DiagnosticRelatedInformation struct {
 	Message  string   `json:"message"`
 }
 
+type DiagnosticTag int
+
+// DiagnosticTagUnnecessary marks unused or unreachable code; clients may
+// render it faded out instead of with an error squiggle.
+const DiagnosticTagUnnecessary DiagnosticTag = 1
+
 type Diagnostic struct {
 	Range              Range                          `json:"range"`
 	Severity           int                            `json:"severity,omitempty"`
 	Code               *string                        `json:"code,omitempty"`
 	Source             *string                        `json:"source,omitempty"`
 	Message            string                         `json:"message"`
+	Tags               []DiagnosticTag                `json:"tags,omitempty"`
 	RelatedInformation []DiagnosticRelatedInformation `json:"relatedInformation,omitempty"`
 }
 

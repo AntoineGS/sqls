@@ -2,16 +2,17 @@ package sqlsymbol
 
 import "github.com/sqls-server/sqls/token"
 
-const nullComparisonMessage = "comparison with NULL yields UNKNOWN; use IS NULL/IS NOT NULL if testing nullness"
+const nullComparisonMessage = "InterBase does not accept NULL as a comparison operand; use IS NULL/IS NOT NULL"
 
 // codeNullComparison marks a direct `= NULL`/`<> NULL`/`!= NULL` comparison,
-// which InterBase always evaluates to UNKNOWN rather than true/false.
+// which InterBase rejects at prepare time (SQLCODE -104, Token unknown NULL),
+// unlike Firebird and standard SQL, which evaluate it to UNKNOWN.
 const codeNullComparison = "interbase-null-comparison"
 
-// nullComparisonFindings warns about a direct `= NULL` / `<> NULL` / `!= NULL`
-// comparison, which InterBase always evaluates to UNKNOWN rather than
-// true/false. This is pure lexical pattern matching over the boolean
-// condition of WHERE, JOIN...ON, HAVING, CASE WHEN, and procedural IF: no
+// nullComparisonFindings reports a direct `= NULL` / `<> NULL` / `!= NULL`
+// comparison, which InterBase rejects at prepare time. This is pure lexical
+// pattern matching over the boolean condition of WHERE, JOIN...ON, HAVING,
+// CASE WHEN, and procedural IF: no
 // catalog or query-scope model is needed, since a NULL literal and a
 // comparison operator are both recognized syntactically wherever they occur.
 // `IS [NOT] NULL` never matches (it tokenizes as the IS keyword, not
@@ -171,7 +172,7 @@ func scanClauseForNullComparisons(items []lexeme) []Finding {
 			Span:     Span{Start: items[0].Span.Start, End: items[len(items)-1].Span.End},
 			Code:     codeNullComparison,
 			Message:  nullComparisonMessage,
-			Severity: 2,
+			Severity: 1,
 		}}
 	}
 	return nil

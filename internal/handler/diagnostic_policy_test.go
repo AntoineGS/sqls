@@ -154,7 +154,7 @@ func TestDiagnosticsConfigChangeRequeuesAndChangesPublishedSeverity(t *testing.T
 		t.Fatal("old-policy analysis did not enter gate")
 	}
 
-	updated := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{"interbase-null-comparison": "error"}}}
+	updated := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{"interbase-null-comparison": "warning"}}}
 	raw, _ := json.Marshal(map[string]any{"settings": map[string]any{"sqls": updated}})
 	params := json.RawMessage(raw)
 	if _, err := tx.server.handleWorkspaceDidChangeConfiguration(context.Background(), nil, &jsonrpc2.Request{Params: &params}); err != nil {
@@ -169,14 +169,14 @@ func TestDiagnosticsConfigChangeRequeuesAndChangesPublishedSeverity(t *testing.T
 	tx.server.diagnosticAnalyzer = nil
 	tx.server.publishDocumentDiagnostics(tx.ctx, tx.serverConn, uri)
 	updatedNotification := tx.client.next(t, uri, func(n diagnosticsNotification) bool { return n.Version != nil })
-	if len(updatedNotification.Diagnostics) != 1 || updatedNotification.Diagnostics[0].Severity != 1 {
-		t.Fatalf("new-policy publication = %+v, want one error-severity finding", updatedNotification.Diagnostics)
+	if len(updatedNotification.Diagnostics) != 1 || updatedNotification.Diagnostics[0].Severity != 2 {
+		t.Fatalf("new-policy publication = %+v, want one warning-severity finding", updatedNotification.Diagnostics)
 	}
 	tx.client.mu.Lock()
 	defer tx.client.mu.Unlock()
 	for _, n := range tx.client.notifications {
-		if n.URI == uri && n.Version != nil && len(n.Diagnostics) > 0 && n.Diagnostics[0].Severity == 2 {
-			t.Fatalf("old warning publication survived policy revision change: %+v", n)
+		if n.URI == uri && n.Version != nil && len(n.Diagnostics) > 0 && n.Diagnostics[0].Severity == 1 {
+			t.Fatalf("old error publication survived policy revision change: %+v", n)
 		}
 	}
 }
@@ -202,11 +202,14 @@ func TestDiagnosticsSnapshotCurrentRejectsStalePolicyRevision(t *testing.T) {
 func TestDiagnosticsForSnapshotAppliesPolicy(t *testing.T) {
 	text := "SELECT ID FROM T WHERE V = NULL;"
 	snapshot := documentDiagnosticsSnapshot{uri: "file:///policy.sql", text: text, variant: dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase}}
-	snapshot.policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-null-comparison": "error"}}
+	snapshot.policy = language.DiagnosticPolicy{Rules: map[string]string{"interbase-null-comparison": "warning"}}
 	snapshot.dialectResolved = true
 	got := diagnosticsForSnapshot(context.Background(), snapshot)
-	if len(got) != 1 || diagnosticCode(got[0]) != "interbase-null-comparison" || got[0].Severity != 1 {
-		t.Fatalf("diagnostics = %+v, want one error-severity null-comparison finding", got)
+	if len(got) != 1 || diagnosticCode(got[0]) != "interbase-null-comparison" || got[0].Severity != 2 {
+		t.Fatalf("diagnostics = %+v, want one warning-severity null-comparison finding", got)
+	}
+	if got[0].Tags != nil {
+		t.Fatalf("null-comparison tags = %v, want none", got[0].Tags)
 	}
 	snapshot.policy.Rules["interbase-null-comparison"] = "off"
 	got = diagnosticsForSnapshot(context.Background(), snapshot)

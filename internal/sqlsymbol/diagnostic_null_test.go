@@ -220,10 +220,10 @@ func TestDiagnosticNullComparisonSpan(t *testing.T) {
 	if got := text[found.Span.Start:found.Span.End]; got != "V = NULL" {
 		t.Fatalf("span = %q, want %q", got, "V = NULL")
 	}
-	if found.Severity != 2 {
-		t.Fatalf("severity = %d, want 2", found.Severity)
+	if found.Severity != 1 {
+		t.Fatalf("severity = %d, want 1 (InterBase rejects the statement)", found.Severity)
 	}
-	wantMessage := "comparison with NULL yields UNKNOWN; use IS NULL/IS NOT NULL if testing nullness"
+	wantMessage := "InterBase does not accept NULL as a comparison operand; use IS NULL/IS NOT NULL"
 	if found.Message != wantMessage {
 		t.Fatalf("message = %q, want %q", found.Message, wantMessage)
 	}

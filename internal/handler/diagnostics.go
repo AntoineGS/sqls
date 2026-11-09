@@ -189,6 +189,9 @@ func lspDiagnostics(diags []language.Diagnostic) []lsp.Diagnostic {
 			Source:   &source,
 			Message:  d.Message,
 		}
+		if d.Unnecessary {
+			diagnostics[i].Tags = []lsp.DiagnosticTag{lsp.DiagnosticTagUnnecessary}
+		}
 	}
 	return diagnostics
 }

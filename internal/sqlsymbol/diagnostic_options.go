@@ -13,13 +13,13 @@ var diagnosticRegistry = map[string]int{
 	codeUnused:               4,
 	codeStringTruncation:     2,
 	codeSingletonSelect:      2,
-	codeNullComparison:       2,
+	codeNullComparison:       1,
 	codeUnknownVariable:      1,
 	codeDuplicateDeclaration: 1,
 	codeUnknownRelation:      1,
 	codeUnknownColumn:        1,
 	codeUnknownQualifier:     1,
-	codeAmbiguousColumn:      1,
+	codeAmbiguousColumn:      2,
 	codeTargetCount:          1,
 	codeProcedureArity:       1,
 	codeInvalidAssignment:    1,
@@ -49,6 +49,19 @@ var diagnosticDefaultOff = map[string]bool{
 	codeNullableAssignment:   true,
 	codeNullableNotIn:        true,
 	codeOuterJoinFilter:      true,
+}
+
+// diagnosticUnnecessary lists every registered code whose findings mark
+// removable code (LSP DiagnosticTag.Unnecessary), whatever their severity.
+var diagnosticUnnecessary = map[string]bool{
+	codeUnused:      true,
+	codeDeadStore:   true,
+	codeUnreachable: true,
+}
+
+// UnnecessaryCode reports whether code's findings mark removable code.
+func UnnecessaryCode(code string) bool {
+	return diagnosticUnnecessary[code]
 }
 
 // diagnosticLevelSeverity maps every level that overrides a finding's

@@ -66,11 +66,12 @@ func (s *Service) Diagnostics(ctx context.Context, req Request) (Result[[]Diagno
 			continue
 		}
 		diagnostics = append(diagnostics, Diagnostic{
-			Range:    rangeValue,
-			Severity: finding.Severity,
-			Code:     finding.Code,
-			Source:   "sqls",
-			Message:  finding.Message,
+			Range:       rangeValue,
+			Severity:    finding.Severity,
+			Code:        finding.Code,
+			Source:      "sqls",
+			Message:     finding.Message,
+			Unnecessary: sqlsymbol.UnnecessaryCode(finding.Code),
 		})
 	}
 	return Result[[]Diagnostic]{Value: diagnostics, Stamp: stamp}, nil
