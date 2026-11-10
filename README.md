@@ -211,8 +211,8 @@ string literals, resolved variables and columns, `CAST` to `CHAR(n)` or
 
 Unknown or ambiguous widths are silent: sqls does not guess for unsupported
 expressions or types, incomplete statements, unresolved columns, or missing
-catalog metadata. Unused hints remain available without a catalog. Diagnostics
-use the cached catalog only; editing does not execute or prepare SQL.
+catalog metadata. Unused hints remain available without a catalog. Static
+diagnostics use the cached catalog only; they do not execute or prepare SQL.
 
 Procedural `SELECT ... INTO` also receives a `Possible multiple rows in
 singleton SELECT` warning (`interbase-singleton-select`) when a supported
@@ -251,6 +251,31 @@ warning. It does not inspect data, diagnose scalar subqueries, or automatically
 add a row limit.
 Simple scalar function projections such as `F_LEFT(CONFIG_VALUE, 1)` are
 supported: changing the selected value does not make a multi-row query unique.
+
+##### Server-prepare diagnostics
+
+On a connected InterBase database, sqls can also ask the server to prepare each
+statement after you stop typing. The check runs inside a read-only transaction
+that is rolled back; it never executes the statement. Documents are checked
+immediately when opened or saved, and edits use a trailing debounce. Cached
+findings remain visible for unchanged statements; an edited statement is
+checked again after the debounce. Other database drivers and builds without
+the native InterBase adapter do not run server checks.
+
+`interbase-syntax` reports server SQLCODE -104, and
+`interbase-server-check` reports other prepare-time server rejections. Both
+default to error severity and can be configured with `diagnostics.rules`.
+Server checks are enabled by default, with a 750 ms edit delay (minimum 100 ms):
+
+```yaml
+diagnostics:
+  serverCheck:
+    enabled: true
+    delayMs: 750
+  rules:
+    interbase-syntax: error
+    interbase-server-check: error
+```
 
 **Signature help.** Typing an argument list for a known procedure shows its
 input parameters and highlights the one under the cursor, both for

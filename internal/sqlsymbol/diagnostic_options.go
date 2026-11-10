@@ -2,6 +2,13 @@ package sqlsymbol
 
 import "fmt"
 
+const (
+	// CodeServerSyntax identifies syntax errors reported by the connected InterBase server.
+	CodeServerSyntax = "interbase-syntax"
+	// CodeServerCheck identifies failures while checking SQL with the connected InterBase server.
+	CodeServerCheck = "interbase-server-check"
+)
+
 // diagnosticRegistry lists every finding code DiagnosticsWithOptions knows
 // how to configure, together with the severity it reports today when no
 // explicit level override applies -- copied from each rule's own Finding
@@ -31,6 +38,8 @@ var diagnosticRegistry = map[string]int{
 	codeNullableAssignment:   2,
 	codeNullableNotIn:        2,
 	codeOuterJoinFilter:      2,
+	CodeServerSyntax:         1,
+	CodeServerCheck:          1,
 }
 
 // diagnosticDefaultOff lists every registered code whose default level (an
@@ -156,6 +165,15 @@ func (o DiagnosticOptions) severity(code string, fallback int) int {
 		return severity
 	}
 	return fallback
+}
+
+// Level resolves code's effective severity under o, returning on=false when
+// the code is disabled.
+func (o DiagnosticOptions) Level(code string, fallback int) (severity int, on bool) {
+	if o.off(code) {
+		return 0, false
+	}
+	return o.severity(code, fallback), true
 }
 
 // anyOn reports whether at least one of codes is not off under o. It gates

@@ -21,6 +21,7 @@ func (s *Server) queueAllDiagnostics() {
 	s.diagnosticAllOpen = true
 	s.diagnosticDocuments = make(map[string]struct{})
 	s.diagnosticWorkMu.Unlock()
+	s.scheduleAllServerChecks()
 	s.signalDiagnostics()
 }
 

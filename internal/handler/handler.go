@@ -45,12 +45,14 @@ type Server struct {
 	// diagnostic sends. Connection generation changes use the same fence so a
 	// publication from the previous attachment cannot follow the switch's
 	// clearing/recompute notification.
-	diagnosticsPublishMu sync.Mutex
-	diagnosticWorkMu     sync.Mutex
-	diagnosticDocuments  map[string]struct{}
-	diagnosticAllOpen    bool
-	diagnosticAnalyzer   func(documentDiagnosticsSnapshot) []lsp.Diagnostic
-	languageService      *language.Service
+	diagnosticsPublishMu  sync.Mutex
+	diagnosticWorkMu      sync.Mutex
+	diagnosticDocuments   map[string]struct{}
+	diagnosticAllOpen     bool
+	diagnosticAnalyzer    func(documentDiagnosticsSnapshot) []lsp.Diagnostic
+	languageService       *language.Service
+	serverCheck           *serverCheckState
+	serverCheckerOverride func() language.StatementChecker
 
 	dbConn *database.DBConnection
 
@@ -143,6 +145,7 @@ func NewServer() *Server {
 	server := &Server{
 		files:               make(map[string]*File),
 		languageService:     language.NewService(),
+		serverCheck:         newServerCheckState(),
 		cancels:             newCancelRegistry(),
 		lifecycleCtx:        lifecycleCtx,
 		lifecycleCancel:     lifecycleCancel,
@@ -196,6 +199,7 @@ func panicf(r interface{}, format string, v ...interface{}) error {
 func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		s.lifecycleCancel()
+		s.stopAllServerChecks()
 		s.coordinator.Stop()
 		s.stateMu.Lock()
 		lease, sub := s.metaLease, s.metaSub
@@ -366,6 +370,7 @@ func (s *Server) handleTextDocumentDidOpen(ctx context.Context, conn *jsonrpc2.C
 	}
 	s.languageService.InvalidateDocument(params.TextDocument.URI)
 	s.queueDiagnosticDocument(params.TextDocument.URI)
+	s.scheduleServerCheck(params.TextDocument.URI, 0)
 	return nil, nil
 }
 
@@ -389,6 +394,10 @@ func (s *Server) handleTextDocumentDidChange(ctx context.Context, conn *jsonrpc2
 	if changed {
 		s.languageService.InvalidateDocument(params.TextDocument.URI)
 		s.queueDiagnosticDocument(params.TextDocument.URI)
+		s.stateMu.RLock()
+		delay := s.effectiveConfigLocked().Diagnostics.ServerCheckDelay()
+		s.stateMu.RUnlock()
+		s.scheduleServerCheck(params.TextDocument.URI, delay)
 	}
 	return nil, nil
 }
@@ -423,6 +432,7 @@ func (s *Server) handleTextDocumentDidSave(ctx context.Context, conn *jsonrpc2.C
 	if err != nil {
 		return nil, err
 	}
+	s.scheduleServerCheck(params.TextDocument.URI, 0)
 	return nil, nil
 }
 
@@ -439,6 +449,7 @@ func (s *Server) handleTextDocumentDidClose(ctx context.Context, conn *jsonrpc2.
 	if err := s.closeFile(params.TextDocument.URI); err != nil {
 		return nil, err
 	}
+	s.cancelServerCheck(params.TextDocument.URI)
 	s.clearClosedDiagnostics(ctx, conn, params.TextDocument.URI)
 	return nil, nil
 }
@@ -660,6 +671,8 @@ func (s *Server) attachIntent(ctx context.Context, intent *connectionIntent) err
 	s.curDBName = intent.DatabaseName
 	s.stateMu.Unlock()
 	s.diagnosticsPublishMu.Unlock()
+	// Do not let cleanup close an attachment while a prepare still uses it.
+	s.cancelAllServerChecks()
 	_ = s.enqueueDetachedConnection(old)
 	s.queueAllDiagnostics()
 	candidate, err := s.openConnection(ctx, cloneConnectionConfig(intent.Config))

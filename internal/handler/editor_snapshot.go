@@ -43,10 +43,12 @@ type editorSnapshot struct {
 	MetadataIncarnation uint64
 	MetadataGeneration  uint64
 	MetadataKey         metadata.Key
+	MetadataScope       metadata.Scope
 	MetadataLease       *metadata.Lease
 	Repository          database.DBRepository
 	LowercaseKeywords   bool
 	DiagnosticPolicy    language.DiagnosticPolicy
+	ServerCheckEnabled  bool
 	PolicyRevision      uint64
 	Attaching           bool
 	ConnectionReady     bool
@@ -76,12 +78,13 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 	snapshot := editorSnapshot{
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
 		CacheEpoch: s.languageService.CacheEpoch(),
-		Generation: s.connGeneration, Cache: &database.DBCache{},
-		LowercaseKeywords: configSnapshot.LowercaseKeywords,
-		DiagnosticPolicy:  language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
-		PolicyRevision:    s.policyRevision,
-		Attaching:         s.connectionState == connectionConnecting,
-		ConnectionReady:   s.connectionState == connectionReady,
+		Generation: s.connGeneration, Cache: &database.DBCache{}, MetadataScope: s.metaScope,
+		LowercaseKeywords:  configSnapshot.LowercaseKeywords,
+		DiagnosticPolicy:   language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
+		ServerCheckEnabled: configSnapshot.Diagnostics.ServerCheckEnabled(),
+		PolicyRevision:     s.policyRevision,
+		Attaching:          s.connectionState == connectionConnecting,
+		ConnectionReady:    s.connectionState == connectionReady,
 	}
 	if cfg != nil {
 		snapshot.SourceContext = snapshotContextForConfig(snapshot.Generation, cfg)
@@ -130,6 +133,10 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 		}
 	}
 	return snapshot, nil
+}
+
+func serverCheckPartition(scope metadata.Scope) string {
+	return fmt.Sprintf("%#v", scope)
 }
 
 func cloneDiagnosticRules(rules map[string]string) map[string]string {
