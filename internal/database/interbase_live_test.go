@@ -521,14 +521,17 @@ func TestInterBaseDriverConfigMapsEveryFieldToTheDriverStruct(t *testing.T) {
 // EncryptedPassword, SystemEncryptionPassword and TransactionOptions are
 // listed but deliberately left unmapped by interBaseDriverConfig: the spec
 // defers all three (docs/superpowers/specs/2026-09-19-interbase-dialect-and-catalog-design.md).
-// If one of those three is ever removed from interbase.Config, or a field
+// DriverPanicObserver is also left unmapped: it is an optional host
+// notification hook, not a connection setting, and without it the driver
+// still recovers the panic as an error and discards the connection.
+// If one of those four is ever removed from interbase.Config, or a field
 // this list does not name appears, this test must fail and interBaseDriverConfig
 // must be updated alongside it.
 func TestInterBaseDriverConfigFieldsAreAllKnown(t *testing.T) {
 	wantConfigFields := []string{
 		"Database", "Host", "User", "Password", "Role",
 		"EncryptedPassword", "SystemEncryptionPassword", "Charset", "CatalogTextCharset",
-		"Dialect", "ConnectTimeout", "TLS", "TransactionOptions",
+		"Dialect", "ConnectTimeout", "TLS", "TransactionOptions", "DriverPanicObserver",
 	}
 	if got := interBaseStructFieldNames(reflect.TypeOf(interbase.Config{})); !reflect.DeepEqual(got, wantConfigFields) {
 		t.Fatalf("interbase.Config fields = %v, want %v (update interBaseDriverConfig and this list together)", got, wantConfigFields)
