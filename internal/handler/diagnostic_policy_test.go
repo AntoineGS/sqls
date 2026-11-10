@@ -48,14 +48,28 @@ func TestCaptureEditorSnapshotDeepCopiesDiagnosticRules(t *testing.T) {
 }
 
 func TestDiagnosticsConfigChangeValidationAndRevision(t *testing.T) {
-	s := NewServer()
-	t.Cleanup(func() { _ = s.Stop() })
+	tx := newDiagnosticsTestContext(t, dialect.DatabaseDriverInterBase)
+	s := tx.server
 	const uri = "file:///policy-change.sql"
 	s.stateMu.Lock()
 	s.WSCfg = &config.Config{}
 	s.files[uri] = &File{Text: "SELECT 1"}
+	s.notificationConn = tx.serverConn
 	before := s.policyRevision
 	s.stateMu.Unlock()
+	// The background diagnostics worker drains queued work as soon as it is
+	// signalled, so observe the requeue through the analysis it causes rather
+	// than through the transient pending-work flag.
+	analyzed := make(chan uint64, 16)
+	s.diagnosticAnalyzer = func(snapshot documentDiagnosticsSnapshot) []lsp.Diagnostic {
+		if snapshot.uri == uri {
+			select {
+			case analyzed <- snapshot.policyRevision:
+			default:
+			}
+		}
+		return nil
+	}
 
 	bad := &config.Config{Diagnostics: config.DiagnosticsConfig{Rules: map[string]string{"unknown-rule": "error"}}}
 	raw, _ := json.Marshal(map[string]any{"settings": map[string]any{"sqls": bad}})
@@ -82,11 +96,16 @@ func TestDiagnosticsConfigChangeValidationAndRevision(t *testing.T) {
 	if after != before+1 {
 		t.Fatalf("policy revision = %d, want %d", after, before+1)
 	}
-	s.diagnosticWorkMu.Lock()
-	queued := s.diagnosticAllOpen
-	s.diagnosticWorkMu.Unlock()
-	if !queued {
-		t.Fatal("configuration change did not queue all open documents")
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case revision := <-analyzed:
+			if revision == after {
+				return
+			}
+		case <-deadline:
+			t.Fatal("configuration change did not queue all open documents")
+		}
 	}
 }
 
