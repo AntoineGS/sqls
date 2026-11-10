@@ -37,6 +37,9 @@ type serverCache struct {
 	entries map[serverCacheKey]*list.Element
 	order   *list.List
 	gens    map[serverIdentity]serverGen
+	// counts tracks cached entries per identity so a generation record can be
+	// dropped with its identity's last entry, keeping gens bounded.
+	counts map[serverIdentity]int
 }
 
 func (c *serverCache) sync(id serverIdentity, generation serverGen) {
@@ -57,8 +60,25 @@ func (c *serverCache) sync(id serverIdentity, generation serverGen) {
 				c.order.Remove(element)
 			}
 		}
+		delete(c.counts, id)
+		c.gens[id] = generation
+		return
 	}
 	c.gens[id] = generation
+	if len(c.gens) > serverCacheLimit {
+		c.pruneEmptyIdentitiesLocked(id)
+	}
+}
+
+// pruneEmptyIdentitiesLocked drops the generation records of identities that
+// hold no cached entries, except keep. Losing a record only costs a cache miss:
+// reads and writes still require an exact generation match.
+func (c *serverCache) pruneEmptyIdentitiesLocked(keep serverIdentity) {
+	for id := range c.gens {
+		if id != keep && c.counts[id] == 0 {
+			delete(c.gens, id)
+		}
+	}
 }
 
 func compareServerGen(left, right serverGen) int {
@@ -108,11 +128,16 @@ func (c *serverCache) put(key serverCacheKey, outcome serverOutcome) {
 	}
 	element := c.order.PushFront(serverCacheEntry{key: key, outcome: cloneServerOutcome(outcome)})
 	c.entries[key] = element
+	c.counts[key.id]++
 	for len(c.entries) > serverCacheLimit {
 		oldest := c.order.Back()
 		entry := oldest.Value.(serverCacheEntry)
 		delete(c.entries, entry.key)
 		c.order.Remove(oldest)
+		if c.counts[entry.key.id]--; c.counts[entry.key.id] <= 0 {
+			delete(c.counts, entry.key.id)
+			delete(c.gens, entry.key.id)
+		}
 	}
 }
 
@@ -130,6 +155,9 @@ func (c *serverCache) initializeLocked() {
 	}
 	if c.gens == nil {
 		c.gens = make(map[serverIdentity]serverGen)
+	}
+	if c.counts == nil {
+		c.counts = make(map[serverIdentity]int)
 	}
 }
 
