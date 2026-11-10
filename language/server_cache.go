@@ -4,6 +4,7 @@ import (
 	"container/list"
 	"sync"
 
+	"github.com/sqls-server/sqls/dialect"
 	"github.com/sqls-server/sqls/metadata"
 )
 
@@ -12,6 +13,8 @@ const serverCacheLimit = 2048
 type serverIdentity struct {
 	key         metadata.Key
 	incarnation uint64
+	variant     dialect.DriverVariant
+	partition   string
 }
 
 type serverGen struct {
@@ -20,8 +23,9 @@ type serverGen struct {
 }
 
 type serverCacheKey struct {
-	id  serverIdentity
-	sql string
+	id         serverIdentity
+	generation serverGen
+	sql        string
 }
 
 type serverOutcome struct {
@@ -39,7 +43,14 @@ func (c *serverCache) sync(id serverIdentity, generation serverGen) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.initializeLocked()
-	if previous, ok := c.gens[id]; ok && previous != generation {
+	if previous, ok := c.gens[id]; ok {
+		comparison := compareServerGen(generation, previous)
+		if comparison < 0 {
+			return
+		}
+		if comparison == 0 {
+			return
+		}
 		for key, element := range c.entries {
 			if key.id == id {
 				delete(c.entries, key)
@@ -50,10 +61,29 @@ func (c *serverCache) sync(id serverIdentity, generation serverGen) {
 	c.gens[id] = generation
 }
 
+func compareServerGen(left, right serverGen) int {
+	if left.generation < right.generation {
+		return -1
+	}
+	if left.generation > right.generation {
+		return 1
+	}
+	if left.revision < right.revision {
+		return -1
+	}
+	if left.revision > right.revision {
+		return 1
+	}
+	return 0
+}
+
 func (c *serverCache) get(key serverCacheKey) (serverOutcome, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
+		return serverOutcome{}, false
+	}
+	if active, ok := c.gens[key.id]; !ok || active != key.generation {
 		return serverOutcome{}, false
 	}
 	element, ok := c.entries[key]
@@ -64,10 +94,10 @@ func (c *serverCache) get(key serverCacheKey) (serverOutcome, bool) {
 	return cloneServerOutcome(element.Value.(serverCacheEntry).outcome), true
 }
 
-func (c *serverCache) put(key serverCacheKey, generation serverGen, outcome serverOutcome) {
+func (c *serverCache) put(key serverCacheKey, outcome serverOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if active, ok := c.gens[key.id]; !ok || active != generation {
+	if active, ok := c.gens[key.id]; !ok || active != key.generation {
 		return
 	}
 	c.initializeLocked()

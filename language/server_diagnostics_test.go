@@ -262,6 +262,69 @@ func TestServerDiagnosticsCachesOutcomesByStatementText(t *testing.T) {
 	}
 }
 
+func TestServerDiagnosticsDoesNotShareCacheAcrossDialects(t *testing.T) {
+	service := language.NewService()
+	request := serverRequest(`SELECT "VALUE" FROM RDB$DATABASE`)
+	request.Context.Variant.Variant = dialect.SQLVariantInterBase3
+	dialect3Checker := &fakeChecker{defaultResult: &language.StatementError{
+		SQLCode: -104, Message: "Token unknown\nVALUE", Token: "VALUE",
+	}}
+	dialect3, err := service.ServerDiagnostics(context.Background(), request, dialect3Checker, language.ServerDiagnosticsOptions{})
+	if err != nil {
+		t.Fatalf("dialect-3 ServerDiagnostics() error = %v", err)
+	}
+	if len(dialect3.Value) != 1 || len(dialect3Checker.calls) != 1 {
+		t.Fatalf("dialect-3 diagnostics=%+v checker calls=%d, want one rejection and one prepare", dialect3.Value, len(dialect3Checker.calls))
+	}
+
+	request.Context.Variant.Variant = dialect.SQLVariantInterBase1
+	dialect1Checker := &fakeChecker{}
+	dialect1, err := service.ServerDiagnostics(context.Background(), request, dialect1Checker, language.ServerDiagnosticsOptions{})
+	if err != nil {
+		t.Fatalf("dialect-1 ServerDiagnostics() error = %v", err)
+	}
+	if len(dialect1.Value) != 0 || len(dialect1Checker.calls) != 1 {
+		t.Fatalf("dialect-1 diagnostics=%+v checker calls=%d, want accepted outcome from a distinct prepare", dialect1.Value, len(dialect1Checker.calls))
+	}
+}
+
+func TestServerDiagnosticsDoesNotShareCacheAcrossPartitions(t *testing.T) {
+	service := language.NewService()
+	request := serverRequest("SELECT * FROM PRIVATE_TABLE")
+	partitionA := language.ServerDiagnosticsOptions{Partition: "scope-a"}
+	partitionB := language.ServerDiagnosticsOptions{Partition: "scope-b"}
+	checkerA := &fakeChecker{defaultResult: &language.StatementError{
+		SQLCode: -204, Message: "Table unknown\nPRIVATE_TABLE", Token: "PRIVATE_TABLE",
+	}}
+	if result, err := service.ServerDiagnostics(context.Background(), request, checkerA, partitionA); err != nil || len(result.Value) != 1 {
+		t.Fatalf("partition-a ServerDiagnostics() = (%+v, %v), want its server rejection", result.Value, err)
+	}
+
+	cachedB, err := service.ServerDiagnostics(context.Background(), request, nil,
+		language.ServerDiagnosticsOptions{CachedOnly: true, Partition: partitionB.Partition})
+	if err != nil {
+		t.Fatalf("partition-b CachedOnly ServerDiagnostics() error = %v", err)
+	}
+	if len(cachedB.Value) != 0 {
+		t.Fatalf("partition-b reused partition-a diagnostics: %+v", cachedB.Value)
+	}
+
+	checkerB := &fakeChecker{}
+	fullB, err := service.ServerDiagnostics(context.Background(), request, checkerB, partitionB)
+	if err != nil {
+		t.Fatalf("partition-b ServerDiagnostics() error = %v", err)
+	}
+	if len(fullB.Value) != 0 || len(checkerB.calls) != 1 {
+		t.Fatalf("partition-b diagnostics=%+v checker calls=%d, want accepted result from one independent prepare", fullB.Value, len(checkerB.calls))
+	}
+
+	cachedA, err := service.ServerDiagnostics(context.Background(), request, nil,
+		language.ServerDiagnosticsOptions{CachedOnly: true, Partition: partitionA.Partition})
+	if err != nil || len(cachedA.Value) != 1 {
+		t.Fatalf("partition-a CachedOnly ServerDiagnostics() = (%+v, %v), want its cached rejection", cachedA.Value, err)
+	}
+}
+
 func TestServerDiagnosticsEvictsLeastRecentlyUsedCachedStatement(t *testing.T) {
 	var statements []string
 	for i := 0; i < 2049; i++ {

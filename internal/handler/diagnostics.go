@@ -41,6 +41,7 @@ type documentDiagnosticsSnapshot struct {
 	policyRevision      uint64
 	metadataLease       *metadata.Lease
 	metadataKey         metadata.Key
+	metadataScope       metadata.Scope
 	metadataIncarnation uint64
 	metadataGeneration  uint64
 	metadataRevision    uint64
@@ -67,6 +68,7 @@ func (s *Server) diagnosticsSnapshot(uri string) (documentDiagnosticsSnapshot, b
 		policyRevision:      editor.PolicyRevision,
 		metadataLease:       editor.MetadataLease,
 		metadataKey:         editor.MetadataKey,
+		metadataScope:       editor.MetadataScope,
 		metadataIncarnation: editor.MetadataIncarnation,
 		metadataGeneration:  editor.MetadataGeneration,
 		metadataRevision:    metadataRevision(editor),
@@ -89,7 +91,7 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 		current = current && s.dbConn.DriverVariant() == snapshot.variant
 	}
 	lease, bound := s.metaLease, s.metaBoundGeneration
-	key, incarnation := s.metaKey, uint64(0)
+	key, scope, incarnation := s.metaKey, s.metaScope, uint64(0)
 	if lease != nil {
 		incarnation = lease.Incarnation()
 	}
@@ -105,9 +107,10 @@ func (s *Server) diagnosticsSnapshotCurrent(snapshot documentDiagnosticsSnapshot
 		// diagnostics still have a coherent nil-catalog binding.
 		return snapshot.metadataLease == nil && snapshot.metadata == nil &&
 			snapshot.metadataKey == (metadata.Key{}) && snapshot.metadataIncarnation == 0 &&
-			snapshot.metadataGeneration == 0
+			snapshot.metadataGeneration == 0 && snapshot.metadataScope == scope
 	}
-	if lease != snapshot.metadataLease || key != snapshot.metadataKey || incarnation != snapshot.metadataIncarnation {
+	if lease != snapshot.metadataLease || key != snapshot.metadataKey || scope != snapshot.metadataScope ||
+		incarnation != snapshot.metadataIncarnation {
 		// The active lease was rebound (a connection switch) since this
 		// diagnostic snapshot was captured: a late-arriving old-generation
 		// result must never publish against the new connection's state.
@@ -172,7 +175,9 @@ func diagnosticsForSnapshotWithService(ctx context.Context, snapshot documentDia
 	}
 	diagnostics := lspDiagnostics(res.Value)
 	if snapshot.serverCheckEnabled && snapshot.variant.Driver == dialect.DatabaseDriverInterBase {
-		cached, err := service.ServerDiagnostics(ctx, req, nil, language.ServerDiagnosticsOptions{CachedOnly: true})
+		cached, err := service.ServerDiagnostics(ctx, req, nil, language.ServerDiagnosticsOptions{
+			CachedOnly: true, Partition: serverCheckPartition(snapshot.metadataScope),
+		})
 		if err == nil {
 			diagnostics = append(diagnostics, lspDiagnostics(cached.Value)...)
 			sortLSPDiagnostics(diagnostics)
@@ -219,6 +224,7 @@ func editorSnapshotFromDiagnosticsSnapshot(snapshot documentDiagnosticsSnapshot)
 		Generation: snapshot.generation, Variant: snapshot.variant, CacheEpoch: snapshot.cacheEpoch,
 		DialectResolved: snapshot.dialectResolved, Metadata: snapshot.metadata,
 		MetadataKey: snapshot.metadataKey, MetadataLease: snapshot.metadataLease,
+		MetadataScope:       snapshot.metadataScope,
 		MetadataIncarnation: snapshot.metadataIncarnation, MetadataGeneration: snapshot.metadataGeneration,
 		DiagnosticPolicy: snapshot.policy, ServerCheckEnabled: snapshot.serverCheckEnabled,
 		PolicyRevision: snapshot.policyRevision,

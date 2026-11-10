@@ -166,9 +166,14 @@ Call `Service.ServerDiagnostics` with a checker to prepare uncached statement
 texts. It returns `interbase-syntax` for SQLCODE -104 and
 `interbase-server-check` for other server rejections. Findings use the same
 request `Stamp` and can be published with static findings. The service caches
-accepted statements and rejections by database identity, metadata generation
-and revision, and statement text; each full run prepares at most 200 statements,
-with a 2-second timeout per prepare.
+accepted statements and rejections by database identity, dialect variant,
+metadata generation and revision, statement text, and `Partition`. `Partition`
+is a host-supplied stable identity for the authorization/visibility scope and
+connection used for checks; results never cross partitions. Derive it
+deterministically from all fields of the host's metadata scope (for example,
+`fmt.Sprintf("%#v", scope)`) and pass the same value for full and cached-only
+requests. Each full run prepares at most 200 statements, with a 2-second
+timeout per prepare.
 
 For an immediate editor publication, request cached findings only. This mode
 does no I/O, accepts a nil checker, and remaps findings for unchanged statements
@@ -177,11 +182,11 @@ cache:
 
 ```go
 cached, err := service.ServerDiagnostics(ctx, request, nil,
-    language.ServerDiagnosticsOptions{CachedOnly: true})
+    language.ServerDiagnosticsOptions{CachedOnly: true, Partition: partition})
 // Publish cached.Value together with the static Diagnostics result.
 
 fresh, err := service.ServerDiagnostics(ctx, request, checker,
-    language.ServerDiagnosticsOptions{})
+    language.ServerDiagnosticsOptions{Partition: partition})
 // Publish fresh.Value only if fresh.Stamp is still current.
 ```
 

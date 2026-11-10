@@ -43,6 +43,7 @@ type editorSnapshot struct {
 	MetadataIncarnation uint64
 	MetadataGeneration  uint64
 	MetadataKey         metadata.Key
+	MetadataScope       metadata.Scope
 	MetadataLease       *metadata.Lease
 	Repository          database.DBRepository
 	LowercaseKeywords   bool
@@ -77,7 +78,7 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 	snapshot := editorSnapshot{
 		URI: uri, Text: file.Text, Version: file.Version, Revision: file.Revision,
 		CacheEpoch: s.languageService.CacheEpoch(),
-		Generation: s.connGeneration, Cache: &database.DBCache{},
+		Generation: s.connGeneration, Cache: &database.DBCache{}, MetadataScope: s.metaScope,
 		LowercaseKeywords:  configSnapshot.LowercaseKeywords,
 		DiagnosticPolicy:   language.DiagnosticPolicy{Rules: cloneDiagnosticRules(configSnapshot.Diagnostics.Rules)},
 		ServerCheckEnabled: configSnapshot.Diagnostics.ServerCheckEnabled(),
@@ -132,6 +133,10 @@ func (s *Server) captureEditorSnapshotLocked(uri string) (editorSnapshot, error)
 		}
 	}
 	return snapshot, nil
+}
+
+func serverCheckPartition(scope metadata.Scope) string {
+	return fmt.Sprintf("%#v", scope)
 }
 
 func cloneDiagnosticRules(rules map[string]string) map[string]string {

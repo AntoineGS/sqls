@@ -232,7 +232,9 @@ func (s *Server) runServerCheck(uri string) {
 
 	request := languageRequest(editorSnapshotFromDiagnosticsSnapshot(snapshot))
 	loggingChecker := &serverCheckLoggingChecker{checker: checker, runCtx: ctx, uri: uri}
-	_, err := s.languageService.ServerDiagnostics(ctx, request, loggingChecker, language.ServerDiagnosticsOptions{})
+	_, err := s.languageService.ServerDiagnostics(ctx, request, loggingChecker, language.ServerDiagnosticsOptions{
+		Partition: serverCheckPartition(snapshot.metadataScope),
+	})
 	if err != nil {
 		if ctx.Err() == nil && loggingChecker.err == nil {
 			log.Printf("sqls: server check skipped for %s: %v", uri, err)

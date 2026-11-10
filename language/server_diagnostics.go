@@ -26,6 +26,9 @@ type StatementChecker interface {
 // statements or only return findings already computed for unchanged text.
 type ServerDiagnosticsOptions struct {
 	CachedOnly bool
+	// Partition is a host-supplied identity for the authorization/visibility
+	// scope and connection used for checks. Cached results never cross partitions.
+	Partition string
 }
 
 const (
@@ -66,7 +69,10 @@ func (s *Service) ServerDiagnostics(ctx context.Context, req Request, checker St
 		return Result[[]Diagnostic]{}, ErrCanceled
 	}
 
-	id := serverIdentity{key: req.Context.Key, incarnation: req.Context.Incarnation}
+	id := serverIdentity{
+		key: req.Context.Key, incarnation: req.Context.Incarnation,
+		variant: req.Context.Variant, partition: opts.Partition,
+	}
 	generation := serverGen{}
 	if req.Context.Snapshot != nil {
 		generation.generation = req.Context.Snapshot.Generation
@@ -91,7 +97,7 @@ func (s *Service) ServerDiagnostics(ctx context.Context, req Request, checker St
 			}
 		}
 
-		key := serverCacheKey{id: id, sql: sql}
+		key := serverCacheKey{id: id, generation: generation, sql: sql}
 		outcome, cached := s.server.get(key)
 		if !cached {
 			if opts.CachedOnly || preparingStopped || prepares >= serverPrepareLimit {
@@ -109,7 +115,7 @@ func (s *Service) ServerDiagnostics(ctx context.Context, req Request, checker St
 				continue
 			}
 			outcome = serverOutcome{err: statementErr}
-			s.server.put(key, generation, outcome)
+			s.server.put(key, outcome)
 		}
 		if outcome.err == nil {
 			continue
