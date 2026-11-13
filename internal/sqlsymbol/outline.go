@@ -40,7 +40,7 @@ func QueryOutline(text string, dv dialect.DriverVariant) ([]OutlineQuery, error)
 		return nil, err
 	}
 	items = significantLexemes(items)
-	contexts, _ := buildContexts(&Analysis{Text: text}, items)
+	contexts, _ := buildContexts(&Analysis{Text: text, Variant: dv}, items)
 	depths, matching := sqlDepths(items)
 	queries := discoverSQLQueries(items, contexts, depths)
 

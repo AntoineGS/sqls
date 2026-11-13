@@ -84,6 +84,46 @@ func ParseWithDialect(text string, d dialect.Dialect) (ast.TokenList, error) {
 	return parsed, nil
 }
 
+// markCaretTerminators turns each InterBase "^" statement terminator into a
+// Semicolon token that keeps its "^" spelling, so statements split there. A
+// "^" in the ^=, ^< and ^> operators or naming the SET TERM terminator stays.
+func markCaretTerminators(tokens []*token.Token) {
+	for i, tok := range tokens {
+		if tok.Kind != token.Caret {
+			continue
+		}
+		if i+1 < len(tokens) {
+			switch tokens[i+1].Kind {
+			case token.Eq, token.Lt, token.Gt, token.LtEq, token.GtEq:
+				continue
+			}
+		}
+		if followsSetTerm(tokens[:i]) {
+			continue
+		}
+		tok.Kind = token.Semicolon
+	}
+}
+
+func followsSetTerm(tokens []*token.Token) bool {
+	var words []string
+	for i := len(tokens) - 1; i >= 0 && len(words) < 2; i-- {
+		switch tokens[i].Kind {
+		case token.Whitespace, token.Comment, token.MultilineComment:
+			continue
+		case token.SQLKeyword:
+			word, ok := tokens[i].Value.(*token.SQLWord)
+			if !ok {
+				return false
+			}
+			words = append(words, word.Value)
+		default:
+			return false
+		}
+	}
+	return len(words) == 2 && strings.EqualFold(words[0], "TERM") && strings.EqualFold(words[1], "SET")
+}
+
 type Parser struct {
 	root ast.TokenList
 }
@@ -93,6 +133,10 @@ func NewParser(src io.Reader, d dialect.Dialect) (*Parser, error) {
 	tokens, err := tokenizer.Tokenize()
 	if err != nil && !errors.Is(err, token.ErrUnclosedMultilineComment) {
 		return nil, fmt.Errorf("tokenize err failed: %w", err)
+	}
+
+	if _, ok := d.(*dialect.InterBaseDialect); ok {
+		markCaretTerminators(tokens)
 	}
 
 	parsed := []ast.Node{}

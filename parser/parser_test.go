@@ -218,6 +218,42 @@ func TestParseStatement(t *testing.T) {
 	}
 }
 
+func parseStatementsWith(t *testing.T, input string, dv dialect.DriverVariant) []string {
+	t.Helper()
+	parsed, err := ParseWithDriverVariant(input, dv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, node := range parsed.GetTokens() {
+		stmt, ok := node.(*ast.Statement)
+		if !ok {
+			t.Fatalf("invalid type want Statement parsed %T", node)
+		}
+		got = append(got, stmt.String())
+	}
+	return got
+}
+
+func TestParseInterBaseCaretEndsStatement(t *testing.T) {
+	interbase := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
+	got := parseStatementsWith(t, "select 1 from a^\nselect 2 from b where x ^= 1 and y ^< 2 and z ^> 3", interbase)
+	want := []string{"select 1 from a^", "\nselect 2 from b where x ^= 1 and y ^< 2 and z ^> 3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("statements = %q, want %q", got, want)
+	}
+	got = parseStatementsWith(t, "SET TERM ^ ;\nselect 1 from a^", interbase)
+	want = []string{"SET TERM ^ ;", "\nselect 1 from a^"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("set term statements = %q, want %q", got, want)
+	}
+	got = parseStatementsWith(t, "select 5 ^ 3 from a; select 1 from b", dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL})
+	want = []string{"select 5 ^ 3 from a;", " select 1 from b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mysql statements = %q, want %q", got, want)
+	}
+}
+
 func TestParseComments(t *testing.T) {
 	testcases := []struct {
 		name    string

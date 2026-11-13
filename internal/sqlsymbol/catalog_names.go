@@ -61,7 +61,7 @@ func (a *Analysis) Triggers(relations TriggerCatalog) []Trigger {
 	invalidated := func(i int, name Name) bool {
 		if !ddlDetected {
 			ddlDetected = true
-			ddl = detectDDL(a.Text, items, splitStatements(items, boundaryAfterItems(items, scriptDelimiterOffsets(a.Text))))
+			ddl = detectDDL(a.Text, items, splitStatements(items, boundaryAfterItems(items, scriptDelimiterOffsets(a.Text, a.Variant))))
 		}
 		return ddlInvalidated(ddl, i, name)
 	}

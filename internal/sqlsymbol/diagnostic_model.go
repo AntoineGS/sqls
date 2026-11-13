@@ -175,7 +175,7 @@ func (a *Analysis) diagnosticModel(c Catalog) *diagnosticModel {
 	}
 	depths, matching := sqlDepths(items)
 	m.depths = depths
-	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text))
+	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text, a.Variant))
 	m.statements = splitStatements(items, boundaryAfter)
 
 	triggers := discoverTriggers(a.Text, items)

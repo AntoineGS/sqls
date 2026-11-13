@@ -27,16 +27,18 @@ type ScriptStatement struct {
 }
 
 // ScriptStatements splits an InterBase script into preparable SQL statements
-// using isql's SET TERM delimiter semantics. isql-only commands and empty
+// using isql's SET TERM delimiter semantics; while ";" is active an InterBase
+// "^" also ends a statement. isql-only commands and empty
 // statements are omitted. A lexical error rejects the whole script rather
 // than returning a partial result.
 func ScriptStatements(text string, dv dialect.DriverVariant) ([]ScriptStatement, error) {
 	var statements []ScriptStatement
 	active := ";"
+	caret := caretTerminates(dv)
 	offset := 0
 	regionStart := 0
 	for {
-		end, delimiter, err := nextDelimiter(text, offset, active)
+		end, delimiter, err := nextDelimiter(text, offset, active, caret)
 		if err != nil {
 			return nil, err
 		}
@@ -64,6 +66,14 @@ func ScriptStatements(text string, dv dialect.DriverVariant) ([]ScriptStatement,
 					return nil, err
 				}
 				break
+			}
+			if delimiter == "^" {
+				// "^" ends the statement even inside a routine body.
+				statements, err = appendSemicolonRegion(statements, text, regionStart, end, dv)
+				if err != nil {
+					return nil, err
+				}
+				regionStart = end + len(delimiter)
 			}
 			offset = end + len(delimiter)
 			continue

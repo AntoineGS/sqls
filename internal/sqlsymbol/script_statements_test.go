@@ -96,6 +96,38 @@ func TestScriptStatements(t *testing.T) {
 				{"RECREATE TRIGGER R FOR T ACTIVE BEFORE INSERT AS BEGIN X = 1; END", true},
 			},
 		},
+		{
+			name: "caret terminators without set term",
+			text: "SELECT '^' FROM A^\nSELECT 2 FROM B; SELECT 3 FROM C /* ^ */^SELECT 4 FROM D",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT '^' FROM A", false}, {"SELECT 2 FROM B", false}, {"SELECT 3 FROM C", false}, {"SELECT 4 FROM D", false}},
+		},
+		{
+			name: "caret ends a routine body without set term",
+			text: "CREATE PROCEDURE P AS BEGIN IF (X ^= 1) THEN X = 1; END^\nSELECT 1 FROM A^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"CREATE PROCEDURE P AS BEGIN IF (X ^= 1) THEN X = 1; END", true}, {"SELECT 1 FROM A", false}},
+		},
+		{
+			name: "caret comparison operators do not split",
+			text: "SELECT 1 FROM A WHERE X ^= 1 AND Y ^< 2 AND Z ^> 3^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT 1 FROM A WHERE X ^= 1 AND Y ^< 2 AND Z ^> 3", false}},
+		},
+		{
+			name: "set term ends with caret and custom terminator disables caret",
+			text: "SET TERM !! ^\nSELECT 1 FROM A WHERE X = 1 ^ 2; SELECT 2 FROM B!!\nSET TERM ; !!\nSELECT 3 FROM C^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT 1 FROM A WHERE X = 1 ^ 2; SELECT 2 FROM B", false}, {"SELECT 3 FROM C", false}},
+		},
 	}
 
 	for _, tt := range tests {
@@ -166,5 +198,14 @@ func TestScriptStatementsExposeIdentifierWords(t *testing.T) {
 	}
 	if !mixed || !table {
 		t.Fatalf("identifier tokens = %#v, want quoted Mixed and unquoted TBL", statements[0].Tokens)
+	}
+}
+
+func TestScriptStatementsKeepCaretForOtherDrivers(t *testing.T) {
+	dv := dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL}
+	text := "SELECT 5 ^ 3 FROM A; SELECT 1 FROM B;"
+	got, err := ScriptStatements(text, dv)
+	if err != nil || len(got) != 2 || text[got[0].Span.Start:got[0].Span.End] != "SELECT 5 ^ 3 FROM A" {
+		t.Fatalf("ScriptStatements() = %#v, %v", got, err)
 	}
 }
