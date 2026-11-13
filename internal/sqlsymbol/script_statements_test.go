@@ -128,6 +128,22 @@ func TestScriptStatements(t *testing.T) {
 				routine bool
 			}{{"SELECT 1 FROM A WHERE X = 1 ^ 2; SELECT 2 FROM B", false}, {"SELECT 3 FROM C", false}},
 		},
+		{
+			name: "set term with attached semicolon",
+			text: "SET TERM ^;\nSELECT 1 FROM A; SELECT 2 FROM B^\nSET TERM ;^\nSELECT 3 FROM C^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT 1 FROM A; SELECT 2 FROM B", false}, {"SELECT 3 FROM C", false}},
+		},
+		{
+			name: "set term with a caret inside a longer terminator",
+			text: "SET TERM !^ ;\nSELECT 1 FROM A; SELECT 2 FROM B!^\nSET TERM ; !^\nSET TERM ^^;\nSELECT 3 FROM C; SELECT 4 FROM D^^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT 1 FROM A; SELECT 2 FROM B", false}, {"SELECT 3 FROM C; SELECT 4 FROM D", false}},
+		},
 	}
 
 	for _, tt := range tests {

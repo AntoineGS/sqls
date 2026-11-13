@@ -216,10 +216,16 @@ func nextDelimiter(text string, offset int, delimiter string, caret bool) (int, 
 			}
 		default:
 			if caret && delimiter == ";" && isCaretTerminator(text, i) {
-				if !isSetTermPrefix(text[offset:i]) {
+				// A caret in the name SET TERM gives the new terminator, which
+				// runs to a space or the ";" ending SET TERM, is not a boundary.
+				name := i
+				for name > offset && !isASCIISpace(text[name-1]) && text[name-1] != ';' {
+					name--
+				}
+				if !isSetTermPrefix(text[offset:name]) {
 					return i, "^", nil
 				}
-				for i < len(text) && !isASCIISpace(text[i]) {
+				for i < len(text) && !isASCIISpace(text[i]) && text[i] != ';' {
 					i++
 				}
 				i--

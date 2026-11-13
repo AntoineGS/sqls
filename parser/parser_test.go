@@ -247,6 +247,25 @@ func TestParseInterBaseCaretEndsStatement(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("set term statements = %q, want %q", got, want)
 	}
+	// SET TERM is honored: another terminator turns carets off until SET TERM
+	// ; or ^, and a terminator made of more than a caret is left unsplit.
+	for _, tc := range []struct {
+		input string
+		want  []string
+	}{
+		{"SET TERM % ;\nselect 1 ^ 2 from a%", []string{"SET TERM % ;", "\nselect 1 ^ 2 from a%"}},
+		{"SET TERM ^^ ;\nselect 1 from a^^", []string{"SET TERM ^^ ;", "\nselect 1 from a^^"}},
+		{"SET TERM ^;\nselect 1 from a where x ^= 1^", []string{"SET TERM ^;", "\nselect 1 from a where x ^", "= 1^"}},
+		{"SET TERM % ;\nselect 1 from a%\nSET TERM ; %\nselect 2 from b^ select 3 from c",
+			// The parser has always split at a ";" token, whatever SET TERM says.
+			[]string{"SET TERM % ;", "\nselect 1 from a%\nSET TERM ;", " %\nselect 2 from b^", " select 3 from c"}},
+		{"SET TERM ^ ;\nselect 1 from a^\nSET TERM ; ^\nselect 2 from b^",
+			[]string{"SET TERM ^ ;", "\nselect 1 from a^", "\nSET TERM ;", " ^", "\nselect 2 from b^"}},
+	} {
+		if got := parseStatementsWith(t, tc.input, interbase); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%q: statements = %q, want %q", tc.input, got, tc.want)
+		}
+	}
 	got = parseStatementsWith(t, "select 5 ^ 3 from a; select 1 from b", dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL})
 	want = []string{"select 5 ^ 3 from a;", " select 1 from b"}
 	if !reflect.DeepEqual(got, want) {

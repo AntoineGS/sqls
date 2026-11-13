@@ -85,33 +85,95 @@ func ParseWithDialect(text string, d dialect.Dialect) (ast.TokenList, error) {
 }
 
 // markCaretTerminators turns each InterBase "^" statement terminator into a
-// Semicolon token that keeps its "^" spelling, so statements split there. A
-// "^" in the ^=, ^< and ^> operators or naming the SET TERM terminator stays.
+// Semicolon token that keeps its "^" spelling, so statements split there.
+// While ";" is the terminator a "^" also ends a statement, except in the ^=,
+// ^< and ^> operators. SET TERM is followed: under SET TERM ^ every "^" ends
+// a statement, under any other terminator none does, and the terminator
+// SET TERM names is never a boundary.
 func markCaretTerminators(tokens []*token.Token) {
-	for i, tok := range tokens {
+	active := ";"
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if isTrivia(tok) {
+			continue
+		}
+		if followsSetTerm(tokens[:i]) {
+			previous := active
+			name, end := setTermName(tokens, i, previous)
+			active, i = name, end-1
+			// SET TERM itself ends with the terminator it replaces.
+			if next := nextSignificant(tokens, end); next >= 0 && tokens[next].Kind == token.Caret && (previous == ";" || previous == "^") {
+				tokens[next].Kind = token.Semicolon
+				i = next
+			}
+			continue
+		}
 		if tok.Kind != token.Caret {
 			continue
 		}
-		if i+1 < len(tokens) {
-			switch tokens[i+1].Kind {
-			case token.Eq, token.Lt, token.Gt, token.LtEq, token.GtEq:
-				continue
+		switch active {
+		case "^":
+			tok.Kind = token.Semicolon
+		case ";":
+			if i+1 < len(tokens) {
+				switch tokens[i+1].Kind {
+				case token.Eq, token.Lt, token.Gt, token.LtEq, token.GtEq:
+					continue
+				}
 			}
+			tok.Kind = token.Semicolon
 		}
-		if followsSetTerm(tokens[:i]) {
-			continue
+	}
+}
+
+// setTermName reads the terminator SET TERM names at tokens[start]: the run
+// of tokens up to a space or the terminator it replaces. It returns the name
+// and the index just past it.
+func setTermName(tokens []*token.Token, start int, previous string) (string, int) {
+	var name strings.Builder
+	end := start
+	for end < len(tokens) && !isTrivia(tokens[end]) {
+		text := tokenText(tokens[end])
+		if end > start && text == previous {
+			break
 		}
-		tok.Kind = token.Semicolon
+		name.WriteString(text)
+		end++
+	}
+	return name.String(), end
+}
+
+func nextSignificant(tokens []*token.Token, from int) int {
+	for i := from; i < len(tokens); i++ {
+		if !isTrivia(tokens[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isTrivia(tok *token.Token) bool {
+	return tok.Kind == token.Whitespace || tok.Kind == token.Comment || tok.Kind == token.MultilineComment
+}
+
+func tokenText(tok *token.Token) string {
+	switch value := tok.Value.(type) {
+	case string:
+		return value
+	case *token.SQLWord:
+		return value.String()
+	default:
+		return fmt.Sprint(value)
 	}
 }
 
 func followsSetTerm(tokens []*token.Token) bool {
 	var words []string
 	for i := len(tokens) - 1; i >= 0 && len(words) < 2; i-- {
-		switch tokens[i].Kind {
-		case token.Whitespace, token.Comment, token.MultilineComment:
+		switch {
+		case isTrivia(tokens[i]):
 			continue
-		case token.SQLKeyword:
+		case tokens[i].Kind == token.SQLKeyword:
 			word, ok := tokens[i].Value.(*token.SQLWord)
 			if !ok {
 				return false
