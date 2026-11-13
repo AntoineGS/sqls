@@ -800,3 +800,16 @@ func TestInterBaseDerivedTableInLaterSelectItem(t *testing.T) {
 		}
 	}
 }
+
+func TestInterBaseCompletionStopsAtCaretTerminator(t *testing.T) {
+	// The UPDATE's CITY belongs to the first statement only: "^" ends it.
+	const first = "update CITY set ID = 1^ select "
+	got := completeAt(t, interBaseCompletionRequest(interBaseCompletionCatalogCache(), first+" from MYVIEW y", dialect.SQLVariantInterBase3), len(first))
+	id := soleCandidate(t, got, "ID")
+	if id.Detail != `column from "MYVIEW"` {
+		t.Fatalf("ID detail = %q, want the column of MYVIEW in the statement after ^", id.Detail)
+	}
+	if len(candidatesFor(got, "y")) != 1 {
+		t.Fatalf("alias y of the current statement missing: %v", completionLabels(got))
+	}
+}

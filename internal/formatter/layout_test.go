@@ -112,6 +112,16 @@ func TestFormatLayout(t *testing.T) {
 			want:  "SELECT\n  CAST(a AS VARCHAR(8) CHARACTER SET NONE)\nFROM\n  t",
 		},
 		{
+			name:  "caret terminators without set term",
+			input: "select a from t where b = 1^ select c from u^",
+			want:  "SELECT\n  a\nFROM\n  t\nWHERE\n  b = 1^\nSELECT\n  c\nFROM\n  u^",
+		},
+		{
+			name:  "procedure ending with caret without set term",
+			input: "CREATE PROCEDURE P1 AS BEGIN X = 1; END^\nselect a from t^",
+			want:  "CREATE PROCEDURE P1 AS\nBEGIN\n  X = 1;\nEND^\nSELECT\n  a\nFROM\n  t^",
+		},
+		{
 			name:  "trigger body without set term",
 			input: "CREATE TRIGGER T1 FOR T ACTIVE BEFORE INSERT AS BEGIN NEW.ID = GEN_ID(G, 1); END",
 			want:  "CREATE TRIGGER T1 FOR T ACTIVE BEFORE INSERT AS\nBEGIN\n  NEW.ID = GEN_ID(G, 1);\nEND",

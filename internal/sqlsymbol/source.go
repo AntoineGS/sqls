@@ -58,9 +58,10 @@ func lex(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 	// such as !! is not a legal standalone SQL token, while it is perfectly
 	// valid in an InterBase script.
 	active := ";"
+	caret := caretTerminates(dv)
 	result := make([]lexeme, 0)
 	for offset := 0; offset < len(text); {
-		end, delimiter, err := nextDelimiter(text, offset, active)
+		end, delimiter, err := nextDelimiter(text, offset, active, caret)
 		if err != nil {
 			return nil, err
 		}
@@ -97,18 +98,20 @@ func lex(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 }
 
 // scriptDelimiterOffsets returns, in document order, the byte offset where
-// each SET TERM custom (non-";") statement delimiter begins. lex() consumes
+// each SET TERM custom (non-";") statement delimiter, or InterBase "^"
+// terminator, begins. lex() consumes
 // a custom delimiter without producing any lexeme for it at all (only
 // ordinary ";" boundaries are represented as Semicolon lexemes), so
 // diagnostic statement-boundary detection cannot see those boundaries
 // without this separate, lightweight mirror of lex()'s own segment
 // splitting. It changes nothing about what lex() returns to its other
 // callers (navigation, rename).
-func scriptDelimiterOffsets(text string) []int {
+func scriptDelimiterOffsets(text string, dv dialect.DriverVariant) []int {
 	active := ";"
+	caret := caretTerminates(dv)
 	var offsets []int
 	for offset := 0; offset < len(text); {
-		end, delimiter, err := nextDelimiter(text, offset, active)
+		end, delimiter, err := nextDelimiter(text, offset, active, caret)
 		if err != nil {
 			return offsets
 		}
@@ -150,10 +153,19 @@ func lexRaw(text string, dv dialect.DriverVariant) ([]lexeme, error) {
 	return result, nil
 }
 
+// caretTerminates reports whether a bare "^" also ends a statement while ";"
+// is the active delimiter. InterBase scripts written for MDExplorer use "^"
+// without SET TERM; other drivers keep "^" as an operator.
+func caretTerminates(dv dialect.DriverVariant) bool {
+	return dv.Driver == dialect.DatabaseDriverInterBase
+}
+
 // nextDelimiter returns the next active script delimiter outside SQL strings
 // and comments. It also validates those protected regions so an incomplete
-// literal or comment cannot produce a misleading partial symbol index.
-func nextDelimiter(text string, offset int, delimiter string) (int, string, error) {
+// literal or comment cannot produce a misleading partial symbol index. With
+// caret, a "^" outside the ^=, ^< and ^> operators also ends a statement
+// while ";" is active, except as the argument of SET TERM.
+func nextDelimiter(text string, offset int, delimiter string, caret bool) (int, string, error) {
 	for i := offset; i < len(text); i++ {
 		switch text[i] {
 		case '\'', '"':
@@ -203,12 +215,48 @@ func nextDelimiter(text string, offset int, delimiter string) (int, string, erro
 				i--
 			}
 		default:
+			if caret && delimiter == ";" && isCaretTerminator(text, i) {
+				// A caret in the name SET TERM gives the new terminator, which
+				// runs to a space or the ";" ending SET TERM, is not a boundary.
+				name := i
+				for name > offset && !isASCIISpace(text[name-1]) && text[name-1] != ';' {
+					name--
+				}
+				if !isSetTermPrefix(text[offset:name]) {
+					return i, "^", nil
+				}
+				for i < len(text) && !isASCIISpace(text[i]) && text[i] != ';' {
+					i++
+				}
+				i--
+				continue
+			}
 			if delimiter != "" && strings.HasPrefix(text[i:], delimiter) {
 				return i, delimiter, nil
 			}
 		}
 	}
 	return len(text), "", nil
+}
+
+// isCaretTerminator reports whether text[i] is a "^" statement terminator
+// rather than part of the ^=, ^< or ^> comparison operators.
+func isCaretTerminator(text string, i int) bool {
+	if text[i] != '^' {
+		return false
+	}
+	return i+1 >= len(text) || text[i+1] != '=' && text[i+1] != '<' && text[i+1] != '>'
+}
+
+// isSetTermPrefix reports text holding exactly "SET TERM", so a following
+// "^" is the new terminator rather than the end of the statement.
+func isSetTermPrefix(text string) bool {
+	fields := strings.Fields(maskSQLProtected(text))
+	return len(fields) == 2 && strings.EqualFold(fields[0], "SET") && strings.EqualFold(fields[1], "TERM")
+}
+
+func isASCIISpace(c byte) bool {
+	return c == ' ' || c >= '\t' && c <= '\r'
 }
 
 func setTermDelimiter(segment string) (string, bool) {

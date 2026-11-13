@@ -330,16 +330,40 @@ func TestDiagnosticModelSetTermSplitsStatementsAndDDL(t *testing.T) {
 	if m.DDLInvalidated(selectPos, Name{Text: "Z"}) {
 		t.Fatalf("DDLInvalidated(Z) = true, want false: Z was never touched by DDL")
 	}
-	// The current fix only makes statement-boundary and DDL detection aware
-	// of the SET TERM delimiter; the navigation binder's own token contexts
-	// (buildContexts in resolve.go) still do not reset at a custom
-	// delimiter, so this SELECT's contexts stay contextUnsupported and
-	// RelationScope cannot resolve B here. Unsupported correctly reports
-	// that instead of a false conclusion, which is the safe fallback: a
-	// caller checking Unsupported before trusting RelationScope is not
-	// misled.
-	if !m.Unsupported(selectPos) {
-		t.Fatalf("Unsupported(SELECT in SET TERM block) = false, want true: navigation's own context tracking does not reset at a SET TERM boundary")
+	// The navigation binder's token contexts (buildContexts in resolve.go)
+	// also reset at a custom delimiter, so this SELECT resolves B.
+	if m.Unsupported(selectPos) {
+		t.Fatalf("Unsupported(SELECT in SET TERM block) = true, want false: the SET TERM delimiter ends the previous statement")
+	}
+	if scope := m.RelationScope(selectPos); len(scope) != 1 || len(scope[0]) != 1 || scope[0][0].Name.Key() != "B" {
+		t.Fatalf("RelationScope(SELECT in SET TERM block) = %+v, want B", scope)
+	}
+}
+
+// An InterBase "^" without SET TERM splits statements, is visible to DDL
+// detection, and resets the binder so later statements resolve normally.
+func TestDiagnosticModelCaretSplitsStatementsAndBinder(t *testing.T) {
+	text := "CREATE TABLE A (ID INTEGER)^\nSELECT ID FROM B WHERE ID ^= 1^\nSELECT ID FROM B^\n"
+	_, m := buildModel(t, text, newDiagnosticFixtureCatalog())
+	statements := m.Statements()
+	if len(statements) != 3 {
+		t.Fatalf("Statements() = %+v, want 3 statements split at ^", statements)
+	}
+	for i, stmt := range statements {
+		if stmt.Malformed {
+			t.Fatalf("Statements()[%d] = %+v, want cleanly modeled (not malformed)", i, stmt)
+		}
+	}
+	selectPos := itemAt(t, m, text, "SELECT", 1)
+	if !m.DDLInvalidated(selectPos, Name{Text: "A"}) {
+		t.Fatalf("DDLInvalidated(A) = false, want true: A was CREATEd by an earlier ^-terminated statement")
+	}
+	if m.Unsupported(selectPos) {
+		t.Fatalf("Unsupported(SELECT after ^) = true, want false: ^ ends the previous statement")
+	}
+	scope := m.RelationScope(selectPos)
+	if len(scope) != 1 || len(scope[0]) != 1 || scope[0][0].Name.Key() != "B" {
+		t.Fatalf("RelationScope(SELECT after ^) = %+v, want B", scope)
 	}
 }
 

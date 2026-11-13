@@ -286,8 +286,16 @@ func buildContexts(a *Analysis, items []lexeme) ([]tokenContext, []int) {
 	unsupportedFrames := make([]bodyFrame, 0, 2)
 	bodyStarted := make([]bool, len(a.procedures))
 	head := ""
+	// A SET TERM or "^" delimiter ends its statement outright; lex() leaves no
+	// lexeme for it, so its boundaries come from the source text.
+	boundaryAfter := boundaryAfterItems(items, scriptDelimiterOffsets(a.Text, a.Variant))
 	for i, item := range items {
 		procedureIndex := procedureAt[i]
+		if i > 0 && boundaryAfter[i-1] {
+			unsupportedFrames = unsupportedFrames[:0]
+			kind, active, depth, restoreProcedureDepth = contextProcedure, false, 0, -1
+			updateSetDepth, updateExpectTarget, outputDepth, outputActive, outputExpect, head = -1, false, -1, false, false, ""
+		}
 		if item.Token.Kind == token.Semicolon && len(unsupportedFrames) == 0 {
 			kind, active, depth, restoreProcedureDepth = contextProcedure, false, 0, -1
 			updateSetDepth, updateExpectTarget, outputDepth, outputActive, outputExpect, head = -1, false, -1, false, false, ""

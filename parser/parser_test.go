@@ -218,6 +218,65 @@ func TestParseStatement(t *testing.T) {
 	}
 }
 
+func parseStatementsWith(t *testing.T, input string, dv dialect.DriverVariant) []string {
+	t.Helper()
+	parsed, err := ParseWithDriverVariant(input, dv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, node := range parsed.GetTokens() {
+		stmt, ok := node.(*ast.Statement)
+		if !ok {
+			t.Fatalf("invalid type want Statement parsed %T", node)
+		}
+		got = append(got, stmt.String())
+	}
+	return got
+}
+
+func TestParseInterBaseCaretEndsStatement(t *testing.T) {
+	interbase := dialect.DriverVariant{Driver: dialect.DatabaseDriverInterBase, Variant: dialect.SQLVariantInterBase3}
+	got := parseStatementsWith(t, "select 1 from a^\nselect 2 from b where x ^= 1 and y ^< 2 and z ^> 3", interbase)
+	want := []string{"select 1 from a^", "\nselect 2 from b where x ^= 1 and y ^< 2 and z ^> 3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("statements = %q, want %q", got, want)
+	}
+	got = parseStatementsWith(t, "SET TERM ^ ;\nselect 1 from a^", interbase)
+	want = []string{"SET TERM ^ ;", "\nselect 1 from a^"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("set term statements = %q, want %q", got, want)
+	}
+	// SET TERM is honored: another terminator turns carets off until SET TERM
+	// ; or ^, and a terminator made of more than a caret is left unsplit.
+	for _, tc := range []struct {
+		input string
+		want  []string
+	}{
+		{"SET TERM % ;\nselect 1 ^ 2 from a%", []string{"SET TERM % ;", "\nselect 1 ^ 2 from a%"}},
+
+		{"SET TERM ^;\nselect 1 from a where x ^= 1^", []string{"SET TERM ^;", "\nselect 1 from a where x ^", "= 1^"}},
+		{"SET TERM % ;\nselect 1 from a%\nSET TERM ; %\nselect 2 from b^ select 3 from c",
+			// The parser has always split at a ";" token, whatever SET TERM says.
+			[]string{"SET TERM % ;", "\nselect 1 from a%\nSET TERM ;", " %\nselect 2 from b^", " select 3 from c"}},
+		// A terminator made only of carets ends statements as a whole, also
+		// when it ends the SET TERM that replaces it.
+		{"SET TERM ^^ ;\nselect 1 from a^^\nSET TERM ^ ^^\nselect 2 from b^",
+			[]string{"SET TERM ^^ ;", "\nselect 1 from a^^", "\nSET TERM ^ ^^", "\nselect 2 from b^"}},
+		{"SET TERM ^ ;\nselect 1 from a^\nSET TERM ; ^\nselect 2 from b^",
+			[]string{"SET TERM ^ ;", "\nselect 1 from a^", "\nSET TERM ;", " ^", "\nselect 2 from b^"}},
+	} {
+		if got := parseStatementsWith(t, tc.input, interbase); !reflect.DeepEqual(got, tc.want) {
+			t.Fatalf("%q: statements = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+	got = parseStatementsWith(t, "select 5 ^ 3 from a; select 1 from b", dialect.DriverVariant{Driver: dialect.DatabaseDriverMySQL})
+	want = []string{"select 5 ^ 3 from a;", " select 1 from b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mysql statements = %q, want %q", got, want)
+	}
+}
+
 func TestParseComments(t *testing.T) {
 	testcases := []struct {
 		name    string

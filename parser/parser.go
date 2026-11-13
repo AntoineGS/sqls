@@ -84,6 +84,132 @@ func ParseWithDialect(text string, d dialect.Dialect) (ast.TokenList, error) {
 	return parsed, nil
 }
 
+// markCaretTerminators turns each InterBase "^" statement terminator into a
+// Semicolon token that keeps its spelling, so statements split there. While
+// ";" is the terminator a "^" also ends a statement, except in the ^=, ^< and
+// ^> operators. SET TERM is followed: a terminator made only of carets, such
+// as "^" or "^^", ends statements as a whole, any other terminator leaves
+// carets alone, and the terminator SET TERM names is never a boundary.
+func markCaretTerminators(tokens []*token.Token) []*token.Token {
+	out := make([]*token.Token, 0, len(tokens))
+	active := ";"
+	for i := 0; i < len(tokens); i++ {
+		tok := tokens[i]
+		if !isTrivia(tok) && followsSetTerm(out) {
+			previous := active
+			name, end := setTermName(tokens, i, previous)
+			out = append(out, tokens[i:end]...)
+			active, i = name, end-1
+			// SET TERM itself ends with the terminator it replaces.
+			if next := nextSignificant(tokens, end); next >= 0 {
+				if n := caretTerminator(tokens, next, previous); n > 0 {
+					out = append(out, tokens[end:next]...)
+					out = append(out, mergeTerminator(tokens[next:next+n]))
+					i = next + n - 1
+				}
+			}
+			continue
+		}
+		if n := caretTerminator(tokens, i, active); n > 0 {
+			out = append(out, mergeTerminator(tokens[i:i+n]))
+			i += n - 1
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// caretTerminator returns how many tokens at tokens[i] spell a caret
+// terminator under the active terminator, or 0.
+func caretTerminator(tokens []*token.Token, i int, active string) int {
+	if tokens[i].Kind != token.Caret {
+		return 0
+	}
+	if active == ";" {
+		if i+1 < len(tokens) {
+			switch tokens[i+1].Kind {
+			case token.Eq, token.Lt, token.Gt, token.LtEq, token.GtEq:
+				return 0
+			}
+		}
+		return 1
+	}
+	if active == "" || strings.Trim(active, "^") != "" || i+len(active) > len(tokens) {
+		return 0
+	}
+	for _, tok := range tokens[i : i+len(active)] {
+		if tok.Kind != token.Caret {
+			return 0
+		}
+	}
+	return len(active)
+}
+
+func mergeTerminator(run []*token.Token) *token.Token {
+	return &token.Token{Kind: token.Semicolon, Value: strings.Repeat("^", len(run)), From: run[0].From, To: run[len(run)-1].To}
+}
+
+// setTermName reads the terminator SET TERM names at tokens[start]: the run
+// of tokens up to a space or the terminator it replaces. It returns the name
+// and the index just past it.
+func setTermName(tokens []*token.Token, start int, previous string) (string, int) {
+	var name strings.Builder
+	end := start
+	for end < len(tokens) && !isTrivia(tokens[end]) {
+		text := tokenText(tokens[end])
+		if end > start && text == previous {
+			break
+		}
+		name.WriteString(text)
+		end++
+	}
+	return name.String(), end
+}
+
+func nextSignificant(tokens []*token.Token, from int) int {
+	for i := from; i < len(tokens); i++ {
+		if !isTrivia(tokens[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+func isTrivia(tok *token.Token) bool {
+	return tok.Kind == token.Whitespace || tok.Kind == token.Comment || tok.Kind == token.MultilineComment
+}
+
+func tokenText(tok *token.Token) string {
+	switch value := tok.Value.(type) {
+	case string:
+		return value
+	case *token.SQLWord:
+		return value.String()
+	default:
+		return fmt.Sprint(value)
+	}
+}
+
+func followsSetTerm(tokens []*token.Token) bool {
+	var words []string
+	for i := len(tokens) - 1; i >= 0 && len(words) < 2; i-- {
+		switch {
+		case isTrivia(tokens[i]):
+			continue
+		case tokens[i].Kind == token.SQLKeyword:
+			word, ok := tokens[i].Value.(*token.SQLWord)
+			if !ok {
+				return false
+			}
+			words = append(words, word.Value)
+		default:
+			return false
+		}
+	}
+	return len(words) == 2 && strings.EqualFold(words[0], "TERM") && strings.EqualFold(words[1], "SET")
+}
+
 type Parser struct {
 	root ast.TokenList
 }
@@ -93,6 +219,10 @@ func NewParser(src io.Reader, d dialect.Dialect) (*Parser, error) {
 	tokens, err := tokenizer.Tokenize()
 	if err != nil && !errors.Is(err, token.ErrUnclosedMultilineComment) {
 		return nil, fmt.Errorf("tokenize err failed: %w", err)
+	}
+
+	if _, ok := d.(*dialect.InterBaseDialect); ok {
+		tokens = markCaretTerminators(tokens)
 	}
 
 	parsed := []ast.Node{}
