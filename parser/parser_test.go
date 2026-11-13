@@ -254,11 +254,15 @@ func TestParseInterBaseCaretEndsStatement(t *testing.T) {
 		want  []string
 	}{
 		{"SET TERM % ;\nselect 1 ^ 2 from a%", []string{"SET TERM % ;", "\nselect 1 ^ 2 from a%"}},
-		{"SET TERM ^^ ;\nselect 1 from a^^", []string{"SET TERM ^^ ;", "\nselect 1 from a^^"}},
+
 		{"SET TERM ^;\nselect 1 from a where x ^= 1^", []string{"SET TERM ^;", "\nselect 1 from a where x ^", "= 1^"}},
 		{"SET TERM % ;\nselect 1 from a%\nSET TERM ; %\nselect 2 from b^ select 3 from c",
 			// The parser has always split at a ";" token, whatever SET TERM says.
 			[]string{"SET TERM % ;", "\nselect 1 from a%\nSET TERM ;", " %\nselect 2 from b^", " select 3 from c"}},
+		// A terminator made only of carets ends statements as a whole, also
+		// when it ends the SET TERM that replaces it.
+		{"SET TERM ^^ ;\nselect 1 from a^^\nSET TERM ^ ^^\nselect 2 from b^",
+			[]string{"SET TERM ^^ ;", "\nselect 1 from a^^", "\nSET TERM ^ ^^", "\nselect 2 from b^"}},
 		{"SET TERM ^ ;\nselect 1 from a^\nSET TERM ; ^\nselect 2 from b^",
 			[]string{"SET TERM ^ ;", "\nselect 1 from a^", "\nSET TERM ;", " ^", "\nselect 2 from b^"}},
 	} {

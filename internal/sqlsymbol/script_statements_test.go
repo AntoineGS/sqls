@@ -144,6 +144,14 @@ func TestScriptStatements(t *testing.T) {
 				routine bool
 			}{{"SELECT 1 FROM A; SELECT 2 FROM B", false}, {"SELECT 3 FROM C; SELECT 4 FROM D", false}},
 		},
+		{
+			name: "set term ends with the caret run it replaces",
+			text: "SET TERM ^^ ;\nSELECT 1 FROM A^^\nSET TERM ^ ^^\nSELECT 2 FROM B^",
+			want: []struct {
+				text    string
+				routine bool
+			}{{"SELECT 1 FROM A", false}, {"SELECT 2 FROM B", false}},
+		},
 	}
 
 	for _, tt := range tests {
