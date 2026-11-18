@@ -196,7 +196,7 @@ func TestDriverDSNDefaultsAndTimeout(t *testing.T) {
 			if parsed.Net != "tcp" || parsed.Addr != "DB.Example:3307" || parsed.DBName != "mde_fixture" {
 				t.Fatalf("parsed endpoint = %s(%s)/%s, want tcp(DB.Example:3307)/mde_fixture", parsed.Net, parsed.Addr, parsed.DBName)
 			}
-			if parsed.TLSConfig != "preferred" || parsed.ParseTime || parsed.InterpolateParams || !parsed.ClientFoundRows {
+			if parsed.TLSConfig != preferredTLS || parsed.ParseTime || parsed.InterpolateParams || !parsed.ClientFoundRows {
 				t.Fatalf("parsed options = tls:%q parseTime:%t interpolateParams:%t clientFoundRows:%t", parsed.TLSConfig, parsed.ParseTime, parsed.InterpolateParams, parsed.ClientFoundRows)
 			}
 			if parsed.Timeout != tt.wantTimeout {

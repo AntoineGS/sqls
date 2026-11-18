@@ -3,6 +3,7 @@
 package mymeta
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/url"
@@ -15,6 +16,34 @@ import (
 )
 
 const defaultPort = 3306
+
+// preferredTLS is the driver's tls=preferred (TLS without certificate
+// verification, plaintext when the server has no TLS) plus plain-RSA key
+// exchange. MySQL 5.7 servers built with OpenSSL 1.0.2 offer neither ECDHE
+// nor TLS 1.3, and Go offers only ECDHE by default; ECDHE stays first.
+const preferredTLS = "sqls-preferred"
+
+func init() {
+	if err := mysql.RegisterTLSConfig(preferredTLS, &tls.Config{
+		InsecureSkipVerify: true,
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		},
+	}); err != nil {
+		panic(err)
+	}
+}
 
 // Config contains the target and login settings for one MySQL connection.
 type Config struct {
@@ -95,7 +124,8 @@ func DriverDSN(cfg Config, extra url.Values) (string, error) {
 	driverConfig.Net = "tcp"
 	driverConfig.Addr = target.Addr()
 	driverConfig.DBName = target.Schema
-	driverConfig.TLSConfig = "preferred"
+	driverConfig.TLSConfig = preferredTLS
+	driverConfig.AllowFallbackToPlaintext = true
 	driverConfig.Timeout = timeout
 	driverConfig.ClientFoundRows = true
 	driverConfig.Params = map[string]string{"charset": "utf8mb4"}
