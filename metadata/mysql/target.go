@@ -125,7 +125,8 @@ func DriverDSN(cfg Config, extra url.Values) (string, error) {
 	driverConfig.Addr = target.Addr()
 	driverConfig.DBName = target.Schema
 	driverConfig.TLSConfig = preferredTLS
-	driverConfig.AllowFallbackToPlaintext = true
+	// A tls mode in extra replaces this one and keeps its own fallback rule.
+	driverConfig.AllowFallbackToPlaintext = !extra.Has("tls")
 	driverConfig.Timeout = timeout
 	driverConfig.ClientFoundRows = true
 	driverConfig.Params = map[string]string{"charset": "utf8mb4"}

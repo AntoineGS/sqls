@@ -8,6 +8,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"net/url"
 	"testing"
 	"time"
 
@@ -37,6 +38,24 @@ func TestDriverDSNTLSIsUnverifiedWithPlaintextFallback(t *testing.T) {
 	}
 	if !parsed.AllowFallbackToPlaintext {
 		t.Fatal("TLS does not fall back to plaintext for servers without TLS")
+	}
+}
+
+func TestDriverDSNExtraTLSModeKeepsItsOwnFallback(t *testing.T) {
+	for _, mode := range []string{"true", "skip-verify", preferredTLS} {
+		t.Run(mode, func(t *testing.T) {
+			dsn, err := DriverDSN(Config{Target: "db.example:3306/app", User: "app"}, url.Values{"tls": {mode}})
+			if err != nil {
+				t.Fatalf("DriverDSN(): %v", err)
+			}
+			parsed, err := mysql.ParseDSN(dsn)
+			if err != nil {
+				t.Fatalf("mysql.ParseDSN(%q): %v", dsn, err)
+			}
+			if parsed.AllowFallbackToPlaintext {
+				t.Fatalf("tls=%s from extra allows plaintext fallback: %q", mode, dsn)
+			}
+		})
 	}
 }
 
